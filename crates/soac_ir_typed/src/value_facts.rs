@@ -39,6 +39,12 @@ pub enum NoneFact {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum PyObjectNullabilityFact {
+    Unknown,
+    NonNull,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum BoolSingletonFact {
     Unknown,
     IsTrue,
@@ -127,6 +133,7 @@ pub struct PyObjFacts {
     pub ty: TypeFact,
     pub truthiness: TruthinessFact,
     pub none: NoneFact,
+    pub nullability: PyObjectNullabilityFact,
     pub bool_singleton: BoolSingletonFact,
     pub refcount: RefcountFact,
     pub provenance: ProvenanceFact,
@@ -139,6 +146,7 @@ impl PyObjFacts {
             ty: TypeFact::Unknown,
             truthiness: TruthinessFact::Unknown,
             none: NoneFact::Unknown,
+            nullability: PyObjectNullabilityFact::Unknown,
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
@@ -151,6 +159,7 @@ impl PyObjFacts {
             ty: TypeFact::Exact(PyExactType::NoneType),
             truthiness: TruthinessFact::AlwaysFalse,
             none: NoneFact::IsNone,
+            nullability: PyObjectNullabilityFact::NonNull,
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Immortal,
             provenance: ProvenanceFact::RuntimeSingleton(RuntimeSingleton::None),
@@ -167,6 +176,7 @@ impl PyObjFacts {
                 TruthinessFact::AlwaysFalse
             },
             none: NoneFact::IsNotNone,
+            nullability: PyObjectNullabilityFact::NonNull,
             bool_singleton: if value {
                 BoolSingletonFact::IsTrue
             } else {
@@ -187,6 +197,7 @@ impl PyObjFacts {
             ty: TypeFact::Exact(PyExactType::Bool),
             truthiness: TruthinessFact::Unknown,
             none: NoneFact::IsNotNone,
+            nullability: PyObjectNullabilityFact::NonNull,
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Immortal,
             provenance: ProvenanceFact::Unknown,
@@ -199,6 +210,7 @@ impl PyObjFacts {
             ty: TypeFact::Exact(exact_type),
             truthiness: TruthinessFact::Unknown,
             none: none_fact_for_exact_type(exact_type),
+            nullability: PyObjectNullabilityFact::NonNull,
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
@@ -214,6 +226,7 @@ impl PyObjFacts {
             ty: TypeFact::Exact(exact_type),
             truthiness,
             none: none_fact_for_exact_type(exact_type),
+            nullability: PyObjectNullabilityFact::NonNull,
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
@@ -226,6 +239,7 @@ impl PyObjFacts {
             ty: TypeFact::Unknown,
             truthiness: TruthinessFact::Unknown,
             none: NoneFact::Unknown,
+            nullability: PyObjectNullabilityFact::Unknown,
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::ModuleConstant(index),
@@ -248,6 +262,7 @@ impl PyObjFacts {
             ty: TypeFact::Unknown,
             truthiness: TruthinessFact::AlwaysTrue,
             none: NoneFact::IsNotNone,
+            nullability: PyObjectNullabilityFact::NonNull,
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
@@ -260,6 +275,7 @@ impl PyObjFacts {
             ty: TypeFact::Unknown,
             truthiness: TruthinessFact::Unknown,
             none: NoneFact::IsNotNone,
+            nullability: PyObjectNullabilityFact::NonNull,
             bool_singleton: BoolSingletonFact::Unknown,
             refcount: RefcountFact::Unknown,
             provenance: ProvenanceFact::Unknown,
@@ -273,6 +289,15 @@ impl PyObjFacts {
 
     pub const fn is_known_not_none(self) -> bool {
         matches!(self.none, NoneFact::IsNotNone)
+    }
+
+    pub const fn with_non_null_ref(mut self) -> Self {
+        self.nullability = PyObjectNullabilityFact::NonNull;
+        self
+    }
+
+    pub const fn is_non_null_ref(self) -> bool {
+        matches!(self.nullability, PyObjectNullabilityFact::NonNull)
     }
 
     pub const fn is_truthy(self) -> Option<bool> {
@@ -306,6 +331,7 @@ impl PyObjFacts {
         self.ty == TypeFact::Unknown
             && self.truthiness == TruthinessFact::Unknown
             && self.none == NoneFact::Unknown
+            && self.nullability == PyObjectNullabilityFact::Unknown
             && self.bool_singleton == BoolSingletonFact::Unknown
             && self.refcount == RefcountFact::Unknown
             && self.callable == CallableFact::Unknown

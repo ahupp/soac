@@ -1595,6 +1595,34 @@ struct JitEmitCtx<'mc> {
 }
 
 #[derive(Clone, Copy)]
+struct RefcountEmitter {
+    ptr_ty: ir::Type,
+    thread_state_value: ir::Value,
+    lowering: RefcountLowering,
+}
+
+impl RefcountEmitter {
+    fn emit_incref(
+        self,
+        fb: &mut FunctionBuilder<'_>,
+        value: ir::Value,
+        facts: Option<PyObjFacts>,
+    ) {
+        self.lowering.emit_incref(fb, self.ptr_ty, value, facts);
+    }
+
+    fn emit_decref(
+        self,
+        fb: &mut FunctionBuilder<'_>,
+        value: ir::Value,
+        facts: Option<PyObjFacts>,
+    ) {
+        self.lowering
+            .emit_decref(fb, self.ptr_ty, self.thread_state_value, value, facts);
+    }
+}
+
+#[derive(Clone, Copy)]
 struct RefcountDecrefLocationCounterParts<'a> {
     counter_refs: &'a HashMap<String, CounterRef>,
     counter_slots_by_id: &'a [CounterRuntimeSlot],
@@ -1963,18 +1991,38 @@ fn deopt_binding_stack_slot_for_location(
 }
 
 impl JitEmitCtx<'_> {
+    fn refcount_emitter(&self) -> RefcountEmitter {
+        RefcountEmitter {
+            ptr_ty: self.consts.ptr_ty,
+            thread_state_value: self.consts.thread_state_value,
+            lowering: self.refcount_lowering,
+        }
+    }
+
     fn emit_incref(&self, fb: &mut FunctionBuilder<'_>, value: ir::Value) {
-        self.refcount_lowering
-            .emit_incref(fb, self.consts.ptr_ty, value);
+        self.refcount_emitter().emit_incref(fb, value, None);
+    }
+
+    fn emit_incref_with_facts(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        value: ir::Value,
+        facts: PyObjFacts,
+    ) {
+        self.refcount_emitter().emit_incref(fb, value, Some(facts));
     }
 
     fn emit_decref(&self, fb: &mut FunctionBuilder<'_>, value: ir::Value) {
-        self.refcount_lowering.emit_decref(
-            fb,
-            self.consts.ptr_ty,
-            self.consts.thread_state_value,
-            value,
-        );
+        self.refcount_emitter().emit_decref(fb, value, None);
+    }
+
+    fn emit_decref_with_facts(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        value: ir::Value,
+        facts: PyObjFacts,
+    ) {
+        self.refcount_emitter().emit_decref(fb, value, Some(facts));
     }
 
     fn value_facts_for_instr_id(&self, instr_id: InstrId) -> Option<ValueFacts> {
@@ -2624,7 +2672,11 @@ impl LocalEnv {
                 ));
             }
             if local_ref_kind_needs_incref_for_load(entry.ref_kind(), borrowed) {
-                ctx.emit_incref(fb, value);
+                if let Some(py_facts) = entry.py_facts() {
+                    ctx.emit_incref_with_facts(fb, value, py_facts);
+                } else {
+                    ctx.emit_incref(fb, value);
+                }
             }
             return Some(value);
         }
@@ -2690,7 +2742,11 @@ impl LocalEnv {
                 ));
             }
             if local_ref_kind_needs_incref_for_load(entry.ref_kind(), borrowed) {
-                ctx.emit_incref(fb, value);
+                if let Some(py_facts) = entry.py_facts() {
+                    ctx.emit_incref_with_facts(fb, value, py_facts);
+                } else {
+                    ctx.emit_incref(fb, value);
+                }
             }
             return Some(value);
         }
@@ -2706,11 +2762,13 @@ impl LocalEnv {
         value: ir::Value,
         facts: IntFacts,
         cleanup_root_previous_state: CleanupRootSlotState,
+        cleanup_root_previous_facts: Option<PyObjFacts>,
         stack_slots: &StackSlots,
         refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
     ) {
         let previous_entry = if let Some(existing_index) = self
             .entry_index_for_location(location)
@@ -2738,6 +2796,11 @@ impl LocalEnv {
                         ptr_ty,
                         thread_state_value,
                         decref_ref,
+                        refcounts,
+                        previous_entry
+                            .as_ref()
+                            .and_then(LocalEnvEntry::py_facts)
+                            .or(cleanup_root_previous_facts),
                         refcount_location_counters,
                     )
                     .expect("slot-backed scalar local missing from stack slots");
@@ -2758,7 +2821,7 @@ impl LocalEnv {
             && previous.storage == LocalEnvStorage::LocalOnly
             && transient_local_needs_decref(previous.ref_kind())
         {
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value());
+            emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
         }
     }
 
@@ -2770,11 +2833,13 @@ impl LocalEnv {
         name: &str,
         value: ir::Value,
         cleanup_root_previous_state: CleanupRootSlotState,
+        cleanup_root_previous_facts: Option<PyObjFacts>,
         stack_slots: &StackSlots,
         refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
     ) {
         let previous_entry = if let Some(existing_index) = self
             .entry_index_for_location(location)
@@ -2802,6 +2867,11 @@ impl LocalEnv {
                         ptr_ty,
                         thread_state_value,
                         decref_ref,
+                        refcounts,
+                        previous_entry
+                            .as_ref()
+                            .and_then(LocalEnvEntry::py_facts)
+                            .or(cleanup_root_previous_facts),
                         refcount_location_counters,
                     )
                     .expect("slot-backed scalar bool local missing from stack slots");
@@ -2821,7 +2891,7 @@ impl LocalEnv {
             && previous.storage == LocalEnvStorage::LocalOnly
             && transient_local_needs_decref(previous.ref_kind())
         {
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value());
+            emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
         }
     }
 
@@ -2835,12 +2905,14 @@ impl LocalEnv {
         py_facts: Option<PyObjFacts>,
         allow_local_only_slot_backed_store: bool,
         cleanup_root_previous_state: CleanupRootSlotState,
+        cleanup_root_previous_facts: Option<PyObjFacts>,
         stack_slots: &StackSlots,
         refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
     ) {
         let previous_entry = if let Some(existing_index) = self
             .entry_index_for_location(location)
@@ -2874,6 +2946,11 @@ impl LocalEnv {
                         thread_state_value,
                         incref_ref,
                         decref_ref,
+                        refcounts,
+                        previous_entry
+                            .as_ref()
+                            .and_then(LocalEnvEntry::py_facts)
+                            .or(cleanup_root_previous_facts),
                         refcount_location_counters,
                     )
                     .expect("cleanup-root local missing from stack slots");
@@ -2888,11 +2965,13 @@ impl LocalEnv {
                         thread_state_value,
                         incref_ref,
                         decref_ref,
+                        refcounts,
+                        previous_entry.as_ref().and_then(LocalEnvEntry::py_facts),
                         refcount_location_counters,
                     )
                     .expect("slot-backed local missing from stack slots");
                 if local_ref_kind_needs_refcount_call(value_ref_kind) {
-                    emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
+                    emit_decref_via_lowering(fb, refcounts, value, py_facts);
                 }
             }
             self.entries.push(LocalEnvEntry::pyobject(
@@ -2934,6 +3013,11 @@ impl LocalEnv {
                             ptr_ty,
                             thread_state_value,
                             decref_ref,
+                            refcounts,
+                            previous_entry
+                                .as_ref()
+                                .and_then(LocalEnvEntry::py_facts)
+                                .or(cleanup_root_previous_facts),
                             refcount_location_counters,
                         )
                         .expect("slot-backed local missing from stack slots");
@@ -2955,13 +3039,7 @@ impl LocalEnv {
         }
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind()) {
-                emit_decref_if_not_null(
-                    fb,
-                    ptr_ty,
-                    decref_ref,
-                    thread_state_value,
-                    previous.value(),
-                );
+                emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
             }
         }
     }
@@ -2973,9 +3051,10 @@ impl LocalEnv {
         value: ir::Value,
         value_ref_kind: LocalRefKind,
         py_facts: Option<PyObjFacts>,
-        ptr_ty: ir::Type,
-        thread_state_value: ir::Value,
-        decref_ref: ir::FuncRef,
+        _ptr_ty: ir::Type,
+        _thread_state_value: ir::Value,
+        _decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
     ) {
         let previous_entry = self
             .entry_index_for_name(name)
@@ -2992,13 +3071,7 @@ impl LocalEnv {
         ));
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind()) {
-                emit_decref_if_not_null(
-                    fb,
-                    ptr_ty,
-                    decref_ref,
-                    thread_state_value,
-                    previous.value(),
-                );
+                emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
             }
         }
     }
@@ -3010,10 +3083,12 @@ impl LocalEnv {
         name: &str,
         stack_slots: &StackSlots,
         cleanup_root_previous_state: CleanupRootSlotState,
+        cleanup_root_previous_facts: Option<PyObjFacts>,
         refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
     ) -> Result<(), String> {
         let had_stack_slot = stack_slots.has_name(name);
         let removed_entry = if let Some(index) = self
@@ -3022,13 +3097,7 @@ impl LocalEnv {
         {
             let previous = self.entries.remove(index);
             if transient_local_needs_decref(previous.ref_kind()) {
-                emit_decref_if_not_null(
-                    fb,
-                    ptr_ty,
-                    decref_ref,
-                    thread_state_value,
-                    previous.value(),
-                );
+                emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
             }
             Some(previous)
         } else {
@@ -3051,6 +3120,11 @@ impl LocalEnv {
                     ptr_ty,
                     thread_state_value,
                     decref_ref,
+                    refcounts,
+                    removed_entry
+                        .as_ref()
+                        .and_then(LocalEnvEntry::py_facts)
+                        .or(cleanup_root_previous_facts),
                     refcount_location_counters,
                 )
                 .expect("slot-backed delete target missing from stack slots");
@@ -3089,11 +3163,13 @@ impl LocalEnv {
         allow_local_only_slot_backed_store: bool,
         source_cleanup_root_previous_state: CleanupRootSlotState,
         target_cleanup_root_previous_state: CleanupRootSlotState,
+        target_cleanup_root_previous_facts: Option<PyObjFacts>,
         stack_slots: &StackSlots,
         refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
     ) -> bool {
         if source_location == target_location || source_name == target_name {
             return false;
@@ -3161,6 +3237,11 @@ impl LocalEnv {
                     ptr_ty,
                     thread_state_value,
                     decref_ref,
+                    refcounts,
+                    previous_entry
+                        .as_ref()
+                        .and_then(LocalEnvEntry::py_facts)
+                        .or(target_cleanup_root_previous_facts),
                     refcount_location_counters,
                 )
                 .expect("moved generated-temp target missing from stack slots");
@@ -3205,13 +3286,7 @@ impl LocalEnv {
         ));
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind()) {
-                emit_decref_if_not_null(
-                    fb,
-                    ptr_ty,
-                    decref_ref,
-                    thread_state_value,
-                    previous.value(),
-                );
+                emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
             }
         }
         true
@@ -3290,6 +3365,7 @@ fn bind_planned_local_env_at_block_entry(
     thread_state_value: ir::Value,
     incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
+    refcounts: RefcountEmitter,
     propagate_entry_py_facts: bool,
 ) -> Result<(), String> {
     for entry in &jit_local_plan.entry_materializations[block_index] {
@@ -3365,6 +3441,8 @@ fn bind_planned_local_env_at_block_entry(
                             thread_state_value,
                             incref_ref,
                             decref_ref,
+                            refcounts,
+                            None,
                             refcount_location_counters,
                         )
                         .expect("runtime block param missing from stack slots");
@@ -3551,6 +3629,20 @@ fn planned_cleanup_root_previous_state_for_key(
     } else {
         CleanupRootSlotState::MaybeOwnedReference
     }
+}
+
+fn planned_cleanup_root_previous_facts_for_key(
+    instr_key: InstrKey,
+    name: &str,
+    ctx: &JitEmitCtx<'_>,
+) -> Option<PyObjFacts> {
+    ctx.stack_slots
+        .has_cleanup_root_name(name)
+        .then(|| {
+            ctx.cleanup_root_slot_states
+                .previous_facts_for_instr(instr_key, name)
+        })
+        .flatten()
 }
 
 fn cleanup_root_state_key(states: &HashMap<String, CleanupRootSlotState>) -> Vec<String> {
@@ -3846,10 +3938,16 @@ fn emit_local_store_result_with_local_env(
                         name,
                         emit_ctx,
                     ),
+                    planned_cleanup_root_previous_facts_for_key(
+                        expr.semantic_instr_key(emit_ctx.function_id),
+                        name,
+                        emit_ctx,
+                    ),
                     Some(refcount_decref_location_counter_parts(emit_ctx)),
                     emit_ctx.consts.ptr_ty,
                     emit_ctx.consts.thread_state_value,
                     emit_ctx.decref_ref,
+                    emit_ctx.refcount_emitter(),
                 )
                 .unwrap_or_else(|error| panic!("{error}"));
             return Some(emit_none_for_demand(fb, emit_ctx, demand));
@@ -3886,12 +3984,18 @@ fn emit_local_store_result_with_local_env(
                 name,
                 emit_ctx,
             ),
+            planned_cleanup_root_previous_facts_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
             &emit_ctx.stack_slots,
             Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.incref_ref,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         );
         return Some(emit_none_for_demand(fb, emit_ctx, demand));
     }
@@ -3953,12 +4057,18 @@ fn emit_local_store_result_with_local_env(
                 backing_name,
                 emit_ctx,
             ),
+            planned_cleanup_root_previous_facts_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                backing_name,
+                emit_ctx,
+            ),
             &emit_ctx.stack_slots,
             Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.incref_ref,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         );
     } else {
         local_env.store_name(
@@ -3970,6 +4080,7 @@ fn emit_local_store_result_with_local_env(
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         );
     }
     Some(emit_none_for_demand(fb, emit_ctx, demand))
@@ -4008,10 +4119,16 @@ fn emit_typed_local_store_result_with_local_env(
                     name,
                     emit_ctx,
                 ),
+                planned_cleanup_root_previous_facts_for_key(
+                    expr.semantic_instr_key(emit_ctx.function_id),
+                    name,
+                    emit_ctx,
+                ),
                 Some(refcount_decref_location_counter_parts(emit_ctx)),
                 emit_ctx.consts.ptr_ty,
                 emit_ctx.consts.thread_state_value,
                 emit_ctx.decref_ref,
+                emit_ctx.refcount_emitter(),
             )
             .unwrap_or_else(|error| panic!("{error}"));
         return Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)));
@@ -4059,11 +4176,17 @@ fn emit_typed_local_store_result_with_local_env(
                 name,
                 emit_ctx,
             ),
+            planned_cleanup_root_previous_facts_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
             &emit_ctx.stack_slots,
             Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         );
         return Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)));
     }
@@ -4091,11 +4214,17 @@ fn emit_typed_local_store_result_with_local_env(
                 name,
                 emit_ctx,
             ),
+            planned_cleanup_root_previous_facts_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
             &emit_ctx.stack_slots,
             Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         );
         return Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)));
     }
@@ -4144,12 +4273,18 @@ fn emit_typed_local_store_result_with_local_env(
             name,
             emit_ctx,
         ),
+        planned_cleanup_root_previous_facts_for_key(
+            expr.semantic_instr_key(emit_ctx.function_id),
+            name,
+            emit_ctx,
+        ),
         &emit_ctx.stack_slots,
         Some(refcount_decref_location_counter_parts(emit_ctx)),
         emit_ctx.consts.ptr_ty,
         emit_ctx.consts.thread_state_value,
         emit_ctx.incref_ref,
         emit_ctx.decref_ref,
+        emit_ctx.refcount_emitter(),
     );
     Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)))
 }
@@ -4231,12 +4366,18 @@ fn emit_typed_owned_cell_makecell_store_result_with_local_env(
                 backing_name,
                 emit_ctx,
             ),
+            planned_cleanup_root_previous_facts_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                backing_name,
+                emit_ctx,
+            ),
             &emit_ctx.stack_slots,
             Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.incref_ref,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         );
     } else {
         local_env.store_name(
@@ -4248,6 +4389,7 @@ fn emit_typed_owned_cell_makecell_store_result_with_local_env(
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         );
     }
     Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)))
@@ -4338,10 +4480,16 @@ fn emit_typed_local_delete_result_with_local_env(
                 name,
                 emit_ctx,
             ),
+            planned_cleanup_root_previous_facts_for_key(
+                op.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
             Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         )
         .unwrap_or_else(|error| panic!("{error}"));
     Some(emit_none_for_demand(fb, emit_ctx, demand))
@@ -4431,10 +4579,16 @@ fn emit_local_delete_result_with_local_env(
                 name,
                 emit_ctx,
             ),
+            planned_cleanup_root_previous_facts_for_key(
+                op.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
             Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
+            emit_ctx.refcount_emitter(),
         )
         .unwrap_or_else(|error| panic!("{error}"));
     Some(emit_none_for_demand(fb, emit_ctx, demand))
@@ -4573,6 +4727,8 @@ impl StackSlots {
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
         self.replace_cloned_value_with_previous_state_counted(
@@ -4585,6 +4741,8 @@ impl StackSlots {
             thread_state_value,
             incref_ref,
             decref_ref,
+            refcounts,
+            previous_facts,
             counter_parts,
         )
     }
@@ -4597,9 +4755,11 @@ impl StackSlots {
         value_ref_kind: LocalRefKind,
         previous_state: CleanupRootSlotState,
         ptr_ty: ir::Type,
-        thread_state_value: ir::Value,
-        incref_ref: ir::FuncRef,
-        decref_ref: ir::FuncRef,
+        _thread_state_value: ir::Value,
+        _incref_ref: ir::FuncRef,
+        _decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
         let slot_index = self.slot_index_for_name(name)?;
@@ -4608,7 +4768,7 @@ impl StackSlots {
             .may_hold_owned_reference()
             .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
         if local_ref_kind_needs_refcount_call(value_ref_kind) {
-            emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+            emit_incref_via_lowering(fb, refcounts, value, None);
         }
         fb.ins().stack_store(value, slot, 0);
         if let Some(previous) = previous {
@@ -4621,7 +4781,7 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+            emit_decref_via_lowering(fb, refcounts, previous, previous_facts);
         }
         Some(())
     }
@@ -4636,6 +4796,8 @@ impl StackSlots {
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
     ) -> Option<()> {
         self.replace_transferred_value_counted(
             fb,
@@ -4646,6 +4808,8 @@ impl StackSlots {
             thread_state_value,
             incref_ref,
             decref_ref,
+            refcounts,
+            previous_facts,
             None,
         )
     }
@@ -4660,6 +4824,8 @@ impl StackSlots {
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
         self.replace_transferred_value_with_previous_state_counted(
@@ -4672,6 +4838,8 @@ impl StackSlots {
             thread_state_value,
             incref_ref,
             decref_ref,
+            refcounts,
+            previous_facts,
             counter_parts,
         )
     }
@@ -4684,9 +4852,11 @@ impl StackSlots {
         value_ref_kind: LocalRefKind,
         previous_state: CleanupRootSlotState,
         ptr_ty: ir::Type,
-        thread_state_value: ir::Value,
-        incref_ref: ir::FuncRef,
-        decref_ref: ir::FuncRef,
+        _thread_state_value: ir::Value,
+        _incref_ref: ir::FuncRef,
+        _decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
         let slot_index = self.slot_index_for_name(name)?;
@@ -4695,7 +4865,7 @@ impl StackSlots {
             .may_hold_owned_reference()
             .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
         if local_ref_kind_needs_incref_for_stack_slot_transfer(value_ref_kind) {
-            emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+            emit_incref_via_lowering(fb, refcounts, value, None);
         }
         fb.ins().stack_store(value, slot, 0);
         if let Some(previous) = previous {
@@ -4708,7 +4878,7 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+            emit_decref_via_lowering(fb, refcounts, previous, previous_facts);
         }
         Some(())
     }
@@ -4720,8 +4890,10 @@ impl StackSlots {
         value: ir::Value,
         previous_state: CleanupRootSlotState,
         ptr_ty: ir::Type,
-        thread_state_value: ir::Value,
-        decref_ref: ir::FuncRef,
+        _thread_state_value: ir::Value,
+        _decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
         let slot_index = self.slot_index_for_name(name)?;
@@ -4740,7 +4912,7 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+            emit_decref_via_lowering(fb, refcounts, previous, previous_facts);
         }
         Some(())
     }
@@ -4752,8 +4924,19 @@ impl StackSlots {
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
     ) -> Option<()> {
-        self.clear_value_counted(fb, name, ptr_ty, thread_state_value, decref_ref, None)
+        self.clear_value_counted(
+            fb,
+            name,
+            ptr_ty,
+            thread_state_value,
+            decref_ref,
+            refcounts,
+            previous_facts,
+            None,
+        )
     }
 
     fn clear_value_counted(
@@ -4763,6 +4946,8 @@ impl StackSlots {
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
         self.clear_value_with_previous_state_counted(
@@ -4772,6 +4957,8 @@ impl StackSlots {
             ptr_ty,
             thread_state_value,
             decref_ref,
+            refcounts,
+            previous_facts,
             counter_parts,
         )
     }
@@ -4782,8 +4969,10 @@ impl StackSlots {
         name: &str,
         previous_state: CleanupRootSlotState,
         ptr_ty: ir::Type,
-        thread_state_value: ir::Value,
-        decref_ref: ir::FuncRef,
+        _thread_state_value: ir::Value,
+        _decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
+        previous_facts: Option<PyObjFacts>,
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
         let slot_index = self.slot_index_for_name(name)?;
@@ -4803,7 +4992,7 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+            emit_decref_via_lowering(fb, refcounts, previous, previous_facts);
         }
         Some(())
     }
@@ -4824,9 +5013,11 @@ impl StackSlots {
         &self,
         fb: &mut FunctionBuilder<'_>,
         ptr_ty: ir::Type,
-        thread_state_value: ir::Value,
-        decref_ref: ir::FuncRef,
+        _thread_state_value: ir::Value,
+        _decref_ref: ir::FuncRef,
+        refcounts: RefcountEmitter,
         cleanup_root_states: &HashMap<String, CleanupRootSlotState>,
+        cleanup_root_facts: &HashMap<String, PyObjFacts>,
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) {
         for (slot_index, (name, slot)) in self.names.iter().zip(self.slots.iter()).enumerate() {
@@ -4848,7 +5039,7 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
+            emit_decref_via_lowering(fb, refcounts, value, cleanup_root_facts.get(name).copied());
         }
     }
 }
@@ -4872,6 +5063,24 @@ fn emit_decref_if_not_null(
     value: ir::Value,
 ) {
     fb.ins().call(decref_ref, &[thread_state_value, value]);
+}
+
+fn emit_incref_via_lowering(
+    fb: &mut FunctionBuilder<'_>,
+    refcounts: RefcountEmitter,
+    value: ir::Value,
+    facts: Option<PyObjFacts>,
+) {
+    refcounts.emit_incref(fb, value, facts);
+}
+
+fn emit_decref_via_lowering(
+    fb: &mut FunctionBuilder<'_>,
+    refcounts: RefcountEmitter,
+    value: ir::Value,
+    facts: Option<PyObjFacts>,
+) {
+    refcounts.emit_decref(fb, value, facts);
 }
 
 #[derive(Clone)]
@@ -5639,6 +5848,7 @@ fn emit_checked_owned_pyobject_result_for_demand(
     ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
+    let facts = facts.with_non_null_ref();
     match demand {
         ResultDemand::EffectOnly => {
             let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
@@ -7285,7 +7495,11 @@ fn emit_release_owned_pyobject(
     if facts.is_some_and(PyObjFacts::is_immortal) {
         return;
     }
-    ctx.emit_decref(fb, value);
+    if let Some(facts) = facts {
+        ctx.emit_decref_with_facts(fb, value, facts);
+    } else {
+        ctx.emit_decref(fb, value);
+    }
 }
 
 fn emit_release_pyobject_if_owned(
@@ -8679,12 +8893,14 @@ fn emit_exception_dispatch_slot_writes(
     dispatch_exc: ir::Value,
     stack_slots: &StackSlots,
     cleanup_root_previous_states: &HashMap<String, CleanupRootSlotState>,
+    cleanup_root_previous_facts: &HashMap<String, PyObjFacts>,
     refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     none_const: ir::Value,
     incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
+    refcounts: RefcountEmitter,
 ) -> Result<(), String> {
     let forwarded_locals_by_name = forwarded_local_names
         .iter()
@@ -8722,6 +8938,8 @@ fn emit_exception_dispatch_slot_writes(
                 thread_state_value,
                 incref_ref,
                 decref_ref,
+                refcounts,
+                cleanup_root_previous_facts.get(target_name).copied(),
                 refcount_location_counters,
             )
             .expect("exception dispatch slot target missing from stack slots");
@@ -8861,6 +9079,8 @@ fn emit_pop_handled_exception(
         ctx.consts.ptr_ty,
         ctx.consts.thread_state_value,
         ctx.decref_ref,
+        ctx.refcount_emitter(),
+        None,
         Some(refcount_decref_location_counter_parts(ctx)),
     );
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
@@ -9068,6 +9288,8 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                             emit_ctx.consts.thread_state_value,
                             emit_ctx.incref_ref,
                             emit_ctx.decref_ref,
+                            emit_ctx.refcount_emitter(),
+                            None,
                         )
                         .ok_or_else(|| {
                             format!(
@@ -9107,6 +9329,10 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                     emit_ctx.consts.ptr_ty,
                     emit_ctx.consts.thread_state_value,
                     emit_ctx.decref_ref,
+                    emit_ctx.refcount_emitter(),
+                    removed
+                        .as_ref()
+                        .and_then(LocalEnvEntry::py_facts),
                 )
                 .ok_or_else(|| {
                     format!(
@@ -9133,6 +9359,7 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     decref_ref: ir::FuncRef,
+    refcounts: RefcountEmitter,
 ) -> Result<(), String> {
     if !matches!(
         reason,
@@ -9180,7 +9407,15 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
             scalar_counter_base_value,
         );
         stack_slots
-            .clear_value(fb, local.name.as_str(), ptr_ty, thread_state_value, decref_ref)
+            .clear_value(
+                fb,
+                local.name.as_str(),
+                ptr_ty,
+                thread_state_value,
+                decref_ref,
+                refcounts,
+                None,
+            )
             .ok_or_else(|| {
                 format!(
                     "refcount plan release for block {source_label} references missing stack slot {:?}",
@@ -18224,11 +18459,17 @@ fn emit_typed_codegen_ops(
                     store.name.id.as_str(),
                     emit_ctx,
                 ),
+                planned_cleanup_root_previous_facts_for_key(
+                    store_key,
+                    store.name.id.as_str(),
+                    emit_ctx,
+                ),
                 stack_slots,
                 Some(refcount_decref_location_counter_parts(emit_ctx)),
                 emit_ctx.consts.ptr_ty,
                 emit_ctx.consts.thread_state_value,
                 emit_ctx.decref_ref,
+                emit_ctx.refcount_emitter(),
             ) {
                 index += 2;
                 continue;
@@ -19904,6 +20145,7 @@ fn build_cranelift_run_bb_specialized_function(
             ir::Block,
             Vec<String>,
             HashMap<String, CleanupRootSlotState>,
+            HashMap<String, PyObjFacts>,
         )>::new();
         for block in &function.blocks {
             if !matches!(block.term, BlockTerm::Return(_)) {
@@ -19912,6 +20154,9 @@ fn build_cranelift_run_bb_specialized_function(
             let states = jit_local_plan
                 .cleanup_root_slot_states
                 .exit_state_for_block(block.label);
+            let facts = jit_local_plan
+                .cleanup_root_slot_states
+                .exit_facts_for_block(block.label);
             let key = cleanup_root_state_key(&states);
             let cleanup_block = if let Some(cleanup_block) = return_cleanup_blocks_by_key.get(&key)
             {
@@ -19919,7 +20164,7 @@ fn build_cranelift_run_bb_specialized_function(
             } else {
                 let cleanup_block = fb.create_block();
                 return_cleanup_blocks_by_key.insert(key.clone(), cleanup_block);
-                return_cleanup_block_states.push((cleanup_block, key.clone(), states));
+                return_cleanup_block_states.push((cleanup_block, key.clone(), states, facts));
                 cleanup_block
             };
             return_cleanup_blocks_by_label.insert(block.label, cleanup_block);
@@ -20005,7 +20250,7 @@ fn build_cranelift_run_bb_specialized_function(
             "raise_exc_direct",
             vec!["args".into(), "exc".into()],
         );
-        for (cleanup_block, key, _) in &return_cleanup_block_states {
+        for (cleanup_block, key, _, _) in &return_cleanup_block_states {
             let label = if key.is_empty() {
                 "cleanup_return::no_roots".to_string()
             } else {
@@ -20034,7 +20279,7 @@ fn build_cranelift_run_bb_specialized_function(
         fb.append_block_param(step_null_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // exc
-        for (cleanup_block, _, _) in &return_cleanup_block_states {
+        for (cleanup_block, _, _, _) in &return_cleanup_block_states {
             fb.append_block_param(*cleanup_block, ptr_ty); // ret
         }
         if let Some((_, cleanup)) = shared_null_cleanup {
@@ -20085,8 +20330,15 @@ fn build_cranelift_run_bb_specialized_function(
                 &DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
             );
             RefcountLowering::Explicit {
+                incref_ref,
+                decref_ref,
                 dealloc_preserving_error_ref,
             }
+        };
+        let refcounts = RefcountEmitter {
+            ptr_ty,
+            thread_state_value,
+            lowering: refcount_lowering,
         };
         let py_call_positional_three_ref = func_imports.get_or_panic(
             codegen_env,
@@ -20305,6 +20557,8 @@ fn build_cranelift_run_bb_specialized_function(
                         thread_state_value,
                         incref_ref,
                         decref_ref,
+                        refcounts,
+                        None,
                         Some(RefcountDecrefLocationCounterParts {
                             counter_refs: &refcount_decref_location_counter_refs,
                             counter_slots_by_id,
@@ -20326,6 +20580,8 @@ fn build_cranelift_run_bb_specialized_function(
                         thread_state_value,
                         incref_ref,
                         decref_ref,
+                        refcounts,
+                        None,
                         Some(RefcountDecrefLocationCounterParts {
                             counter_refs: &refcount_decref_location_counter_refs,
                             counter_slots_by_id,
@@ -20420,6 +20676,9 @@ fn build_cranelift_run_bb_specialized_function(
         let empty_cleanup_root_state = HashMap::new();
         let cleanup_root_union_exit_state =
             jit_local_plan.cleanup_root_slot_states.union_exit_states();
+        let empty_cleanup_root_facts = HashMap::new();
+        let cleanup_root_union_exit_facts =
+            jit_local_plan.cleanup_root_slot_states.union_exit_facts();
         for (index, maybe_dispatch) in exc_dispatches.iter().enumerate() {
             if let Some(dispatch_plan) = maybe_dispatch {
                 let dispatch_block = fb.create_block();
@@ -20461,6 +20720,7 @@ fn build_cranelift_run_bb_specialized_function(
                 thread_state_value,
                 incref_ref,
                 decref_ref,
+                refcounts,
                 matches!(function.kind, FunctionKind::Function),
             )?;
             let block_const = globals_value;
@@ -20700,6 +20960,11 @@ fn build_cranelift_run_bb_specialized_function(
                     .block_exit_states
                     .get(&function.blocks[index].label)
                     .unwrap_or(&empty_cleanup_root_state),
+                jit_local_plan
+                    .cleanup_root_slot_states
+                    .block_exit_facts
+                    .get(&function.blocks[index].label)
+                    .unwrap_or(&empty_cleanup_root_facts),
                 Some(RefcountDecrefLocationCounterParts {
                     counter_refs: &refcount_decref_location_counter_refs,
                     counter_slots_by_id,
@@ -20710,6 +20975,7 @@ fn build_cranelift_run_bb_specialized_function(
                 slot_write_none_const,
                 incref_ref,
                 decref_ref,
+                refcounts,
             )?;
             emit_exception_dispatch_forwarded_decrefs(
                 &mut fb,
@@ -20745,6 +21011,7 @@ fn build_cranelift_run_bb_specialized_function(
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
+                refcounts,
             )?;
             let target_arg_none_const = emit_owned_module_constant_from_parts(
                 &mut fb,
@@ -20782,7 +21049,9 @@ fn build_cranelift_run_bb_specialized_function(
                 .jump(exec_blocks[dispatch_plan.target_index], &target_jump_args);
         }
 
-        for (cleanup_block, _, cleanup_root_states) in &return_cleanup_block_states {
+        for (cleanup_block, _, cleanup_root_states, cleanup_root_facts) in
+            &return_cleanup_block_states
+        {
             fb.switch_to_block(*cleanup_block);
             let ret_value = fb.block_params(*cleanup_block)[0];
             stack_slots.decref_all_with_cleanup_root_states_counted(
@@ -20790,7 +21059,9 @@ fn build_cranelift_run_bb_specialized_function(
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
+                refcounts,
                 cleanup_root_states,
+                cleanup_root_facts,
                 Some(RefcountDecrefLocationCounterParts {
                     counter_refs: &refcount_decref_location_counter_refs,
                     counter_slots_by_id,
@@ -20826,6 +21097,8 @@ fn build_cranelift_run_bb_specialized_function(
                                 thread_state_value,
                                 incref_ref,
                                 decref_ref,
+                                refcounts,
+                                None,
                                 Some(RefcountDecrefLocationCounterParts {
                                     counter_refs: &refcount_decref_location_counter_refs,
                                     counter_slots_by_id,
@@ -20879,7 +21152,9 @@ fn build_cranelift_run_bb_specialized_function(
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
+                refcounts,
                 &cleanup_root_union_exit_state,
+                &cleanup_root_union_exit_facts,
                 Some(RefcountDecrefLocationCounterParts {
                     counter_refs: &refcount_decref_location_counter_refs,
                     counter_slots_by_id,
@@ -20930,7 +21205,9 @@ fn build_cranelift_run_bb_specialized_function(
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
+                refcounts,
                 &cleanup_root_union_exit_state,
+                &cleanup_root_union_exit_facts,
                 Some(RefcountDecrefLocationCounterParts {
                     counter_refs: &refcount_decref_location_counter_refs,
                     counter_slots_by_id,
@@ -20952,7 +21229,9 @@ fn build_cranelift_run_bb_specialized_function(
             ptr_ty,
             thread_state_value,
             decref_ref,
+            refcounts,
             &cleanup_root_union_exit_state,
+            &cleanup_root_union_exit_facts,
             Some(RefcountDecrefLocationCounterParts {
                 counter_refs: &refcount_decref_location_counter_refs,
                 counter_slots_by_id,
@@ -20996,7 +21275,9 @@ fn build_cranelift_run_bb_specialized_function(
             ptr_ty,
             thread_state_value,
             decref_ref,
+            refcounts,
             &cleanup_root_union_exit_state,
+            &cleanup_root_union_exit_facts,
             Some(RefcountDecrefLocationCounterParts {
                 counter_refs: &refcount_decref_location_counter_refs,
                 counter_slots_by_id,

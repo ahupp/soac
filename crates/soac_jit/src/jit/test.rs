@@ -70,8 +70,8 @@ mod tests {
         JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage, LocalRefKind, ModuleConstantId,
         ModuleFuncImports, ObjPtr, ParamBindingFacts, ParsedRuntimeClifFunction,
         PlannedJitDeoptPointId, PrecompileModuleIndex, PrecompileModuleIndexEntry,
-        ProcessJitEngine, PyLong_Type, RefcountLowering, RelocTypeRef, ResultDemand,
-        SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_DECREF_SYMBOL,
+        ProcessJitEngine, PyLong_Type, RefcountEmitter, RefcountLowering, RelocTypeRef,
+        ResultDemand, SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_DECREF_SYMBOL,
         SOAC_RUNTIME_INCREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_SYMBOL,
         SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL,
         SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
@@ -6082,6 +6082,7 @@ def build(values):
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let refcounts = helper_refcounts(ptr_ty, null_tstate, incref_ref, decref_ref);
             env.entries.push(local_env_entry(
                 Some(LocalLocation(0)),
                 "x",
@@ -6108,12 +6109,14 @@ def build(values):
                 None,
                 true,
                 CleanupRootSlotState::MaybeOwnedReference,
+                None,
                 &stack_slots,
                 None,
                 ptr_ty,
                 null_tstate,
                 incref_ref,
                 decref_ref,
+                refcounts,
             );
             fb.ins().return_(&[new_value]);
             fb.seal_all_blocks();
@@ -6122,6 +6125,22 @@ def build(values):
 
         let rendered = ctx.func.display().to_string();
         (env, rendered)
+    }
+
+    fn helper_refcounts(
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        incref_ref: ir::FuncRef,
+        decref_ref: ir::FuncRef,
+    ) -> RefcountEmitter {
+        RefcountEmitter {
+            ptr_ty,
+            thread_state_value,
+            lowering: RefcountLowering::HelperCalls {
+                incref_ref,
+                decref_ref,
+            },
+        }
     }
 
     fn local_env_first_store_test_state(
@@ -6218,6 +6237,7 @@ def build(values):
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let refcounts = helper_refcounts(ptr_ty, null_tstate, incref_ref, decref_ref);
             let stack_slots = StackSlots::new(
                 &mut fb,
                 &stack_slot_names
@@ -6240,12 +6260,14 @@ def build(values):
                 None,
                 allow_local_only_slot_backed_store,
                 cleanup_root_previous_state,
+                None,
                 &stack_slots,
                 None,
                 ptr_ty,
                 null_tstate,
                 incref_ref,
                 decref_ref,
+                refcounts,
             );
             fb.ins().return_(&[new_value]);
             fb.seal_all_blocks();
@@ -6296,6 +6318,7 @@ def build(values):
             let value = fb.block_params(entry)[0];
             let thread_state = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let refcounts = helper_refcounts(ptr_ty, thread_state, decref_ref, decref_ref);
             let stack_slots = StackSlots::new(&mut fb, &["x".to_string()], &HashSet::new(), None);
             fb.ins()
                 .stack_store(value, stack_slots.slot_for_name("x").unwrap(), 0);
@@ -6305,7 +6328,9 @@ def build(values):
                 ptr_ty,
                 thread_state,
                 decref_ref,
+                refcounts,
                 &cleanup_root_states,
+                &HashMap::new(),
                 None,
             );
             fb.ins().return_(&[]);
@@ -6500,6 +6525,7 @@ def build(values):
             let value = fb.block_params(entry)[0];
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let refcounts = helper_refcounts(ptr_ty, null_tstate, decref_ref, decref_ref);
             let stack_slots = StackSlots::new(&mut fb, &["x".to_string()], &HashSet::new(), None);
             env.bind_entry_location_with_aliases(
                 LocalLocation(0),
@@ -6519,9 +6545,11 @@ def build(values):
                 &stack_slots,
                 CleanupRootSlotState::MaybeOwnedReference,
                 None,
+                None,
                 ptr_ty,
                 null_tstate,
                 decref_ref,
+                refcounts,
             )
             .expect("local-only delete should succeed");
             fb.ins().return_(&[]);
@@ -6584,6 +6612,7 @@ def build(values):
             let temp_value = fb.block_params(entry)[1];
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let refcounts = helper_refcounts(ptr_ty, null_tstate, decref_ref, decref_ref);
             let stack_slots = StackSlots::new(&mut fb, &[], &HashSet::new(), None);
             env.bind_entry_location_with_aliases(
                 LocalLocation(0),
@@ -6616,11 +6645,13 @@ def build(values):
                 true,
                 CleanupRootSlotState::MaybeOwnedReference,
                 CleanupRootSlotState::MaybeOwnedReference,
+                None,
                 &stack_slots,
                 None,
                 ptr_ty,
                 null_tstate,
                 decref_ref,
+                refcounts,
             ));
             fb.ins().return_(&[temp_value]);
             fb.seal_all_blocks();
@@ -6692,6 +6723,7 @@ def build(values):
             let temp_value = fb.block_params(entry)[1];
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let refcounts = helper_refcounts(ptr_ty, null_tstate, decref_ref, decref_ref);
             let slot_names = vec!["target".to_string(), "_dp_tmp_1".to_string()];
             let cleanup_root_names = HashSet::from(["target".to_string(), "_dp_tmp_1".to_string()]);
             let stack_slots = StackSlots::new(&mut fb, &slot_names, &cleanup_root_names, None);
@@ -6733,11 +6765,13 @@ def build(values):
                 true,
                 CleanupRootSlotState::MaybeOwnedReference,
                 CleanupRootSlotState::MaybeOwnedReference,
+                None,
                 &stack_slots,
                 None,
                 ptr_ty,
                 null_tstate,
                 decref_ref,
+                refcounts,
             ));
             fb.ins().return_(&[temp_value]);
             fb.seal_all_blocks();
@@ -14235,7 +14269,9 @@ def f(x):
         )
     }
 
-    unsafe fn build_explicit_refcount_smoke_context() -> (
+    unsafe fn build_explicit_refcount_smoke_context(
+        facts: Option<PyObjFacts>,
+    ) -> (
         crate::session::CompileSession,
         JITModule,
         cranelift_codegen::Context,
@@ -14283,12 +14319,14 @@ def f(x):
                 &DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
             );
             let lowering = RefcountLowering::Explicit {
+                incref_ref,
+                decref_ref,
                 dealloc_preserving_error_ref: dealloc_ref,
             };
             let tstate = fb.block_params(entry)[0];
             let arg = fb.block_params(entry)[1];
-            lowering.emit_incref(&mut fb, ptr_ty, arg);
-            lowering.emit_decref(&mut fb, ptr_ty, tstate, arg);
+            lowering.emit_incref(&mut fb, ptr_ty, arg, facts);
+            lowering.emit_decref(&mut fb, ptr_ty, tstate, arg, facts);
             fb.ins().return_(&[arg]);
             fb.seal_all_blocks();
             fb.finalize();
@@ -14657,7 +14695,7 @@ def f(x):
     #[test]
     fn explicit_refcount_lowering_avoids_direct_incref_and_decref_calls() {
         let (_compile_session, _jit_module, ctx, _wrapper_id, helper_names) =
-            unsafe { build_explicit_refcount_smoke_context() };
+            unsafe { build_explicit_refcount_smoke_context(Some(PyObjFacts::known_not_none())) };
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names[..2]),
             0,
@@ -14667,6 +14705,42 @@ def f(x):
             count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names[2..]),
             1,
             "explicit decref lowering should keep one shared dealloc-preserving-error call"
+        );
+    }
+
+    #[test]
+    fn explicit_refcount_lowering_uses_non_null_facts_to_remove_null_guards() {
+        let (_compile_session, _jit_module, unknown_ctx, _wrapper_id, _helper_names) =
+            unsafe { build_explicit_refcount_smoke_context(None) };
+        let (_compile_session, _jit_module, known_non_null_ctx, _wrapper_id, _helper_names) =
+            unsafe { build_explicit_refcount_smoke_context(Some(PyObjFacts::known_not_none())) };
+
+        assert_eq!(
+            unknown_ctx.func.layout.blocks().count(),
+            1,
+            "unknown PyObject facts should keep the compact helper-call path"
+        );
+        assert_eq!(
+            known_non_null_ctx.func.layout.blocks().count(),
+            6,
+            "known non-null PyObject facts should remove one null-check block per refcount op"
+        );
+    }
+
+    #[test]
+    fn explicit_refcount_lowering_elides_immortal_values() {
+        let (_compile_session, _jit_module, ctx, _wrapper_id, helper_names) =
+            unsafe { build_explicit_refcount_smoke_context(Some(PyObjFacts::none_singleton())) };
+
+        assert_eq!(
+            ctx.func.layout.blocks().count(),
+            1,
+            "immortal PyObject facts should not emit any refcount control flow"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names),
+            0,
+            "immortal PyObject facts should not emit refcount or dealloc helper calls"
         );
     }
 

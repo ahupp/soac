@@ -11,7 +11,8 @@ use soac_ir_blockpy::BlockPyModuleShape;
 use soac_ir_typed::emit_v3::{MechanicalExitKind, MechanicalStepOp};
 use soac_ir_typed::plan_v3::{MaterializeKind, PlanValue, Rep};
 use soac_ir_typed::{
-    FactStore, InstrTyped, TypedBlock, TypedBlockPyModuleShape, TypedExactIntReturnPlan, ValueFacts,
+    FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockPyModuleShape,
+    TypedExactIntReturnPlan, ValueFacts,
 };
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
@@ -20,7 +21,7 @@ pub use soac_opt::passes::{
 use soac_opt::passes::{
     FunctionLocalEnvResumePlan, FunctionRefcountPlan, LocalEnvModulePlan, LocalEnvResumeEntry,
     LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalRefState,
-    RefcountActionKind, RefcountPlan, RefcountReleaseReason, RefcountSite,
+    RefcountActionKind, RefcountLocal, RefcountPlan, RefcountReleaseReason, RefcountSite,
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
     plan_typed_local_env_module, plan_typed_local_env_resume_module, plan_typed_ownership_effects,
     validate_typed_local_env_module_plan, validate_typed_local_env_resume_module_plan,
@@ -160,6 +161,8 @@ pub struct PlannedCleanupRootSlotStates {
     pub block_entry_states: HashMap<BlockLabel, HashMap<String, CleanupRootSlotState>>,
     pub block_exit_states: HashMap<BlockLabel, HashMap<String, CleanupRootSlotState>>,
     pub instr_previous_states: HashMap<InstrKey, HashMap<String, CleanupRootSlotState>>,
+    pub block_exit_facts: HashMap<BlockLabel, HashMap<String, PyObjFacts>>,
+    pub instr_previous_facts: HashMap<InstrKey, HashMap<String, PyObjFacts>>,
 }
 
 impl PlannedCleanupRootSlotStates {
@@ -194,8 +197,42 @@ impl PlannedCleanupRootSlotStates {
 
     pub fn union_exit_states(&self) -> HashMap<String, CleanupRootSlotState> {
         let mut union = HashMap::new();
+        let mut initialized = false;
         for states in self.block_exit_states.values() {
+            if !initialized {
+                union = states.clone();
+                initialized = true;
+                continue;
+            }
             merge_cleanup_root_slot_state_maps(&mut union, states);
+        }
+        union
+    }
+
+    pub fn previous_facts_for_instr(&self, instr_key: InstrKey, name: &str) -> Option<PyObjFacts> {
+        self.instr_previous_facts
+            .get(&instr_key)
+            .and_then(|facts| facts.get(name))
+            .copied()
+    }
+
+    pub fn exit_facts_for_block(&self, label: BlockLabel) -> HashMap<String, PyObjFacts> {
+        self.block_exit_facts
+            .get(&label)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn union_exit_facts(&self) -> HashMap<String, PyObjFacts> {
+        let mut union = HashMap::new();
+        let mut initialized = false;
+        for facts in self.block_exit_facts.values() {
+            if !initialized {
+                union = facts.clone();
+                initialized = true;
+                continue;
+            }
+            retain_common_cleanup_root_slot_facts(&mut union, facts);
         }
         union
     }
@@ -2591,9 +2628,11 @@ fn merge_cleanup_root_slot_state_maps(
 ) -> bool {
     let mut changed = false;
     for (name, incoming_state) in incoming {
-        let target_state = target
-            .entry(name.clone())
-            .or_insert(CleanupRootSlotState::NoOwnedReference);
+        let Some(target_state) = target.get_mut(name) else {
+            target.insert(name.clone(), *incoming_state);
+            changed = true;
+            continue;
+        };
         if *target_state == CleanupRootSlotState::NoOwnedReference
             && *incoming_state == CleanupRootSlotState::MaybeOwnedReference
         {
@@ -2785,8 +2824,192 @@ fn transfer_cleanup_root_slot_state_for_block(
     state
 }
 
+fn typed_store_py_facts(instr: &InstrTyped, target_location: LocalLocation) -> Option<PyObjFacts> {
+    let InstrTyped::Store(store) = instr else {
+        return None;
+    };
+    (store.name.local_location() == Some(target_location))
+        .then(|| store.value.result_facts().and_then(ValueFacts::as_pyobj))
+        .flatten()
+}
+
+fn cleanup_root_slot_facts_for_local_rebind(
+    instr: &InstrTyped,
+    local: &RefcountLocal,
+    new_state: LocalRefState,
+    store_repr: Option<(LocalLocation, RuntimeBlockParamRepr)>,
+) -> Option<PyObjFacts> {
+    if matches!(
+        store_repr,
+        Some((
+            location,
+            RuntimeBlockParamRepr::ExactI64 | RuntimeBlockParamRepr::I32Bool01,
+        )) if location == local.location
+    ) {
+        return None;
+    }
+    typed_store_py_facts(instr, local.location).or_else(|| {
+        (new_state == LocalRefState::Immortal).then(|| {
+            PyObjFacts::unknown()
+                .with_non_null_ref()
+                .with_immortal_refcount()
+        })
+    })
+}
+
+fn transfer_cleanup_root_slot_facts_for_block(
+    function_id: RuntimeFunctionId,
+    block: &TypedBlock,
+    refcount_plan: &FunctionRefcountPlan,
+    tracked_slot_names: &HashSet<String>,
+    entry_facts: &HashMap<String, PyObjFacts>,
+    entry_runtime_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+    previous_facts: Option<&mut HashMap<InstrKey, HashMap<String, PyObjFacts>>>,
+) -> HashMap<String, PyObjFacts> {
+    let mut facts = entry_facts.clone();
+    let mut runtime_reprs = entry_runtime_reprs.clone();
+    let mut previous_facts = previous_facts;
+    let Some(block_plan) = refcount_plan.block(block.label) else {
+        return facts;
+    };
+    let mut actions_by_instr = HashMap::<InstrKey, Vec<&RefcountActionKind>>::new();
+    for action in &block_plan.actions {
+        let RefcountSite::Instr(instr_key) = &action.site else {
+            continue;
+        };
+        actions_by_instr
+            .entry(*instr_key)
+            .or_default()
+            .push(&action.kind);
+    }
+
+    for instr in &block.body {
+        let store_repr = typed_store_runtime_local_repr(
+            instr,
+            &runtime_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        );
+        let Some(instr_id) = instr.try_semantic_instr_id() else {
+            transfer_runtime_local_repr_for_instr(
+                instr,
+                &mut runtime_reprs,
+                module_constants,
+                truthiness_only_local_locations,
+                exact_int_scalar_deopt_instr_ids,
+            );
+            continue;
+        };
+        let instr_key = InstrKey::new(function_id, instr_id);
+        let Some(actions) = actions_by_instr.get(&instr_key) else {
+            transfer_runtime_local_repr_for_instr(
+                instr,
+                &mut runtime_reprs,
+                module_constants,
+                truthiness_only_local_locations,
+                exact_int_scalar_deopt_instr_ids,
+            );
+            continue;
+        };
+        for action in actions {
+            match action {
+                RefcountActionKind::RebindLocal {
+                    local, new_state, ..
+                } if tracked_slot_names.contains(&local.name) => {
+                    if let Some(previous) = facts.get(&local.name).copied()
+                        && let Some(previous_facts) = previous_facts.as_mut()
+                    {
+                        previous_facts
+                            .entry(instr_key)
+                            .or_default()
+                            .entry(local.name.clone())
+                            .or_insert(previous);
+                    }
+                    if let Some(new_facts) = cleanup_root_slot_facts_for_local_rebind(
+                        instr, local, *new_state, store_repr,
+                    ) {
+                        facts.insert(local.name.clone(), new_facts);
+                    } else {
+                        facts.remove(&local.name);
+                    }
+                }
+                RefcountActionKind::DeleteLocal { local, .. }
+                    if tracked_slot_names.contains(&local.name) =>
+                {
+                    if let Some(previous) = facts.get(&local.name).copied()
+                        && let Some(previous_facts) = previous_facts.as_mut()
+                    {
+                        previous_facts
+                            .entry(instr_key)
+                            .or_default()
+                            .entry(local.name.clone())
+                            .or_insert(previous);
+                    }
+                    facts.remove(&local.name);
+                }
+                _ => {}
+            }
+        }
+        transfer_runtime_local_repr_for_instr(
+            instr,
+            &mut runtime_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        );
+    }
+    facts
+}
+
+fn retain_common_cleanup_root_slot_facts(
+    current: &mut HashMap<String, PyObjFacts>,
+    incoming: &HashMap<String, PyObjFacts>,
+) {
+    current.retain(|name, current_facts| {
+        let Some(incoming_facts) = incoming.get(name).copied() else {
+            return false;
+        };
+        let mut merged = PyObjFacts::unknown();
+        if current_facts.is_non_null_ref() && incoming_facts.is_non_null_ref() {
+            merged = merged.with_non_null_ref();
+        }
+        if current_facts.is_immortal() && incoming_facts.is_immortal() {
+            merged = merged.with_immortal_refcount();
+        }
+        if merged == PyObjFacts::unknown() {
+            return false;
+        }
+        *current_facts = merged;
+        true
+    });
+}
+
+fn cleanup_root_entry_facts_for_block(
+    local_plan: &FunctionLocalPlan,
+    label: BlockLabel,
+    tracked_slot_names: &HashSet<String>,
+) -> HashMap<String, PyObjFacts> {
+    local_plan
+        .block(label)
+        .into_iter()
+        .flat_map(|block| block.entry_locals.iter())
+        .filter(|binding| tracked_slot_names.contains(&binding.name))
+        .filter_map(|binding| {
+            binding
+                .param_facts
+                .value
+                .map(|facts| (binding.name.clone(), facts))
+        })
+        .collect()
+}
+
 pub fn planned_cleanup_root_slot_states_for_typed_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    local_plan: &FunctionLocalPlan,
     refcount_plan: &FunctionRefcountPlan,
     tracked_slot_names: &HashSet<String>,
     exc_dispatches: &[Option<BlockExcDispatchPlan>],
@@ -2798,7 +3021,9 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
     let block_count = function.blocks.len();
     let block_indices_by_label = typed_block_indices_by_label(function);
     let mut entry_states = vec![empty_cleanup_root_slot_state_map(tracked_slot_names); block_count];
+    let mut entry_reached = vec![false; block_count];
     if let Some(entry_state) = entry_states.first_mut() {
+        entry_reached[0] = true;
         for name in tracked_slot_names {
             if is_try_abrupt_kind_slot(name) {
                 entry_state.insert(name.clone(), CleanupRootSlotState::MaybeOwnedReference);
@@ -2810,6 +3035,9 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
     while changed {
         changed = false;
         for (source_index, block) in function.blocks.iter().enumerate() {
+            if !entry_reached[source_index] {
+                continue;
+            }
             let exit_state = transfer_cleanup_root_slot_state_for_block(
                 function.function_id,
                 block,
@@ -2837,8 +3065,16 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
                 } else {
                     exit_state.clone()
                 };
-                changed |=
-                    merge_cleanup_root_slot_state_maps(&mut entry_states[target_index], &incoming);
+                if !entry_reached[target_index] {
+                    entry_states[target_index] = incoming;
+                    entry_reached[target_index] = true;
+                    changed = true;
+                } else {
+                    changed |= merge_cleanup_root_slot_state_maps(
+                        &mut entry_states[target_index],
+                        &incoming,
+                    );
+                }
             }
         }
     }
@@ -2846,6 +3082,8 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
     let mut block_entry_states = HashMap::new();
     let mut block_exit_states = HashMap::new();
     let mut instr_previous_states = HashMap::new();
+    let mut block_exit_facts = HashMap::new();
+    let mut instr_previous_facts = HashMap::new();
     for (index, block) in function.blocks.iter().enumerate() {
         let entry_state = entry_states[index].clone();
         let exit_state = transfer_cleanup_root_slot_state_for_block(
@@ -2860,14 +3098,31 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
             exact_int_scalar_deopt_instr_ids,
             Some(&mut instr_previous_states),
         );
+        let entry_facts =
+            cleanup_root_entry_facts_for_block(local_plan, block.label, tracked_slot_names);
+        let exit_facts = transfer_cleanup_root_slot_facts_for_block(
+            function.function_id,
+            block,
+            refcount_plan,
+            tracked_slot_names,
+            &entry_facts,
+            &runtime_entry_reprs[index],
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+            Some(&mut instr_previous_facts),
+        );
         block_entry_states.insert(block.label, entry_state);
         block_exit_states.insert(block.label, exit_state);
+        block_exit_facts.insert(block.label, exit_facts);
     }
 
     PlannedCleanupRootSlotStates {
         block_entry_states,
         block_exit_states,
         instr_previous_states,
+        block_exit_facts,
+        instr_previous_facts,
     }
 }
 
@@ -3201,6 +3456,7 @@ pub fn plan_jit_typed_function_locals_from_plans(
     .collect::<HashSet<_>>();
     let cleanup_root_slot_states = planned_cleanup_root_slot_states_for_typed_function(
         function,
+        &local_plan,
         &refcount_plan,
         &tracked_stack_slot_names,
         &exc_dispatches,
@@ -3648,6 +3904,77 @@ def f(flag):
                 .values()
                 .any(|states| states.get("x") == Some(&CleanupRootSlotState::MaybeOwnedReference)),
             "at least one exit should still sweep the final x root"
+        );
+    }
+
+    #[test]
+    fn cleanup_root_slot_facts_track_non_null_values_across_block_edges() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def f(flag):
+    x = (1,)
+    if flag:
+        pass
+    x = (2,)
+    return None
+"#,
+            "f",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
+
+        let previous_facts = plan
+            .cleanup_root_slot_states
+            .instr_previous_facts
+            .values()
+            .filter_map(|facts| facts.get("x").copied())
+            .collect::<Vec<_>>();
+        assert!(
+            previous_facts.iter().any(|facts| facts.is_non_null_ref()),
+            "cleanup-root overwrite should retain the previous slot's non-null fact: {previous_facts:?}"
+        );
+        assert!(
+            plan.cleanup_root_slot_states
+                .block_exit_facts
+                .values()
+                .any(|facts| facts.get("x").is_some_and(|facts| facts.is_non_null_ref())),
+            "cleanup-root exits should retain non-null facts for later sweeping: {:?}",
+            plan.cleanup_root_slot_states.block_exit_facts
+        );
+    }
+
+    #[test]
+    fn cleanup_root_slot_state_keeps_branch_optional_roots_maybe_owned() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def f(flag):
+    if flag:
+        x = []
+    if flag:
+        pass
+    x = []
+    return None
+"#,
+            "f",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
+
+        let previous_states = plan
+            .cleanup_root_slot_states
+            .instr_previous_states
+            .values()
+            .filter_map(|states| states.get("x").copied())
+            .collect::<Vec<_>>();
+        assert!(
+            previous_states.contains(&CleanupRootSlotState::MaybeOwnedReference),
+            "branch-optional root should stay nullable at the later overwrite: {previous_states:?}"
         );
     }
 

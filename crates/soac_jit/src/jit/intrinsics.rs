@@ -56,13 +56,13 @@ pub(super) trait OperationEmitState<'fb, E> {
     fn emit_incref(&mut self, value: ir::Value) {
         let ptr_ty = self.ctx().consts.ptr_ty;
         let refcount_lowering = self.ctx().refcount_lowering;
-        refcount_lowering.emit_incref(self.fb(), ptr_ty, value);
+        refcount_lowering.emit_incref(self.fb(), ptr_ty, value, None);
     }
     fn emit_decref(&mut self, value: ir::Value) {
         let ptr_ty = self.ctx().consts.ptr_ty;
         let thread_state_value = self.ctx().consts.thread_state_value;
         let refcount_lowering = self.ctx().refcount_lowering;
-        refcount_lowering.emit_decref(self.fb(), ptr_ty, thread_state_value, value);
+        refcount_lowering.emit_decref(self.fb(), ptr_ty, thread_state_value, value, None);
     }
     fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
         for (value, borrowed_arg) in arg_values {
