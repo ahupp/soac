@@ -19660,6 +19660,144 @@ class Point:
     }
 
     #[test]
+    fn specialized_jit_exact_list_getitem_uses_scalar_local_index_without_hot_reboxing() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_exact_list_getitem_uses_scalar_local_index_without_hot_reboxing",
+        ) {
+            return;
+        }
+        let module_name = "specialized_exact_list_scalar_index_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "read_at_sum");
+        function.params = ParamSpec {
+            params: vec![
+                test_param("items", ParamKind::Any, false),
+                test_param("a", ParamKind::Any, false),
+                test_param("b", ParamKind::Any, false),
+            ],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(0);
+        let add_instr_id = InstrId::new(1);
+        let getitem_instr_id = InstrId::new(2);
+        let index_name = test_local_name("index", 3);
+        function.blocks = vec![BlockPyBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                op_expr(Store::new(
+                    index_name.clone(),
+                    with_instr_id(
+                        op_expr(BinOp::new(
+                            BinOpKind::Add,
+                            name_expr(test_local_name("a", 1)),
+                            name_expr(test_local_name("b", 2)),
+                        )),
+                        add_instr_id,
+                    ),
+                )),
+                store_instr_id,
+            )],
+            term: ret_term(with_instr_id(
+                op_expr(GetItem::new(
+                    name_expr(test_name("items")),
+                    name_expr(index_name),
+                )),
+                getitem_instr_id,
+            )),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut function, &["items", "a", "b", "index"]);
+        let function_id = function.function_id;
+        let module = test_module(module_name_gen, vec![function]);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+
+        let exact_int_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(add_instr_id, vec![exact_int_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: module_name.to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .expect("exact-int v3 artifacts should plan scalar index production");
+        let exact_list_item_plan = OptV3ExactListItemAccessPlan {
+            source: getitem_instr_id,
+            access: PlanV3ExactListItemAccessKind::Get,
+            shape: PlanV3ExactListItemShape::ExactListExactInt,
+            guard: PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+            fallback: PlanV3ExactListItemFallbackKind::OriginalItemAccess,
+        };
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::from([(
+                function_id,
+                HashMap::from([(getitem_instr_id, exact_list_item_plan)]),
+            )]),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::from([(
+                function_id,
+                std::sync::Arc::new(artifacts),
+            )]),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should combine exact-int and exact-list plans");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|candidate| candidate.function_id == function_id)
+            .expect("planned module should include read_at_sum");
+
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &[1usize as ObjPtr],
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(planned_function.clone()),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        let materialize_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &materialize_helpers),
+            1,
+            "the scalar list index should stay unboxed on the hot exact-list path; only the generic fallback reboxes it"
+        );
+    }
+
+    #[test]
     fn runtime_typed_v3_inline_remaps_callee_exact_list_item_access_plans() {
         let module_name = "runtime_typed_v3_inline_exact_list_item_plan_test";
         let module_name_gen = ModuleNameGen::new(0);

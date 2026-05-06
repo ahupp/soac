@@ -12762,6 +12762,9 @@ fn typed_expr_can_emit_guarded_i64_index(
     }
     match expr {
         InstrTyped::Load(op) => {
+            if local_env.scalar_i64_value_for_load(&op.name).is_some() {
+                return true;
+            }
             (op.name.location.as_local().is_some() || op.name.location.as_constant().is_some())
                 && typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx)
         }
@@ -13221,6 +13224,9 @@ fn emit_typed_guarded_i64_index_with_local_env(
             if op.name.location.as_local().is_some()
                 || op.name.location.as_constant().is_some() =>
         {
+            if let Some((value, _)) = local_env.scalar_i64_value_for_load(&op.name) {
+                return Ok(Some(value));
+            }
             if !typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx) {
                 return Ok(None);
             }

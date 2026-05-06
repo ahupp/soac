@@ -674,9 +674,12 @@ access goes through the CPython item APIs.
   - the object is exactly `PyList_Type`
   - the index object is exactly `PyLong_Type`
   - the normalized integer index is in bounds
-- On hit, codegen loads `PyListObject.ob_item[index]` directly, INCREFs the
-  borrowed list element, and returns the owned result expected by the current
-  legacy `GetItem` lowering path.
+- On hit, codegen loads `PyListObject.ob_item[index]` directly. If typed lowering
+  has already proven the index as a scalar `i64`, the direct arm consumes that
+  scalar without first materializing a `PyLong`; otherwise it guards and unboxes
+  the compact exact-int object input. The result path still INCREFs the borrowed
+  list element and returns the owned result expected by the current legacy
+  `GetItem` lowering path.
 - On miss, codegen falls back to `PyObject_GetItem` through the generic helper
   path, which performs no exact-list rediscovery, and records
   `getitem_specialized_fallback` in verify mode.
