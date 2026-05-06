@@ -136,6 +136,8 @@ pub(super) fn push_symbol_component_hex(out: &mut String, component: &str) {
 pub(super) const JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT: &str = "d";
 pub(super) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
 pub(super) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
+pub(super) const SOAC_RUNTIME_DECREF_DEALLOC_PRESERVING_ERROR_SYMBOL: &str =
+    "soac_runtime_decref_dealloc_preserving_error";
 pub(super) const SOAC_RUNTIME_INCREF_APPLIED_SYMBOL: &str = "soac_runtime_incref_applied";
 pub(super) const SOAC_RUNTIME_DECREF_APPLIED_SYMBOL: &str = "soac_runtime_decref_applied";
 pub(super) const SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL: &str =

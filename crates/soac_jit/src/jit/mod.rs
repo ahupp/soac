@@ -104,6 +104,7 @@ mod precompile;
 mod precompiled_library;
 mod precompiled_object;
 mod process;
+mod refcount_lowering;
 mod runtime_context;
 mod runtime_support;
 mod signal_diagnostics;
@@ -213,6 +214,7 @@ pub(crate) use precompiled_library::{
     lookup_precompiled_static_module_constant,
 };
 pub(crate) use process::{ProcessJitEngine, process_jit_is_currently_compiling};
+use refcount_lowering::RefcountLowering;
 pub(crate) use runtime_context::FunctionRuntimeDataLayout;
 use runtime_context::{
     FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
@@ -270,7 +272,8 @@ thread_local! {
 #[cfg(test)]
 use imports::predeclare_typed_direct_call_imports;
 use imports::{
-    DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
+    DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT, DP_JIT_DECREF_IMPORT,
+    DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
     DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT, DP_JIT_LOAD_CELL_IMPORT,
     DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
@@ -605,8 +608,7 @@ fn emit_cell_value_load_from_raw_cell(
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let value_inst = fb.ins().call(ctx.load_cell_ref, &[cell_obj]);
     let value = fb.inst_results(value_inst)[0];
-    fb.ins()
-        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, cell_obj]);
+    ctx.emit_decref(fb, cell_obj);
     let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
     let value_ok_block = fb.create_block();
     fb.append_block_param(value_ok_block, ptr_ty);
@@ -682,7 +684,7 @@ fn emit_codegen_indexed_global_load(
 
     fb.switch_to_block(direct_block);
     let direct_value = fb.block_params(direct_block)[0];
-    fb.ins().call(ctx.incref_ref, &[direct_value]);
+    ctx.emit_incref(fb, direct_value);
     emit_optional_counter_increment_for_kind(fb, ctx, ctx.global_indexed_hit_counter_ids, instr_id);
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
@@ -1045,16 +1047,13 @@ fn emit_codegen_super_helper_call_with_local_env(
         );
         fb.ins().call(raise_super_arg_deleted_ref, &[]);
         if !cls_is_borrowed {
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, cls]);
+            ctx.emit_decref(fb, cls);
         }
         if !super_fn_is_borrowed {
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, super_fn]);
+            ctx.emit_decref(fb, super_fn);
         }
         if !callable_is_borrowed {
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
+            ctx.emit_decref(fb, callable);
         }
         fb.ins()
             .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
@@ -1081,16 +1080,13 @@ fn emit_codegen_super_helper_call_with_local_env(
         );
     }
     if !cls_is_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, cls]);
+        ctx.emit_decref(fb, cls);
     }
     if !super_fn_is_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, super_fn]);
+        ctx.emit_decref(fb, super_fn);
     }
     if !callable_is_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
+        ctx.emit_decref(fb, callable);
     }
 
     let call_value = fb.inst_results(call_inst)[0];
@@ -1518,6 +1514,7 @@ struct JitEmitCtx<'mc> {
     function_runtime_data_layout: &'mc FunctionRuntimeDataLayout,
     incref_ref: ir::FuncRef,
     decref_ref: ir::FuncRef,
+    refcount_lowering: RefcountLowering,
     py_call_positional_three_ref: ir::FuncRef,
     py_vectorcall_ref: ir::FuncRef,
     py_handle_pending_ref: Option<ir::FuncRef>,
@@ -1966,6 +1963,20 @@ fn deopt_binding_stack_slot_for_location(
 }
 
 impl JitEmitCtx<'_> {
+    fn emit_incref(&self, fb: &mut FunctionBuilder<'_>, value: ir::Value) {
+        self.refcount_lowering
+            .emit_incref(fb, self.consts.ptr_ty, value);
+    }
+
+    fn emit_decref(&self, fb: &mut FunctionBuilder<'_>, value: ir::Value) {
+        self.refcount_lowering.emit_decref(
+            fb,
+            self.consts.ptr_ty,
+            self.consts.thread_state_value,
+            value,
+        );
+    }
+
     fn value_facts_for_instr_id(&self, instr_id: InstrId) -> Option<ValueFacts> {
         self.value_facts
             .fact_for(InstrKey::new(self.function_id, instr_id))
@@ -2613,7 +2624,7 @@ impl LocalEnv {
                 ));
             }
             if local_ref_kind_needs_incref_for_load(entry.ref_kind(), borrowed) {
-                fb.ins().call(ctx.incref_ref, &[value]);
+                ctx.emit_incref(fb, value);
             }
             return Some(value);
         }
@@ -2679,7 +2690,7 @@ impl LocalEnv {
                 ));
             }
             if local_ref_kind_needs_incref_for_load(entry.ref_kind(), borrowed) {
-                fb.ins().call(ctx.incref_ref, &[value]);
+                ctx.emit_incref(fb, value);
             }
             return Some(value);
         }
@@ -3476,7 +3487,7 @@ fn emit_local_env_entry_pyobject_for_forward(
     }
     let value = entry.value();
     if local_env_entry_needs_incref_for_forward(entry, forwarded_count, &ctx.stack_slots) {
-        emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
+        ctx.emit_incref(fb, value);
     }
     value
 }
@@ -5325,7 +5336,7 @@ fn emit_forwarded_block_arg_source_value(
     if let Some(slot) = ctx.stack_slots.slot_for_block_arg_name(source_name) {
         let value = fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0);
         if !ctx.stack_slots.has_cleanup_root_name(source_name) {
-            emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
+            ctx.emit_incref(fb, value);
         }
         return Ok((value, None));
     }
@@ -5418,14 +5429,14 @@ fn emit_checked_local_value_or_unbound(
         .expect_pyobject("abrupt kind fallthrough materialize")
         .0;
         if !borrowed {
-            emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, fallthrough_value);
+            ctx.emit_incref(fb, fallthrough_value);
         }
         fb.ins()
             .jump(done_block, &[ir::BlockArg::Value(fallthrough_value)]);
 
         fb.switch_to_block(value_ok_block);
         if local_ref_kind_needs_incref_for_load(ref_kind, borrowed) {
-            fb.ins().call(ctx.incref_ref, &[value]);
+            ctx.emit_incref(fb, value);
         }
         fb.ins().jump(done_block, &[ir::BlockArg::Value(value)]);
 
@@ -5460,7 +5471,7 @@ fn emit_checked_local_value_or_unbound(
     fb.switch_to_block(value_ok_block);
     let value = fb.block_params(value_ok_block)[0];
     if local_ref_kind_needs_incref_for_load(ref_kind, borrowed) {
-        fb.ins().call(ctx.incref_ref, &[value]);
+        ctx.emit_incref(fb, value);
     }
     value
 }
@@ -5642,8 +5653,7 @@ fn emit_checked_owned_pyobject_result_for_demand(
             );
             fb.switch_to_block(value_ok_block);
             if !facts.is_immortal() {
-                fb.ins()
-                    .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+                ctx.emit_decref(fb, value);
             }
             EmitResult::no_value()
         }
@@ -5784,7 +5794,7 @@ fn emit_increment_counter(
     // TODO: Split codegen instructions into value-producing vs non-value-producing ops
     // and elide retain/release work when a statement result is not consumed.
     let none_const = emit_none_const(fb, ctx);
-    fb.ins().call(ctx.incref_ref, &[none_const]);
+    ctx.emit_incref(fb, none_const);
     none_const
 }
 
@@ -5926,7 +5936,7 @@ fn emit_raw_closure_cell_object_for_slot(
     );
     fb.switch_to_block(raw_cell_ok_block);
     let raw_cell_value = fb.block_params(raw_cell_ok_block)[0];
-    fb.ins().call(ctx.incref_ref, &[raw_cell_value]);
+    ctx.emit_incref(fb, raw_cell_value);
     raw_cell_value
 }
 
@@ -5990,7 +6000,7 @@ fn emit_pack_current_values_tuple(
 ) -> ir::Value {
     if values.is_empty() {
         let empty_tuple_const = emit_empty_tuple_const(fb, ctx);
-        fb.ins().call(ctx.incref_ref, &[empty_tuple_const]);
+        ctx.emit_incref(fb, empty_tuple_const);
         return empty_tuple_const;
     }
 
@@ -6071,7 +6081,7 @@ fn emit_pack_current_values_tuple(
     let value_offset = fb.ins().ishl_imm(body_index, 3);
     let value_addr = fb.ins().iadd(values_base, value_offset);
     let value = fb.ins().load(ptr_ty, ir::MemFlags::new(), value_addr, 0);
-    fb.ins().call(ctx.incref_ref, &[value]);
+    ctx.emit_incref(fb, value);
     fb.ins()
         .call(ctx.tuple_set_item_ref, &[body_tuple, body_index, value]);
     let next_index = fb.ins().iadd_imm(body_index, 1);
@@ -6172,7 +6182,7 @@ fn emit_call_args_tuple_from_values(
 
     for (index, (value, borrowed_arg)) in arg_values.iter().enumerate() {
         if *borrowed_arg {
-            fb.ins().call(ctx.incref_ref, &[*value]);
+            ctx.emit_incref(fb, *value);
         }
         let item_index = fb.ins().iconst(i64_ty, index as i64);
         fb.ins().call(
@@ -6567,11 +6577,9 @@ fn emit_kwargs_setitem_or_cleanup(
     let set_inst = fb
         .ins()
         .call(ctx.pyobject_setitem_ref, &[kwargs_obj, key_obj, value_obj]);
-    fb.ins()
-        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, key_obj]);
+    ctx.emit_decref(fb, key_obj);
     if !value_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value_obj]);
+        ctx.emit_decref(fb, value_obj);
     }
     let set_value = fb.inst_results(set_inst)[0];
     let set_failed = fb
@@ -6594,8 +6602,7 @@ fn emit_kwargs_setitem_or_cleanup(
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
     fb.switch_to_block(set_ok);
-    fb.ins()
-        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, set_value]);
+    ctx.emit_decref(fb, set_value);
 }
 
 fn emit_keyword_call_with_local_env(
@@ -7278,8 +7285,7 @@ fn emit_release_owned_pyobject(
     if facts.is_some_and(PyObjFacts::is_immortal) {
         return;
     }
-    fb.ins()
-        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+    ctx.emit_decref(fb, value);
 }
 
 fn emit_release_pyobject_if_owned(
@@ -8195,8 +8201,7 @@ fn emit_direct_call_args_from_plan(
                     .zip(provided_arg_borrowed[start..].iter().copied())
                 {
                     if !borrowed {
-                        fb.ins()
-                            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+                        ctx.emit_decref(fb, value);
                     }
                 }
                 arg_values.push(tuple);
@@ -8542,7 +8547,7 @@ fn emit_planned_target_args_codegen_from_local_env(
             }
             (BlockArg::None, RuntimeBlockParamRepr::PyObject) => {
                 let none_const = emit_none_const(fb, ctx);
-                fb.ins().call(ctx.incref_ref, &[none_const]);
+                ctx.emit_incref(fb, none_const);
                 none_const
             }
             (BlockArg::CurrentException, RuntimeBlockParamRepr::PyObject) => {
@@ -9583,7 +9588,7 @@ fn emit_typed_indexed_getattr(
 
         fb.switch_to_block(direct_block);
         let direct_value = fb.block_params(direct_block)[0];
-        fb.ins().call(emit_ctx.incref_ref, &[direct_value]);
+        emit_ctx.emit_incref(fb, direct_value);
         if let Some(counter_id) = hit_counter_id {
             emit_increment_counter_ref(fb, counter_id, emit_ctx);
         }
@@ -9784,7 +9789,7 @@ fn emit_typed_indexed_setattr(
         }
         if result_needs_pyobject {
             let none_const = emit_none_const(fb, emit_ctx);
-            fb.ins().call(emit_ctx.incref_ref, &[none_const]);
+            emit_ctx.emit_incref(fb, none_const);
             emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
             fb.ins()
                 .jump(result_block, &[ir::BlockArg::Value(none_const)]);
@@ -11138,8 +11143,7 @@ fn emit_codegen_simple_call_with_local_env(
         && codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
             == Some(RuntimeHelperId::Globals)
     {
-        fb.ins()
-            .call(emit_ctx.incref_ref, &[emit_ctx.consts.block_const]);
+        emit_ctx.emit_incref(fb, emit_ctx.consts.block_const);
         return Some(emit_ctx.consts.block_const);
     }
 
@@ -12472,7 +12476,7 @@ fn emit_promote_pyobject_to_owned_boundary(
     emit_ctx: &JitEmitCtx<'_>,
 ) -> (ir::Value, ValueOwnership) {
     if matches!(ownership, ValueOwnership::Borrowed) {
-        fb.ins().call(emit_ctx.incref_ref, &[value]);
+        emit_ctx.emit_incref(fb, value);
         return (value, ValueOwnership::Owned);
     }
     (value, ownership)
@@ -13961,8 +13965,7 @@ fn emit_typed_codegen_call_result_with_local_env(
         && simple_args.is_empty()
         && typed_expr_runtime_helper(call.func.as_ref(), emit_ctx) == Some(RuntimeHelperId::Globals)
     {
-        fb.ins()
-            .call(emit_ctx.incref_ref, &[emit_ctx.consts.block_const]);
+        emit_ctx.emit_incref(fb, emit_ctx.consts.block_const);
         return Ok(Some(emit_owned_pyobject_result_for_demand(
             fb,
             emit_ctx.consts.block_const,
@@ -15096,7 +15099,7 @@ fn emit_typed_codegen_expr_with_local_env(
             facts,
         } => {
             if !borrowed && matches!(ownership, ValueOwnership::Borrowed) {
-                fb.ins().call(emit_ctx.incref_ref, &[value]);
+                emit_ctx.emit_incref(fb, value);
             }
             debug_assert!(
                 !borrowed || !ownership.is_owned(),
@@ -15125,7 +15128,7 @@ fn emit_typed_codegen_expr_with_local_env(
             let false_const = emit_false_const(fb, emit_ctx);
             let bool_value = fb.ins().select(is_true, true_const, false_const);
             if !borrowed {
-                fb.ins().call(emit_ctx.incref_ref, &[bool_value]);
+                emit_ctx.emit_incref(fb, bool_value);
             }
             bool_value
         }
@@ -18983,7 +18986,7 @@ fn emit_codegen_raise_exception_from_function(
     let decref_ref = emit_ctx.decref_ref;
 
     let cause_value = emit_none_const(fb, emit_ctx);
-    fb.ins().call(emit_ctx.incref_ref, &[cause_value]);
+    emit_ctx.emit_incref(fb, cause_value);
     let raise_call_inst = fb.ins().call(
         emit_ctx.py_call_positional_three_ref,
         &[
@@ -19253,7 +19256,7 @@ fn emit_typed_codegen_term(
             (exc_value, ownership)
         } else {
             let none_const = emit_none_const(fb, emit_ctx);
-            fb.ins().call(emit_ctx.incref_ref, &[none_const]);
+            emit_ctx.emit_incref(fb, none_const);
             (none_const, ValueOwnership::Owned)
         };
         return emit_codegen_raise_exception_from_function(
@@ -20066,6 +20069,25 @@ fn build_cranelift_run_bb_specialized_function(
         } else {
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DECREF_IMPORT)
         };
+        let refcount_lowering = if !env_config.jit_refcount_emission_enabled() {
+            RefcountLowering::Disabled
+        } else if counted_refcount_helpers.incref_func_id.is_some()
+            || counted_refcount_helpers.decref_func_id.is_some()
+        {
+            RefcountLowering::HelperCalls {
+                incref_ref,
+                decref_ref,
+            }
+        } else {
+            let dealloc_preserving_error_ref = func_imports.get_or_panic(
+                codegen_env,
+                &mut fb.func,
+                &DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
+            );
+            RefcountLowering::Explicit {
+                dealloc_preserving_error_ref,
+            }
+        };
         let py_call_positional_three_ref = func_imports.get_or_panic(
             codegen_env,
             &mut fb.func,
@@ -20463,6 +20485,7 @@ fn build_cranelift_run_bb_specialized_function(
                 function_runtime_data_layout: &function_runtime_data_layout,
                 incref_ref,
                 decref_ref,
+                refcount_lowering,
                 py_call_positional_three_ref,
                 py_vectorcall_ref,
                 py_handle_pending_ref,

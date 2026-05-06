@@ -53,14 +53,21 @@ pub(super) trait OperationEmitState<'fb, E> {
     ) -> Option<ir::Value> {
         None
     }
-    fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
+    fn emit_incref(&mut self, value: ir::Value) {
+        let ptr_ty = self.ctx().consts.ptr_ty;
+        let refcount_lowering = self.ctx().refcount_lowering;
+        refcount_lowering.emit_incref(self.fb(), ptr_ty, value);
+    }
+    fn emit_decref(&mut self, value: ir::Value) {
+        let ptr_ty = self.ctx().consts.ptr_ty;
         let thread_state_value = self.ctx().consts.thread_state_value;
-        let decref_ref = self.ctx().decref_ref;
+        let refcount_lowering = self.ctx().refcount_lowering;
+        refcount_lowering.emit_decref(self.fb(), ptr_ty, thread_state_value, value);
+    }
+    fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
         for (value, borrowed_arg) in arg_values {
             if !borrowed_arg {
-                self.fb()
-                    .ins()
-                    .call(decref_ref, &[thread_state_value, *value]);
+                self.emit_decref(*value);
             }
         }
     }
@@ -1047,8 +1054,6 @@ fn emit_load<'fb>(
         NameLocation::RuntimeName(_) => state.import_func(&DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT),
         _ => unreachable!("emit_load only applies to global and runtime helper names"),
     };
-    let decref_ref = state.ctx().decref_ref;
-    let thread_state_value = state.ctx().consts.thread_state_value;
     let result = match op.name.location {
         NameLocation::Global(slot) => {
             let globals_obj = state.ctx().consts.block_const;
@@ -1067,10 +1072,7 @@ fn emit_load<'fb>(
                 .fb()
                 .ins()
                 .call(func_ref, &[globals_obj, name_obj, slot_index]);
-            state
-                .fb()
-                .ins()
-                .call(decref_ref, &[thread_state_value, name_obj]);
+            state.emit_decref(name_obj);
             let slow_value = state.fb().inst_results(call_inst)[0];
             let slow_value_is_null =
                 state
@@ -1126,7 +1128,6 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
     let ptr_ty = state.ctx().consts.ptr_ty;
     let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
     let store_global_indexed_ref = state.ctx().store_global_indexed_ref;
-    let decref_ref = state.ctx().decref_ref;
     let thread_state_value = state.ctx().consts.thread_state_value;
     let hit_counter_id = state
         .ctx()
@@ -1174,10 +1175,7 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
     let direct_value = state.fb().block_params(direct_block)[0];
     increment_counter_with_state(state, hit_counter_id);
     state.release_arg_values(arg_values);
-    state
-        .fb()
-        .ins()
-        .call(decref_ref, &[thread_state_value, name_obj]);
+    state.emit_decref(name_obj);
     state
         .fb()
         .ins()
@@ -1193,10 +1191,7 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
             );
             let fallback_value = state.fb().inst_results(fallback_inst)[0];
             state.release_arg_values(arg_values);
-            state
-                .fb()
-                .ins()
-                .call(decref_ref, &[thread_state_value, name_obj]);
+            state.emit_decref(name_obj);
             state
                 .fb()
                 .ins()
@@ -1212,10 +1207,7 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
             increment_counter_with_state(state, fallback_counter_id);
             let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
             state.release_arg_values(arg_values);
-            state
-                .fb()
-                .ins()
-                .call(decref_ref, &[thread_state_value, name_obj]);
+            state.emit_decref(name_obj);
             state.emit_deopt_result_return_or_step_null(deopt_result);
         }
     }
@@ -1270,8 +1262,6 @@ fn emit_store_with_indexed_global_plan<'fb, E: Instr<Name = ResolvedName>>(
 ) -> ir::Value {
     let arg_values = state.emit_arg_values(&[&op.value]);
     let func_ref = state.import_func(&SOAC_RUNTIME_STORE_GLOBAL_IMPORT);
-    let decref_ref = state.ctx().decref_ref;
-    let thread_state_value = state.ctx().consts.thread_state_value;
     let globals_obj = state.ctx().consts.block_const;
     let result = if let Some(plan) = indexed_global_plan {
         emit_indexed_global_store_plan_with_state(
@@ -1298,10 +1288,7 @@ fn emit_store_with_indexed_global_plan<'fb, E: Instr<Name = ResolvedName>>(
         );
         let result = state.fb().inst_results(call_inst)[0];
         state.release_arg_values(&arg_values);
-        state
-            .fb()
-            .ins()
-            .call(decref_ref, &[thread_state_value, name_obj]);
+        state.emit_decref(name_obj);
         result
     };
     state.finish_owned_result(result)
@@ -1317,8 +1304,6 @@ fn emit_del<'fb, E: Instr<Name = ResolvedName>>(
     } else {
         state.import_func(&DP_JIT_DEL_GLOBAL_IMPORT)
     };
-    let decref_ref = state.ctx().decref_ref;
-    let thread_state_value = state.ctx().consts.thread_state_value;
     let globals_obj = state.ctx().consts.block_const;
     let slot_index = match op.name.location {
         NameLocation::Global(slot) => state
@@ -1331,10 +1316,7 @@ fn emit_del<'fb, E: Instr<Name = ResolvedName>>(
         .fb()
         .ins()
         .call(func_ref, &[globals_obj, name_obj, slot_index]);
-    state
-        .fb()
-        .ins()
-        .call(decref_ref, &[thread_state_value, name_obj]);
+    state.emit_decref(name_obj);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
 }
@@ -1349,13 +1331,8 @@ pub(super) fn emit_del_deref_raw_cell<'fb, E>(
     } else {
         &DP_JIT_DEL_DEREF_IMPORT
     });
-    let decref_ref = state.ctx().decref_ref;
-    let thread_state_value = state.ctx().consts.thread_state_value;
     let call_inst = state.fb().ins().call(func_ref, &[cell_obj]);
-    state
-        .fb()
-        .ins()
-        .call(decref_ref, &[thread_state_value, cell_obj]);
+    state.emit_decref(cell_obj);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
 }

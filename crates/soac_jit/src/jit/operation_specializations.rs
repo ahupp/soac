@@ -1151,7 +1151,6 @@ fn emit_exact_list_exact_int_getitem<'fb, E>(
     };
 
     let ptr_ty = state.ctx().consts.ptr_ty;
-    let incref_ref = state.ctx().incref_ref;
 
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
@@ -1184,7 +1183,7 @@ fn emit_exact_list_exact_int_getitem<'fb, E>(
         .fb()
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
-    state.fb().ins().call(incref_ref, &[item]);
+    state.emit_incref(item);
     state.release_arg_values(arg_values);
     state
         .fb()
@@ -1220,7 +1219,6 @@ fn emit_exact_list_item_getitem_from_guarded_i64_index<'fb, E: Instr>(
     };
 
     let ptr_ty = state.ctx().consts.ptr_ty;
-    let incref_ref = state.ctx().incref_ref;
 
     let obj_values = state.emit_arg_values(&[op.value.as_ref()]);
     let result_block = state.fb().create_block();
@@ -1254,7 +1252,7 @@ fn emit_exact_list_item_getitem_from_guarded_i64_index<'fb, E: Instr>(
         .fb()
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
-    state.fb().ins().call(incref_ref, &[item]);
+    state.emit_incref(item);
     state.release_arg_values(&obj_values);
     state
         .fb()
@@ -1301,9 +1299,6 @@ fn emit_exact_list_exact_int_setitem<'fb, E>(
     };
 
     let ptr_ty = state.ctx().consts.ptr_ty;
-    let thread_state_value = state.ctx().consts.thread_state_value;
-    let incref_ref = state.ctx().incref_ref;
-    let decref_ref = state.ctx().decref_ref;
 
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, ptr_ty);
@@ -1352,18 +1347,15 @@ fn emit_exact_list_exact_int_setitem<'fb, E>(
         .fb()
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
-    state.fb().ins().call(incref_ref, &[replacement]);
+    state.emit_incref(replacement);
     state
         .fb()
         .ins()
         .store(ir::MemFlags::trusted(), replacement, item_addr, 0);
-    state
-        .fb()
-        .ins()
-        .call(decref_ref, &[thread_state_value, old_item]);
+    state.emit_decref(old_item);
     state.release_arg_values(arg_values);
     let none = state.emit_owned_module_constant(state.ctx().consts.none_constant_id);
-    state.fb().ins().call(incref_ref, &[none]);
+    state.emit_incref(none);
     state
         .fb()
         .ins()
@@ -1398,9 +1390,6 @@ fn emit_exact_list_item_setitem_from_guarded_i64_index<'fb, E: Instr>(
     };
 
     let ptr_ty = state.ctx().consts.ptr_ty;
-    let thread_state_value = state.ctx().consts.thread_state_value;
-    let incref_ref = state.ctx().incref_ref;
-    let decref_ref = state.ctx().decref_ref;
 
     let obj_values = state.emit_arg_values(&[op.value.as_ref()]);
     let result_block = state.fb().create_block();
@@ -1459,19 +1448,16 @@ fn emit_exact_list_item_setitem_from_guarded_i64_index<'fb, E: Instr>(
         .fb()
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
-    state.fb().ins().call(incref_ref, &[replacement]);
+    state.emit_incref(replacement);
     state
         .fb()
         .ins()
         .store(ir::MemFlags::trusted(), replacement, item_addr, 0);
-    state
-        .fb()
-        .ins()
-        .call(decref_ref, &[thread_state_value, old_item]);
+    state.emit_decref(old_item);
     state.release_arg_values(&obj_values);
     state.release_arg_values(&replacement_values);
     let none = state.emit_owned_module_constant(state.ctx().consts.none_constant_id);
-    state.fb().ins().call(incref_ref, &[none]);
+    state.emit_incref(none);
     state
         .fb()
         .ins()

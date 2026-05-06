@@ -61,15 +61,16 @@ mod tests {
         annotate_typed_indexed_global_accesses,
     };
     use super::super::{
-        BlockPyBlock, ClifBlockDisplayAnnotations, DP_JIT_DECREF_IMPORT,
-        DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
-        DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
-        DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DirectCallArgPlan,
-        DirectCallArgSource, DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
-        IntFacts, IntRange, JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage,
-        LocalRefKind, ModuleConstantId, ModuleFuncImports, ObjPtr, ParamBindingFacts,
-        ParsedRuntimeClifFunction, PlannedJitDeoptPointId, PrecompileModuleIndex,
-        PrecompileModuleIndexEntry, ProcessJitEngine, PyLong_Type, RelocTypeRef, ResultDemand,
+        BlockPyBlock, ClifBlockDisplayAnnotations, DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
+        DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT,
+        DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
+        DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT,
+        DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DirectCallArgPlan, DirectCallArgSource,
+        DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET, IntFacts, IntRange,
+        JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage, LocalRefKind, ModuleConstantId,
+        ModuleFuncImports, ObjPtr, ParamBindingFacts, ParsedRuntimeClifFunction,
+        PlannedJitDeoptPointId, PrecompileModuleIndex, PrecompileModuleIndexEntry,
+        ProcessJitEngine, PyLong_Type, RefcountLowering, RelocTypeRef, ResultDemand,
         SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_DECREF_SYMBOL,
         SOAC_RUNTIME_INCREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_SYMBOL,
         SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL,
@@ -8787,6 +8788,17 @@ def write_point(point, value):
         count
     }
 
+    fn user_external_name_for_func_ref(
+        function: &ir::Function,
+        func_ref: ir::FuncRef,
+    ) -> ir::UserExternalName {
+        let ext_func = &function.dfg.ext_funcs[func_ref];
+        let ir::ExternalName::User(name_ref) = &ext_func.name else {
+            panic!("test helper should reference a user-named function");
+        };
+        function.params.user_named_funcs()[*name_ref].clone()
+    }
+
     fn direct_call_args_to_runtime_helpers(
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
@@ -14223,6 +14235,74 @@ def f(x):
         )
     }
 
+    unsafe fn build_explicit_refcount_smoke_context() -> (
+        crate::session::CompileSession,
+        JITModule,
+        cranelift_codegen::Context,
+        FuncId,
+        [ir::UserExternalName; 3],
+    ) {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.returns.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "jit_explicit_refcount_smoke_wrapper",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut module_imports = ModuleFuncImports::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let helper_names = {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let mut func_imports = FuncBuildImports::new(&mut module_imports);
+            let incref_ref =
+                func_imports.get_or_panic(&mut jit_module, &mut fb.func, &DP_JIT_INCREF_IMPORT);
+            let decref_ref =
+                func_imports.get_or_panic(&mut jit_module, &mut fb.func, &DP_JIT_DECREF_IMPORT);
+            let dealloc_ref = func_imports.get_or_panic(
+                &mut jit_module,
+                &mut fb.func,
+                &DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
+            );
+            let lowering = RefcountLowering::Explicit {
+                dealloc_preserving_error_ref: dealloc_ref,
+            };
+            let tstate = fb.block_params(entry)[0];
+            let arg = fb.block_params(entry)[1];
+            lowering.emit_incref(&mut fb, ptr_ty, arg);
+            lowering.emit_decref(&mut fb, ptr_ty, tstate, arg);
+            fb.ins().return_(&[arg]);
+            fb.seal_all_blocks();
+            fb.finalize();
+
+            [
+                user_external_name_for_func_ref(&ctx.func, incref_ref),
+                user_external_name_for_func_ref(&ctx.func, decref_ref),
+                user_external_name_for_func_ref(&ctx.func, dealloc_ref),
+            ]
+        };
+
+        (compile_session, jit_module, ctx, wrapper_id, helper_names)
+    }
+
     struct RuntimeRefcountSmokeWrapper {
         _jit_module: JITModule,
         compiled: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
@@ -14571,6 +14651,22 @@ def f(x):
         assert_eq!(
             after, 0,
             "runtime support inliner should remove direct incref/decref calls from the caller"
+        );
+    }
+
+    #[test]
+    fn explicit_refcount_lowering_avoids_direct_incref_and_decref_calls() {
+        let (_compile_session, _jit_module, ctx, _wrapper_id, helper_names) =
+            unsafe { build_explicit_refcount_smoke_context() };
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names[..2]),
+            0,
+            "explicit lowering should not emit callable incref/decref helpers"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names[2..]),
+            1,
+            "explicit decref lowering should keep one shared dealloc-preserving-error call"
         );
     }
 
