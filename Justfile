@@ -1380,7 +1380,7 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     PROFILE_OUTPUT="$OUTPUT.profile.json"
   fi
 
-  rm -f "$SOAC_WORK_DIR/profile.bin" "$SOAC_WORK_DIR/verify.bin" "$SOAC_WORK_DIR/events.jsonl" "$SOAC_WORK_DIR/jit-bb-map.jsonl"
+  rm -f "$SOAC_WORK_DIR/profile.bin" "$SOAC_WORK_DIR/verify.bin" "$SOAC_WORK_DIR/events.jsonl" "$SOAC_WORK_DIR/jit-bb-map.jsonl" "$SOAC_WORK_DIR/worker_manifest.jsonl"
   find "$SOAC_WORK_DIR" -mindepth 2 -name profile.bin -delete
   find "$SOAC_WORK_DIR" -mindepth 2 -name verify.bin -delete
   find "$SOAC_WORK_DIR" -mindepth 2 -name events.jsonl -delete
@@ -1392,6 +1392,183 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     exit 1
   fi
   run_pyperformance_once "$OUTPUT" "apply" "apply"
+
+pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpython (update-venv-offline) (build-extension "release")
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  RESULT="{{result}}"
+  BENCHMARK="{{benchmark}}"
+  WORKER=""
+  LOOPS="10"
+  OUTPUT_PREFIX=""
+  set -- {{args}}
+  for arg in "$@"; do
+    case "$arg" in
+      worker=*)
+        WORKER="${arg#worker=}"
+        ;;
+      loops=*)
+        LOOPS="${arg#loops=}"
+        ;;
+      output_prefix=*)
+        OUTPUT_PREFIX="${arg#output_prefix=}"
+        ;;
+      *)
+        echo "unknown pyperformance deep-profile option: $arg" >&2
+        echo "expected worker=<worker-dir>, loops=<count>, or output_prefix=<path>" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if [[ "$RESULT" != /* ]]; then
+    RESULT="$REPO_ROOT/$RESULT"
+  fi
+  if [[ "$RESULT" == *.json ]]; then
+    SOAC_WORK_ROOT="${RESULT%.json}.soac-work"
+  else
+    SOAC_WORK_ROOT="$RESULT.soac-work"
+  fi
+  MANIFEST="$SOAC_WORK_ROOT/worker_manifest.jsonl"
+  if [[ ! -f "$MANIFEST" ]]; then
+    echo "pyperformance worker manifest not found at $MANIFEST; rerun 'just pyperformance soac ...' first" >&2
+    exit 1
+  fi
+
+  selector_args=("$MANIFEST" "$BENCHMARK" "--format=bash")
+  if [[ -n "$WORKER" ]]; then
+    selector_args+=("--worker=$WORKER")
+  fi
+  worker_shell="$("$CPYTHON_BIN" scripts/select_pyperformance_worker.py "${selector_args[@]}")"
+  eval "$worker_shell"
+
+  if [[ -z "$OUTPUT_PREFIX" ]]; then
+    OUTPUT_PREFIX="$WORKER_WORK_DIR/worker_perf"
+  elif [[ "$OUTPUT_PREFIX" != /* ]]; then
+    OUTPUT_PREFIX="$REPO_ROOT/$OUTPUT_PREFIX"
+  fi
+  mkdir -p "$(dirname "$OUTPUT_PREFIX")" "$REPO_ROOT/work/tmp"
+
+  REPO_SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+  BENCHMARK_SITE_PACKAGES="$("$WORKER_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+  BENCHMARK_ROOT="$("$CPYTHON_BIN" -c 'import pathlib, sys; script = pathlib.Path(sys.argv[1]).resolve(); print(next(parent for parent in script.parents if parent.name == "benchmarks"))' "$WORKER_BENCHMARK_SCRIPT")"
+  PYTHONPATH_PREFIX="$REPO_ROOT/soac_py/src:$REPO_SITE_PACKAGES:$BENCHMARK_SITE_PACKAGES"
+  PERF_FREQUENCY="${PERF_FREQUENCY:-999}"
+  PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,65528}"
+  PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.5}"
+  PERF_DATA_BASENAME="$(basename "${OUTPUT_PREFIX}").data"
+  PERF_DATA="$REPO_ROOT/work/tmp/${PERF_DATA_BASENAME}"
+  INJECTED_PERF_DATA="$REPO_ROOT/work/tmp/$(basename "${OUTPUT_PREFIX}").injected.data"
+  RUN_LOG="${OUTPUT_PREFIX}.log"
+  PERF_RECORD_LOG="${OUTPUT_PREFIX}_record.txt"
+  REPORT_SYMBOLS="${OUTPUT_PREFIX}_report.txt"
+  REPORT_DSO="${OUTPUT_PREFIX}_by_dso.txt"
+  REPORT_DSO_SYMBOLS="${OUTPUT_PREFIX}_by_dso_symbol.txt"
+  REPORT_CALLGRAPH="${OUTPUT_PREFIX}_callgraph.txt"
+  REPORT_SPEEDSCOPE="${OUTPUT_PREFIX}_speedscope.json"
+
+  if ! command -v perf >/dev/null 2>&1; then
+    echo "perf is required but was not found on PATH" >&2
+    exit 1
+  fi
+  if ! command -v inferno-collapse-perf >/dev/null 2>&1; then
+    echo "inferno-collapse-perf is required but was not found on PATH; install it with: cargo install inferno" >&2
+    exit 1
+  fi
+
+  echo "date: $(date +%F)"
+  echo "pyperformance result: $RESULT"
+  echo "benchmark: $WORKER_BENCHMARK_NAME"
+  echo "worker dir: $WORKER_WORK_DIR"
+  echo "benchmark script: $WORKER_BENCHMARK_SCRIPT"
+  echo "stable args: ${WORKER_STABLE_ARGS[*]}"
+  echo "profile loops: $LOOPS"
+  echo "perf data: $PERF_DATA"
+  echo "run log: $RUN_LOG"
+  echo "report by dso/symbol: $REPORT_DSO_SYMBOLS"
+  echo "report callgraph: $REPORT_CALLGRAPH"
+
+  set +e
+  env \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" \
+    SOAC_WORK_DIR="$WORKER_WORK_DIR" \
+    SOAC_OPT_MODE=apply \
+    SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}" \
+    SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}" \
+    SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}" \
+    SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$BENCHMARK_ROOT}" \
+    perf record \
+      --call-graph "$PERF_CALL_GRAPH" \
+      -F "$PERF_FREQUENCY" \
+      -k 1 \
+      -o "$PERF_DATA" \
+      -- \
+      "$WORKER_PYTHON" \
+      -u \
+      -m soac.import_hook \
+      "$WORKER_BENCHMARK_SCRIPT" \
+      "${WORKER_STABLE_ARGS[@]}" \
+      --worker \
+      --pipe 1 \
+      --values 1 \
+      --loops "$LOOPS" \
+      --warmups 0 \
+      >"$RUN_LOG" 2>"$PERF_RECORD_LOG"
+  run_status=$?
+  set -e
+  if [[ "$run_status" -ne 0 ]]; then
+    cat "$PERF_RECORD_LOG" >&2
+    cat "$RUN_LOG" >&2
+    exit "$run_status"
+  fi
+
+  perf report \
+    --stdio \
+    --percent-limit "$PERF_PERCENT_LIMIT" \
+    --sort overhead,symbol \
+    -i "$PERF_DATA" \
+    >"$REPORT_SYMBOLS"
+
+  perf report \
+    --stdio \
+    --percent-limit "$PERF_PERCENT_LIMIT" \
+    --sort overhead,dso \
+    -i "$PERF_DATA" \
+    >"$REPORT_DSO"
+
+  perf report \
+    --stdio \
+    --percent-limit "$PERF_PERCENT_LIMIT" \
+    --sort overhead,dso,symbol \
+    -i "$PERF_DATA" \
+    >"$REPORT_DSO_SYMBOLS"
+
+  perf report \
+    --stdio \
+    --percent-limit "$PERF_PERCENT_LIMIT" \
+    --sort overhead,symbol \
+    --children \
+    --call-graph graph,0.5,caller \
+    -i "$PERF_DATA" \
+    >"$REPORT_CALLGRAPH"
+
+  perf inject --jit \
+    -i "$PERF_DATA" \
+    -o "$INJECTED_PERF_DATA"
+
+  perf script \
+    -i "$INJECTED_PERF_DATA" \
+    | inferno-collapse-perf \
+    | python3 "$REPO_ROOT/scripts/folded_to_speedscope.py" "$(basename "${OUTPUT_PREFIX}")" \
+    >"$REPORT_SPEEDSCOPE"
+
+  VIEW_SPEEDSCOPE_PROFILE="$("$CPYTHON_BIN" -c 'import pathlib, sys; repo_root = pathlib.Path(sys.argv[1]).resolve(); report_path = pathlib.Path(sys.argv[2]).resolve(); print(report_path.relative_to(repo_root))' "$REPO_ROOT" "$REPORT_SPEEDSCOPE")"
+
+  echo "finished"
+  echo "view speedscope: just view-speedscope ${VIEW_SPEEDSCOPE_PROFILE@Q}"
 
 benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash

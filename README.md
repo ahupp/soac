@@ -454,6 +454,18 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   per-script-and-variant subdirectory so full-suite runs can profile many
   `__main__` scripts without source-hash or type-observation collisions.
 
+- `just pyperformance-deep-profile-from-profile <result.json> <benchmark> [worker=<worker-dir>] [loops=<count>]`
+  Replay one measured pyperformance worker directly from a prior SOAC
+  profile/apply run and collect `perf` plus Speedscope artifacts for the worker
+  body. The SOAC pyperformance wrapper records replay metadata in
+  `<result>.soac-work/worker_manifest.jsonl`; this recipe selects a measured
+  profile worker, rejects calibration workers, and asks for `worker=<worker-dir>`
+  if the benchmark has more than one measured worker. Artifacts are written
+  beside the selected worker by default under
+  `<worker-dir>/worker_perf*`. Use this when pyperformance says a benchmark is
+  slow and you need benchmark-worker attribution instead of profiling the
+  pyperformance harness.
+
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompile a counter-referenced set of cached BlockPy modules into
   relocatable object files and link them into a shared library. The counter

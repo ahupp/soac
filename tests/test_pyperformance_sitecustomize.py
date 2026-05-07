@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -106,3 +107,51 @@ def test_pyperformance_work_dir_keeps_separate_worker_task_values(monkeypatch, t
     assert first_task_dir != second_task_dir
     assert "bm_deepcopy-worker-task_0" in first_task_dir
     assert "bm_deepcopy-worker-task_1" in second_task_dir
+
+
+def test_pyperformance_worker_manifest_uses_root_work_dir(monkeypatch, tmp_path):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    script = (
+        tmp_path
+        / "pyperformance"
+        / "data-files"
+        / "benchmarks"
+        / "bm_nqueens"
+        / "run_benchmark.py"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text("# benchmark placeholder\n")
+    work_root = tmp_path / "work"
+    work_dir = work_root / "benchmarks" / "bm_nqueens-worker-task_0-example"
+    monkeypatch.setenv("SOAC_OPT_MODE", "profile")
+    monkeypatch.setattr(
+        sitecustomize.sys,
+        "argv",
+        [
+            str(script),
+            "--worker",
+            "--worker-task=0",
+            "--pipe",
+            "4",
+            "--loops",
+            "10",
+        ],
+    )
+    monkeypatch.setattr(sitecustomize.sys, "executable", "/tmp/worker-python")
+
+    sitecustomize._append_benchmark_manifest(str(work_root), str(work_dir))
+
+    rows = [
+        json.loads(line)
+        for line in (work_root / "worker_manifest.jsonl").read_text().splitlines()
+    ]
+    assert rows == [
+        {
+            "benchmark_name": "bm_nqueens",
+            "benchmark_script": str(script.resolve()),
+            "opt_mode": "profile",
+            "python_executable": "/tmp/worker-python",
+            "stable_args": ["--worker-task=0"],
+            "work_dir": str(work_dir),
+        }
+    ]

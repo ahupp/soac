@@ -12,6 +12,7 @@ sharing one counter dump across the full suite would mix different source
 hashes and class/type observations under one module name.
 """
 
+import json
 import os
 import sys
 from hashlib import sha256
@@ -120,6 +121,33 @@ def _benchmark_work_dir() -> str | None:
     )
 
 
+def _benchmark_manifest_record(work_dir: str) -> dict[str, object]:
+    benchmark_path = Path(sys.argv[0]).resolve()
+    return {
+        "benchmark_name": benchmark_path.parent.name or "unknown",
+        "benchmark_script": str(benchmark_path),
+        "opt_mode": os.environ.get("SOAC_OPT_MODE", "none"),
+        "python_executable": sys.executable,
+        "stable_args": _stable_benchmark_args(sys.argv[1:]),
+        "work_dir": work_dir,
+    }
+
+
+def _append_benchmark_manifest(work_root: str, work_dir: str) -> None:
+    manifest_path = Path(work_root) / "worker_manifest.jsonl"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        _benchmark_manifest_record(work_dir),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    fd = os.open(manifest_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+
+
 if (
     _enabled("SOAC_PYPERFORMANCE_ENABLE")
     and not _enabled("SOAC_PYPERFORMANCE_DRIVER")
@@ -127,8 +155,11 @@ if (
     and _is_benchmark_worker()
 ):
     os.environ["SOAC_PYPERFORMANCE_EXEC_WRAPPED"] = "1"
+    work_root = os.environ.get("SOAC_WORK_DIR")
     if benchmark_work_dir := _benchmark_work_dir():
         os.makedirs(benchmark_work_dir, exist_ok=True)
+        if work_root:
+            _append_benchmark_manifest(work_root, benchmark_work_dir)
         os.environ["SOAC_WORK_DIR"] = benchmark_work_dir
     os.execv(
         sys.executable,

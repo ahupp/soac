@@ -445,6 +445,14 @@ another revision's cache.
   module cache under a stable per-script-and-variant subdirectory so full-suite
   runs can profile many `__main__` scripts without source-hash or
   type-observation collisions.
+- `just pyperformance-deep-profile-from-profile <result.json> <benchmark> [worker=<worker-dir>] [loops=<count>]`
+  Replays one measured pyperformance worker directly from a prior SOAC
+  profile/apply run and records `perf` plus Speedscope artifacts for the worker
+  body. SOAC pyperformance runs write worker replay metadata to
+  `<result>.soac-work/worker_manifest.jsonl`; the recipe rejects pyperf
+  calibration workers and requires `worker=<worker-dir>` when the benchmark has
+  multiple measured workers. Use this instead of manually reconstructing worker
+  commands when profiling one pyperformance benchmark.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv, XDG, and cargo state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
