@@ -35,7 +35,7 @@ SOAC_WORK_DIR="<result-dir>/counters" \
 SOAC_OPT_MODE=apply \
 PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.2}" \
 just perf-pystone-jit-warm 10000000 "<result-dir>/perf"
-cargo run -q -p soac-inspector --bin annotate_cranelift_perf -- "<result-dir>" \
+cargo run -q -p soac_inspector --bin annotate_cranelift_perf -- "<result-dir>" \
   > "<result-dir>/perf_cranelift_blocks.tsv"
 ```
 
