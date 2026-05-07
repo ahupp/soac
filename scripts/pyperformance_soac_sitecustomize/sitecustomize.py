@@ -14,6 +14,7 @@ hashes and class/type observations under one module name.
 
 import json
 import os
+import signal
 import sys
 from hashlib import sha256
 from pathlib import Path
@@ -146,6 +147,53 @@ def _append_benchmark_manifest(work_root: str, work_dir: str) -> None:
         os.write(fd, payload)
     finally:
         os.close(fd)
+
+
+def _pause_before_measured_values(ready_file: str) -> None:
+    ready_path = Path(ready_file)
+    ready_path.parent.mkdir(parents=True, exist_ok=True)
+    ready_path.write_text("ready\n")
+    os.kill(os.getpid(), signal.SIGSTOP)
+
+
+def _install_measured_value_pause_hook(worker_task_cls=None) -> None:
+    ready_file = os.environ.get("SOAC_PYPERFORMANCE_MEASURE_READY_FILE")
+    if not ready_file:
+        return
+
+    if worker_task_cls is None:
+        from pyperf._worker import WorkerTask
+
+        worker_task_cls = WorkerTask
+
+    original_compute_values = worker_task_cls._compute_values
+    paused = False
+
+    def compute_values_with_pause(
+        self,
+        values,
+        nvalue,
+        is_warmup=False,
+        calibrate_loops=False,
+        start=0,
+    ):
+        nonlocal paused
+        if not paused and not is_warmup and not calibrate_loops:
+            paused = True
+            _pause_before_measured_values(ready_file)
+        return original_compute_values(
+            self,
+            values,
+            nvalue,
+            is_warmup=is_warmup,
+            calibrate_loops=calibrate_loops,
+            start=start,
+        )
+
+    worker_task_cls._compute_values = compute_values_with_pause
+
+
+_install_measured_value_pause_hook()
 
 
 if (

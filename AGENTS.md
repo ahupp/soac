@@ -451,8 +451,11 @@ another revision's cache.
   body. SOAC pyperformance runs write worker replay metadata to
   `<result>.soac-work/worker_manifest.jsonl`; the recipe rejects pyperf
   calibration workers and requires `worker=<worker-dir>` when the benchmark has
-  multiple measured workers. Use this instead of manually reconstructing worker
-  commands when profiling one pyperformance benchmark.
+  multiple measured workers. During replay it sets
+  `SOAC_PYPERFORMANCE_MEASURE_READY_FILE`, which makes the generic pyperf worker
+  hook pause immediately before measured values so `perf` can attach after
+  benchmark import and any pyperf warmups. Use this instead of manually
+  reconstructing worker commands when profiling one pyperformance benchmark.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv, XDG, and cargo state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,

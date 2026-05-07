@@ -1468,6 +1468,22 @@ pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpytho
   REPORT_DSO_SYMBOLS="${OUTPUT_PREFIX}_by_dso_symbol.txt"
   REPORT_CALLGRAPH="${OUTPUT_PREFIX}_callgraph.txt"
   REPORT_SPEEDSCOPE="${OUTPUT_PREFIX}_speedscope.json"
+  READY_FILE="$(mktemp "$REPO_ROOT/work/tmp/pyperformance_worker_ready.XXXXXX")"
+  PY_PID=""
+  PERF_PID=""
+
+  cleanup() {
+    if [[ -n "${PERF_PID}" ]] && kill -0 "${PERF_PID}" >/dev/null 2>&1; then
+      kill -INT "${PERF_PID}" >/dev/null 2>&1 || true
+      wait "${PERF_PID}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${PY_PID}" ]] && kill -0 "${PY_PID}" >/dev/null 2>&1; then
+      kill "${PY_PID}" >/dev/null 2>&1 || true
+      wait "${PY_PID}" >/dev/null 2>&1 || true
+    fi
+    rm -f "$READY_FILE"
+  }
+  trap cleanup EXIT
 
   if ! command -v perf >/dev/null 2>&1; then
     echo "perf is required but was not found on PATH" >&2
@@ -1490,39 +1506,106 @@ pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpytho
   echo "report by dso/symbol: $REPORT_DSO_SYMBOLS"
   echo "report callgraph: $REPORT_CALLGRAPH"
 
-  set +e
+  rm -f "$READY_FILE"
   env \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH="$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" \
+    PYTHONPATH="$REPO_ROOT/scripts/pyperformance_soac_sitecustomize:$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" \
+    SOAC_PYPERFORMANCE_MEASURE_READY_FILE="$READY_FILE" \
     SOAC_WORK_DIR="$WORKER_WORK_DIR" \
     SOAC_OPT_MODE=apply \
     SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}" \
     SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}" \
     SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}" \
     SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$BENCHMARK_ROOT}" \
-    perf record \
-      --call-graph "$PERF_CALL_GRAPH" \
-      -F "$PERF_FREQUENCY" \
-      -k 1 \
-      -o "$PERF_DATA" \
-      -- \
-      "$WORKER_PYTHON" \
-      -u \
-      -m soac.import_hook \
-      "$WORKER_BENCHMARK_SCRIPT" \
-      "${WORKER_STABLE_ARGS[@]}" \
-      --worker \
-      --pipe 1 \
-      --values 1 \
-      --loops "$LOOPS" \
-      --warmups 0 \
-      >"$RUN_LOG" 2>"$PERF_RECORD_LOG"
-  run_status=$?
+    "$WORKER_PYTHON" \
+    -u \
+    -m soac.import_hook \
+    "$WORKER_BENCHMARK_SCRIPT" \
+    "${WORKER_STABLE_ARGS[@]}" \
+    --worker \
+    --pipe 1 \
+    --values 1 \
+    --loops "$LOOPS" \
+    --warmups 0 \
+    >"$RUN_LOG" 2>&1 &
+  PY_PID=$!
+
+  for _ in $(seq 1 2400); do
+    if [[ -f "$READY_FILE" ]]; then
+      break
+    fi
+    if ! kill -0 "$PY_PID" >/dev/null 2>&1; then
+      wait "$PY_PID"
+      cat "$RUN_LOG" >&2
+      echo "pyperformance worker exited before measured-value readiness" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+
+  if [[ ! -f "$READY_FILE" ]]; then
+    echo "timed out waiting for pyperformance measured-value readiness" >&2
+    exit 1
+  fi
+
+  for _ in $(seq 1 200); do
+    if [[ "$(ps -o state= -p "$PY_PID" 2>/dev/null | tr -d ' ')" == T* ]]; then
+      break
+    fi
+    if ! kill -0 "$PY_PID" >/dev/null 2>&1; then
+      wait "$PY_PID"
+      cat "$RUN_LOG" >&2
+      echo "pyperformance worker exited before stopping for perf attach" >&2
+      exit 1
+    fi
+    sleep 0.01
+  done
+
+  if [[ "$(ps -o state= -p "$PY_PID" 2>/dev/null | tr -d ' ')" != T* ]]; then
+    echo "pyperformance worker never entered SIGSTOP state for perf attach" >&2
+    exit 1
+  fi
+
+  perf record \
+    --call-graph "$PERF_CALL_GRAPH" \
+    -F "$PERF_FREQUENCY" \
+    -k 1 \
+    -o "$PERF_DATA" \
+    -p "$PY_PID" \
+    >"$PERF_RECORD_LOG" 2>&1 &
+  PERF_PID=$!
+
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$PERF_PID" >/dev/null 2>&1; then
+      wait "$PERF_PID"
+      cat "$PERF_RECORD_LOG" >&2
+      echo "perf exited before the pyperformance worker resumed" >&2
+      exit 1
+    fi
+    sleep 0.01
+  done
+
+  kill -CONT "$PY_PID"
+  set +e
+  wait "$PY_PID"
+  worker_status=$?
+  PY_PID=""
+
+  if kill -0 "$PERF_PID" >/dev/null 2>&1; then
+    kill -INT "$PERF_PID" >/dev/null 2>&1 || true
+  fi
+  wait "$PERF_PID"
+  perf_status=$?
   set -e
-  if [[ "$run_status" -ne 0 ]]; then
-    cat "$PERF_RECORD_LOG" >&2
+  PERF_PID=""
+
+  if [[ "$worker_status" -ne 0 ]]; then
     cat "$RUN_LOG" >&2
-    exit "$run_status"
+    exit "$worker_status"
+  fi
+  if [[ "$perf_status" -ne 0 && "$perf_status" -ne 130 ]]; then
+    cat "$PERF_RECORD_LOG" >&2
+    exit "$perf_status"
   fi
 
   perf report \

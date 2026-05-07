@@ -462,9 +462,12 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   profile worker, rejects calibration workers, and asks for `worker=<worker-dir>`
   if the benchmark has more than one measured worker. Artifacts are written
   beside the selected worker by default under
-  `<worker-dir>/worker_perf*`. Use this when pyperformance says a benchmark is
-  slow and you need benchmark-worker attribution instead of profiling the
-  pyperformance harness.
+  `<worker-dir>/worker_perf*`. The replay worker pauses through
+  `SOAC_PYPERFORMANCE_MEASURE_READY_FILE` immediately before pyperf starts its
+  measured values, so the attached profile excludes benchmark-module import and
+  any pyperf warmups. Use this when pyperformance says a benchmark is slow and
+  you need measured-worker attribution instead of profiling the pyperformance
+  harness.
 
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompile a counter-referenced set of cached BlockPy modules into

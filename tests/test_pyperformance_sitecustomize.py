@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import signal
 from pathlib import Path
 
 
@@ -154,4 +156,56 @@ def test_pyperformance_worker_manifest_uses_root_work_dir(monkeypatch, tmp_path)
             "stable_args": ["--worker-task=0"],
             "work_dir": str(work_dir),
         }
+    ]
+
+
+def test_pyperformance_measured_value_hook_pauses_once_before_values(
+    monkeypatch,
+    tmp_path,
+):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    script = (
+        tmp_path
+        / "pyperformance"
+        / "data-files"
+        / "benchmarks"
+        / "bm_nqueens"
+        / "run_benchmark.py"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text("# benchmark placeholder\n")
+    ready_file = tmp_path / "ready"
+    calls = []
+
+    class FakeWorkerTask:
+        def _compute_values(
+            self,
+            values,
+            nvalue,
+            is_warmup=False,
+            calibrate_loops=False,
+            start=0,
+        ):
+            calls.append(("compute", is_warmup, calibrate_loops, start))
+
+    monkeypatch.setattr(sitecustomize.sys, "argv", [str(script), "--worker"])
+    monkeypatch.setenv("SOAC_PYPERFORMANCE_MEASURE_READY_FILE", str(ready_file))
+    monkeypatch.setattr(
+        sitecustomize.os,
+        "kill",
+        lambda pid, signum: calls.append(("kill", pid, signum)),
+    )
+
+    sitecustomize._install_measured_value_pause_hook(FakeWorkerTask)
+    task = FakeWorkerTask()
+    task._compute_values([], 1, is_warmup=True)
+    task._compute_values([], 1)
+    task._compute_values([], 1)
+
+    assert ready_file.read_text() == "ready\n"
+    assert calls == [
+        ("compute", True, False, 0),
+        ("kill", os.getpid(), signal.SIGSTOP),
+        ("compute", False, False, 0),
+        ("compute", False, False, 0),
     ]
