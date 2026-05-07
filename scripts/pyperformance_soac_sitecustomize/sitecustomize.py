@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import sys
+import importlib.util
 from hashlib import sha256
 from pathlib import Path
 
@@ -47,6 +48,8 @@ _PYPERF_FLAGS = {
     "--debug-single-value",
     "--worker",
 }
+
+_DEFAULT_JIT_PACKAGES = ("tomli",)
 
 
 def _enabled(name: str) -> bool:
@@ -100,6 +103,53 @@ def _safe_path_component(value: str) -> str:
         for char in value
     )
     return safe.strip("._-") or "default"
+
+
+def _package_source_root(package_name: str) -> Path | None:
+    spec = importlib.util.find_spec(package_name)
+    if spec is None:
+        return None
+    if spec.submodule_search_locations:
+        return Path(next(iter(spec.submodule_search_locations))).resolve()
+    if spec.origin:
+        return Path(spec.origin).resolve().parent
+    return None
+
+
+def _append_enabled_module_roots(roots: list[Path]) -> None:
+    if not roots:
+        return
+
+    entries = [f"path:{root}" for root in roots]
+    existing = os.environ.get("SOAC_MODULE_ENABLED")
+    if existing:
+        entries.insert(0, existing)
+    os.environ["SOAC_MODULE_ENABLED"] = ",".join(entries)
+
+
+def _benchmark_root() -> Path | None:
+    benchmark_path = Path(sys.argv[0]).resolve()
+    for parent in benchmark_path.parents:
+        if parent.name == "benchmarks":
+            return parent
+    return None
+
+
+def _using_default_module_allowlist() -> bool:
+    benchmark_root = _benchmark_root()
+    return (
+        benchmark_root is not None
+        and os.environ.get("SOAC_MODULE_ENABLED") == f"path:{benchmark_root}"
+    )
+
+
+def _enable_default_dependency_packages() -> None:
+    roots = [
+        root
+        for package_name in _DEFAULT_JIT_PACKAGES
+        if (root := _package_source_root(package_name)) is not None
+    ]
+    _append_enabled_module_roots(roots)
 
 
 def _benchmark_work_dir() -> str | None:
@@ -209,6 +259,8 @@ if (
         if work_root:
             _append_benchmark_manifest(work_root, benchmark_work_dir)
         os.environ["SOAC_WORK_DIR"] = benchmark_work_dir
+    if _using_default_module_allowlist():
+        _enable_default_dependency_packages()
     os.execv(
         sys.executable,
         [

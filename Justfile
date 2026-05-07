@@ -1302,41 +1302,66 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     inherit_csv="$(IFS=,; echo "${inherit_env[*]}")"
   fi
 
-  pyperformance_extra_args=("$@")
-  pyperformance_sample_mode=default
-  pyperformance_min_time=default
-  for arg in "${pyperformance_extra_args[@]}"; do
-    case "$arg" in
-      --debug-single-value|--rigorous)
-        pyperformance_sample_mode=explicit
-        pyperformance_min_time=explicit
-        ;;
-      --fast)
-        pyperformance_sample_mode=explicit
-        ;;
-      --min-time|--min-time=*)
-        pyperformance_min_time=explicit
-        ;;
-    esac
-  done
-  pyperformance_default_args=()
-  if [[ "$pyperformance_sample_mode" == default ]]; then
-    pyperformance_default_args+=(--fast)
-  fi
-  if [[ "$pyperformance_min_time" == default ]]; then
-    pyperformance_default_args+=(--min-time=0.05)
-  fi
-  pyperformance_extra_args=("${pyperformance_default_args[@]}" "${pyperformance_extra_args[@]}")
+  pyperformance_user_args=("$@")
+
+  build_pyperformance_args() {
+    local default_mode="$1"
+    local default_min_time="$2"
+    shift 2
+
+    local sample_mode=default
+    local min_time=default
+    for arg in "$@"; do
+      case "$arg" in
+        --debug-single-value|--rigorous)
+          sample_mode=explicit
+          min_time=explicit
+          ;;
+        --fast)
+          sample_mode=explicit
+          ;;
+        --min-time|--min-time=*)
+          min_time=explicit
+          ;;
+      esac
+    done
+
+    local default_args=()
+    if [[ "$sample_mode" == default ]]; then
+      case "$default_mode" in
+        apply)
+          default_args+=(--fast)
+          ;;
+        profile)
+          default_args+=(--fast --warmups=0)
+          ;;
+      esac
+    fi
+    if [[ "$min_time" == default ]]; then
+      default_args+=("--min-time=$default_min_time")
+    fi
+
+    printf '%s\0' "${default_args[@]}" "$@"
+  }
+
+  mapfile -d '' -t pyperformance_apply_args < <(
+    build_pyperformance_args apply 0.05 "${pyperformance_user_args[@]}"
+  )
+  mapfile -d '' -t pyperformance_profile_args < <(
+    build_pyperformance_args profile 0.01 "${pyperformance_user_args[@]}"
+  )
 
   run_pyperformance_once() {
     local run_output="$1"
     local pass_label="$2"
     local opt_mode="${3:-}"
+    shift 3
+    local run_extra_args=("$@")
     local run_args=("${pyperformance_base_args[@]}" -o "$run_output")
     if [[ -n "$inherit_csv" ]]; then
       run_args+=("--inherit-environ=$inherit_csv")
     fi
-    run_args+=("${pyperformance_extra_args[@]}")
+    run_args+=("${run_extra_args[@]}")
 
     if [[ -n "$opt_mode" ]]; then
       export SOAC_OPT_MODE="$opt_mode"
@@ -1364,13 +1389,13 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
   }
 
   if [[ "$MODE" == "stock" ]]; then
-    run_pyperformance_once "$OUTPUT" "" ""
+    run_pyperformance_once "$OUTPUT" "" "" "${pyperformance_apply_args[@]}"
     exit 0
   fi
 
   if [[ "$MODE" == "soac-single" ]]; then
     export SOAC_OPT_MODE="${SOAC_OPT_MODE:-none}"
-    run_pyperformance_once "$OUTPUT" "" "$SOAC_OPT_MODE"
+    run_pyperformance_once "$OUTPUT" "" "$SOAC_OPT_MODE" "${pyperformance_apply_args[@]}"
     exit 0
   fi
 
@@ -1386,12 +1411,12 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
   find "$SOAC_WORK_DIR" -mindepth 2 -name events.jsonl -delete
   find "$SOAC_WORK_DIR" -mindepth 2 -name jit-bb-map.jsonl -delete
 
-  run_pyperformance_once "$PROFILE_OUTPUT" "profile" "profile"
+  run_pyperformance_once "$PROFILE_OUTPUT" "profile" "profile" "${pyperformance_profile_args[@]}"
   if ! find "$SOAC_WORK_DIR" -name profile.bin -print -quit | grep -q .; then
     echo "SOAC profile pass did not write any profile.bin under $SOAC_WORK_DIR" >&2
     exit 1
   fi
-  run_pyperformance_once "$OUTPUT" "apply" "apply"
+  run_pyperformance_once "$OUTPUT" "apply" "apply" "${pyperformance_apply_args[@]}"
 
 pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash

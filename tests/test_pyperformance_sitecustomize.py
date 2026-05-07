@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import signal
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -157,6 +158,56 @@ def test_pyperformance_worker_manifest_uses_root_work_dir(monkeypatch, tmp_path)
             "work_dir": str(work_dir),
         }
     ]
+
+
+def test_pyperformance_default_dependency_packages_extend_allow_list(
+    monkeypatch,
+    tmp_path,
+):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    benchmark_root = tmp_path / "pyperformance" / "data-files" / "benchmarks"
+    script = benchmark_root / "bm_tomli_loads" / "run_benchmark.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# benchmark placeholder\n")
+    package_root = tmp_path / "venv" / "site-packages" / "tomli"
+    package_root.mkdir(parents=True)
+    monkeypatch.setenv("SOAC_MODULE_ENABLED", f"path:{benchmark_root}")
+    monkeypatch.setattr(sitecustomize.sys, "argv", [str(script)])
+    monkeypatch.setattr(
+        sitecustomize.importlib.util,
+        "find_spec",
+        lambda package_name: SimpleNamespace(
+            submodule_search_locations=[str(package_root)],
+            origin=str(package_root / "__init__.py"),
+        )
+        if package_name == "tomli"
+        else None,
+    )
+
+    sitecustomize._enable_default_dependency_packages()
+
+    assert os.environ["SOAC_MODULE_ENABLED"] == (
+        f"path:{benchmark_root},path:{package_root.resolve()}"
+    )
+
+
+def test_pyperformance_default_dependency_packages_can_be_skipped(
+    monkeypatch,
+    tmp_path,
+):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    benchmark_root = tmp_path / "pyperformance" / "data-files" / "benchmarks"
+    script = benchmark_root / "bm_tomli_loads" / "run_benchmark.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# benchmark placeholder\n")
+    explicit_root = tmp_path / "explicit"
+    monkeypatch.setenv("SOAC_MODULE_ENABLED", f"path:{explicit_root}")
+    monkeypatch.setattr(sitecustomize.sys, "argv", [str(script)])
+
+    if sitecustomize._using_default_module_allowlist():
+        sitecustomize._enable_default_dependency_packages()
+
+    assert os.environ["SOAC_MODULE_ENABLED"] == f"path:{explicit_root}"
 
 
 def test_pyperformance_measured_value_hook_pauses_once_before_values(

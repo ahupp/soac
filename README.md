@@ -437,14 +437,21 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   benchmark virtual environments are created under `work/pyperformance/venv/`.
   When `benchmarks` is omitted, pyperformance uses its default suite selection;
   pass a comma-separated pyperformance benchmark list such as
-  `json_dumps,richards` for a narrower run. The recipe defaults pyperf sampling
-  to `--fast --min-time=0.05` so comparison runs collect multiple values without
-  paying the full default pyperf runtime. Extra arguments are passed through to
+  `json_dumps,richards` for a narrower run. Stock runs, `soac-single`, and the
+  SOAC apply pass default pyperf sampling to `--fast --min-time=0.05` so
+  comparison runs collect multiple values without paying the full default
+  pyperf runtime. The SOAC profile pass instead defaults to
+  `--fast --warmups=0 --min-time=0.01`, which keeps normal pyperf worker
+  behavior while reducing the profiling budget. Extra arguments are passed
+  through to
   `pyperformance run`; `--rigorous` and `--debug-single-value` replace the
   default sample mode, and `--min-time=<seconds>` overrides the default
-  calibration window. SOAC modes default `SOAC_MODULE_ENABLED` to the
-  pyperformance benchmark source tree so the harness, pip, and pyperf internals
-  stay on stock CPython unless the caller overrides the allow-list. They also
+  calibration window for both passes. SOAC modes default `SOAC_MODULE_ENABLED`
+  to the pyperformance benchmark source tree so the harness, pip, and pyperf
+  internals stay on stock CPython unless the caller overrides the allow-list.
+  Pyperformance workers also append the installed `tomli` package path so
+  `tomli_loads` transforms the parser implementation rather than only the
+  benchmark wrapper. They also
   default `SOAC_BACKGROUND_JIT=0`, because pyperformance uses short worker
   subprocesses where background compiler threads can outlive interpreter
   shutdown, and default `SOAC_COMPILE_MODE=eager` because lazy first-call
