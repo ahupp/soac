@@ -40,19 +40,21 @@ guarded direct-call target model. Type registration only attaches that
 metadata for safe default constructor shapes, so unsupported Python type-call
 cases stay generic and do not enter the synthetic target.
 Typed planning can also add static call plans when the callee binding is
-compiler-owned rather than profile-discovered. `RuntimeName::Range` and
-`RuntimeName::IterRange` still resolve directly to the corresponding
+compiler-owned rather than profile-discovered. Runtime constructor names such as
+`RuntimeName::Range`, `RuntimeName::IterRange`, `RuntimeName::ClosureGenerator`,
+and `RuntimeName::ClosureAsyncGenerator` resolve directly to the corresponding
 `soac.runtime` constructor-entry targets, and lowered module globals that have
-one module-init binding with no later in-module stores or deletes are treated
-as static function targets under SOAC's strict-module assumption. Runtime
-constructors such as `IterRange(...)` also lower as unconditional direct callable
-calls; user-module constructors remain generic for now because their type
-metadata is not guaranteed to be available while module initialization is still
-running. The optimization currently assumes, but does not yet runtime-enforce,
-the strict-module rule that outside code cannot later replace those final
-globals. The static path is apply/verify-only; profile mode keeps
-the original call graph so nested protocol sites still collect ordinary
-evidence before later rewrites inline them.
+one module-init binding with no later in-module stores or deletes are treated as
+static function targets under SOAC's strict-module assumption. Runtime
+constructors such as `IterRange(...)` and compiler-generated
+`ClosureGenerator(...)` calls can therefore lower as unconditional direct
+callable calls; user-module constructors remain generic for now because their
+type metadata is not guaranteed to be available while module initialization is
+still running. The optimization currently assumes, but does not yet
+runtime-enforce, the strict-module rule that outside code cannot later replace
+those final globals. The static path is apply/verify-only; profile mode keeps the
+original call graph so nested protocol sites still collect ordinary evidence
+before later rewrites inline them.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan and lowered

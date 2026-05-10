@@ -727,55 +727,37 @@ fn build_factory_block(
     let generator = match kind {
         FunctionKind::Generator | FunctionKind::Coroutine => core_call_expr(
             core_runtime_attr("ClosureGenerator"),
-            Vec::new(),
             vec![
-                ("resume", resume_entry),
-                (
-                    "name",
-                    core_string_literal(visible_names.display_name.as_str()),
+                resume_entry,
+                core_string_literal(visible_names.display_name.as_str()),
+                core_string_literal(visible_names.qualname.as_str()),
+                core_generator_code(
+                    false,
+                    visible_names.display_name.as_str(),
+                    visible_names.qualname.as_str(),
                 ),
-                (
-                    "qualname",
-                    core_string_literal(visible_names.qualname.as_str()),
-                ),
-                (
-                    "code",
-                    core_generator_code(
-                        false,
-                        visible_names.display_name.as_str(),
-                        visible_names.qualname.as_str(),
-                    ),
-                ),
-                ("preserved_values", preserved_values.clone()),
-                ("yieldfrom_slot", yieldfrom_slot.clone()),
-                ("throw_context_slot", throw_context_slot.clone()),
+                preserved_values.clone(),
+                yieldfrom_slot.clone(),
+                throw_context_slot.clone(),
             ],
+            Vec::new(),
         ),
         FunctionKind::AsyncGenerator => core_call_expr(
             core_runtime_attr("ClosureAsyncGenerator"),
-            Vec::new(),
             vec![
-                ("resume", resume_entry),
-                (
-                    "name",
-                    core_string_literal(visible_names.display_name.as_str()),
+                resume_entry,
+                core_string_literal(visible_names.display_name.as_str()),
+                core_string_literal(visible_names.qualname.as_str()),
+                core_generator_code(
+                    true,
+                    visible_names.display_name.as_str(),
+                    visible_names.qualname.as_str(),
                 ),
-                (
-                    "qualname",
-                    core_string_literal(visible_names.qualname.as_str()),
-                ),
-                (
-                    "code",
-                    core_generator_code(
-                        true,
-                        visible_names.display_name.as_str(),
-                        visible_names.qualname.as_str(),
-                    ),
-                ),
-                ("preserved_values", preserved_values),
-                ("yieldfrom_slot", yieldfrom_slot),
-                ("throw_context_slot", throw_context_slot),
+                preserved_values,
+                yieldfrom_slot,
+                throw_context_slot,
             ],
+            Vec::new(),
         ),
         FunctionKind::Function => {
             unreachable!("plain functions do not use generator factories")

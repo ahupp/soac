@@ -73,7 +73,7 @@ fn build_closure_backed_generator_factory_block(
 
     let generator_expr = if is_async_generator {
         py_expr!(
-            "runtime.ClosureAsyncGenerator(resume={resume:expr}, name={name:literal}, qualname={qualname:literal}, code=runtime.code_template_async_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), preserved_values={preserved_values:expr}, yieldfrom_slot=1, throw_context_slot=2)",
+            "runtime.ClosureAsyncGenerator({resume:expr}, {name:literal}, {qualname:literal}, runtime.code_template_async_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), {preserved_values:expr}, 1, 2)",
             resume = resume_entry,
             name = visible_names.display_name.as_str(),
             qualname = visible_names.qualname.as_str(),
@@ -81,7 +81,7 @@ fn build_closure_backed_generator_factory_block(
         )
     } else {
         py_expr!(
-            "runtime.ClosureGenerator(resume={resume:expr}, name={name:literal}, qualname={qualname:literal}, code=runtime.code_template_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), preserved_values={preserved_values:expr}, yieldfrom_slot=1, throw_context_slot=2)",
+            "runtime.ClosureGenerator({resume:expr}, {name:literal}, {qualname:literal}, runtime.code_template_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), {preserved_values:expr}, 1, 2)",
             resume = resume_entry,
             name = visible_names.display_name.as_str(),
             qualname = visible_names.qualname.as_str(),

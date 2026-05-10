@@ -3807,13 +3807,13 @@ def make_counter(delta):
     let closure_generator = runtime_call_by_name(bb_module, return_expr, "ClosureGenerator")
         .expect("expected ClosureGenerator");
     let resume_expr = closure_generator
-        .keywords
-        .iter()
-        .find_map(|keyword| match keyword {
-            CallArgKeyword::Named { arg, value } if arg.as_str() == "resume" => Some(value),
-            _ => None,
+        .args
+        .first()
+        .and_then(|arg| match arg {
+            CallArgPositional::Positional(value) => Some(value),
+            CallArgPositional::Starred(_) => None,
         })
-        .expect("ClosureGenerator should carry a resume= keyword");
+        .expect("ClosureGenerator should carry resume as its first positional argument");
     let captures_expr = match resume_expr {
         InstrResolved::MakeFunctionWithClosure(make_function) => make_function.captures.as_ref(),
         other => panic!("resume should use MakeFunctionWithClosure, got {other:?}"),
@@ -3844,11 +3844,10 @@ def make_counter(delta):
         lowering.name_binding_text(),
     );
     assert!(
-        closure_generator.keywords.iter().any(|keyword| matches!(
-            keyword,
-            CallArgKeyword::Named { arg, value }
-                if arg.as_str() == "preserved_values" && matches!(value, InstrResolved::Tuple(_))
-        )),
+        matches!(
+            closure_generator.args.get(4),
+            Some(CallArgPositional::Positional(InstrResolved::Tuple(_)))
+        ),
         "generator wrapper should own preserved activation state:\n{}",
         lowering.name_binding_text(),
     );

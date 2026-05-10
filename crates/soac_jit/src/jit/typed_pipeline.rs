@@ -184,7 +184,10 @@ fn trusted_fully_virtual_constructor_owner(owner: &TypedAttrOwnerRef) -> bool {
             module_name,
             qualname,
         } if module_name == "soac.runtime"
-            && matches!(qualname.as_str(), "range" | "IterRange")
+            && matches!(
+                qualname.as_str(),
+                "range" | "IterRange" | "ClosureGenerator" | "ClosureAsyncGenerator"
+            )
     )
 }
 
@@ -192,6 +195,8 @@ fn static_runtime_constructor_init_qualname(runtime_name: RuntimeName) -> Option
     match runtime_name {
         RuntimeName::Range => Some("range.__init__"),
         RuntimeName::IterRange => Some("IterRange.__init__"),
+        RuntimeName::ClosureGenerator => Some("ClosureGenerator.__init__"),
+        RuntimeName::ClosureAsyncGenerator => Some("ClosureAsyncGenerator.__init__"),
         _ => None,
     }
 }
@@ -4985,6 +4990,66 @@ def values(limit):
             .values()
             .next()
             .expect("runtime range call should receive a static direct-call plan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].target, entry_function_id);
+        assert_eq!(plans[0].body.kind, CallBodyKind::Inline);
+    }
+
+    #[test]
+    fn generated_closure_generator_calls_build_inline_constructor_plans() {
+        let caller_lowered =
+            soac_lowering::lower_python_to_blockpy_for_testing("def gen():\n    yield 1\n")
+                .expect("caller source should lower");
+        let caller_typed = lower_blockpy_module_to_typed(caller_lowered.blockpy_module);
+        let factory = caller_typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "gen")
+            .expect("typed generator factory should exist");
+
+        let runtime_lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class ClosureGenerator:\n    def __init__(self, resume, name, qualname, code, preserved_values, yieldfrom_slot, throw_context_slot):\n        self.resume = resume\n",
+        )
+        .expect("runtime source should lower");
+        let init_function = runtime_lowered
+            .blockpy_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "ClosureGenerator.__init__")
+            .expect("runtime module should contain ClosureGenerator.__init__");
+        let entry_function_id = soac_ir_blockpy::constructor_entry_function_id_for_init(
+            &runtime_lowered.blockpy_module,
+            init_function.function_id,
+        )
+        .expect("ClosureGenerator init should have a constructor entry");
+        let entry_function = runtime_lowered
+            .blockpy_module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == entry_function_id)
+            .cloned()
+            .expect("runtime module should contain the constructor entry");
+        let plans = static_direct_call_plans_for_function(
+            factory,
+            &caller_typed.module_constants,
+            &StaticDirectCallTargets {
+                runtime_names: HashMap::from([(
+                    RuntimeName::ClosureGenerator,
+                    StaticDirectCallTarget {
+                        function: entry_function,
+                        constructor_owner_type_ref: Some(TypedAttrOwnerRef::TypeKey {
+                            module_name: "soac.runtime".to_string(),
+                            qualname: "ClosureGenerator".to_string(),
+                        }),
+                    },
+                )]),
+                module_globals: HashMap::new(),
+            },
+        );
+        let plans = plans
+            .values()
+            .next()
+            .expect("generated ClosureGenerator call should receive a static direct-call plan");
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].target, entry_function_id);
         assert_eq!(plans[0].body.kind, CallBodyKind::Inline);

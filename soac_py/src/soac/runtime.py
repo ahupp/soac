@@ -777,7 +777,6 @@ class ClosureGenerator:
 
     def __init__(
         self,
-        *,
         resume,
         name,
         qualname,
@@ -897,7 +896,6 @@ class ClosureAsyncGenerator:
 
     def __init__(
         self,
-        *,
         resume,
         name,
         qualname,
