@@ -214,11 +214,9 @@ __deepcopy__
 templatelib_Template
 templatelib_Interpolation
 bb_trace_enter
-_yieldfrom_cell_value
 _current_yieldfrom
 _is_cancelled_error
 _reraise_control_flow
-_clear_cell
 _mark_closed
 _normalize_throw_exc
 _current_throw_context

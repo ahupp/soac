@@ -1,7 +1,7 @@
 use super::{
     augment_resume_semantic_for_standard_name_binding, build_blockpy_storage_layout,
-    current_exception_value_expr, is_name_not_none_test, persistent_generator_state_order,
-    resume_closure_bindings, yield_from_method_lookup_expr, yield_from_send_expr, ErrOnYield,
+    current_exception_value_expr, is_name_not_none_test, resume_closure_bindings,
+    resume_closure_state_order, yield_from_method_lookup_expr, yield_from_send_expr, ErrOnYield,
 };
 use crate::block_py::{
     core_call_expr_with_meta, BinOpKind, BindingKind, BindingPurpose, Block, BlockBuilder,
@@ -53,7 +53,7 @@ fn build_closure_backed_generator_factory_block(
     visible_names: &FunctionName,
     resume_function_id: RuntimeFunctionId,
     _resume_state_order: &[String],
-    _layout: &StorageLayout,
+    layout: &StorageLayout,
     is_coroutine: bool,
     is_async_generator: bool,
 ) -> Block<InstrRuff> {
@@ -61,20 +61,31 @@ fn build_closure_backed_generator_factory_block(
         "__dp_make_function({function_id:literal}, \"function\", __dp_tuple(), __dp_tuple(), None)",
         function_id = resume_function_id.to_packed_runtime_u64(),
     );
+    let preserved_values = layout
+        .preserved_slots
+        .iter()
+        .map(|slot| slot.logical_name.as_str())
+        .collect::<Vec<_>>();
+    let preserved_values = match preserved_values.as_slice() {
+        ["_dp_pc", "_dp_yieldfrom", "_dp_throw_context"] => py_expr!("(1, None, None)"),
+        other => panic!("unexpected preserved test slots {other:?}"),
+    };
 
     let generator_expr = if is_async_generator {
         py_expr!(
-            "runtime.ClosureAsyncGenerator(resume={resume:expr}, name={name:literal}, qualname={qualname:literal}, code=runtime.code_template_async_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), yieldfrom_cell=__dp_cell_ref(\"_dp_yieldfrom\"), throw_context_cell=__dp_cell_ref(\"_dp_throw_context\"))",
+            "runtime.ClosureAsyncGenerator(resume={resume:expr}, name={name:literal}, qualname={qualname:literal}, code=runtime.code_template_async_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), preserved_values={preserved_values:expr}, yieldfrom_slot=1, throw_context_slot=2)",
             resume = resume_entry,
             name = visible_names.display_name.as_str(),
             qualname = visible_names.qualname.as_str(),
+            preserved_values = preserved_values.clone(),
         )
     } else {
         py_expr!(
-            "runtime.ClosureGenerator(resume={resume:expr}, name={name:literal}, qualname={qualname:literal}, code=runtime.code_template_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), yieldfrom_cell=__dp_cell_ref(\"_dp_yieldfrom\"), throw_context_cell=__dp_cell_ref(\"_dp_throw_context\"))",
+            "runtime.ClosureGenerator(resume={resume:expr}, name={name:literal}, qualname={qualname:literal}, code=runtime.code_template_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), preserved_values={preserved_values:expr}, yieldfrom_slot=1, throw_context_slot=2)",
             resume = resume_entry,
             name = visible_names.display_name.as_str(),
             qualname = visible_names.qualname.as_str(),
+            preserved_values = preserved_values,
         )
     };
 
@@ -210,7 +221,7 @@ fn current_exception_value_helper_builds_value_attr_lookup() {
 }
 
 #[test]
-fn resume_closure_bindings_keep_internal_eval_state_on_runtime_binding_path() {
+fn resume_closure_bindings_keep_cell_backed_eval_state_on_closure_path() {
     let layout = StorageLayout {
         freevars: vec![ClosureSlot {
             logical_name: "captured".to_string(),
@@ -255,18 +266,7 @@ fn resume_closure_bindings_keep_internal_eval_state_on_runtime_binding_path() {
     };
 
     let scope = generator_resume_source_semantic(&layout);
-    let closure_bindings = resume_closure_bindings(
-        &scope,
-        &[
-            "captured".to_string(),
-            "total".to_string(),
-            "_dp_eval_1".to_string(),
-            "_dp_eval_2".to_string(),
-            "_dp_yieldfrom".to_string(),
-            "_dp_pc".to_string(),
-            "_dp_try_exc_0".to_string(),
-        ],
-    );
+    let closure_bindings = resume_closure_bindings(&scope, &resume_closure_state_order(&layout));
 
     assert_eq!(
         closure_bindings.runtime_state_bindings,
@@ -276,11 +276,6 @@ fn resume_closure_bindings_keep_internal_eval_state_on_runtime_binding_path() {
             ("_dp_eval_1".to_string(), "_dp_cell__dp_eval_1".to_string()),
             ("_dp_eval_2".to_string(), "_dp_cell__dp_eval_2".to_string()),
             (
-                "_dp_yieldfrom".to_string(),
-                "_dp_cell__dp_yieldfrom".to_string()
-            ),
-            ("_dp_pc".to_string(), "_dp_cell__dp_pc".to_string()),
-            (
                 "_dp_try_exc_0".to_string(),
                 "_dp_cell__dp_try_exc_0".to_string()
             ),
@@ -289,7 +284,7 @@ fn resume_closure_bindings_keep_internal_eval_state_on_runtime_binding_path() {
 }
 
 #[test]
-fn persistent_generator_state_order_omits_resume_abi_params() {
+fn resume_closure_state_order_omits_preserved_slots() {
     let layout = StorageLayout {
         freevars: vec![ClosureSlot {
             logical_name: "captured".to_string(),
@@ -310,12 +305,8 @@ fn persistent_generator_state_order_omits_resume_abi_params() {
     };
 
     assert_eq!(
-        persistent_generator_state_order(&layout),
-        vec![
-            "captured".to_string(),
-            "total".to_string(),
-            "_dp_pc".to_string(),
-        ]
+        resume_closure_state_order(&layout),
+        vec!["captured".to_string(), "total".to_string()]
     );
 }
 
@@ -459,6 +450,11 @@ fn builds_closure_backed_generator_factory_block() {
                 init: ClosureInit::RuntimePcUnstarted,
             },
             ClosureSlot {
+                logical_name: "_dp_yieldfrom".to_string(),
+                storage_name: "_dp_cell__dp_yieldfrom".to_string(),
+                init: ClosureInit::RuntimeNone,
+            },
+            ClosureSlot {
                 logical_name: "_dp_throw_context".to_string(),
                 storage_name: "_dp_cell__dp_throw_context".to_string(),
                 init: ClosureInit::RuntimeNone,
@@ -515,26 +511,13 @@ fn resume_closure_bindings_use_semantic_capture_sources_for_cell_backed_state() 
     };
 
     let scope = generator_resume_source_semantic(&layout);
-    let closure_bindings = resume_closure_bindings(
-        &scope,
-        &[
-            "captured".to_string(),
-            "total".to_string(),
-            "_dp_pc".to_string(),
-            "_dp_throw_context".to_string(),
-        ],
-    );
+    let closure_bindings = resume_closure_bindings(&scope, &resume_closure_state_order(&layout));
 
     assert_eq!(
         closure_bindings.runtime_state_bindings,
         vec![
             ("captured".to_string(), "_dp_cell_captured".to_string()),
             ("total".to_string(), "_dp_cell_total".to_string()),
-            ("_dp_pc".to_string(), "_dp_cell__dp_pc".to_string()),
-            (
-                "_dp_throw_context".to_string(),
-                "_dp_cell__dp_throw_context".to_string()
-            ),
         ]
     );
 }
@@ -564,30 +547,16 @@ fn resume_closure_bindings_use_logical_names_for_shared_storage() {
     };
 
     let scope = generator_resume_source_semantic(&layout);
-    let closure_bindings = resume_closure_bindings(
-        &scope,
-        &[
-            "j".to_string(),
-            "_dp_pc".to_string(),
-            "_dp_throw_context".to_string(),
-        ],
-    );
+    let closure_bindings = resume_closure_bindings(&scope, &resume_closure_state_order(&layout));
 
     assert_eq!(
         closure_bindings.runtime_state_bindings,
-        vec![
-            ("j".to_string(), "_dp_cell_j".to_string()),
-            ("_dp_pc".to_string(), "_dp_cell__dp_pc".to_string()),
-            (
-                "_dp_throw_context".to_string(),
-                "_dp_cell__dp_throw_context".to_string()
-            ),
-        ]
+        vec![("j".to_string(), "_dp_cell_j".to_string())]
     );
 }
 
 #[test]
-fn resume_semantic_marks_generator_state_as_cell_captures() {
+fn resume_semantic_marks_only_closure_state_as_cell_captures() {
     let layout = StorageLayout {
         freevars: vec![ClosureSlot {
             logical_name: "captured".to_string(),
@@ -618,12 +587,7 @@ fn resume_semantic_marks_generator_state_as_cell_captures() {
         scope_kind: CallableScopeKind::Function,
         ..Default::default()
     };
-    for slot in layout
-        .freevars
-        .iter()
-        .chain(layout.cellvars.iter())
-        .chain(layout.preserved_slots.iter())
-    {
+    for slot in layout.freevars.iter().chain(layout.cellvars.iter()) {
         scope.insert_binding(
             slot.logical_name.clone(),
             BindingKind::Cell(CellBindingKind::Capture),
@@ -642,22 +606,12 @@ fn resume_semantic_marks_generator_state_as_cell_captures() {
         Some(BindingKind::Cell(CellBindingKind::Capture))
     );
     assert_eq!(
-        scope.binding_kind("_dp_pc"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
-    assert_eq!(
-        scope.binding_kind("_dp_throw_context"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
-    assert_eq!(
         scope.resolved_load_binding_kind("_dp_pc"),
-        BindingKind::Cell(CellBindingKind::Capture)
+        BindingKind::Local
     );
     assert_eq!(
         scope.effective_binding("_dp_pc", BindingPurpose::Load),
-        Some(crate::block_py::EffectiveBinding::Cell(
-            CellBindingKind::Capture
-        ))
+        None
     );
     assert_eq!(
         scope.resolved_load_binding_kind("_dp_self"),
@@ -666,7 +620,7 @@ fn resume_semantic_marks_generator_state_as_cell_captures() {
 }
 
 #[test]
-fn resume_semantic_overlay_marks_runtime_and_logical_state_for_standard_name_binding() {
+fn resume_semantic_overlay_marks_only_closure_state_for_standard_name_binding() {
     let layout = StorageLayout {
         freevars: vec![ClosureSlot {
             logical_name: "captured".to_string(),
@@ -715,19 +669,8 @@ fn resume_semantic_overlay_marks_runtime_and_logical_state_for_standard_name_bin
         stack_slots: Vec::new(),
     };
     let semantic_for_bindings = generator_resume_source_semantic(&layout);
-    let closure_bindings = resume_closure_bindings(
-        &semantic_for_bindings,
-        &[
-            "captured".to_string(),
-            "total".to_string(),
-            "_dp_eval_1".to_string(),
-            "_dp_eval_2".to_string(),
-            "_dp_yieldfrom".to_string(),
-            "_dp_throw_context".to_string(),
-            "_dp_pc".to_string(),
-            "_dp_try_exc_0".to_string(),
-        ],
-    );
+    let closure_bindings =
+        resume_closure_bindings(&semantic_for_bindings, &resume_closure_state_order(&layout));
     let mut scope = CallableScopeInfo {
         names: FunctionName::new("gen_resume", "_dp_resume", "gen", "gen"),
         scope_kind: CallableScopeKind::Function,
@@ -738,10 +681,6 @@ fn resume_semantic_overlay_marks_runtime_and_logical_state_for_standard_name_bin
 
     assert_eq!(
         scope.binding_kind("total"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
-    assert_eq!(
-        scope.binding_kind("_dp_pc"),
         Some(BindingKind::Cell(CellBindingKind::Capture))
     );
     assert_eq!(
@@ -776,40 +715,20 @@ fn resume_semantic_overlay_marks_runtime_and_logical_state_for_standard_name_bin
         scope.cell_capture_source_name("_dp_eval_2"),
         "_dp_cell__dp_eval_2"
     );
+    assert_eq!(scope.binding_kind("_dp_pc"), None);
     assert_eq!(
         scope.resolved_load_binding_kind("_dp_pc"),
-        BindingKind::Cell(CellBindingKind::Capture)
+        BindingKind::Local
     );
-    assert_eq!(scope.cell_storage_name("_dp_pc"), "_dp_pc");
-    assert_eq!(scope.cell_capture_source_name("_dp_pc"), "_dp_cell__dp_pc");
-    assert_eq!(
-        scope.binding_kind("_dp_yieldfrom"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
+    assert_eq!(scope.binding_kind("_dp_yieldfrom"), None);
     assert_eq!(
         scope.resolved_load_binding_kind("_dp_yieldfrom"),
-        BindingKind::Cell(CellBindingKind::Capture)
+        BindingKind::Local
     );
-    assert_eq!(scope.cell_storage_name("_dp_yieldfrom"), "_dp_yieldfrom");
-    assert_eq!(
-        scope.cell_capture_source_name("_dp_yieldfrom"),
-        "_dp_cell__dp_yieldfrom"
-    );
-    assert_eq!(
-        scope.binding_kind("_dp_throw_context"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
+    assert_eq!(scope.binding_kind("_dp_throw_context"), None);
     assert_eq!(
         scope.resolved_load_binding_kind("_dp_throw_context"),
-        BindingKind::Cell(CellBindingKind::Capture)
-    );
-    assert_eq!(
-        scope.cell_storage_name("_dp_throw_context"),
-        "_dp_throw_context"
-    );
-    assert_eq!(
-        scope.cell_capture_source_name("_dp_throw_context"),
-        "_dp_cell__dp_throw_context"
+        BindingKind::Local
     );
     assert_eq!(
         scope.binding_kind("_dp_try_exc_0"),

@@ -660,7 +660,6 @@ fn prepend_owned_cell_init_preamble(callable: &mut BlockPyFunction<CoreModuleSha
             layout
                 .cellvars
                 .iter()
-                .chain(layout.preserved_slots.iter())
                 .map(build_closure_slot_cell_init_assign)
                 .collect::<Vec<_>>()
         }
@@ -1200,12 +1199,11 @@ fn collect_owned_cell_storage_bindings(
     if let Some(layout) = callable
         .storage_layout
         .as_ref()
-        .filter(|layout| !layout.cellvars.is_empty() || !layout.preserved_slots.is_empty())
+        .filter(|layout| !layout.cellvars.is_empty())
     {
         return layout
             .cellvars
             .iter()
-            .chain(layout.preserved_slots.iter())
             .map(|slot| (slot.logical_name.clone(), slot.storage_name.clone()))
             .collect();
     }
@@ -1935,7 +1933,6 @@ fn compute_callable_storage_layout_for_name_binding(
             layout
                 .cellvars
                 .iter()
-                .chain(layout.preserved_slots.iter())
                 .map(|slot| slot.storage_name.clone())
                 .collect::<Vec<_>>()
         })
@@ -2124,7 +2121,6 @@ fn compute_module_make_function_capture_names(
             return layout
                 .cellvars
                 .iter()
-                .chain(layout.preserved_slots.iter())
                 .map(|slot| slot.logical_name.clone())
                 .collect();
         }
@@ -2143,7 +2139,6 @@ fn compute_module_make_function_capture_names(
             return layout
                 .cellvars
                 .iter()
-                .chain(layout.preserved_slots.iter())
                 .map(|slot| slot.storage_name.clone())
                 .collect();
         }

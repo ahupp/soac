@@ -291,7 +291,7 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
 }
 
 #[test]
-fn generator_throw_handler_plan_keeps_try_exception_state_and_closure_exc_binding() {
+fn generator_throw_handler_plan_keeps_try_exception_state_and_local_exc_binding() {
     let source = r#"
 def exercise():
     outer_capture = 2
@@ -380,19 +380,16 @@ def exercise():
         .as_ref()
         .expect("hidden resume should preserve closure layout");
     assert!(
-        storage_layout
-            .freevars
-            .iter()
-            .any(|slot| slot.logical_name == "exc"),
-        "expected hidden resume closure layout to preserve the user-visible exception binding as a freevar cell: {:?}",
+        storage_layout.stack_slots.iter().any(|slot| slot == "exc"),
+        "expected hidden resume layout to preserve the user-visible exception binding as a local slot: {:?}",
         storage_layout
     );
     assert!(
         storage_layout
             .freevars
             .iter()
-            .any(|slot| slot.logical_name == "exc" && slot.storage_name.contains("exc")),
-        "expected hidden resume closure slot for exc to keep a stable cell storage name: {:?}",
+            .all(|slot| slot.logical_name != "exc"),
+        "expected hidden resume layout to keep user-visible exception bindings out of closure state: {:?}",
         storage_layout
     );
 }

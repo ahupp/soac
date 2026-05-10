@@ -31,8 +31,8 @@ pub struct StorageLayout {
     pub freevars: Vec<ClosureSlot>,
     pub cellvars: Vec<ClosureSlot>,
     // Private activation state that survives suspension but is not a Python
-    // lexical cell. The current generator runtime still backs these with cells
-    // while the resumed body is split into a separate function.
+    // lexical cell. Generator lowering spills these into the runtime wrapper
+    // across suspension and reloads them as ordinary locals on resume.
     pub preserved_slots: Vec<ClosureSlot>,
     pub stack_slots: Vec<String>,
 }
@@ -43,10 +43,7 @@ impl StorageLayout {
     }
 
     pub fn owned_slot(&self, slot: u32) -> Option<&ClosureSlot> {
-        self.cellvars
-            .iter()
-            .chain(self.preserved_slots.iter())
-            .nth(slot as usize)
+        self.cellvars.get(slot as usize)
     }
 
     pub fn has_freevar_storage_name(&self, storage_name: &str) -> bool {

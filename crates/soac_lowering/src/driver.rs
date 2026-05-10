@@ -249,8 +249,8 @@ pub fn lower_source_to_blockpy_module_with_tracker(
      Convert generators into a state machine, driven by an internal `resume(send, throw)` function.
 
      Suspension state is modeled separately from lexical closure cells as preserved slots. The
-     current runtime still materializes those slots through closure cells while the resumed body
-     remains split into a separate function.
+     runtime wrapper owns those values across suspension, and the resumed body reloads them as
+     ordinary locals while it remains split into a separate function.
 
     */
     let core_blockpy_without_await_or_yield: BlockPyModule<CoreModuleShape> = pass_tracker

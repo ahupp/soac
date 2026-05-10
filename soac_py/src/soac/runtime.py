@@ -145,16 +145,8 @@ def bb_trace_enter(function_qualname, block_label, params=None):
     print(message, file=_sys.stderr, flush=True)
 
 
-def _yieldfrom_cell_value(cell):
-    try:
-        value = cell.cell_contents
-    except ValueError:
-        return None
-    return value
-
-
 def _current_yieldfrom(owner):
-    return _yieldfrom_cell_value(owner._yield_from_cell)
+    return owner._preserved_values[owner._yield_from_slot]
 
 
 def _is_cancelled_error(exc):
@@ -171,20 +163,8 @@ def _reraise_control_flow(exc):
     raise exc
 
 
-def _clear_cell(cell):
-    try:
-        del cell.cell_contents
-    except ValueError:
-        pass
-
-
 def _mark_closed(owner):
-    cleanup_cells = owner._cleanup_cells
-    owner._cleanup_cells = ()
-    for cell in cleanup_cells:
-        _clear_cell(cell)
-    _clear_cell(owner._yield_from_cell)
-    _clear_cell(owner._throw_context_cell)
+    owner._preserved_values = []
     owner._is_closed = True
     owner._resume_fn = None
 
@@ -199,7 +179,7 @@ def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
 
 
 def _current_throw_context(owner):
-    return _yieldfrom_cell_value(owner._throw_context_cell)
+    return owner._preserved_values[owner._throw_context_slot]
 
 def complex_from_parts(real, imag):
     return _builtins.complex(real, imag)
@@ -787,9 +767,9 @@ class ClosureGenerator:
     __slots__ = (
         "_resume_fn",
         "_is_closed",
-        "_yield_from_cell",
-        "_throw_context_cell",
-        "_cleanup_cells",
+        "_preserved_values",
+        "_yield_from_slot",
+        "_throw_context_slot",
         "__name__",
         "__qualname__",
         "gi_code",
@@ -802,15 +782,15 @@ class ClosureGenerator:
         name,
         qualname,
         code,
-        yieldfrom_cell,
-        throw_context_cell,
-        cleanup_cells=(),
+        preserved_values,
+        yieldfrom_slot,
+        throw_context_slot,
     ):
         self._resume_fn = resume
         self._is_closed = False
-        self._yield_from_cell = yieldfrom_cell
-        self._throw_context_cell = throw_context_cell
-        self._cleanup_cells = tuple(cleanup_cells)
+        self._preserved_values = list(preserved_values)
+        self._yield_from_slot = yieldfrom_slot
+        self._throw_context_slot = throw_context_slot
         self.__name__ = name
         self.__qualname__ = qualname
         self.gi_code = code
@@ -907,9 +887,9 @@ class ClosureAsyncGenerator:
     __slots__ = (
         "_resume_fn",
         "_is_closed",
-        "_yield_from_cell",
-        "_throw_context_cell",
-        "_cleanup_cells",
+        "_preserved_values",
+        "_yield_from_slot",
+        "_throw_context_slot",
         "__name__",
         "__qualname__",
         "ag_code",
@@ -922,15 +902,15 @@ class ClosureAsyncGenerator:
         name,
         qualname,
         code,
-        yieldfrom_cell,
-        throw_context_cell,
-        cleanup_cells=(),
+        preserved_values,
+        yieldfrom_slot,
+        throw_context_slot,
     ):
         self._resume_fn = resume
         self._is_closed = False
-        self._yield_from_cell = yieldfrom_cell
-        self._throw_context_cell = throw_context_cell
-        self._cleanup_cells = tuple(cleanup_cells)
+        self._preserved_values = list(preserved_values)
+        self._yield_from_slot = yieldfrom_slot
+        self._throw_context_slot = throw_context_slot
         self.__name__ = name
         self.__qualname__ = qualname
         self.ag_code = code
