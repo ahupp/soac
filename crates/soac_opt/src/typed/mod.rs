@@ -3784,9 +3784,9 @@ fn build_multi_block_typed_inline_fragment_to_target(
 fn typed_inline_callee_has_nonstack_storage(
     storage_layout: &soac_core::block_py::StorageLayout,
 ) -> bool {
-    !storage_layout.freevars.is_empty()
-        || !storage_layout.cellvars.is_empty()
-        || !storage_layout.preserved_slots.is_empty()
+    // Preserved slots belong to the generator wrapper, not to addressable
+    // storage inside the visible factory body being inlined here.
+    !storage_layout.freevars.is_empty() || !storage_layout.cellvars.is_empty()
 }
 
 fn allocate_typed_inline_locals(
@@ -6908,6 +6908,60 @@ def caller(a, b):\n    return add(a, b)\n",
         assert_eq!(stats.rewritten_effect_only_calls, 0);
         assert!(stats.skipped_candidates > 0);
         assert_eq!(outer.storage_layout, original_storage_layout);
+    }
+
+    #[test]
+    fn typed_direct_call_inlining_allows_generator_factories_with_preserved_state() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def gen():\n    yield 1\n\n\
+def caller():\n    value = gen()\n    return value\n",
+        )
+        .expect("source should lower");
+        let gen_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "gen");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let generator_factory = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "gen")
+            .expect("missing typed generator factory");
+        let layout = generator_factory
+            .storage_layout
+            .as_ref()
+            .expect("generator factory should record storage layout");
+        assert!(layout.freevars.is_empty(), "{layout:?}");
+        assert!(layout.cellvars.is_empty(), "{layout:?}");
+        assert!(!layout.preserved_slots.is_empty(), "{layout:?}");
+
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: gen_id,
+                        arg_plan: TypedDirectCallArgPlan { sources: vec![] },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(gen_id, TypedDirectCallArgPlan { sources: vec![] })],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
+        assert_eq!(stats.skipped_candidates, 0);
     }
 
     #[test]

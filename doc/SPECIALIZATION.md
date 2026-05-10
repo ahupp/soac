@@ -508,6 +508,9 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   starred args, and positional inputs that can bind through the direct-entry
   argument plan. Omitted trailing/defaulted parameters are passed as default
   sentinels and resolved by the callee's default-resolving direct entry.
+  Visible generator factories may inline when their only non-stack layout is
+  wrapper-owned preserved activation state; true lexical `freevars` or
+  `cellvars` still keep the callee out of the typed inliner.
   Constructor-entry targets currently require all user arguments to be explicit
   because their type-stored metadata does not yet refresh `__init__` defaults.
 - In apply/verify mode, JIT module planning consumes the cached pre-opt module
