@@ -259,7 +259,7 @@ def f():
             storage_name: "_dp_wrong_storage".to_string(),
             init: crate::block_py::ClosureInit::Deferred,
         }],
-        runtime_cells: vec![],
+        preserved_slots: vec![],
         stack_slots: Vec::new(),
     });
     function.scope.insert_binding(

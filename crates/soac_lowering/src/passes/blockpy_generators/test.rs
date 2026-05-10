@@ -239,7 +239,7 @@ fn resume_closure_bindings_keep_internal_eval_state_on_runtime_binding_path() {
                 init: ClosureInit::EmptyCell,
             },
         ],
-        runtime_cells: vec![
+        preserved_slots: vec![
             ClosureSlot {
                 logical_name: "_dp_yieldfrom".to_string(),
                 storage_name: "_dp_cell__dp_yieldfrom".to_string(),
@@ -301,7 +301,7 @@ fn persistent_generator_state_order_omits_resume_abi_params() {
             storage_name: "_dp_cell_total".to_string(),
             init: ClosureInit::Deferred,
         }],
-        runtime_cells: vec![ClosureSlot {
+        preserved_slots: vec![ClosureSlot {
             logical_name: "_dp_pc".to_string(),
             storage_name: "_dp_cell__dp_pc".to_string(),
             init: ClosureInit::RuntimePcUnstarted,
@@ -320,7 +320,7 @@ fn persistent_generator_state_order_omits_resume_abi_params() {
 }
 
 #[test]
-fn build_blockpy_storage_layout_classifies_capture_local_and_runtime_cells() {
+fn build_blockpy_storage_layout_classifies_capture_local_and_preserved_slots() {
     let scope = generator_test_semantic();
     let layout = build_blockpy_storage_layout(
         &scope,
@@ -334,6 +334,7 @@ fn build_blockpy_storage_layout_classifies_capture_local_and_runtime_cells() {
             "_dp_try_exc_0".to_string(),
         ],
         &["captured".to_string()],
+        &HashSet::new(),
         &HashSet::from(["_dp_try_exc_0".to_string()]),
     );
 
@@ -355,18 +356,11 @@ fn build_blockpy_storage_layout_classifies_capture_local_and_runtime_cells() {
                 &slot.init
             ))
             .collect::<Vec<_>>(),
-        vec![
-            ("arg", "_dp_cell_arg", &ClosureInit::Parameter),
-            (
-                "_dp_try_exc_0",
-                "_dp_cell__dp_try_exc_0",
-                &ClosureInit::RuntimeNone
-            ),
-        ]
+        Vec::<(&str, &str, &ClosureInit)>::new()
     );
     assert_eq!(
         layout
-            .runtime_cells
+            .preserved_slots
             .iter()
             .map(|slot| (
                 slot.logical_name.as_str(),
@@ -375,6 +369,7 @@ fn build_blockpy_storage_layout_classifies_capture_local_and_runtime_cells() {
             ))
             .collect::<Vec<_>>(),
         vec![
+            ("arg", "_dp_cell_arg", &ClosureInit::Parameter),
             (
                 "_dp_yieldfrom",
                 "_dp_cell__dp_yieldfrom",
@@ -388,6 +383,11 @@ fn build_blockpy_storage_layout_classifies_capture_local_and_runtime_cells() {
             (
                 "_dp_throw_context",
                 "_dp_cell__dp_throw_context",
+                &ClosureInit::RuntimeNone
+            ),
+            (
+                "_dp_try_exc_0",
+                "_dp_cell__dp_try_exc_0",
                 &ClosureInit::RuntimeNone
             ),
         ]
@@ -425,6 +425,7 @@ fn build_blockpy_storage_layout_uses_semantic_classcell_storage_mapping() {
         &[],
         &["__class__".to_string()],
         &[],
+        &HashSet::from(["_dp_classcell".to_string()]),
         &HashSet::new(),
     );
 
@@ -451,7 +452,7 @@ fn builds_closure_backed_generator_factory_block() {
             storage_name: "_dp_cell_x".to_string(),
             init: ClosureInit::Parameter,
         }],
-        runtime_cells: vec![
+        preserved_slots: vec![
             ClosureSlot {
                 logical_name: "_dp_pc".to_string(),
                 storage_name: "_dp_cell__dp_pc".to_string(),
@@ -498,7 +499,7 @@ fn resume_closure_bindings_use_semantic_capture_sources_for_cell_backed_state() 
             storage_name: "_dp_cell_total".to_string(),
             init: ClosureInit::Deferred,
         }],
-        runtime_cells: vec![
+        preserved_slots: vec![
             ClosureSlot {
                 logical_name: "_dp_pc".to_string(),
                 storage_name: "_dp_cell__dp_pc".to_string(),
@@ -547,7 +548,7 @@ fn resume_closure_bindings_use_logical_names_for_shared_storage() {
             init: ClosureInit::InheritedCapture,
         }],
         cellvars: vec![],
-        runtime_cells: vec![
+        preserved_slots: vec![
             ClosureSlot {
                 logical_name: "_dp_pc".to_string(),
                 storage_name: "_dp_cell__dp_pc".to_string(),
@@ -598,7 +599,7 @@ fn resume_semantic_marks_generator_state_as_cell_captures() {
             storage_name: "_dp_cell_total".to_string(),
             init: ClosureInit::Deferred,
         }],
-        runtime_cells: vec![
+        preserved_slots: vec![
             ClosureSlot {
                 logical_name: "_dp_pc".to_string(),
                 storage_name: "_dp_cell__dp_pc".to_string(),
@@ -621,7 +622,7 @@ fn resume_semantic_marks_generator_state_as_cell_captures() {
         .freevars
         .iter()
         .chain(layout.cellvars.iter())
-        .chain(layout.runtime_cells.iter())
+        .chain(layout.preserved_slots.iter())
     {
         scope.insert_binding(
             slot.logical_name.clone(),
@@ -694,7 +695,7 @@ fn resume_semantic_overlay_marks_runtime_and_logical_state_for_standard_name_bin
                 init: ClosureInit::EmptyCell,
             },
         ],
-        runtime_cells: vec![
+        preserved_slots: vec![
             ClosureSlot {
                 logical_name: "_dp_yieldfrom".to_string(),
                 storage_name: "_dp_cell__dp_yieldfrom".to_string(),

@@ -634,7 +634,7 @@ where
     Some(StorageLayout {
         freevars,
         cellvars,
-        runtime_cells: Vec::new(),
+        preserved_slots: Vec::new(),
         stack_slots: Vec::new(),
     })
 }

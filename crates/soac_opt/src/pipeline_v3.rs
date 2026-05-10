@@ -386,7 +386,7 @@ fn function_uses_generator_resume_state(function: &BlockPyFunction<BlockPyModule
             .freevars
             .iter()
             .chain(layout.cellvars.iter())
-            .chain(layout.runtime_cells.iter())
+            .chain(layout.preserved_slots.iter())
             .any(|slot| slot.logical_name == "_dp_pc")
     })
 }

@@ -5811,7 +5811,7 @@ def build(values):
         let storage_layout = StorageLayout {
             freevars: Vec::new(),
             cellvars: Vec::new(),
-            runtime_cells: Vec::new(),
+            preserved_slots: Vec::new(),
             stack_slots: vec!["x".to_string()],
         };
 
@@ -5844,7 +5844,7 @@ def build(values):
         let storage_layout = StorageLayout {
             freevars: Vec::new(),
             cellvars: Vec::new(),
-            runtime_cells: Vec::new(),
+            preserved_slots: Vec::new(),
             stack_slots: vec!["x".to_string()],
         };
         let expr = InstrTyped::Load(Load::<InstrTyped>::new(name.clone()));
@@ -9929,7 +9929,7 @@ def f(x):
                 storage_name: "cell".to_string(),
                 init: ClosureInit::Deferred,
             }],
-            runtime_cells: vec![],
+            preserved_slots: vec![],
             stack_slots: vec!["cell".to_string()],
         });
         let module = test_module(ModuleNameGen::new(0), vec![function]);
@@ -10045,7 +10045,7 @@ def f(x):
                 storage_name: "cell".to_string(),
                 init: ClosureInit::Deferred,
             }],
-            runtime_cells: vec![],
+            preserved_slots: vec![],
             stack_slots: vec!["cell".to_string()],
         });
         let module = test_module(ModuleNameGen::new(0), vec![function]);
@@ -10095,7 +10095,7 @@ def f(x):
                 storage_name: "cell".to_string(),
                 init: ClosureInit::Deferred,
             }],
-            runtime_cells: vec![],
+            preserved_slots: vec![],
             stack_slots: vec!["cell".to_string()],
         });
         let module = test_module(ModuleNameGen::new(0), vec![function]);
@@ -13107,7 +13107,7 @@ def f(x):
                     storage_name: "cell".to_string(),
                     init: ClosureInit::Deferred,
                 }],
-                runtime_cells: vec![],
+                preserved_slots: vec![],
                 stack_slots: vec!["cell".to_string()],
             });
             let function_id = function.function_id;
@@ -13276,7 +13276,7 @@ def f(x):
                     storage_name: "cell".to_string(),
                     init: ClosureInit::Deferred,
                 }],
-                runtime_cells: vec![],
+                preserved_slots: vec![],
                 stack_slots: vec!["cell".to_string()],
             });
             let function_id = function.function_id;
@@ -13380,7 +13380,7 @@ def f(x):
                     storage_name: "cell".to_string(),
                     init: ClosureInit::Deferred,
                 }],
-                runtime_cells: vec![],
+                preserved_slots: vec![],
                 stack_slots: vec!["cell".to_string()],
             });
             let function_id = function.function_id;
@@ -13495,7 +13495,7 @@ def f(x):
                     storage_name: "cell".to_string(),
                     init: ClosureInit::Deferred,
                 }],
-                runtime_cells: vec![],
+                preserved_slots: vec![],
                 stack_slots: vec!["cell".to_string()],
             });
             let function_id = function.function_id;
@@ -23973,7 +23973,7 @@ class Point:
                 },
             ],
             cellvars: vec![],
-            runtime_cells: vec![],
+            preserved_slots: vec![],
             stack_slots: Vec::new(),
         });
         set_stack_slots(&mut function, &["_dp_classcell"]);

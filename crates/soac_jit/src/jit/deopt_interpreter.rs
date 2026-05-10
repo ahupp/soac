@@ -1077,7 +1077,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                 function.function_id
             )
         })?;
-        let closure_slot = layout.local_cell_slot(slot).ok_or_else(|| {
+        let closure_slot = layout.owned_slot(slot).ok_or_else(|| {
             format!(
                 "deopt continuation expected owned {debug_name} slot {slot} in function {} storage layout",
                 function.function_id

@@ -30,7 +30,10 @@ pub enum BindingKind {
 pub struct StorageLayout {
     pub freevars: Vec<ClosureSlot>,
     pub cellvars: Vec<ClosureSlot>,
-    pub runtime_cells: Vec<ClosureSlot>,
+    // Private activation state that survives suspension but is not a Python
+    // lexical cell. The current generator runtime still backs these with cells
+    // while the resumed body is split into a separate function.
+    pub preserved_slots: Vec<ClosureSlot>,
     pub stack_slots: Vec<String>,
 }
 
@@ -39,19 +42,11 @@ impl StorageLayout {
         self.freevars.get(slot as usize)
     }
 
-    pub fn local_cell_slot(&self, slot: u32) -> Option<&ClosureSlot> {
+    pub fn owned_slot(&self, slot: u32) -> Option<&ClosureSlot> {
         self.cellvars
             .iter()
-            .chain(self.runtime_cells.iter())
+            .chain(self.preserved_slots.iter())
             .nth(slot as usize)
-    }
-
-    pub fn local_cell_storage_names(&self) -> Vec<String> {
-        self.cellvars
-            .iter()
-            .chain(self.runtime_cells.iter())
-            .map(|slot| slot.storage_name.clone())
-            .collect()
     }
 
     pub fn has_freevar_storage_name(&self, storage_name: &str) -> bool {
@@ -70,7 +65,7 @@ impl StorageLayout {
         self.has_freevar_storage_name(storage_name)
             || self.has_cellvar_storage_name(storage_name)
             || self
-                .runtime_cells
+                .preserved_slots
                 .iter()
                 .any(|slot| slot.storage_name == storage_name)
     }

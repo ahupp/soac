@@ -230,10 +230,10 @@ impl BlockPyFormatter {
                         render_closure_slots(&layout.cellvars)
                     ));
                 }
-                if !layout.runtime_cells.is_empty() {
+                if !layout.preserved_slots.is_empty() {
                     this.line(format!(
-                        "runtime_cells: [{}]",
-                        render_closure_slots(&layout.runtime_cells)
+                        "preserved_slots: [{}]",
+                        render_closure_slots(&layout.preserved_slots)
                     ));
                 }
             }

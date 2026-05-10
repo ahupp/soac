@@ -1000,7 +1000,7 @@ impl<'a> RuntimeJitDeoptSupportCtx<'a> {
 
     fn owned_cell_supported(&self, slot: u32) -> bool {
         self.storage_layout
-            .and_then(|layout| layout.local_cell_slot(slot))
+            .and_then(|layout| layout.owned_slot(slot))
             .is_some()
     }
 

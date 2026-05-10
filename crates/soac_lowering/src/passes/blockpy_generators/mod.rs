@@ -123,6 +123,7 @@ pub(crate) fn build_blockpy_storage_layout(
     param_names: &[String],
     state_vars: &[String],
     capture_names: &[String],
+    semantic_cell_storage_names: &HashSet<String>,
     injected_exception_names: &HashSet<String>,
 ) -> StorageLayout {
     let capture_names = capture_names.iter().cloned().collect::<HashSet<_>>();
@@ -130,7 +131,7 @@ pub(crate) fn build_blockpy_storage_layout(
 
     let mut freevars = Vec::new();
     let mut cellvars = Vec::new();
-    let mut runtime_cells = Vec::new();
+    let mut preserved_slots = Vec::new();
 
     for name in state_vars {
         let logical_name = generator_state_logical_name(scope, name.as_str());
@@ -139,7 +140,7 @@ pub(crate) fn build_blockpy_storage_layout(
             continue;
         }
         if let Some(init) = runtime_init(logical_name.as_str()) {
-            runtime_cells.push(ClosureSlot {
+            preserved_slots.push(ClosureSlot {
                 logical_name,
                 storage_name,
                 init,
@@ -164,7 +165,12 @@ pub(crate) fn build_blockpy_storage_layout(
         } else {
             ClosureInit::Deferred
         };
-        cellvars.push(ClosureSlot {
+        let slots = if semantic_cell_storage_names.contains(storage_name.as_str()) {
+            &mut cellvars
+        } else {
+            &mut preserved_slots
+        };
+        slots.push(ClosureSlot {
             logical_name,
             storage_name,
             init,
@@ -174,7 +180,7 @@ pub(crate) fn build_blockpy_storage_layout(
     StorageLayout {
         freevars,
         cellvars,
-        runtime_cells,
+        preserved_slots,
         stack_slots: Vec::new(),
     }
 }
@@ -435,7 +441,7 @@ fn build_generator_storage_layout(
     let semantic_layout = compute_storage_layout_from_scope(callable).unwrap_or(StorageLayout {
         freevars: Vec::new(),
         cellvars: Vec::new(),
-        runtime_cells: Vec::new(),
+        preserved_slots: Vec::new(),
         stack_slots: Vec::new(),
     });
     let capture_names = semantic_layout
@@ -448,6 +454,7 @@ fn build_generator_storage_layout(
         .iter()
         .map(|slot| slot.storage_name.clone())
         .collect::<Vec<_>>();
+    let semantic_cell_storage_names = local_cell_slots.iter().cloned().collect::<HashSet<_>>();
 
     let mut state_vars = collect_state_vars(&callable.scope, &param_names, &callable.blocks);
     for capture_name in &capture_names {
@@ -482,6 +489,7 @@ fn build_generator_storage_layout(
         &param_names,
         &state_vars,
         &capture_names,
+        &semantic_cell_storage_names,
         &injected_exception_names(&callable.blocks),
     )
 }
@@ -492,30 +500,18 @@ fn persistent_generator_state_order(layout: &StorageLayout) -> Vec<String> {
     order.extend(layout.cellvars.iter().map(|slot| slot.logical_name.clone()));
     order.extend(
         layout
-            .runtime_cells
+            .preserved_slots
             .iter()
             .map(|slot| slot.logical_name.clone()),
     );
     order
 }
 
-fn generator_cleanup_cell_logical_names(
-    callable: &BlockPyFunction<CoreModuleShapeWithYield>,
-    layout: &StorageLayout,
-) -> Vec<String> {
-    let semantic_cellvars = compute_storage_layout_from_scope(callable)
-        .map(|layout| {
-            layout
-                .cellvars
-                .into_iter()
-                .map(|slot| slot.logical_name)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
+fn generator_cleanup_cell_logical_names(layout: &StorageLayout) -> Vec<String> {
     layout
-        .cellvars
+        .preserved_slots
         .iter()
-        .filter(|slot| !semantic_cellvars.contains(slot.logical_name.as_str()))
+        .filter(|slot| runtime_init(slot.logical_name.as_str()).is_none())
         .map(|slot| slot.logical_name.clone())
         .collect()
 }
@@ -1802,7 +1798,7 @@ pub(crate) fn lower_generator_like_function(
     let resume_function_id = resume_name_gen.function_id();
     let storage_layout = build_generator_storage_layout(&callable);
     let persistent_state_order = persistent_generator_state_order(&storage_layout);
-    let cleanup_cell_names = generator_cleanup_cell_logical_names(&callable, &storage_layout);
+    let cleanup_cell_names = generator_cleanup_cell_logical_names(&storage_layout);
     let resume_binding_logical_names =
         ordered_resume_binding_logical_names(&callable, &persistent_state_order);
     let (resume_blocks, _resume_exception_edges, _resume_entry_label) =

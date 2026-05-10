@@ -3923,7 +3923,7 @@ fn owned_cell_backing_local(
     storage_layout: &StorageLayout,
     slot: u32,
 ) -> Option<(LocalLocation, &str)> {
-    let closure_slot = storage_layout.local_cell_slot(slot)?;
+    let closure_slot = storage_layout.owned_slot(slot)?;
     let location = storage_layout
         .stack_slots()
         .iter()
@@ -4111,7 +4111,7 @@ fn emit_local_store_result_with_local_env(
         .map(|(_, name)| *name)
         .or_else(|| {
             layout
-                .local_cell_slot(location.slot())
+                .owned_slot(location.slot())
                 .map(|slot| slot.storage_name.as_str())
         })
         .unwrap_or_else(|| {
@@ -4412,7 +4412,7 @@ fn emit_typed_owned_cell_makecell_store_result_with_local_env(
         .map(|(_, name)| *name)
         .or_else(|| {
             layout
-                .local_cell_slot(location.slot())
+                .owned_slot(location.slot())
                 .map(|slot| slot.storage_name.as_str())
         })
         .unwrap_or_else(|| {
@@ -6310,7 +6310,7 @@ fn emit_raw_cell_object_for_location_with_local_env(
             let closure_slot = ctx
                 .storage_layout
                 .as_ref()
-                .and_then(|layout| layout.local_cell_slot(slot))
+                .and_then(|layout| layout.owned_slot(slot))
                 .unwrap_or_else(|| {
                     panic!(
                         "missing owned cell slot mapping for {} at local cell slot {}",

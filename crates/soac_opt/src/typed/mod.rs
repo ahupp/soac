@@ -3786,7 +3786,7 @@ fn typed_inline_callee_has_closure_storage(
 ) -> bool {
     !storage_layout.freevars.is_empty()
         || !storage_layout.cellvars.is_empty()
-        || !storage_layout.runtime_cells.is_empty()
+        || !storage_layout.preserved_slots.is_empty()
 }
 
 fn allocate_typed_inline_locals(

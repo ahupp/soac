@@ -336,7 +336,7 @@ impl PreparedTraceNameLocator {
                 for (slot, closure_slot) in layout
                     .cellvars
                     .iter()
-                    .chain(layout.runtime_cells.iter())
+                    .chain(layout.preserved_slots.iter())
                     .enumerate()
                 {
                     slots.insert(closure_slot.storage_name.clone(), slot as u32);

@@ -2855,7 +2855,7 @@ fn owned_cell_locations(
     storage_layout
         .cellvars
         .iter()
-        .chain(storage_layout.runtime_cells.iter())
+        .chain(storage_layout.preserved_slots.iter())
         .enumerate()
         .filter_map(|(slot, cell)| {
             let location = location_by_name.get(cell.storage_name.as_str()).copied()?;
@@ -2875,7 +2875,7 @@ fn typed_owned_cell_locations(
     storage_layout
         .cellvars
         .iter()
-        .chain(storage_layout.runtime_cells.iter())
+        .chain(storage_layout.preserved_slots.iter())
         .enumerate()
         .filter_map(|(slot, cell)| {
             let location = location_by_name.get(cell.storage_name.as_str()).copied()?;

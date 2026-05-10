@@ -3104,7 +3104,7 @@ def outer(scale):
     assert_eq!(pc.storage_name, "_dp_pc");
     assert_eq!(pc.init, ClosureInit::InheritedCapture);
     assert!(layout.cellvars.is_empty(), "{layout:?}");
-    assert!(layout.runtime_cells.is_empty(), "{layout:?}");
+    assert!(layout.preserved_slots.is_empty(), "{layout:?}");
 }
 
 #[test]
@@ -3140,7 +3140,7 @@ def gen():
         "{layout:?}"
     );
     assert!(layout.cellvars.is_empty(), "{layout:?}");
-    assert!(layout.runtime_cells.is_empty(), "{layout:?}");
+    assert!(layout.preserved_slots.is_empty(), "{layout:?}");
 }
 
 #[test]
@@ -3181,7 +3181,7 @@ def outer(scale):
     assert_eq!(pc.storage_name, "_dp_pc");
     assert_eq!(pc.init, ClosureInit::InheritedCapture);
     assert!(layout.cellvars.is_empty(), "{layout:?}");
-    assert!(layout.runtime_cells.is_empty(), "{layout:?}");
+    assert!(layout.preserved_slots.is_empty(), "{layout:?}");
 }
 
 #[test]
@@ -3238,7 +3238,7 @@ async def set_flag():
             .freevars
             .iter()
             .chain(layout.cellvars.iter())
-            .chain(layout.runtime_cells.iter())
+            .chain(layout.preserved_slots.iter())
             .any(|slot| slot.logical_name == "flag"),
         "global assignment target should not become coroutine state: {layout:#?}"
     );
@@ -3293,7 +3293,7 @@ def outer(scale):
     assert_eq!(pc.storage_name, "_dp_pc");
     assert_eq!(pc.init, ClosureInit::InheritedCapture);
     assert!(layout.cellvars.is_empty(), "{layout:?}");
-    assert!(layout.runtime_cells.is_empty(), "{layout:?}");
+    assert!(layout.preserved_slots.is_empty(), "{layout:?}");
 }
 
 #[test]
@@ -3625,7 +3625,11 @@ def make_counter(delta):
     let bb_module = tracked_name_binding_module(source)
         .expect("transform should succeed")
         .expect("bb module should be available");
-    let gen = function_by_name(&bb_module, "gen");
+    let gen = bb_module
+        .callable_defs
+        .iter()
+        .find(|func| func.names.bind_name == "gen")
+        .expect("missing visible generator factory");
     let layout = gen
         .storage_layout
         .as_ref()
@@ -3636,6 +3640,59 @@ def make_counter(delta):
             .iter()
             .any(|slot| slot.logical_name == "outer_capture"),
         "visible generator should still capture outer_capture for resume closure materialization: {layout:#?}"
+    );
+}
+
+#[test]
+fn closure_backed_simple_generator_records_private_state_as_preserved_slots() {
+    let source = r#"
+def make_counter(delta):
+    outer_capture = delta
+    def gen():
+        total = 1
+        total += outer_capture
+        sent = yield total
+        total += sent
+        yield total
+    return gen()
+"#;
+
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let visible_gen = bb_module
+        .callable_defs
+        .iter()
+        .find(|func| func.names.bind_name == "gen")
+        .expect("missing visible generator factory");
+    let layout = visible_gen
+        .storage_layout
+        .as_ref()
+        .expect("visible generator should have a storage layout");
+
+    let preserved_names = layout
+        .preserved_slots
+        .iter()
+        .map(|slot| slot.logical_name.as_str())
+        .collect::<HashSet<_>>();
+    assert!(
+        [
+            "sent",
+            "total",
+            "_dp_pc",
+            "_dp_yieldfrom",
+            "_dp_throw_context"
+        ]
+        .into_iter()
+        .all(|name| preserved_names.contains(name)),
+        "private generator state should remain distinct from lexical closure state: {layout:#?}"
+    );
+    assert!(
+        layout
+            .cellvars
+            .iter()
+            .all(|slot| !matches!(slot.logical_name.as_str(), "sent" | "total")),
+        "private generator state should not be represented as lexical cellvars: {layout:#?}"
     );
 }
 
