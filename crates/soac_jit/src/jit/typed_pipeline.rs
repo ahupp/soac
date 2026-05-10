@@ -11,8 +11,8 @@ use soac_config::SpecializationMode;
 use soac_core::block_py::{
     BlockArg, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
     CallableScopeKind, ChildVisitable, ConstantExpr, FunctionKind, HasSemanticInstrId, InstrId,
-    InstrLocationMap, LocalLocation, NameLike, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
-    current_instr_locations,
+    InstrLocationMap, Literal, LocalLocation, NameLike, RuntimeFunctionId, RuntimeName, Visit,
+    VisitMut, current_instr_locations,
 };
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_entry_function_id_for_init,
@@ -26,13 +26,13 @@ use soac_ir_typed::plan_v3::{
     RegionSource,
 };
 use soac_ir_typed::{
-    FactStore, InstrTyped, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlockPyModuleShape,
-    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedConstructorInitPlan,
-    TypedConstructorInitPlanSource, TypedDirectCallArgPlan, TypedDirectFunctionCallGuard,
-    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
-    TypedExactIntReturnPlan, TypedExactListItemAccessPlan, TypedExactListItemCounterSource,
-    TypedExactListItemPlanSource, TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource,
-    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    FactStore, InstrTyped, ProvenanceFact, TypedAttrAccessPlan, TypedAttrOwnerRef,
+    TypedBlockPyModuleShape, TypedCallEmissionPlan, TypedCallEmissionPlans,
+    TypedConstructorInitPlan, TypedConstructorInitPlanSource, TypedDirectCallArgPlan,
+    TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
+    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactListItemAccessPlan,
+    TypedExactListItemCounterSource, TypedExactListItemPlanSource, TypedIndexedFieldCounterSource,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -90,11 +90,14 @@ struct StaticDirectCallTarget {
 
 type StaticRuntimeDirectCallTargets = HashMap<RuntimeName, StaticDirectCallTarget>;
 type StaticModuleGlobalDirectCallTargets = HashMap<u32, HashMap<String, StaticDirectCallTarget>>;
+type StaticStrictMethodTargets =
+    HashMap<(String, String, String), BlockPyFunction<BlockPyModuleShape>>;
 
 #[derive(Clone, Default)]
 struct StaticDirectCallTargets {
     runtime_names: StaticRuntimeDirectCallTargets,
     module_globals: StaticModuleGlobalDirectCallTargets,
+    strict_methods: StaticStrictMethodTargets,
 }
 
 fn typed_expr_is_runtime_name_load(
@@ -115,6 +118,42 @@ fn typed_expr_is_runtime_name_load(
         module_constants.get(index as usize),
         Some(ConstantExpr::RuntimeName(name)) if *name == runtime_name
     )
+}
+
+fn typed_expr_runtime_name_provenance(
+    expr: &InstrTyped,
+    module_constants: &[ConstantExpr],
+) -> Option<RuntimeName> {
+    if let InstrTyped::Load(load) = expr
+        && let Some(runtime_name) = load.name.runtime_name_id()
+    {
+        return Some(runtime_name);
+    }
+    let facts = expr.result_facts()?.as_pyobj()?;
+    let ProvenanceFact::ModuleConstant(index) = facts.provenance else {
+        return None;
+    };
+    match module_constants.get(index as usize) {
+        Some(ConstantExpr::RuntimeName(runtime_name)) => Some(*runtime_name),
+        _ => None,
+    }
+}
+
+fn typed_constant_string<'a>(
+    expr: &InstrTyped,
+    module_constants: &'a [ConstantExpr],
+) -> Option<&'a str> {
+    let InstrTyped::Load(load) = expr else {
+        return None;
+    };
+    let constant_index = load.name.location.as_constant()? as usize;
+    match module_constants.get(constant_index)? {
+        ConstantExpr::Literal(value) => match value.as_literal() {
+            Literal::StringLiteral(value) => Some(value.value.as_str()),
+            Literal::BytesLiteral(_) | Literal::NumberLiteral(_) => None,
+        },
+        ConstantExpr::RuntimeName(_) => None,
+    }
 }
 
 #[derive(Clone)]
@@ -328,6 +367,34 @@ fn strict_module_global_direct_call_targets_for_module(
     targets
 }
 
+fn strict_module_method_targets_for_module(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    module_name: &str,
+) -> StaticStrictMethodTargets {
+    let writes = summarize_strict_module_global_writes(module);
+    let mut targets = HashMap::new();
+    for function in &module.callable_defs {
+        let Some((owner_qualname, method_name)) = function.names.qualname.split_once('.') else {
+            continue;
+        };
+        if owner_qualname.contains('.')
+            || function.lowered_kind() != &FunctionKind::Function
+            || !is_strict_module_final_global(&writes, owner_qualname)
+        {
+            continue;
+        }
+        targets.insert(
+            (
+                module_name.to_string(),
+                owner_qualname.to_string(),
+                method_name.to_string(),
+            ),
+            function.clone(),
+        );
+    }
+    targets
+}
+
 fn static_direct_call_target_for_expr<'a>(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     expr: &InstrTyped,
@@ -367,6 +434,7 @@ fn static_direct_call_targets(
     compile_session: Option<&crate::session::CompileSession>,
 ) -> Result<StaticDirectCallTargets, String> {
     let mut module_globals = HashMap::new();
+    let mut strict_methods = HashMap::new();
     module_globals.insert(
         shared_state
             .lowered_module
@@ -378,6 +446,10 @@ fn static_direct_call_targets(
             shared_state.module_name.as_str(),
         ),
     );
+    strict_methods.extend(strict_module_method_targets_for_module(
+        &shared_state.lowered_module,
+        shared_state.module_name.as_str(),
+    ));
 
     let shared_module_states = compile_session
         .map(crate::session::CompileSession::shared_module_states_snapshot)
@@ -398,6 +470,10 @@ fn static_direct_call_targets(
                     state.module_name.as_str(),
                 )
             });
+        strict_methods.extend(strict_module_method_targets_for_module(
+            &state.lowered_module,
+            state.module_name.as_str(),
+        ));
     }
 
     let runtime_module_id = if shared_state.module_name == "soac.runtime" {
@@ -434,6 +510,7 @@ fn static_direct_call_targets(
     Ok(StaticDirectCallTargets {
         runtime_names,
         module_globals,
+        strict_methods,
     })
 }
 
@@ -671,6 +748,28 @@ fn trusted_static_constructor_calls(
                 .map(|(instr_id, owner)| (*instr_id, owner.clone()))
                 .collect::<HashMap<_, _>>();
             (!trusted_calls.is_empty()).then_some((*function_id, trusted_calls))
+        })
+        .collect()
+}
+
+fn trusted_constructor_init_owner_refs(
+    static_targets: &StaticDirectCallTargets,
+) -> HashMap<RuntimeFunctionId, TypedAttrOwnerRef> {
+    static_targets
+        .runtime_names
+        .values()
+        .chain(
+            static_targets
+                .module_globals
+                .values()
+                .flat_map(|targets| targets.values()),
+        )
+        .filter_map(|target| {
+            let owner_type_ref = target.constructor_owner_type_ref.as_ref()?;
+            trusted_fully_virtual_constructor_owner(owner_type_ref).then_some(())?;
+            let init_function_id =
+                constructor_init_function_id_for_entry_function(&target.function)?;
+            Some((init_function_id, owner_type_ref.clone()))
         })
         .collect()
 }
@@ -3292,37 +3391,19 @@ fn remap_cloned_static_constructor_calls(
     calls.extend(remapped);
 }
 
-fn trusted_static_constructor_calls_from_inline_stats(
+fn remapped_static_constructor_calls_from_inline_stats(
     stats: &soac_opt::passes::TypedInlineRewriteStats,
-    trusted_call_sources: &HashMap<InstrId, TypedAttrOwnerRef>,
     static_constructor_calls: &StaticConstructorCalls,
 ) -> HashMap<InstrId, TypedAttrOwnerRef> {
-    let trusted_inline_instances = stats
-        .inline_instance_sources
-        .iter()
-        .filter_map(|mapping| {
-            trusted_call_sources
-                .contains_key(&mapping.source_instr_id)
-                .then_some(mapping.inline_instance)
-        })
-        .collect::<HashSet<_>>();
-    if trusted_inline_instances.is_empty() {
-        return HashMap::new();
-    }
     stats
         .instr_id_mappings
         .iter()
         .filter_map(|mapping| {
-            trusted_inline_instances
-                .contains(&mapping.inline_instance)
-                .then(|| {
-                    static_constructor_calls
-                        .get(&mapping.callee)?
-                        .get(&mapping.callee_instr_id)
-                        .cloned()
-                        .map(|owner_type_ref| (mapping.caller_instr_id, owner_type_ref))
-                })
-                .flatten()
+            static_constructor_calls
+                .get(&mapping.callee)?
+                .get(&mapping.callee_instr_id)
+                .cloned()
+                .map(|owner_type_ref| (mapping.caller_instr_id, owner_type_ref))
         })
         .collect()
 }
@@ -3364,15 +3445,16 @@ fn trusted_materialized_constructor_calls_from_inline_stats(
 
 fn trusted_runtime_protocol_calls_for_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
     trusted_constructor_calls: Option<&HashMap<InstrId, TypedAttrOwnerRef>>,
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
 ) -> HashMap<InstrId, TypedAttrOwnerRef> {
-    let Some(trusted_constructor_calls) = trusted_constructor_calls else {
-        return HashMap::new();
-    };
-    if trusted_constructor_calls.is_empty() {
-        return HashMap::new();
-    }
-    trusted_runtime_protocol_calls_from_owner_states(function, trusted_constructor_calls)
+    trusted_runtime_protocol_calls_from_owner_states(
+        function,
+        module_constants,
+        trusted_constructor_calls.unwrap_or(&HashMap::new()),
+        trusted_constructor_init_owners,
+    )
 }
 
 #[cfg(test)]
@@ -3432,17 +3514,34 @@ fn trusted_runtime_protocol_calls_from_field_states(
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TrustedOwnerState {
     locals: HashMap<LocalLocation, TypedAttrOwnerRef>,
+    runtime_names: HashMap<LocalLocation, RuntimeName>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TrustedOwnerStateAnalysis {
+    body_before_instr: HashMap<TypedVirtualBodyInstr, TrustedOwnerState>,
+    block_before_term: HashMap<BlockLabel, TrustedOwnerState>,
 }
 
 fn trusted_owner_state_for_store_value(
     value: &InstrTyped,
     state: &TrustedOwnerState,
+    module_constants: &[ConstantExpr],
     trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
 ) -> Option<TypedAttrOwnerRef> {
     if let Some(instr_id) = value.try_semantic_instr_id()
         && let Some(owner_type_ref) = trusted_constructor_calls.get(&instr_id)
     {
         return Some(owner_type_ref.clone());
+    }
+    if let Some(owner_type_ref) = trusted_materialized_constructor_owner(
+        value,
+        state,
+        module_constants,
+        trusted_constructor_init_owners,
+    ) {
+        return Some(owner_type_ref);
     }
     let InstrTyped::Load(load) = value else {
         return None;
@@ -3450,10 +3549,85 @@ fn trusted_owner_state_for_store_value(
     state.locals.get(&load.name.local_location()?).cloned()
 }
 
+fn trusted_runtime_name_for_expr(
+    expr: &InstrTyped,
+    state: &TrustedOwnerState,
+    module_constants: &[ConstantExpr],
+) -> Option<RuntimeName> {
+    if let InstrTyped::Load(load) = expr {
+        if let Some(runtime_name) = load.name.runtime_name_id() {
+            return Some(runtime_name);
+        }
+        if let Some(location) = load.name.local_location()
+            && let Some(runtime_name) = state.runtime_names.get(&location)
+        {
+            return Some(*runtime_name);
+        }
+        if let Some(index) = load.name.location.as_constant()
+            && let Some(ConstantExpr::RuntimeName(runtime_name)) =
+                module_constants.get(index as usize)
+        {
+            return Some(*runtime_name);
+        }
+    }
+    typed_expr_runtime_name_provenance(expr, module_constants)
+}
+
+fn trusted_materialized_constructor_owner(
+    value: &InstrTyped,
+    state: &TrustedOwnerState,
+    module_constants: &[ConstantExpr],
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
+) -> Option<TypedAttrOwnerRef> {
+    let (func, args, init_plan) = match value {
+        InstrTyped::CallTyped(call) => (
+            call.func.as_ref(),
+            call.args.as_slice(),
+            call.extra.constructor_init_plan(),
+        ),
+        InstrTyped::DirectCallableCallTyped(call) => (
+            call.func.as_ref(),
+            call.args.as_slice(),
+            call.extra.constructor_init_plan(),
+        ),
+        _ => return None,
+    };
+    if let Some(init_plan) = init_plan
+        && let Some(owner_type_ref) =
+            trusted_constructor_init_owners.get(&init_plan.init_function_id)
+    {
+        return Some(owner_type_ref.clone());
+    }
+    if init_plan.is_none()
+        && !typed_expr_is_runtime_name_load(func, RuntimeName::ConstructorCall, module_constants)
+    {
+        return None;
+    }
+    let soac_core::block_py::CallArgPositional::Positional(class_expr) = args.first()? else {
+        return None;
+    };
+    let runtime_name = trusted_runtime_name_for_expr(class_expr, state, module_constants)?;
+    let owner_type_ref = TypedAttrOwnerRef::TypeKey {
+        module_name: "soac.runtime".to_string(),
+        qualname: runtime_name.name().to_string(),
+    };
+    trusted_fully_virtual_constructor_owner(&owner_type_ref).then_some(owner_type_ref)
+}
+
+fn trusted_runtime_name_for_store_value(
+    value: &InstrTyped,
+    state: &TrustedOwnerState,
+    module_constants: &[ConstantExpr],
+) -> Option<RuntimeName> {
+    trusted_runtime_name_for_expr(value, state, module_constants)
+}
+
 fn transfer_trusted_owner_instr(
     instr: &InstrTyped,
     state: &mut TrustedOwnerState,
+    module_constants: &[ConstantExpr],
     trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
 ) {
     match instr {
         InstrTyped::Store(store) => {
@@ -3463,16 +3637,26 @@ fn transfer_trusted_owner_instr(
             if let Some(owner_type_ref) = trusted_owner_state_for_store_value(
                 store.value.as_ref(),
                 state,
+                module_constants,
                 trusted_constructor_calls,
+                trusted_constructor_init_owners,
             ) {
                 state.locals.insert(location, owner_type_ref);
             } else {
                 state.locals.remove(&location);
             }
+            if let Some(runtime_name) =
+                trusted_runtime_name_for_store_value(store.value.as_ref(), state, module_constants)
+            {
+                state.runtime_names.insert(location, runtime_name);
+            } else {
+                state.runtime_names.remove(&location);
+            }
         }
         InstrTyped::Del(del) => {
             if let Some(location) = del.name.local_location() {
                 state.locals.remove(&location);
+                state.runtime_names.remove(&location);
             }
         }
         _ => {}
@@ -3493,7 +3677,20 @@ fn merge_trusted_owner_states(states: &[TrustedOwnerState]) -> TrustedOwnerState
         })
         .map(|(location, owner)| (*location, owner.clone()))
         .collect();
-    TrustedOwnerState { locals }
+    let runtime_names = first
+        .runtime_names
+        .iter()
+        .filter(|(location, runtime_name)| {
+            states
+                .iter()
+                .all(|state| state.runtime_names.get(location) == Some(*runtime_name))
+        })
+        .map(|(location, runtime_name)| (*location, *runtime_name))
+        .collect();
+    TrustedOwnerState {
+        locals,
+        runtime_names,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3581,14 +3778,24 @@ fn remap_trusted_owner_state_for_edge(
                 remapped.locals.remove(&target);
             }
         }
+        match remapped.runtime_names.get(&source).copied() {
+            Some(runtime_name) => {
+                remapped.runtime_names.insert(target, runtime_name);
+            }
+            None => {
+                remapped.runtime_names.remove(&target);
+            }
+        }
     }
     remapped
 }
 
-fn trusted_runtime_protocol_calls_from_owner_states(
+fn analyze_trusted_owner_states(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
     trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
-) -> HashMap<InstrId, TypedAttrOwnerRef> {
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
+) -> TrustedOwnerStateAnalysis {
     let labels = function
         .blocks
         .iter()
@@ -3630,7 +3837,13 @@ fn trusted_runtime_protocol_calls_from_owner_states(
             }
             let out_state = in_state.map(|mut state| {
                 for instr in &block.body {
-                    transfer_trusted_owner_instr(instr, &mut state, trusted_constructor_calls);
+                    transfer_trusted_owner_instr(
+                        instr,
+                        &mut state,
+                        module_constants,
+                        trusted_constructor_calls,
+                        trusted_constructor_init_owners,
+                    );
                 }
                 state
             });
@@ -3644,6 +3857,55 @@ fn trusted_runtime_protocol_calls_from_owner_states(
         }
     }
 
+    let mut analysis = TrustedOwnerStateAnalysis::default();
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        let Some(mut state) = in_states[block_index].clone() else {
+            continue;
+        };
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            analysis.body_before_instr.insert(
+                TypedVirtualBodyInstr {
+                    block: block.label,
+                    instr_index,
+                },
+                state.clone(),
+            );
+            transfer_trusted_owner_instr(
+                instr,
+                &mut state,
+                module_constants,
+                trusted_constructor_calls,
+                trusted_constructor_init_owners,
+            );
+        }
+        analysis.block_before_term.insert(block.label, state);
+    }
+    analysis
+}
+
+fn visit_trusted_owner_term_instrs(
+    term: &BlockTerm<InstrTyped>,
+    visitor: &mut impl Visit<InstrTyped>,
+) {
+    match term {
+        BlockTerm::IfTerm(if_term) => visitor.visit_instr(&if_term.test),
+        BlockTerm::BranchTable(branch) => visitor.visit_instr(&branch.index),
+        BlockTerm::Raise(raise) => {
+            if let Some(exc) = &raise.exc {
+                visitor.visit_instr(exc);
+            }
+        }
+        BlockTerm::Return(value) => visitor.visit_instr(value),
+        BlockTerm::Jump(_) => {}
+    }
+}
+
+fn trusted_runtime_protocol_calls_from_owner_states(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
+) -> HashMap<InstrId, TypedAttrOwnerRef> {
     struct Collector<'a> {
         state: &'a TrustedOwnerState,
         calls: HashMap<InstrId, TypedAttrOwnerRef>,
@@ -3670,21 +3932,307 @@ fn trusted_runtime_protocol_calls_from_owner_states(
     }
 
     let mut calls = HashMap::new();
-    for (block_index, block) in function.blocks.iter().enumerate() {
-        let Some(mut state) = in_states[block_index].clone() else {
-            continue;
-        };
-        for instr in &block.body {
+    let states = analyze_trusted_owner_states(
+        function,
+        module_constants,
+        trusted_constructor_calls,
+        trusted_constructor_init_owners,
+    );
+    for block in &function.blocks {
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            let Some(state) = states.body_before_instr.get(&TypedVirtualBodyInstr {
+                block: block.label,
+                instr_index,
+            }) else {
+                continue;
+            };
             let mut collector = Collector {
-                state: &state,
+                state,
                 calls: HashMap::new(),
             };
             collector.visit_instr(instr);
             calls.extend(collector.calls);
-            transfer_trusted_owner_instr(instr, &mut state, trusted_constructor_calls);
         }
+        let Some(state) = states.block_before_term.get(&block.label) else {
+            continue;
+        };
+        let mut collector = Collector {
+            state,
+            calls: HashMap::new(),
+        };
+        visit_trusted_owner_term_instrs(&block.term, &mut collector);
+        calls.extend(collector.calls);
     }
     calls
+}
+
+fn trusted_static_runtime_protocol_inlines_for_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
+    static_targets: &StaticDirectCallTargets,
+) -> (HashMap<InstrId, TypedAttrOwnerRef>, TypedInlineTargets) {
+    struct Collector<'a> {
+        module_constants: &'a [ConstantExpr],
+        state: &'a TrustedOwnerState,
+        static_targets: &'a StaticDirectCallTargets,
+        owners: HashMap<InstrId, TypedAttrOwnerRef>,
+        inline_targets: TypedInlineTargets,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && matches!(call.access, soac_ir_typed::TypedCallAccessPlan::Generic)
+                && let Some(instr_id) = call.try_semantic_instr_id()
+            {
+                let runtime_name =
+                    [RuntimeName::Iter, RuntimeName::Next]
+                        .into_iter()
+                        .find_map(|runtime_name| {
+                            typed_expr_is_runtime_name_load(
+                                call.func.as_ref(),
+                                runtime_name,
+                                self.module_constants,
+                            )
+                            .then_some(runtime_name)
+                        });
+                let owner_type_ref = call
+                    .args
+                    .first()
+                    .and_then(|arg| match arg {
+                        soac_core::block_py::CallArgPositional::Positional(InstrTyped::Load(
+                            load,
+                        )) => load.name.local_location(),
+                        _ => None,
+                    })
+                    .and_then(|location| self.state.locals.get(&location));
+                let target =
+                    runtime_name
+                        .zip(owner_type_ref)
+                        .and_then(|(runtime_name, owner_type_ref)| {
+                            let TypedAttrOwnerRef::TypeKey {
+                                module_name,
+                                qualname,
+                            } = owner_type_ref
+                            else {
+                                return None;
+                            };
+                            self.static_targets.strict_methods.get(&(
+                                module_name.clone(),
+                                qualname.clone(),
+                                match runtime_name {
+                                    RuntimeName::Iter => "__iter__".to_string(),
+                                    RuntimeName::Next => "__next__".to_string(),
+                                    _ => unreachable!(
+                                        "only iter/next protocol names are synthesized here"
+                                    ),
+                                },
+                            ))
+                        });
+                let Some(_) = runtime_name else {
+                    expr.visit_children(self);
+                    return;
+                };
+                let Some(owner_type_ref) = owner_type_ref else {
+                    expr.visit_children(self);
+                    return;
+                };
+                let Some(target) = target else {
+                    expr.visit_children(self);
+                    return;
+                };
+                let has_starred_arguments = call
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg, soac_core::block_py::CallArgPositional::Starred(_)));
+                let explicit_positional_arg_count = call
+                    .args
+                    .iter()
+                    .filter(|arg| {
+                        matches!(arg, soac_core::block_py::CallArgPositional::Positional(_))
+                    })
+                    .count();
+                if !call.keywords.is_empty() {
+                    return;
+                }
+                let Ok(arg_plan) = super::direct_function::plan_direct_call_args_for_target(
+                    target,
+                    explicit_positional_arg_count,
+                    0,
+                    has_starred_arguments,
+                    false,
+                ) else {
+                    return;
+                };
+                let arg_plan = typed_direct_call_arg_plan_from_direct_plan(arg_plan);
+                self.owners.insert(instr_id, owner_type_ref.clone());
+                self.inline_targets
+                    .entry(instr_id)
+                    .or_default()
+                    .push((target.function_id, arg_plan));
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let states = analyze_trusted_owner_states(
+        function,
+        module_constants,
+        trusted_constructor_calls,
+        trusted_constructor_init_owners,
+    );
+    let mut owners = HashMap::new();
+    let mut inline_targets = HashMap::new();
+    for block in &function.blocks {
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            let Some(state) = states.body_before_instr.get(&TypedVirtualBodyInstr {
+                block: block.label,
+                instr_index,
+            }) else {
+                continue;
+            };
+            let mut collector = Collector {
+                module_constants,
+                state,
+                static_targets,
+                owners: HashMap::new(),
+                inline_targets: HashMap::new(),
+            };
+            collector.visit_instr(instr);
+            owners.extend(collector.owners);
+            inline_targets.extend(collector.inline_targets);
+        }
+        let Some(state) = states.block_before_term.get(&block.label) else {
+            continue;
+        };
+        let mut collector = Collector {
+            module_constants,
+            state,
+            static_targets,
+            owners: HashMap::new(),
+            inline_targets: HashMap::new(),
+        };
+        visit_trusted_owner_term_instrs(&block.term, &mut collector);
+        owners.extend(collector.owners);
+        inline_targets.extend(collector.inline_targets);
+    }
+    (owners, inline_targets)
+}
+
+fn trusted_static_method_inlines_for_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
+    static_targets: &StaticDirectCallTargets,
+) -> (HashMap<InstrId, TypedAttrOwnerRef>, TypedInlineTargets) {
+    struct Collector<'a> {
+        module_constants: &'a [ConstantExpr],
+        state: &'a TrustedOwnerState,
+        static_targets: &'a StaticDirectCallTargets,
+        owners: HashMap<InstrId, TypedAttrOwnerRef>,
+        inline_targets: TypedInlineTargets,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && matches!(call.access, soac_ir_typed::TypedCallAccessPlan::Generic)
+                && let Some(instr_id) = call.try_semantic_instr_id()
+                && let InstrTyped::GetAttrTyped(get_attr) = call.func.as_ref()
+                && let Some(method_name) =
+                    typed_constant_string(get_attr.attr.as_ref(), self.module_constants)
+                && let InstrTyped::Load(load) = get_attr.value.as_ref()
+                && let Some(location) = load.name.local_location()
+                && let Some(owner_type_ref) = self.state.locals.get(&location)
+                && let TypedAttrOwnerRef::TypeKey {
+                    module_name,
+                    qualname,
+                } = owner_type_ref
+                && let Some(target) = self.static_targets.strict_methods.get(&(
+                    module_name.clone(),
+                    qualname.clone(),
+                    method_name.to_string(),
+                ))
+            {
+                let has_starred_arguments = call
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg, soac_core::block_py::CallArgPositional::Starred(_)));
+                let explicit_positional_arg_count = call
+                    .args
+                    .iter()
+                    .filter(|arg| {
+                        matches!(arg, soac_core::block_py::CallArgPositional::Positional(_))
+                    })
+                    .count();
+                if !call.keywords.is_empty() {
+                    return;
+                }
+                let Ok(arg_plan) = super::direct_function::plan_direct_call_args_for_target(
+                    target,
+                    explicit_positional_arg_count + 1,
+                    0,
+                    has_starred_arguments,
+                    false,
+                ) else {
+                    return;
+                };
+                let arg_plan = typed_direct_call_arg_plan_from_direct_plan(arg_plan);
+                self.owners.insert(instr_id, owner_type_ref.clone());
+                self.inline_targets
+                    .entry(instr_id)
+                    .or_default()
+                    .push((target.function_id, arg_plan));
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let states = analyze_trusted_owner_states(
+        function,
+        module_constants,
+        trusted_constructor_calls,
+        trusted_constructor_init_owners,
+    );
+    let mut owners = HashMap::new();
+    let mut inline_targets = HashMap::new();
+    for block in &function.blocks {
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            let Some(state) = states.body_before_instr.get(&TypedVirtualBodyInstr {
+                block: block.label,
+                instr_index,
+            }) else {
+                continue;
+            };
+            let mut collector = Collector {
+                module_constants,
+                state,
+                static_targets,
+                owners: HashMap::new(),
+                inline_targets: HashMap::new(),
+            };
+            collector.visit_instr(instr);
+            owners.extend(collector.owners);
+            inline_targets.extend(collector.inline_targets);
+        }
+        let Some(state) = states.block_before_term.get(&block.label) else {
+            continue;
+        };
+        let mut collector = Collector {
+            module_constants,
+            state,
+            static_targets,
+            owners: HashMap::new(),
+            inline_targets: HashMap::new(),
+        };
+        visit_trusted_owner_term_instrs(&block.term, &mut collector);
+        owners.extend(collector.owners);
+        inline_targets.extend(collector.inline_targets);
+    }
+    (owners, inline_targets)
 }
 
 fn runtime_protocol_call_instr_ids(
@@ -3727,19 +4275,24 @@ fn staged_inline_targets_for_trusted_runtime_protocols(
     if runtime_protocol_calls.is_empty() {
         return inline_targets;
     }
-    let pending_trusted_constructor_sources = trusted_constructor_calls
+    let pending_trusted_constructor_owners = trusted_constructor_calls
         .into_iter()
-        .flat_map(|calls| calls.keys().copied())
-        .filter(|source| {
-            live_instr_ids.contains(source)
-                && !constructor_field_bindings.is_some_and(|bindings| bindings.contains_key(source))
+        .flat_map(|calls| calls.iter())
+        .filter_map(|(source, owner)| {
+            (live_instr_ids.contains(source)
+                && !constructor_field_bindings
+                    .is_some_and(|bindings| bindings.contains_key(source))
+                && inline_targets.contains_key(source))
+            .then_some(owner.clone())
         })
-        .collect::<HashSet<_>>();
-    if pending_trusted_constructor_sources
-        .iter()
-        .any(|source| inline_targets.contains_key(source))
-    {
-        inline_targets.retain(|instr_id, _| !runtime_protocol_calls.contains(instr_id));
+        .collect::<Vec<_>>();
+    if !pending_trusted_constructor_owners.is_empty() {
+        inline_targets.retain(|instr_id, _| {
+            !runtime_protocol_calls.contains(instr_id)
+                || trusted_runtime_protocol_calls
+                    .get(instr_id)
+                    .is_some_and(|owner| !pending_trusted_constructor_owners.contains(owner))
+        });
         return inline_targets;
     }
     if !trusted_runtime_protocol_calls.is_empty() {
@@ -3842,6 +4395,91 @@ fn split_typed_post_inline_hot_continuations(
     assign_missing_typed_function_instr_ids(function);
     refresh_typed_function_value_facts(function);
     Ok(cloned_instr_id_mappings.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_typed_post_inline_cleanup_hot_continuations(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    profile: &SpecializationProfile<'_>,
+    static_direct_calls: &StaticTypedDirectCalls,
+    trusted_static_constructor_calls: &mut StaticConstructorCalls,
+    hot_state_cleanup_labels: &mut HashSet<BlockLabel>,
+    remapped_call_emissions: &mut RemappedTypedCallEmissions,
+    remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+    suppressed_inline_targets: &mut SuppressedTypedInlineTargets,
+    remapped_indexed_fields: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    >,
+    remapped_indexed_field_counter_sources: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    >,
+    remapped_exact_list_items: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, ProfileExactListItemAccessPlan>,
+    >,
+    remapped_exact_int_branches: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedExactIntBranchPlan>,
+    >,
+    remapped_exact_int_returns: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedExactIntReturnPlan>,
+    >,
+    constructor_init_plans: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedConstructorInitPlan>,
+    >,
+    constructor_field_bindings: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedConstructorFieldBindings>,
+    >,
+) -> Result<usize, String> {
+    let caller_function_id = function.function_id;
+    let split_stats = split_typed_inline_cleanup_hot_continuations_for_labels_with_budget(
+        function,
+        hot_state_cleanup_labels,
+        MAX_TYPED_INLINE_CLEANUP_CLONED_BLOCKS_PER_FUNCTION,
+    );
+    for clone in &split_stats.clones {
+        hot_state_cleanup_labels.remove(&clone.hot_block);
+    }
+    if split_stats.instr_id_mappings.is_empty() {
+        return Ok(0);
+    }
+    remap_cloned_profile_rewrites(
+        caller_function_id,
+        &split_stats.instr_id_mappings,
+        profile,
+        static_direct_calls,
+        remapped_call_emissions,
+        remapped_inline_targets,
+        suppressed_inline_targets,
+        remapped_indexed_fields,
+        remapped_indexed_field_counter_sources,
+        remapped_exact_list_items,
+        remapped_exact_int_branches,
+        remapped_exact_int_returns,
+        constructor_init_plans,
+        constructor_field_bindings,
+    )?;
+    if let Some(calls) = trusted_static_constructor_calls.get_mut(&caller_function_id) {
+        remap_cloned_static_constructor_calls(
+            calls,
+            caller_function_id,
+            &split_stats.instr_id_mappings,
+        );
+    }
+    retire_cloned_inline_targets(
+        caller_function_id,
+        &split_stats.instr_id_mappings,
+        remapped_inline_targets,
+        suppressed_inline_targets,
+    );
+    assign_missing_typed_function_instr_ids(function);
+    refresh_typed_function_value_facts(function);
+    Ok(split_stats.instr_id_mappings.len())
 }
 
 #[cfg(test)]
@@ -3999,6 +4637,13 @@ fn external_typed_inline_callees(
             .map(|target| target.function.function_id)
             .filter(|function_id| function_id.runtime_module_id().as_u32() != current_module_id),
     );
+    targets.extend(
+        static_targets
+            .strict_methods
+            .values()
+            .map(|target| target.function_id)
+            .filter(|function_id| function_id.runtime_module_id().as_u32() != current_module_id),
+    );
     if targets.is_empty() {
         return Ok(HashMap::new());
     }
@@ -4078,6 +4723,7 @@ fn apply_typed_v3_module_rewrites(
         external_callees,
         static_targets,
     ));
+    let trusted_constructor_init_owners = trusted_constructor_init_owner_refs(static_targets);
     let mut trusted_static_constructor_calls =
         trusted_static_constructor_calls(&static_constructor_calls);
     for function in &mut module.callable_defs {
@@ -4115,25 +4761,74 @@ fn apply_typed_v3_module_rewrites(
             &mut remapped_exact_int_returns,
         )?;
         for pass in 0..MAX_TYPED_INLINE_PASSES {
-            let trusted_runtime_protocol_calls = trusted_runtime_protocol_calls_for_function(
+            let mut trusted_runtime_protocol_calls = trusted_runtime_protocol_calls_for_function(
                 function,
+                &module.module_constants,
                 trusted_static_constructor_calls.get(&function.function_id),
+                &trusted_constructor_init_owners,
             );
+            let (static_protocol_calls, static_protocol_inline_targets) =
+                trusted_static_runtime_protocol_inlines_for_function(
+                    function,
+                    &module.module_constants,
+                    trusted_static_constructor_calls
+                        .get(&function.function_id)
+                        .unwrap_or(&HashMap::new()),
+                    &trusted_constructor_init_owners,
+                    static_targets,
+                );
+            trusted_runtime_protocol_calls.extend(static_protocol_calls);
+            let (trusted_static_method_calls, static_method_inline_targets) =
+                trusted_static_method_inlines_for_function(
+                    function,
+                    &module.module_constants,
+                    trusted_static_constructor_calls
+                        .get(&function.function_id)
+                        .unwrap_or(&HashMap::new()),
+                    &trusted_constructor_init_owners,
+                    static_targets,
+                );
+            trusted_runtime_protocol_calls.extend(trusted_static_method_calls);
+            let mut runtime_protocol_call_instr_ids = runtime_protocol_call_instr_ids(function);
+            runtime_protocol_call_instr_ids.extend(trusted_runtime_protocol_calls.keys().copied());
+            let mut inline_targets = typed_inline_targets_for_function(
+                function.function_id,
+                profile,
+                static_direct_calls,
+                &remapped_inline_targets,
+                &suppressed_inline_targets,
+            );
+            inline_targets.extend(static_protocol_inline_targets);
+            inline_targets.extend(static_method_inline_targets);
             let inline_targets = staged_inline_targets_for_trusted_runtime_protocols(
-                typed_inline_targets_for_function(
-                    function.function_id,
-                    profile,
-                    static_direct_calls,
-                    &remapped_inline_targets,
-                    &suppressed_inline_targets,
-                ),
-                &runtime_protocol_call_instr_ids(function),
+                inline_targets,
+                &runtime_protocol_call_instr_ids,
                 &trusted_runtime_protocol_calls,
                 trusted_static_constructor_calls.get(&function.function_id),
                 constructor_field_bindings.get(&function.function_id),
                 &collect_typed_semantic_instr_ids(function),
             );
             if inline_targets.is_empty() {
+                if split_typed_post_inline_cleanup_hot_continuations(
+                    function,
+                    profile,
+                    static_direct_calls,
+                    &mut trusted_static_constructor_calls,
+                    &mut hot_state_cleanup_labels,
+                    &mut remapped_call_emissions,
+                    &mut remapped_inline_targets,
+                    &mut suppressed_inline_targets,
+                    &mut remapped_indexed_fields,
+                    &mut remapped_indexed_field_counter_sources,
+                    &mut remapped_exact_list_items,
+                    &mut remapped_exact_int_branches,
+                    &mut remapped_exact_int_returns,
+                    &mut constructor_init_plans,
+                    &mut constructor_field_bindings,
+                )? != 0
+                {
+                    continue;
+                }
                 break;
             }
             let caller_function_id = function.function_id;
@@ -4146,7 +4841,30 @@ fn apply_typed_v3_module_rewrites(
                     &inline_targets,
                     &trusted_runtime_protocol_calls,
                 );
-            if stats.rewritten_stores == 0 && stats.rewritten_effect_only_calls == 0 {
+            let rewrote_inline = stats.rewritten_stores != 0
+                || stats.rewritten_effect_only_calls != 0
+                || stats.rewritten_returns != 0;
+            if !rewrote_inline {
+                if split_typed_post_inline_cleanup_hot_continuations(
+                    function,
+                    profile,
+                    static_direct_calls,
+                    &mut trusted_static_constructor_calls,
+                    &mut hot_state_cleanup_labels,
+                    &mut remapped_call_emissions,
+                    &mut remapped_inline_targets,
+                    &mut suppressed_inline_targets,
+                    &mut remapped_indexed_fields,
+                    &mut remapped_indexed_field_counter_sources,
+                    &mut remapped_exact_list_items,
+                    &mut remapped_exact_int_branches,
+                    &mut remapped_exact_int_returns,
+                    &mut constructor_init_plans,
+                    &mut constructor_field_bindings,
+                )? != 0
+                {
+                    continue;
+                }
                 break;
             }
             hot_state_cleanup_labels.extend(stats.hot_state_cleanup_labels.iter().copied());
@@ -4156,22 +4874,13 @@ fn apply_typed_v3_module_rewrites(
                 external_callees,
                 &stats,
             );
-            let trusted_inline_sources = trusted_static_constructor_calls
-                .get(&caller_function_id)
-                .cloned()
-                .into_iter()
-                .flatten()
-                .chain(trusted_runtime_protocol_calls.clone())
-                .collect::<HashMap<_, _>>();
-            if let Some(trusted_calls) =
-                trusted_static_constructor_calls.get_mut(&caller_function_id)
-            {
-                trusted_calls.extend(trusted_static_constructor_calls_from_inline_stats(
+            trusted_static_constructor_calls
+                .entry(caller_function_id)
+                .or_default()
+                .extend(remapped_static_constructor_calls_from_inline_stats(
                     &stats,
-                    &trusted_inline_sources,
                     &static_constructor_calls,
                 ));
-            }
             if !init_plans.is_empty() {
                 constructor_init_plans
                     .entry(caller_function_id)
@@ -4382,6 +5091,23 @@ fn apply_typed_v3_module_rewrites(
                 &mut constructor_init_plans,
                 &mut constructor_field_bindings,
             )?;
+            split_typed_post_inline_cleanup_hot_continuations(
+                function,
+                profile,
+                static_direct_calls,
+                &mut trusted_static_constructor_calls,
+                &mut hot_state_cleanup_labels,
+                &mut remapped_call_emissions,
+                &mut remapped_inline_targets,
+                &mut suppressed_inline_targets,
+                &mut remapped_indexed_fields,
+                &mut remapped_indexed_field_counter_sources,
+                &mut remapped_exact_list_items,
+                &mut remapped_exact_int_branches,
+                &mut remapped_exact_int_returns,
+                &mut constructor_init_plans,
+                &mut constructor_field_bindings,
+            )?;
             if pass + 1 == MAX_TYPED_INLINE_PASSES {
                 return Err(format!(
                     "typed-v3 direct-call inlining exceeded {MAX_TYPED_INLINE_PASSES} passes in function {}",
@@ -4407,45 +5133,23 @@ fn apply_typed_v3_module_rewrites(
             &mut constructor_init_plans,
             &mut constructor_field_bindings,
         )?;
-        let split_stats = split_typed_inline_cleanup_hot_continuations_for_labels_with_budget(
+        split_typed_post_inline_cleanup_hot_continuations(
             function,
-            &hot_state_cleanup_labels,
-            MAX_TYPED_INLINE_CLEANUP_CLONED_BLOCKS_PER_FUNCTION,
-        );
-        for clone in &split_stats.clones {
-            hot_state_cleanup_labels.remove(&clone.hot_block);
-        }
-        if !split_stats.instr_id_mappings.is_empty() {
-            remap_cloned_profile_rewrites(
-                function.function_id,
-                &split_stats.instr_id_mappings,
-                profile,
-                static_direct_calls,
-                &mut remapped_call_emissions,
-                &mut remapped_inline_targets,
-                &suppressed_inline_targets,
-                &mut remapped_indexed_fields,
-                &mut remapped_indexed_field_counter_sources,
-                &mut remapped_exact_list_items,
-                &mut remapped_exact_int_branches,
-                &mut remapped_exact_int_returns,
-                &mut constructor_init_plans,
-                &mut constructor_field_bindings,
-            )?;
-            if let Some(calls) = trusted_static_constructor_calls.get_mut(&function.function_id) {
-                remap_cloned_static_constructor_calls(
-                    calls,
-                    function.function_id,
-                    &split_stats.instr_id_mappings,
-                );
-            }
-            retire_cloned_inline_targets(
-                function.function_id,
-                &split_stats.instr_id_mappings,
-                &mut remapped_inline_targets,
-                &mut suppressed_inline_targets,
-            );
-        }
+            profile,
+            static_direct_calls,
+            &mut trusted_static_constructor_calls,
+            &mut hot_state_cleanup_labels,
+            &mut remapped_call_emissions,
+            &mut remapped_inline_targets,
+            &mut suppressed_inline_targets,
+            &mut remapped_indexed_fields,
+            &mut remapped_indexed_field_counter_sources,
+            &mut remapped_exact_list_items,
+            &mut remapped_exact_int_branches,
+            &mut remapped_exact_int_returns,
+            &mut constructor_init_plans,
+            &mut constructor_field_bindings,
+        )?;
         if let Some(remapped_call_emissions) = remapped_call_emissions.get(&function.function_id) {
             lower_typed_function_call_emission_plans(function, remapped_call_emissions)?;
             refresh_typed_function_value_facts(function);
@@ -4550,16 +5254,11 @@ mod tests {
     use soac_opt::passes::{TypedInlineInstanceSource, TypedInlineRewriteStats};
 
     #[test]
-    fn trusted_static_constructor_calls_follow_inlined_static_calls() {
-        let range_owner = TypedAttrOwnerRef::TypeKey {
-            module_name: "soac.runtime".to_string(),
-            qualname: "range".to_string(),
-        };
+    fn static_constructor_calls_follow_ordinary_inlining() {
         let iter_range_owner = TypedAttrOwnerRef::TypeKey {
             module_name: "soac.runtime".to_string(),
             qualname: "IterRange".to_string(),
         };
-        let trusted_call_sources = HashMap::from([(InstrId::new(1), range_owner)]);
         let function_id = RuntimeFunctionId::new(RuntimeModuleId::new(3), LocalFunctionId::new(4));
         let static_constructor_calls = HashMap::from([(
             function_id,
@@ -4586,7 +5285,7 @@ mod tests {
                 TypedInlineInstrIdMapping {
                     callee: function_id,
                     inline_instance: 1,
-                    callee_instr_id: InstrId::new(4),
+                    callee_instr_id: InstrId::new(3),
                     caller_instr_id: InstrId::new(9),
                 },
             ],
@@ -4594,26 +5293,20 @@ mod tests {
         };
 
         assert_eq!(
-            trusted_static_constructor_calls_from_inline_stats(
-                &stats,
-                &trusted_call_sources,
-                &static_constructor_calls,
-            ),
-            HashMap::from([(InstrId::new(8), iter_range_owner)]),
+            remapped_static_constructor_calls_from_inline_stats(&stats, &static_constructor_calls),
+            HashMap::from([
+                (InstrId::new(8), iter_range_owner.clone()),
+                (InstrId::new(9), iter_range_owner),
+            ]),
         );
     }
 
     #[test]
-    fn trusted_static_constructor_calls_follow_trusted_protocol_inlines() {
-        let range_owner = TypedAttrOwnerRef::TypeKey {
-            module_name: "soac.runtime".to_string(),
-            qualname: "range".to_string(),
-        };
+    fn static_constructor_calls_follow_protocol_inlines() {
         let iter_range_owner = TypedAttrOwnerRef::TypeKey {
             module_name: "soac.runtime".to_string(),
             qualname: "IterRange".to_string(),
         };
-        let trusted_call_sources = HashMap::from([(InstrId::new(1), range_owner)]);
         let function_id = RuntimeFunctionId::new(RuntimeModuleId::new(3), LocalFunctionId::new(4));
         let static_constructor_calls = HashMap::from([(
             function_id,
@@ -4634,11 +5327,7 @@ mod tests {
         };
 
         assert_eq!(
-            trusted_static_constructor_calls_from_inline_stats(
-                &stats,
-                &trusted_call_sources,
-                &static_constructor_calls,
-            ),
+            remapped_static_constructor_calls_from_inline_stats(&stats, &static_constructor_calls),
             HashMap::from([(InstrId::new(8), iter_range_owner)]),
         );
     }
@@ -4746,12 +5435,98 @@ def caller():\n    it = make()\n    value = next(it)\n    return value\n",
         assert_eq!(
             trusted_runtime_protocol_calls_for_function(
                 caller,
+                &typed.module_constants,
                 Some(&HashMap::from([(
                     constructor_instr_id,
                     owner_type_ref.clone()
                 )])),
+                &HashMap::new(),
             ),
             HashMap::from([(protocol_instr_id, owner_type_ref)]),
+        );
+    }
+
+    #[test]
+    fn trusted_static_protocol_inlines_follow_generic_runtime_calls_in_terms() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        return 1\n\n\
+def make():\n    return None\n\n\
+def caller():\n    it = make()\n    return next(it)\n",
+        )
+        .expect("source should lower");
+        let next_function = lowered
+            .blockpy_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "IterRange.__next__")
+            .cloned()
+            .expect("IterRange.__next__ should exist");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let caller = typed
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        let mut protocol_instr_id = None;
+        let constructor_init_function_id =
+            RuntimeFunctionId::new(RuntimeModuleId::new(7), LocalFunctionId::new(11));
+        for block in &mut caller.blocks {
+            for instr in &mut block.body {
+                if let InstrTyped::Store(store) = instr
+                    && let InstrTyped::CallTyped(call) = store.value.as_mut()
+                {
+                    call.extra.set_constructor_init_plan(TypedConstructorInitPlan {
+                        source:
+                            TypedConstructorInitPlanSource::InlinedConstructorEntryWithInlinedInitBody,
+                        init_function_id: constructor_init_function_id,
+                    });
+                }
+            }
+            if let BlockTerm::Return(InstrTyped::CallTyped(call)) = &block.term
+                && typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::Next,
+                    &typed.module_constants,
+                )
+            {
+                protocol_instr_id = call.try_semantic_instr_id();
+            }
+        }
+        let protocol_instr_id = protocol_instr_id.expect("caller should contain next()");
+        let owner_type_ref = TypedAttrOwnerRef::TypeKey {
+            module_name: "pkg.runtime".to_string(),
+            qualname: "IterRange".to_string(),
+        };
+        let (owners, inline_targets) = trusted_static_runtime_protocol_inlines_for_function(
+            caller,
+            &module_constants,
+            &HashMap::new(),
+            &HashMap::from([(constructor_init_function_id, owner_type_ref.clone())]),
+            &StaticDirectCallTargets {
+                strict_methods: HashMap::from([(
+                    (
+                        "pkg.runtime".to_string(),
+                        "IterRange".to_string(),
+                        "__next__".to_string(),
+                    ),
+                    next_function.clone(),
+                )]),
+                ..StaticDirectCallTargets::default()
+            },
+        );
+        assert_eq!(owners, HashMap::from([(protocol_instr_id, owner_type_ref)]));
+        assert_eq!(
+            inline_targets,
+            HashMap::from([(
+                protocol_instr_id,
+                vec![(
+                    next_function.function_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
         );
     }
 
@@ -4913,6 +5688,39 @@ def values(limit):
     }
 
     #[test]
+    fn strict_module_protocol_methods_build_static_targets() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+class IterRange:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return 1
+"#,
+        )
+        .expect("source should lower")
+        .blockpy_module;
+        let targets = strict_module_method_targets_for_module(&lowered, "pkg.runtime");
+        let next_function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "IterRange.__next__")
+            .expect("IterRange.__next__ should exist");
+        assert_eq!(
+            targets
+                .get(&(
+                    "pkg.runtime".to_string(),
+                    "IterRange".to_string(),
+                    "__next__".to_string(),
+                ))
+                .expect("strict protocol method should be static")
+                .function_id,
+            next_function.function_id,
+        );
+    }
+
+    #[test]
     fn only_runtime_range_constructors_are_trusted_for_full_virtualization() {
         assert!(trusted_fully_virtual_constructor_owner(
             &TypedAttrOwnerRef::TypeKey {
@@ -4984,6 +5792,7 @@ def values(limit):
                     },
                 )]),
                 module_globals: HashMap::new(),
+                strict_methods: HashMap::new(),
             },
         );
         let plans = plans
@@ -5044,6 +5853,7 @@ def values(limit):
                     },
                 )]),
                 module_globals: HashMap::new(),
+                strict_methods: HashMap::new(),
             },
         );
         let plans = plans
@@ -5084,6 +5894,7 @@ def caller(value):
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "soac.runtime"),
             )]),
+            strict_methods: HashMap::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let caller = typed
@@ -5127,6 +5938,7 @@ def caller(value):
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "soac.runtime"),
             )]),
+            strict_methods: HashMap::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let mut caller = typed
@@ -5185,6 +5997,7 @@ def caller(value):
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "pkg.mod"),
             )]),
+            strict_methods: HashMap::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let caller = typed
@@ -5222,6 +6035,7 @@ helper(1)
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "pkg.mod"),
             )]),
+            strict_methods: HashMap::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let module_init = typed
@@ -5343,6 +6157,7 @@ helper(1)
         let constructor_source = InstrId::new(1);
         let trusted_protocol_source = InstrId::new(2);
         let untrusted_protocol_source = InstrId::new(3);
+        let unrelated_trusted_protocol_source = InstrId::new(4);
         let target = RuntimeFunctionId::new(RuntimeModuleId::new(4), LocalFunctionId::new(5));
         let arg_plan = TypedDirectCallArgPlan {
             sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
@@ -5351,12 +6166,23 @@ helper(1)
             (constructor_source, vec![(target, arg_plan.clone())]),
             (trusted_protocol_source, vec![(target, arg_plan.clone())]),
             (untrusted_protocol_source, vec![(target, arg_plan.clone())]),
+            (
+                unrelated_trusted_protocol_source,
+                vec![(target, arg_plan.clone())],
+            ),
         ]);
-        let runtime_protocol_calls =
-            HashSet::from([trusted_protocol_source, untrusted_protocol_source]);
+        let runtime_protocol_calls = HashSet::from([
+            trusted_protocol_source,
+            untrusted_protocol_source,
+            unrelated_trusted_protocol_source,
+        ]);
         let trusted_owner = TypedAttrOwnerRef::TypeKey {
             module_name: "soac.runtime".to_string(),
             qualname: "IterRange".to_string(),
+        };
+        let unrelated_trusted_owner = TypedAttrOwnerRef::TypeKey {
+            module_name: "soac.runtime".to_string(),
+            qualname: "ClosureGenerator".to_string(),
         };
         let trusted_constructor_calls =
             HashMap::from([(constructor_source, trusted_owner.clone())]);
@@ -5364,19 +6190,32 @@ helper(1)
             constructor_source,
             trusted_protocol_source,
             untrusted_protocol_source,
+            unrelated_trusted_protocol_source,
         ]);
 
         assert_eq!(
             staged_inline_targets_for_trusted_runtime_protocols(
                 inline_targets.clone(),
                 &runtime_protocol_calls,
-                &HashMap::new(),
+                &HashMap::from([
+                    (trusted_protocol_source, trusted_owner.clone()),
+                    (
+                        unrelated_trusted_protocol_source,
+                        unrelated_trusted_owner.clone(),
+                    ),
+                ]),
                 Some(&trusted_constructor_calls),
                 None,
                 &live_instr_ids,
             ),
-            HashMap::from([(constructor_source, vec![(target, arg_plan.clone())])]),
-            "pending trusted constructors should run before protocol calls"
+            HashMap::from([
+                (constructor_source, vec![(target, arg_plan.clone())]),
+                (
+                    unrelated_trusted_protocol_source,
+                    vec![(target, arg_plan.clone())],
+                ),
+            ]),
+            "pending trusted constructors should only delay protocol calls for the same owner"
         );
 
         let constructor_field_bindings = HashMap::from([(
@@ -5387,14 +6226,18 @@ helper(1)
             staged_inline_targets_for_trusted_runtime_protocols(
                 inline_targets,
                 &runtime_protocol_calls,
-                &HashMap::from([(trusted_protocol_source, trusted_owner)]),
+                &HashMap::from([
+                    (trusted_protocol_source, trusted_owner),
+                    (unrelated_trusted_protocol_source, unrelated_trusted_owner,),
+                ]),
                 Some(&trusted_constructor_calls),
                 Some(&constructor_field_bindings),
                 &live_instr_ids,
             ),
             HashMap::from([
                 (constructor_source, vec![(target, arg_plan.clone())]),
-                (trusted_protocol_source, vec![(target, arg_plan)]),
+                (trusted_protocol_source, vec![(target, arg_plan.clone())]),
+                (unrelated_trusted_protocol_source, vec![(target, arg_plan)]),
             ]),
             "once trusted protocol calls are available, weaker protocol calls should wait"
         );

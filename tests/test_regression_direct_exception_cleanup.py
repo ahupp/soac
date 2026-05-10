@@ -184,10 +184,11 @@ def test_apply_mode_direct_call_miss_uses_generic_fallback(tmp_path: Path) -> No
         """,
     )
 
-    direct_edge_rows = [
+    generic_fallback_rows = [
         row
         for row in rows
-        if row.get("target") == "soac_jit_direct_edges" and row.get("clif_direct_edges", 0) > 0
+        if row.get("target") == "soac_jit_direct_edges"
+        and row.get("generic_fallback_edges", 0) > 0
     ]
-    assert direct_edge_rows, rows
+    assert generic_fallback_rows, rows
     assert result == 42

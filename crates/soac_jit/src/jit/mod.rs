@@ -4201,10 +4201,8 @@ fn emit_typed_local_store_result_with_local_env(
         .as_ref()
         .expect("Store local slot should have storage layout during typed codegen");
     let name = local_name_for_location(layout, location);
-    if matches!(
-        planned_typed_local_store_effect(expr, location, emit_ctx),
-        Some(PlannedLocalStoreEffect::Delete)
-    ) {
+    let planned_store_effect = planned_typed_local_store_effect(expr, location, emit_ctx);
+    if matches!(planned_store_effect, Some(PlannedLocalStoreEffect::Delete)) {
         local_env
             .delete_location(
                 fb,
@@ -4231,7 +4229,6 @@ fn emit_typed_local_store_result_with_local_env(
         return Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)));
     }
 
-    let planned_store_effect = planned_typed_local_store_effect(expr, location, emit_ctx);
     let planned_borrowed_store = matches!(
         planned_store_effect.as_ref(),
         Some(PlannedLocalStoreEffect::Rebind(LocalRefKind::Borrowed))
@@ -4249,9 +4246,9 @@ fn emit_typed_local_store_result_with_local_env(
     let planned_truthiness_only_store =
         emit_ctx.truthiness_only_local_locations.contains(&location)
             && planning::typed_expr_can_satisfy_pyobject_truthiness_repr(op.value.as_ref());
-    if !planned_borrowed_store
-        && (typed_expr_i32_bool01_demand_facts(op.value.as_ref(), local_env, emit_ctx).is_some()
-            || planned_truthiness_only_store)
+    if (!planned_borrowed_store
+        && typed_expr_i32_bool01_demand_facts(op.value.as_ref(), local_env, emit_ctx).is_some())
+        || planned_truthiness_only_store
     {
         let value_result = emit_typed_codegen_stmt_result_with_local_env(
             fb,
@@ -4384,6 +4381,28 @@ fn emit_typed_local_store_result_with_local_env(
         emit_ctx.refcount_emitter(),
     );
     Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)))
+}
+
+fn typed_local_store_prefers_scalar_repr(
+    expr: &InstrTyped,
+    store: &Store<InstrTyped>,
+    target_location: LocalLocation,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    let planned_store_effect = planned_typed_local_store_effect(expr, target_location, emit_ctx);
+    let planned_borrowed_store = matches!(
+        planned_store_effect.as_ref(),
+        Some(PlannedLocalStoreEffect::Rebind(LocalRefKind::Borrowed))
+    );
+    ((!planned_borrowed_store
+        && typed_expr_i32_bool01_demand_facts(store.value.as_ref(), local_env, emit_ctx).is_some())
+        || (emit_ctx
+            .truthiness_only_local_locations
+            .contains(&target_location)
+            && planning::typed_expr_can_satisfy_pyobject_truthiness_repr(store.value.as_ref())))
+        || (!planned_borrowed_store
+            && typed_expr_i64_demand_facts(store.value.as_ref(), local_env, emit_ctx).is_some())
 }
 
 fn emit_typed_owned_cell_makecell_store_result_with_local_env(
@@ -18825,6 +18844,13 @@ fn emit_typed_codegen_ops(
             && source_location == delete_location
             && source.name.id.as_str() == delete.name.id.as_str()
             && is_generated_transfer_temp_name(source.name.id.as_str())
+            && !typed_local_store_prefers_scalar_repr(
+                expr,
+                store,
+                target_location,
+                local_env,
+                emit_ctx,
+            )
         {
             let value_py_facts = if matches!(emit_ctx.function_kind, FunctionKind::Function) {
                 py_facts_for_typed_expr_with_local_env(store.value.as_ref(), local_env)

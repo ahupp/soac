@@ -4430,6 +4430,94 @@ def build(values):
     }
 
     #[test]
+    fn specialized_jit_transfer_temp_to_truthiness_only_temp_compiles_as_bool_scalar() {
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![test_param("f", ParamKind::Any, false)],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let test_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let source_name = test_local_name("_dp_tmp_bool_source", 1);
+        let target_name = test_local_name("_dp_bool_target", 2);
+        let entry = BlockPyBlock {
+            label: entry_label,
+            body: vec![
+                op_expr(Store::new(
+                    source_name.clone(),
+                    op_expr(Call::new(
+                        name_expr(test_local_name("f", 0)),
+                        vec![],
+                        vec![],
+                    )),
+                )),
+                op_expr(Store::new(
+                    target_name.clone(),
+                    name_expr(source_name.clone()),
+                )),
+                op_expr(Del::new(source_name, false)),
+            ],
+            term: BlockTerm::Jump(BlockEdge::new(test_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let test_block = BlockPyBlock {
+            label: test_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(target_name),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let then_block = BlockPyBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let else_block = BlockPyBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let mut function =
+            with_test_blocks(function, vec![entry, test_block, then_block, else_block]);
+        set_stack_slots(
+            &mut function,
+            &["f", "_dp_tmp_bool_source", "_dp_bool_target"],
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+
+        build_test_specialized_function(
+            &[
+                1usize as ObjPtr,
+                2usize as ObjPtr,
+                3usize as ObjPtr,
+                4usize as ObjPtr,
+            ],
+            &module,
+            &function,
+            &module_constants,
+        );
+    }
+
+    #[test]
     fn specialized_jit_raise_terms_compile_via_typed_exception_expr() {
         let mut constants = TestConstantPool::default();
         let function = test_function();
@@ -21890,6 +21978,110 @@ class Point:
                         && arg.repr == RuntimeBlockParamRepr::I32Bool01
                 }),
             "truthiness-only temp should flow as I32Bool01 edge args: {:#?}",
+            function_plan.jump_edge_transports
+        );
+    }
+
+    #[test]
+    fn typed_plan_truthiness_only_borrowed_temp_store_flows_as_bool_scalar() {
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![test_param("value", ParamKind::Any, false)],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let test_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let value_name = test_local_name("value", 0);
+        let temp_name = test_local_name("_dp_bool_target", 1);
+        let entry = BlockPyBlock {
+            label: entry_label,
+            body: vec![op_expr(Store::new(
+                temp_name.clone(),
+                name_expr(value_name),
+            ))],
+            term: BlockTerm::Jump(BlockEdge::new(test_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let test_block = BlockPyBlock {
+            label: test_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(temp_name),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let then_block = BlockPyBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let else_block = BlockPyBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let mut function =
+            with_test_blocks(function, vec![entry, test_block, then_block, else_block]);
+        set_stack_slots(&mut function, &["value", "_dp_bool_target"]);
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function_id = module.callable_defs[0].function_id;
+        let module_plan = optimize_blockpy(&module, None, &typed_v3_env_config())
+            .expect("typed-v3 module plan should preserve the borrowed truthiness temp");
+        let jit_plan = super::super::planning::plan_jit_typed_module(
+            module_plan.module.as_ref().clone(),
+            module_plan.value_facts.clone(),
+        );
+        let jit_plan = jit_plan.expect("typed JIT local planning should accept borrowed temps");
+        let function_plan = jit_plan
+            .locals
+            .function(function_id)
+            .expect("planned JIT locals should include borrowed truthiness temp");
+
+        assert!(
+            function_plan
+                .truthiness_only_local_locations
+                .contains(&LocalLocation(1)),
+            "borrowed internal temp should be recognized as truthiness-only: {:#?}",
+            function_plan.truthiness_only_local_locations
+        );
+        assert!(
+            function_plan
+                .runtime_block_params
+                .iter()
+                .flat_map(|params| params.iter())
+                .any(|param| {
+                    param.binding.name == "_dp_bool_target"
+                        && param.repr == RuntimeBlockParamRepr::I32Bool01
+                }),
+            "borrowed truthiness-only temp should flow as I32Bool01 runtime params: {:#?}",
+            function_plan.runtime_block_params
+        );
+        assert!(
+            function_plan
+                .jump_edge_transports
+                .iter()
+                .flatten()
+                .flat_map(|transport| transport.target_args.iter())
+                .any(|arg| {
+                    arg.target_name == "_dp_bool_target"
+                        && arg.repr == RuntimeBlockParamRepr::I32Bool01
+                }),
+            "borrowed truthiness-only temp should flow as I32Bool01 edge args: {:#?}",
             function_plan.jump_edge_transports
         );
     }

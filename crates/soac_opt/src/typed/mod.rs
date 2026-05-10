@@ -760,6 +760,7 @@ pub struct TypedInlineInstanceSource {
 pub struct TypedInlineRewriteStats {
     pub rewritten_stores: usize,
     pub rewritten_effect_only_calls: usize,
+    pub rewritten_returns: usize,
     pub skipped_candidates: usize,
     pub skipped_exception_edges: usize,
     pub inline_instance_sources: Vec<TypedInlineInstanceSource>,
@@ -997,7 +998,7 @@ pub fn inline_typed_function_direct_call_stores_with_external_callees_and_truste
     caller_module_constants: &mut Vec<ConstantExpr>,
     external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
-    trusted_runtime_protocol_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
 ) -> TypedInlineRewriteStats {
     inline_typed_function_direct_call_stores_impl(
         function,
@@ -1005,7 +1006,7 @@ pub fn inline_typed_function_direct_call_stores_with_external_callees_and_truste
         Some(caller_module_constants),
         TypedInlineExternalCallees::Contextual(external_callees),
         direct_calls_by_instr_id,
-        trusted_runtime_protocol_calls,
+        trusted_direct_method_calls,
     )
 }
 
@@ -1021,7 +1022,7 @@ fn inline_typed_function_direct_call_stores_impl(
     mut caller_module_constants: Option<&mut Vec<ConstantExpr>>,
     external_callees: TypedInlineExternalCallees<'_>,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
-    trusted_runtime_protocol_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
 ) -> TypedInlineRewriteStats {
     if direct_calls_by_instr_id.is_empty() {
         return TypedInlineRewriteStats::default();
@@ -1040,7 +1041,7 @@ fn inline_typed_function_direct_call_stores_impl(
             external_callees,
             block,
             direct_calls_by_instr_id,
-            trusted_runtime_protocol_calls,
+            trusted_direct_method_calls,
             &mut instr_id_allocator,
             &mut next_inline_instance,
             &mut stats,
@@ -1071,6 +1072,7 @@ struct TypedInlineStoreCandidate {
 enum TypedInlineResult {
     StoreTo(ResolvedName),
     EffectOnly,
+    Return,
 }
 
 #[derive(Clone)]
@@ -1081,6 +1083,10 @@ enum TypedInlineCall {
         call: TypedGuardedMethodCall<InstrTyped>,
         receiver: InstrTyped,
         attr: InstrTyped,
+    },
+    DirectMethod {
+        call: TypedCall<InstrTyped>,
+        receiver: InstrTyped,
     },
     RuntimeProtocolMethod {
         call: TypedCall<InstrTyped>,
@@ -1098,6 +1104,7 @@ impl TypedInlineCall {
             Self::DirectCallable(call) => call.meta(),
             Self::Callable(call) => call.meta(),
             Self::Method { call, .. } => call.meta(),
+            Self::DirectMethod { call, .. } => call.meta(),
             Self::RuntimeProtocolMethod { call, .. } => call.meta(),
             Self::DirectRuntimeProtocolMethod { call, .. } => call.meta(),
         }
@@ -1108,6 +1115,7 @@ impl TypedInlineCall {
             Self::DirectCallable(call) => call.try_semantic_instr_id(),
             Self::Callable(call) => call.try_semantic_instr_id(),
             Self::Method { call, .. } => call.try_semantic_instr_id(),
+            Self::DirectMethod { call, .. } => call.try_semantic_instr_id(),
             Self::RuntimeProtocolMethod { call, .. } => call.try_semantic_instr_id(),
             Self::DirectRuntimeProtocolMethod { call, .. } => call.try_semantic_instr_id(),
         }
@@ -1118,6 +1126,7 @@ impl TypedInlineCall {
             Self::DirectCallable(call) => call.args.clone(),
             Self::Callable(call) => call.args.clone(),
             Self::Method { call, .. } => call.args.clone(),
+            Self::DirectMethod { call, .. } => call.args.clone(),
             Self::RuntimeProtocolMethod { call, .. }
             | Self::DirectRuntimeProtocolMethod { call, .. } => {
                 runtime_protocol_explicit_args(call)
@@ -1132,6 +1141,7 @@ impl TypedInlineCall {
             Self::DirectCallable(_) => &[],
             Self::Callable(call) => call.keywords.as_slice(),
             Self::Method { call, .. } => call.keywords.as_slice(),
+            Self::DirectMethod { call, .. } => call.keywords.as_slice(),
             Self::RuntimeProtocolMethod { call, .. } => call.keywords.as_slice(),
             Self::DirectRuntimeProtocolMethod { call, .. } => call.keywords.as_slice(),
         }
@@ -1145,7 +1155,7 @@ fn build_typed_direct_call_inline_rewrite(
     external_callees: TypedInlineExternalCallees<'_>,
     block: TypedBlock,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
-    trusted_runtime_protocol_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
     next_inline_instance: &mut u32,
     stats: &mut TypedInlineRewriteStats,
@@ -1156,7 +1166,7 @@ fn build_typed_direct_call_inline_rewrite(
         &block,
         caller.function_id,
         direct_calls_by_instr_id,
-        trusted_runtime_protocol_calls,
+        trusted_direct_method_calls,
     ) else {
         return TypedInlineBlockRewrite::Unchanged(block);
     };
@@ -1173,6 +1183,7 @@ fn build_typed_direct_call_inline_rewrite(
     let receiver_temp = match &candidate.call {
         TypedInlineCall::DirectCallable(_) | TypedInlineCall::Callable(_) => None,
         TypedInlineCall::Method { .. }
+        | TypedInlineCall::DirectMethod { .. }
         | TypedInlineCall::RuntimeProtocolMethod { .. }
         | TypedInlineCall::DirectRuntimeProtocolMethod { .. } => {
             match try_allocate_typed_stack_temp(caller, "typed_inline_receiver") {
@@ -1196,6 +1207,7 @@ fn build_typed_direct_call_inline_rewrite(
             }
         }
         TypedInlineCall::Method { .. }
+        | TypedInlineCall::DirectMethod { .. }
         | TypedInlineCall::RuntimeProtocolMethod { .. }
         | TypedInlineCall::DirectRuntimeProtocolMethod { .. } => None,
     };
@@ -1224,11 +1236,24 @@ fn build_typed_direct_call_inline_rewrite(
             let return_target = result_temp.resolved_name();
             (return_target.clone(), Some(return_target))
         }
+        TypedInlineResult::Return => {
+            let result_temp = match try_allocate_typed_stack_temp(caller, "typed_inline_return") {
+                Ok(temp) => temp,
+                Err(_) => {
+                    stats.skipped_candidates += 1;
+                    caller.storage_layout = original_storage_layout;
+                    return TypedInlineBlockRewrite::Unchanged(block);
+                }
+            };
+            (result_temp.resolved_name(), None)
+        }
     };
     let continuation_label = caller.name_gen.next_block_name();
     let has_generic_fallback = !matches!(
         candidate.call,
-        TypedInlineCall::DirectCallable(_) | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+        TypedInlineCall::DirectCallable(_)
+            | TypedInlineCall::DirectMethod { .. }
+            | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
     );
     let generic_label = has_generic_fallback.then(|| caller.name_gen.next_block_name());
     let cleanup_label = caller.name_gen.next_block_name();
@@ -1251,9 +1276,18 @@ fn build_typed_direct_call_inline_rewrite(
         .map(|constants| constants.to_vec());
     let mut cleanup_carries_hot_state = receiver_temp.is_some();
 
+    let return_candidate = matches!(&candidate.result, TypedInlineResult::Return);
     let mut before = block.body;
-    let after = before.split_off(candidate.instr_index + 1);
-    before.truncate(candidate.instr_index);
+    let (after, continuation_term) = if return_candidate {
+        (
+            Vec::new(),
+            BlockTerm::Return(typed_load_temp(&return_target)),
+        )
+    } else {
+        let after = before.split_off(candidate.instr_index + 1);
+        before.truncate(candidate.instr_index);
+        (after, block.term)
+    };
     match &candidate.call {
         TypedInlineCall::DirectCallable(call) => {
             let callable_temp = callable_temp
@@ -1276,6 +1310,7 @@ fn build_typed_direct_call_inline_rewrite(
             );
         }
         TypedInlineCall::Method { receiver, .. }
+        | TypedInlineCall::DirectMethod { receiver, .. }
         | TypedInlineCall::RuntimeProtocolMethod { receiver, .. }
         | TypedInlineCall::DirectRuntimeProtocolMethod { receiver, .. } => {
             let receiver_temp = receiver_temp
@@ -1298,7 +1333,9 @@ fn build_typed_direct_call_inline_rewrite(
 
     let entry_term = if matches!(
         candidate.call,
-        TypedInlineCall::DirectCallable(_) | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+        TypedInlineCall::DirectCallable(_)
+            | TypedInlineCall::DirectMethod { .. }
+            | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
     ) {
         debug_assert_eq!(candidate.inline_plans.len(), 1);
         BlockTerm::Jump(BlockEdge::new(hot_labels[0]))
@@ -1470,7 +1507,7 @@ fn build_typed_direct_call_inline_rewrite(
     blocks.push(Block::new_with_extra(
         continuation_label,
         after,
-        block.term,
+        continuation_term,
         Vec::new(),
         original_exc_edge,
         TypedBlockExtra::default(),
@@ -1479,6 +1516,7 @@ fn build_typed_direct_call_inline_rewrite(
     match candidate.result {
         TypedInlineResult::StoreTo(_) => stats.rewritten_stores += 1,
         TypedInlineResult::EffectOnly => stats.rewritten_effect_only_calls += 1,
+        TypedInlineResult::Return => stats.rewritten_returns += 1,
     }
     stats.instr_id_mappings.extend(instr_id_mappings);
     stats.local_mappings.extend(local_mappings);
@@ -2865,11 +2903,65 @@ fn typed_constructor_call_instr_ids(
     collector.instr_ids
 }
 
+fn typed_inline_candidate_for_expr(
+    instr_index: usize,
+    result: TypedInlineResult,
+    expr: &InstrTyped,
+    caller_id: RuntimeFunctionId,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+    trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+) -> Option<TypedInlineStoreCandidate> {
+    match expr {
+        InstrTyped::DirectCallableCallTyped(call) => {
+            typed_inline_candidate_for_direct_callable_call(
+                instr_index,
+                result,
+                call,
+                caller_id,
+                direct_calls_by_instr_id,
+            )
+        }
+        InstrTyped::GuardedCallableCallTyped(call) => typed_inline_candidate_for_callable_call(
+            instr_index,
+            result,
+            call,
+            caller_id,
+            direct_calls_by_instr_id,
+        ),
+        InstrTyped::GuardedMethodCallTyped(call) => typed_inline_candidate_for_method_call(
+            instr_index,
+            result,
+            call,
+            caller_id,
+            direct_calls_by_instr_id,
+        ),
+        InstrTyped::CallTyped(call) => typed_inline_candidate_for_direct_method_call(
+            instr_index,
+            result.clone(),
+            call,
+            caller_id,
+            direct_calls_by_instr_id,
+            trusted_direct_method_calls,
+        )
+        .or_else(|| {
+            typed_inline_candidate_for_runtime_protocol_call(
+                instr_index,
+                result,
+                call,
+                caller_id,
+                direct_calls_by_instr_id,
+                trusted_direct_method_calls,
+            )
+        }),
+        _ => None,
+    }
+}
+
 fn find_typed_inline_candidate(
     block: &TypedBlock,
     caller_id: RuntimeFunctionId,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
-    trusted_runtime_protocol_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
 ) -> Option<TypedInlineStoreCandidate> {
     block
         .body
@@ -2877,83 +2969,34 @@ fn find_typed_inline_candidate(
         .enumerate()
         .find_map(|(instr_index, instr)| {
             let InstrTyped::Store(store) = instr else {
-                if let InstrTyped::DirectCallableCallTyped(call) = instr {
-                    return typed_inline_candidate_for_direct_callable_call(
-                        instr_index,
-                        TypedInlineResult::EffectOnly,
-                        call,
-                        caller_id,
-                        direct_calls_by_instr_id,
-                    );
-                }
-                if let InstrTyped::GuardedCallableCallTyped(call) = instr {
-                    return typed_inline_candidate_for_callable_call(
-                        instr_index,
-                        TypedInlineResult::EffectOnly,
-                        call,
-                        caller_id,
-                        direct_calls_by_instr_id,
-                    );
-                }
-                if let InstrTyped::GuardedMethodCallTyped(call) = instr {
-                    return typed_inline_candidate_for_method_call(
-                        instr_index,
-                        TypedInlineResult::EffectOnly,
-                        call,
-                        caller_id,
-                        direct_calls_by_instr_id,
-                    );
-                }
-                if let InstrTyped::CallTyped(call) = instr
-                    && let Some(candidate) = typed_inline_candidate_for_runtime_protocol_call(
-                        instr_index,
-                        TypedInlineResult::EffectOnly,
-                        call,
-                        caller_id,
-                        direct_calls_by_instr_id,
-                        trusted_runtime_protocol_calls,
-                    )
-                {
-                    return Some(candidate);
-                }
-                return None;
+                return typed_inline_candidate_for_expr(
+                    instr_index,
+                    TypedInlineResult::EffectOnly,
+                    instr,
+                    caller_id,
+                    direct_calls_by_instr_id,
+                    trusted_direct_method_calls,
+                );
             };
-            match store.value.as_ref() {
-                InstrTyped::DirectCallableCallTyped(call) => {
-                    typed_inline_candidate_for_direct_callable_call(
-                        instr_index,
-                        TypedInlineResult::StoreTo(store.name.clone()),
-                        call,
-                        caller_id,
-                        direct_calls_by_instr_id,
-                    )
-                }
-                InstrTyped::GuardedCallableCallTyped(call) => {
-                    typed_inline_candidate_for_callable_call(
-                        instr_index,
-                        TypedInlineResult::StoreTo(store.name.clone()),
-                        call,
-                        caller_id,
-                        direct_calls_by_instr_id,
-                    )
-                }
-                InstrTyped::GuardedMethodCallTyped(call) => typed_inline_candidate_for_method_call(
-                    instr_index,
-                    TypedInlineResult::StoreTo(store.name.clone()),
-                    call,
-                    caller_id,
-                    direct_calls_by_instr_id,
-                ),
-                InstrTyped::CallTyped(call) => typed_inline_candidate_for_runtime_protocol_call(
-                    instr_index,
-                    TypedInlineResult::StoreTo(store.name.clone()),
-                    call,
-                    caller_id,
-                    direct_calls_by_instr_id,
-                    trusted_runtime_protocol_calls,
-                ),
-                _ => None,
-            }
+            typed_inline_candidate_for_expr(
+                instr_index,
+                TypedInlineResult::StoreTo(store.name.clone()),
+                store.value.as_ref(),
+                caller_id,
+                direct_calls_by_instr_id,
+                trusted_direct_method_calls,
+            )
+        })
+        .or_else(|| match &block.term {
+            BlockTerm::Return(value) => typed_inline_candidate_for_expr(
+                block.body.len(),
+                TypedInlineResult::Return,
+                value,
+                caller_id,
+                direct_calls_by_instr_id,
+                trusted_direct_method_calls,
+            ),
+            _ => None,
         })
 }
 
@@ -3062,11 +3105,49 @@ fn typed_inline_candidate_for_method_call(
     })
 }
 
+fn typed_inline_candidate_for_direct_method_call(
+    instr_index: usize,
+    result: TypedInlineResult,
+    call: &TypedCall<InstrTyped>,
+    caller_id: RuntimeFunctionId,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+    trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+) -> Option<TypedInlineStoreCandidate> {
+    if !matches!(call.access, TypedCallAccessPlan::Generic) {
+        return None;
+    }
+    let instr_id = call.try_semantic_instr_id()?;
+    trusted_direct_method_calls.get(&instr_id)?;
+    let InstrTyped::GetAttrTyped(get_attr) = call.func.as_ref() else {
+        return None;
+    };
+    let [(target, arg_plan)] = direct_calls_by_instr_id.get(&instr_id)?.as_slice() else {
+        return None;
+    };
+    if *target == caller_id {
+        return None;
+    }
+    Some(TypedInlineStoreCandidate {
+        instr_index,
+        result,
+        call: TypedInlineCall::DirectMethod {
+            call: call.clone(),
+            receiver: get_attr.value.as_ref().clone(),
+        },
+        inline_plans: vec![TypedInlineDirectCallPlan {
+            target: *target,
+            arg_plan: arg_plan.clone(),
+            guard: TypedInlineGuardPlan::Direct,
+        }],
+    })
+}
+
 fn runtime_protocol_explicit_args(
     call: &TypedCall<InstrTyped>,
 ) -> Option<&[CallArgPositional<InstrTyped>]> {
     match &call.access {
-        TypedCallAccessPlan::GuardedRuntimeProtocolMethod { .. } => {}
+        TypedCallAccessPlan::GuardedRuntimeProtocolMethod { .. } | TypedCallAccessPlan::Generic => {
+        }
         _ => return None,
     }
     if call.args.is_empty() {
@@ -3088,21 +3169,41 @@ fn typed_inline_candidate_for_runtime_protocol_call(
     call: &TypedCall<InstrTyped>,
     caller_id: RuntimeFunctionId,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
-    trusted_runtime_protocol_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
 ) -> Option<TypedInlineStoreCandidate> {
-    let TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
-        runtime_name: _,
-        method_name: _,
-        method_guards,
-    } = &call.access
-    else {
-        return None;
-    };
     let instr_id = call.try_semantic_instr_id()?;
     let receiver = runtime_protocol_receiver(call)?.clone();
     typed_positional_arg_exprs(runtime_protocol_explicit_args(call)?.to_vec())?;
     let plans = direct_calls_by_instr_id.get(&instr_id)?;
-    if let Some(owner_type_ref) = trusted_runtime_protocol_calls.get(&instr_id) {
+    if let Some(owner_type_ref) = trusted_direct_method_calls.get(&instr_id) {
+        if matches!(call.access, TypedCallAccessPlan::Generic) {
+            if let [(target, arg_plan)] = plans.as_slice() {
+                if *target == caller_id {
+                    return None;
+                }
+                return Some(TypedInlineStoreCandidate {
+                    instr_index,
+                    result,
+                    call: TypedInlineCall::DirectRuntimeProtocolMethod {
+                        call: call.clone(),
+                        receiver,
+                    },
+                    inline_plans: vec![TypedInlineDirectCallPlan {
+                        target: *target,
+                        arg_plan: arg_plan.clone(),
+                        guard: TypedInlineGuardPlan::Direct,
+                    }],
+                });
+            }
+        }
+        let TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+            runtime_name: _,
+            method_name: _,
+            method_guards,
+        } = &call.access
+        else {
+            return None;
+        };
         let direct_plans = plans
             .iter()
             .filter_map(|(target, arg_plan)| {
@@ -3135,6 +3236,14 @@ fn typed_inline_candidate_for_runtime_protocol_call(
             });
         }
     }
+    let TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+        runtime_name: _,
+        method_name: _,
+        method_guards,
+    } = &call.access
+    else {
+        return None;
+    };
     let inline_plans = plans
         .iter()
         .filter_map(|(target, arg_plan)| {
@@ -3238,6 +3347,7 @@ fn typed_inline_guard_term(
         (
             TypedInlineGuardPlan::Direct,
             TypedInlineCall::DirectCallable(_)
+            | TypedInlineCall::DirectMethod { .. }
             | TypedInlineCall::DirectRuntimeProtocolMethod { .. },
         ) => BlockTerm::Jump(BlockEdge::new(then_label)),
         (TypedInlineGuardPlan::Callable, TypedInlineCall::Callable(_)) => {
@@ -3315,6 +3425,9 @@ fn typed_inline_generic_fallback_body(
     match call {
         TypedInlineCall::DirectCallable(_) => {
             unreachable!("direct callable inlining does not emit a generic fallback")
+        }
+        TypedInlineCall::DirectMethod { .. } => {
+            unreachable!("direct method inlining does not emit a generic fallback")
         }
         TypedInlineCall::DirectRuntimeProtocolMethod { .. } => {
             unreachable!("direct runtime-protocol inlining does not emit a generic fallback")
@@ -3474,6 +3587,7 @@ fn typed_inline_provided_values(
             + usize::from(matches!(
                 call,
                 TypedInlineCall::Method { .. }
+                    | TypedInlineCall::DirectMethod { .. }
                     | TypedInlineCall::RuntimeProtocolMethod { .. }
                     | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
             )),
@@ -3481,6 +3595,7 @@ fn typed_inline_provided_values(
     if matches!(
         call,
         TypedInlineCall::Method { .. }
+            | TypedInlineCall::DirectMethod { .. }
             | TypedInlineCall::RuntimeProtocolMethod { .. }
             | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
     ) {
@@ -5979,6 +6094,53 @@ mod typed_codegen_tests {
         );
         assert_eq!(stats.rewritten_stores, 1);
         typed
+    }
+
+    #[test]
+    fn inlines_trusted_runtime_protocol_calls_from_return_terms() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        return 1\n\n\
+def caller(it):\n    return next(it)\n",
+        )
+        .expect("source should lower");
+        let next_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller_index = typed
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        let call_id = first_typed_call_instr_id(&typed.callable_defs[caller_index]);
+        let callee_module = typed.clone();
+        let stats = {
+            let (module_constants, callable_defs) =
+                (&mut typed.module_constants, &mut typed.callable_defs);
+            inline_typed_function_direct_call_stores_with_external_callees_and_trusted_calls(
+                &mut callable_defs[caller_index],
+                &callee_module,
+                module_constants,
+                &HashMap::new(),
+                &HashMap::from([(
+                    call_id,
+                    vec![(
+                        next_id,
+                        TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    )],
+                )]),
+                &HashMap::from([(
+                    call_id,
+                    TypedAttrOwnerRef::TypeKey {
+                        module_name: "__main__".to_string(),
+                        qualname: "IterRange".to_string(),
+                    },
+                )]),
+            )
+        };
+
+        assert_eq!(stats.rewritten_returns, 1);
     }
 
     fn first_typed_call_instr_id(function: &BlockPyFunction<TypedBlockPyModuleShape>) -> InstrId {
