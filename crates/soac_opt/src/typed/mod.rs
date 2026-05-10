@@ -2769,15 +2769,12 @@ pub fn typed_constructor_field_bindings_from_inline_stats_with_external_callees(
         let fields = plan
             .field_stores
             .iter()
-            .filter_map(|store| {
-                let index = match &store.value {
-                    ConstructorFieldValue::Param { index, .. } => *index,
-                    ConstructorFieldValue::Local { .. }
-                    | ConstructorFieldValue::Constant { .. }
-                    | ConstructorFieldValue::Other => return None,
+            .map(|store| {
+                let ConstructorFieldValue::Param { index, .. } = &store.value else {
+                    return None;
                 };
                 let callee_location = LocalLocation(
-                    u32::try_from(index).expect("constructor parameter index should fit in u32"),
+                    u32::try_from(*index).expect("constructor parameter index should fit in u32"),
                 );
                 let local_mapping = local_mappings.get(&(
                     mapping.callee,
@@ -2793,7 +2790,10 @@ pub fn typed_constructor_field_bindings_from_inline_stats_with_external_callees(
                     scalar: None,
                 })
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>();
+        let Some(fields) = fields else {
+            continue;
+        };
         if !fields.is_empty() {
             bindings.insert(
                 mapping.caller_instr_id,
@@ -8916,6 +8916,118 @@ def caller(value):\n    obj = Box(value)\n    return obj.value\n",
         );
         assert_eq!(init_body_stats.inline_stats.rewritten_stores, 0);
         assert!(init_body_stats.inlined_constructor_init_calls.is_empty());
+    }
+
+    #[test]
+    fn typed_constructor_field_bindings_keep_generator_wrapper_state_as_locals() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class ClosureGenerator:\n    def __init__(self, resume, preserved_values):\n        is_closed = False\n        self._resume_fn = resume\n        self._is_closed = is_closed\n        self._preserved_values = preserved_values\n\n\
+def caller(resume, preserved_values):\n    gen = ClosureGenerator(resume, preserved_values)\n    return gen._preserved_values\n",
+        )
+        .expect("source should lower");
+        let inline_plan = crate::passes::plan_module_inlining(
+            &crate::passes::summarize_module_escapes(&lowered.blockpy_module),
+        );
+        let init_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "ClosureGenerator.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let caller_index = typed
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        let call_id;
+        {
+            let caller = &mut typed.callable_defs[caller_index];
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                                TypedDirectCallArgSource::Provided(2),
+                            ],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+        let callee_module = typed.clone();
+        let inline_stats = inline_typed_function_direct_call_stores(
+            &mut typed.callable_defs[caller_index],
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                            TypedDirectCallArgSource::Provided(2),
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(inline_stats.rewritten_stores, 1);
+
+        let constructor_field_bindings = typed_constructor_field_bindings_from_inline_stats(
+            &callee_module,
+            &inline_plan,
+            &module_constants,
+            &inline_stats,
+        );
+        assert!(
+            constructor_field_bindings.is_empty(),
+            "non-straightline wrapper init should use explicit init-body inlining"
+        );
+        let constructor_init_plans =
+            typed_constructor_init_plans_from_inline_stats_with_external_callees(
+                &callee_module,
+                &module_constants,
+                &HashMap::new(),
+                &inline_stats,
+            );
+        assert_eq!(constructor_init_plans.len(), 1);
+        annotate_constructor_init_plans_for_test(
+            &mut typed.callable_defs[caller_index],
+            &constructor_init_plans,
+        );
+        let init_body_stats = inline_typed_constructor_init_bodies_with_external_callees(
+            &mut typed.callable_defs[caller_index],
+            &callee_module,
+            &mut typed.module_constants,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(init_body_stats.inline_stats.rewritten_stores, 1);
+        assert_eq!(init_body_stats.inlined_constructor_init_calls.len(), 1);
+        let fields = init_body_stats
+            .constructor_field_bindings
+            .values()
+            .flat_map(|bindings| {
+                bindings
+                    .fields
+                    .iter()
+                    .map(|field| field.field_name.as_str())
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            fields,
+            HashSet::from(["_is_closed", "_preserved_values", "_resume_fn"]),
+            "generator-wrapper constructor fields should remain visible to virtualization"
+        );
     }
 
     #[test]

@@ -3843,12 +3843,22 @@ def make_counter(delta):
         "resume layout should not capture private preserved state:\n{}",
         lowering.name_binding_text(),
     );
+    let preserved_values_expr = closure_generator
+        .args
+        .get(4)
+        .and_then(|arg| match arg {
+            CallArgPositional::Positional(value) => Some(value),
+            CallArgPositional::Starred(_) => None,
+        })
+        .expect("ClosureGenerator should carry preserved activation state");
+    let preserved_values_list = runtime_call_by_name(bb_module, preserved_values_expr, "list")
+        .expect("generator wrapper should own preserved activation state as a list");
     assert!(
         matches!(
-            closure_generator.args.get(4),
-            Some(CallArgPositional::Positional(InstrResolved::Tuple(_)))
+            preserved_values_list.args.as_slice(),
+            [CallArgPositional::Positional(InstrResolved::Tuple(_))]
         ),
-        "generator wrapper should own preserved activation state:\n{}",
+        "generator wrapper should initialize preserved activation state from a tuple:\n{}",
         lowering.name_binding_text(),
     );
     assert!(

@@ -785,9 +785,10 @@ class ClosureGenerator:
         yieldfrom_slot,
         throw_context_slot,
     ):
+        is_closed = False
         self._resume_fn = resume
-        self._is_closed = False
-        self._preserved_values = list(preserved_values)
+        self._is_closed = is_closed
+        self._preserved_values = preserved_values
         self._yield_from_slot = yieldfrom_slot
         self._throw_context_slot = throw_context_slot
         self.__name__ = name
@@ -904,9 +905,10 @@ class ClosureAsyncGenerator:
         yieldfrom_slot,
         throw_context_slot,
     ):
+        is_closed = False
         self._resume_fn = resume
-        self._is_closed = False
-        self._preserved_values = list(preserved_values)
+        self._is_closed = is_closed
+        self._preserved_values = preserved_values
         self._yield_from_slot = yieldfrom_slot
         self._throw_context_slot = throw_context_slot
         self.__name__ = name

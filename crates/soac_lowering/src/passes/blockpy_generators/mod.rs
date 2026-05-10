@@ -714,12 +714,16 @@ fn build_factory_block(
         core_tuple(Vec::new()),
         core_none(),
     );
-    let preserved_values = core_tuple(
-        storage_layout
-            .preserved_slots
-            .iter()
-            .map(preserved_slot_init_expr)
-            .collect(),
+    let preserved_values = core_call_expr(
+        core_runtime_attr("list"),
+        vec![core_tuple(
+            storage_layout
+                .preserved_slots
+                .iter()
+                .map(preserved_slot_init_expr)
+                .collect(),
+        )],
+        Vec::new(),
     );
     let yieldfrom_slot = core_literal_int(preserved_slot_index(storage_layout, "_dp_yieldfrom"));
     let throw_context_slot =
