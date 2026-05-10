@@ -832,7 +832,7 @@ pub enum TypedInlineUnsupportedReason {
     JumpArgs,
     ExceptionEdge,
     NonReturnTerm,
-    ClosureStorage,
+    NonStackStorage,
     CrossModuleGlobalName(String),
     UnknownBlockName(String),
     TooManyCallerConstants,
@@ -3610,8 +3610,8 @@ fn build_single_block_typed_inline_fragment_to_target(
         .storage_layout
         .as_ref()
         .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
-    if typed_inline_callee_has_closure_storage(callee_layout) {
-        return Err(TypedInlineUnsupportedReason::ClosureStorage);
+    if typed_inline_callee_has_nonstack_storage(callee_layout) {
+        return Err(TypedInlineUnsupportedReason::NonStackStorage);
     }
     for location in value_bindings.keys().copied() {
         if location.slot() as usize >= callee_layout.stack_slots().len() {
@@ -3695,8 +3695,8 @@ fn build_multi_block_typed_inline_fragment_to_target(
         .storage_layout
         .as_ref()
         .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
-    if typed_inline_callee_has_closure_storage(callee_layout) {
-        return Err(TypedInlineUnsupportedReason::ClosureStorage);
+    if typed_inline_callee_has_nonstack_storage(callee_layout) {
+        return Err(TypedInlineUnsupportedReason::NonStackStorage);
     }
     for location in value_bindings.keys().copied() {
         if location.slot() as usize >= callee_layout.stack_slots().len() {
@@ -3781,7 +3781,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
     })
 }
 
-fn typed_inline_callee_has_closure_storage(
+fn typed_inline_callee_has_nonstack_storage(
     storage_layout: &soac_core::block_py::StorageLayout,
 ) -> bool {
     !storage_layout.freevars.is_empty()
