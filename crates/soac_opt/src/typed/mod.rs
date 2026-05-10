@@ -6390,6 +6390,7 @@ mod typed_codegen_tests {
                 }],
             },
             true,
+            false,
         );
         state.set_alias(alias, object);
 
@@ -9027,6 +9028,80 @@ def caller(resume, preserved_values):\n    gen = ClosureGenerator(resume, preser
             fields,
             HashSet::from(["_is_closed", "_preserved_values", "_resume_fn"]),
             "generator-wrapper constructor fields should remain visible to virtualization"
+        );
+
+        let constructor_field_bindings = init_body_stats.constructor_field_bindings;
+        let module_constants = typed.module_constants.clone();
+        let caller = &mut typed.callable_defs[caller_index];
+        let split_stats = split_typed_constructor_hot_continuations(caller, &module_constants);
+        assert_eq!(split_stats.clones.len(), 1);
+        let generic_plan =
+            plan_typed_virtual_objects(caller, &module_constants, &constructor_field_bindings);
+        assert!(
+            generic_plan.objects.is_empty(),
+            "ordinary constructor virtualization should still require indexed-field evidence"
+        );
+        let mut trusted_sources = HashSet::from([call_id]);
+        let trusted_inline_instances = inline_stats
+            .inline_instance_sources
+            .iter()
+            .filter_map(|mapping| {
+                trusted_sources
+                    .contains(&mapping.source_instr_id)
+                    .then_some(mapping.inline_instance)
+            })
+            .collect::<HashSet<_>>();
+        trusted_sources.extend(inline_stats.instr_id_mappings.iter().filter_map(|mapping| {
+            (trusted_inline_instances.contains(&mapping.inline_instance)
+                && constructor_field_bindings.contains_key(&mapping.caller_instr_id))
+            .then_some(mapping.caller_instr_id)
+        }));
+        for mapping in &split_stats.instr_id_mappings {
+            if trusted_sources.contains(&mapping.callee_instr_id) {
+                trusted_sources.insert(mapping.caller_instr_id);
+            }
+        }
+        let mut fully_virtual_plan = plan_typed_fully_virtual_objects(
+            caller,
+            &module_constants,
+            &constructor_field_bindings,
+            &trusted_sources,
+        );
+        assert_eq!(
+            fully_virtual_plan.objects.len(),
+            1,
+            "trusted generated wrapper constructors should virtualize without waiting for indexed-field replay"
+        );
+        assert!(fully_virtual_plan.materialization_boundaries().is_empty());
+        assert!(
+            getattrs_for_field_in_reachable_blocks(
+                caller,
+                split_stats.clones[0].cloned_entry,
+                &module_constants,
+                "_preserved_values",
+            ) > 0,
+            "the hot cloned continuation should still read wrapper state before lowering"
+        );
+        let stats = lower_typed_fully_virtual_objects_to_locals_with_plan(
+            caller,
+            &module_constants,
+            &mut fully_virtual_plan,
+        );
+        assert!(stats.changed());
+        assert_eq!(stats.field_lowering.seeded_objects, 1);
+        assert!(
+            stats.virtualization.removed_materializations >= 1,
+            "trusted generated wrappers should lower to locals without leaving the hot allocation alive"
+        );
+        assert_eq!(
+            getattrs_for_field_in_reachable_blocks(
+                caller,
+                split_stats.clones[0].cloned_entry,
+                &module_constants,
+                "_preserved_values",
+            ),
+            0,
+            "the hot cloned continuation should use the wrapper-state local after lowering"
         );
     }
 

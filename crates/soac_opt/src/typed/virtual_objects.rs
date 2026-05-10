@@ -24,6 +24,7 @@ pub struct TypedVirtualObjectPlan {
     pub virtual_names: HashSet<String>,
     pub assumed_owner_type: Option<TypedAttrOwnerRef>,
     pub guard_blocks: HashSet<BlockLabel>,
+    pub allow_generic_field_accesses: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -76,6 +77,7 @@ pub struct TypedVirtualizationPlan {
     pub objects: Vec<TypedVirtualObjectPlan>,
     pub materializing_objects: Vec<TypedVirtualObjectPlan>,
     field_lowering_bindings: HashMap<InstrId, TypedConstructorFieldBindings>,
+    field_lowering_generic_sources: HashSet<InstrId>,
     materialization_boundaries: Vec<TypedVirtualMaterializationBoundary>,
     pub field_states: Option<TypedVirtualFieldStateAnalysis>,
 }
@@ -250,6 +252,7 @@ fn analyze_typed_virtual_field_states(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    generic_field_sources: &HashSet<InstrId>,
 ) -> TypedVirtualLoweringAnalysis {
     let predecessors = typed_scalar_block_predecessor_edges(function);
     let mut in_states = vec![None::<TypedVirtualLoweringState>; function.blocks.len()];
@@ -284,12 +287,14 @@ fn analyze_typed_virtual_field_states(
                         &mut snapshot_state,
                         module_constants,
                         constructor_field_bindings,
+                        generic_field_sources,
                     );
                     transfer_typed_field_scalar_body(
                         &mut block_clone.body,
                         &mut out_state,
                         module_constants,
                         constructor_field_bindings,
+                        generic_field_sources,
                         &mut ignored_stats,
                         false,
                     );
@@ -398,6 +403,7 @@ fn lower_typed_virtual_fields_to_locals_from_analysis(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    generic_field_sources: &HashSet<InstrId>,
     scalar_slots: usize,
     analysis: &TypedVirtualLoweringAnalysis,
 ) -> TypedFieldScalarizationStats {
@@ -415,6 +421,7 @@ fn lower_typed_virtual_fields_to_locals_from_analysis(
             &mut state,
             module_constants,
             constructor_field_bindings,
+            generic_field_sources,
             &mut stats,
             true,
         );
@@ -502,6 +509,7 @@ fn plan_typed_virtual_objects_impl(
         .filter(|(source, _)| allowed_sources.is_none_or(|allowed| allowed.contains(source)))
         .map(|(source, bindings)| (*source, bindings.clone()))
         .collect::<HashMap<_, _>>();
+    let field_lowering_generic_sources = allowed_sources.cloned().unwrap_or_default();
     for block in &function.blocks {
         for (instr_index, instr) in block.body.iter().enumerate() {
             let Some((source, root)) = typed_virtual_constructor_materialization(instr) else {
@@ -542,6 +550,7 @@ fn plan_typed_virtual_objects_impl(
                 virtual_names: HashSet::from([root.id_str().to_string()]),
                 assumed_owner_type: None,
                 guard_blocks: HashSet::new(),
+                allow_generic_field_accesses: allowed_sources.is_some(),
             };
             plan.materialization_recipe =
                 typed_virtual_materialization_recipe(function, module_constants, bindings, &plan);
@@ -570,11 +579,13 @@ fn plan_typed_virtual_objects_impl(
         function,
         module_constants,
         &field_lowering_bindings,
+        &field_lowering_generic_sources,
     ));
     let plan = TypedVirtualizationPlan {
         objects,
         materializing_objects,
         field_lowering_bindings,
+        field_lowering_generic_sources,
         materialization_boundaries,
         field_states: Some(field_states),
     };
@@ -623,10 +634,15 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
         return TypedFieldScalarizationStats::default();
     }
     let mut constructor_field_bindings = plan.field_lowering_bindings.clone();
+    let generic_field_sources = plan.field_lowering_generic_sources.clone();
     let scalar_slots =
         allocate_typed_constructor_field_scalar_slots(function, &mut constructor_field_bindings);
-    let mut analysis =
-        analyze_typed_virtual_field_states(function, module_constants, &constructor_field_bindings);
+    let mut analysis = analyze_typed_virtual_field_states(
+        function,
+        module_constants,
+        &constructor_field_bindings,
+        &generic_field_sources,
+    );
     let removable_objects = plan
         .objects
         .iter()
@@ -641,6 +657,7 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
                 function,
                 module_constants,
                 &constructor_field_bindings,
+                &generic_field_sources,
             );
         }
         let next_block_param_stats =
@@ -652,12 +669,14 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
                 function,
                 module_constants,
                 &constructor_field_bindings,
+                &generic_field_sources,
             );
             refresh_typed_virtual_field_block_param_args(function, &analysis);
             analysis = analyze_typed_virtual_field_states(
                 function,
                 module_constants,
                 &constructor_field_bindings,
+                &generic_field_sources,
             );
         }
         if split_edges == 0 && next_block_param_stats.inserted_block_params == 0 {
@@ -668,6 +687,7 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
         function,
         module_constants,
         &constructor_field_bindings,
+        &generic_field_sources,
         scalar_slots,
         &analysis,
     );
@@ -1610,7 +1630,7 @@ fn typed_virtual_constructor_field_store(
     plan: &TypedVirtualObjectPlan,
 ) -> bool {
     if !typed_expr_is_virtual_constructor_load(op.value.as_ref(), plan)
-        || !typed_attr_access_is_indexed_field(&op.access)
+        || (!typed_attr_access_is_indexed_field(&op.access) && !plan.allow_generic_field_accesses)
     {
         return false;
     }
@@ -1630,7 +1650,7 @@ fn typed_virtual_constructor_field_load(
     plan: &TypedVirtualObjectPlan,
 ) -> bool {
     if !typed_expr_is_virtual_constructor_load(op.value.as_ref(), plan)
-        || !typed_attr_access_is_indexed_field(&op.access)
+        || (!typed_attr_access_is_indexed_field(&op.access) && !plan.allow_generic_field_accesses)
     {
         return false;
     }
@@ -2254,6 +2274,7 @@ pub(super) struct TypedVirtualLoweringState {
     virtual_state: TypedVirtualState,
     value_aliases: HashMap<LocalLocation, ResolvedName>,
     field_scalars: HashMap<TypedVirtualFieldRef, ResolvedName>,
+    generic_field_objects: HashSet<TypedVirtualObjectId>,
 }
 
 impl TypedVirtualLoweringState {
@@ -2315,9 +2336,13 @@ impl TypedVirtualLoweringState {
         location: LocalLocation,
         bindings: &TypedConstructorFieldBindings,
         initialize_fields: bool,
+        allow_generic_field_accesses: bool,
     ) {
         self.rebind_local(location);
         self.virtual_state.aliases.insert(location, object);
+        if allow_generic_field_accesses {
+            self.generic_field_objects.insert(object);
+        }
         for field in &bindings.fields {
             let field_ref = TypedVirtualFieldRef {
                 object,
@@ -2359,6 +2384,10 @@ impl TypedVirtualLoweringState {
         })
     }
 
+    fn allows_generic_field_accesses(&self, object: TypedVirtualObjectId) -> bool {
+        self.generic_field_objects.contains(&object)
+    }
+
     fn set_field(&mut self, object: TypedVirtualObjectId, field_name: String, value: ResolvedName) {
         let value = self.resolve_scalar_name(&value);
         self.virtual_state
@@ -2381,6 +2410,7 @@ impl TypedVirtualLoweringState {
             .fields
             .retain(|field, _| field.object != object);
         self.field_scalars.retain(|field, _| field.object != object);
+        self.generic_field_objects.remove(&object);
     }
 
     fn invalidate_objects(&mut self, objects: HashSet<TypedVirtualObjectId>) {
@@ -2431,6 +2461,10 @@ fn merge_typed_field_scalar_states<'a>(
     merged.field_scalars.retain(|field, value| {
         rest.iter()
             .all(|state| state.field_scalars.get(field) == Some(value))
+    });
+    merged.generic_field_objects.retain(|object| {
+        rest.iter()
+            .all(|state| state.generic_field_objects.contains(object))
     });
     merged.virtual_state.fields.retain(|field, value| {
         let resolved = first.resolve_scalar_name(value);
@@ -2553,6 +2587,7 @@ fn transfer_typed_field_scalar_block(
     state: &mut TypedVirtualLoweringState,
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    generic_field_sources: &HashSet<InstrId>,
     stats: &mut TypedFieldScalarizationStats,
     rewrite: bool,
 ) {
@@ -2561,6 +2596,7 @@ fn transfer_typed_field_scalar_block(
         state,
         module_constants,
         constructor_field_bindings,
+        generic_field_sources,
         stats,
         rewrite,
     );
@@ -2572,6 +2608,7 @@ fn transfer_typed_field_scalar_body(
     state: &mut TypedVirtualLoweringState,
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    generic_field_sources: &HashSet<InstrId>,
     stats: &mut TypedFieldScalarizationStats,
     rewrite: bool,
 ) {
@@ -2585,6 +2622,7 @@ fn transfer_typed_field_scalar_body(
             state,
             module_constants,
             constructor_field_bindings,
+            generic_field_sources,
             stats,
             rewrite,
             &mut inserted_before,
@@ -2606,6 +2644,7 @@ fn typed_field_scalar_body_snapshots(
     state: &mut TypedVirtualLoweringState,
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    generic_field_sources: &HashSet<InstrId>,
 ) -> Vec<TypedVirtualLoweringState> {
     let mut snapshots = Vec::with_capacity(block.body.len());
     let mut ignored_stats = TypedFieldScalarizationStats::default();
@@ -2619,6 +2658,7 @@ fn typed_field_scalar_body_snapshots(
             state,
             module_constants,
             constructor_field_bindings,
+            generic_field_sources,
             &mut ignored_stats,
             false,
             &mut inserted_before,
@@ -2633,6 +2673,7 @@ fn transfer_typed_field_scalar_instr(
     state: &mut TypedVirtualLoweringState,
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    generic_field_sources: &HashSet<InstrId>,
     stats: &mut TypedFieldScalarizationStats,
     rewrite: bool,
     inserted_before: &mut Vec<InstrTyped>,
@@ -2640,8 +2681,12 @@ fn transfer_typed_field_scalar_instr(
 ) {
     match instr {
         InstrTyped::Store(store) => {
-            if let Some((source, bindings, initialize_fields)) =
-                typed_constructor_field_bindings_for_store(store, constructor_field_bindings)
+            if let Some((source, bindings, initialize_fields, allow_generic_field_accesses)) =
+                typed_constructor_field_bindings_for_store(
+                    store,
+                    constructor_field_bindings,
+                    generic_field_sources,
+                )
             {
                 state
                     .invalidate_objects(typed_virtual_objects_in_expr(store.value.as_ref(), state));
@@ -2651,6 +2696,7 @@ fn transfer_typed_field_scalar_instr(
                         location,
                         bindings,
                         initialize_fields,
+                        allow_generic_field_accesses,
                     );
                     if rewrite {
                         stats.seeded_objects += 1;
@@ -2748,7 +2794,9 @@ fn rewrite_typed_field_scalar_setattr(
         state.invalidate_object(object);
         return;
     };
-    if !typed_attr_access_is_indexed_field(&op.access) {
+    if !typed_attr_access_is_indexed_field(&op.access)
+        && !state.allows_generic_field_accesses(object)
+    {
         state.invalidate_object(object);
         return;
     }
@@ -2783,7 +2831,8 @@ fn rewrite_typed_field_scalar_setattr(
 fn typed_constructor_field_bindings_for_store<'a>(
     store: &Store<InstrTyped>,
     constructor_field_bindings: &'a HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> Option<(InstrId, &'a TypedConstructorFieldBindings, bool)> {
+    generic_field_sources: &HashSet<InstrId>,
+) -> Option<(InstrId, &'a TypedConstructorFieldBindings, bool, bool)> {
     let InstrTyped::CallTyped(call) = store.value.as_ref() else {
         return None;
     };
@@ -2796,6 +2845,7 @@ fn typed_constructor_field_bindings_for_store<'a>(
                 plan.source
                     != TypedConstructorInitPlanSource::InlinedConstructorEntryWithInlinedInitBody
             }),
+            generic_field_sources.contains(&instr_id),
         )
     })
 }
@@ -2908,7 +2958,8 @@ fn rewrite_typed_field_scalar_getattr(
     if let Some(receiver) = typed_instr_local_load_location(op.value.as_ref())
         && let Some(object) = state.object_for_location(receiver)
     {
-        if typed_attr_access_is_indexed_field(&op.access)
+        if (typed_attr_access_is_indexed_field(&op.access)
+            || state.allows_generic_field_accesses(object))
             && let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants)
         {
             state.invalidate_field(object, field_name);
@@ -2925,11 +2976,13 @@ fn typed_field_scalar_getattr_replacement(
     state: &TypedVirtualLoweringState,
     module_constants: &[ConstantExpr],
 ) -> Option<ResolvedName> {
-    if !typed_attr_access_is_indexed_field(&op.access) {
-        return None;
-    }
     let receiver = typed_instr_local_load_location(op.value.as_ref())?;
     let object = state.object_for_location(receiver)?;
+    if !typed_attr_access_is_indexed_field(&op.access)
+        && !state.allows_generic_field_accesses(object)
+    {
+        return None;
+    }
     let field_name = typed_constant_string(op.attr.as_ref(), module_constants)?;
     state.field_value(object, field_name).cloned()
 }

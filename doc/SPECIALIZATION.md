@@ -636,7 +636,13 @@ hot continuation where the constructed local no longer has an identity use: fiel
 loads have been replaced with scalar locals, scalarized field stores can be
 dropped, cleanup deletes can be removed, and exact-type direct-call guards on
 the same virtual object can be proven redundant. The generic fallback path keeps
-the original materialized object behavior.
+the original materialized object behavior. Ordinary profiled constructor
+virtualization still requires indexed-field access plans before field loads and
+stores are rewritten, but fully trusted static runtime constructors can consume
+their bound constant fields directly in the fully-virtual path. That lets
+compiler-generated runtime wrappers such as `ClosureGenerator` lower their hot
+state to locals before indexed-field replay would otherwise make those fields
+visible.
 
 ## Operation Specializations
 
