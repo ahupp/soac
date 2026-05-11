@@ -220,13 +220,12 @@ templatelib_Interpolation
 bb_trace_enter
 _current_yieldfrom
 _is_cancelled_error
+_is_generator_closed
 _reraise_control_flow
-_mark_closed
 resume_generator
 resume_async_generator
 make_preserved_state
 load_preserved_state
-clear_preserved_state
 _normalize_throw_exc
 _current_throw_context
 complex_from_parts

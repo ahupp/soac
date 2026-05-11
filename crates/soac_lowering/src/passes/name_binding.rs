@@ -607,6 +607,12 @@ fn closure_slot_init_expr(slot: &ClosureSlot) -> InstrUnresolved {
             },
             crate::block_py::Meta::new(node_index, range),
         ),
+        ClosureInit::RuntimeZero => literal_expr(
+            NumberLiteral {
+                value: NumberLiteralValue::Int(IntLiteral::from_i64(0)),
+            },
+            crate::block_py::Meta::new(node_index, range),
+        ),
         ClosureInit::RuntimeNone | ClosureInit::Deferred => {
             core_name_expr("NONE", ast::ExprContext::Load, node_index, range)
         }

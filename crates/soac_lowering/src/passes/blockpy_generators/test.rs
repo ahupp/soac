@@ -25,9 +25,9 @@ fn generator_test_semantic() -> CallableScopeInfo {
 
 fn preserved_slot(logical_name: &str, storage_name: &str, init: ClosureInit) -> PreservedSlot {
     let storage = match init {
-        ClosureInit::RuntimePcUnstarted | ClosureInit::RuntimeAbruptKindFallthrough => {
-            PreservedSlotStorage::I64
-        }
+        ClosureInit::RuntimePcUnstarted
+        | ClosureInit::RuntimeAbruptKindFallthrough
+        | ClosureInit::RuntimeZero => PreservedSlotStorage::I64,
         ClosureInit::InheritedCapture
         | ClosureInit::Parameter
         | ClosureInit::EmptyCell
@@ -255,6 +255,7 @@ fn build_blockpy_storage_layout_classifies_capture_local_and_preserved_slots() {
             "captured".to_string(),
             "_dp_yieldfrom".to_string(),
             "_dp_pc".to_string(),
+            "_dp_is_closed".to_string(),
             "_dp_throw_context".to_string(),
             "_dp_try_exc_0".to_string(),
         ],
@@ -304,6 +305,11 @@ fn build_blockpy_storage_layout_classifies_capture_local_and_preserved_slots() {
                 "_dp_pc",
                 "_dp_cell__dp_pc",
                 &ClosureInit::RuntimePcUnstarted
+            ),
+            (
+                "_dp_is_closed",
+                "_dp_cell__dp_is_closed",
+                &ClosureInit::RuntimeZero
             ),
             (
                 "_dp_throw_context",

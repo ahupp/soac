@@ -5102,6 +5102,9 @@ fn lower_typed_generator_state_origin_to_locals(
             soac_core::block_py::ClosureInit::RuntimeAbruptKindFallthrough => {
                 typed_i64_constant_load(module_constants, 0, constructor_call.meta())
             }
+            soac_core::block_py::ClosureInit::RuntimeZero => {
+                typed_i64_constant_load(module_constants, 0, constructor_call.meta())
+            }
             soac_core::block_py::ClosureInit::RuntimeNone
             | soac_core::block_py::ClosureInit::Deferred => InstrTyped::constant_none(),
             soac_core::block_py::ClosureInit::InheritedCapture

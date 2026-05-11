@@ -779,16 +779,6 @@ fn load_preserved_state(
     unsafe { Bound::from_owned_ptr_or_err(py, value) }.map(Bound::unbind)
 }
 
-#[pyfunction]
-fn clear_preserved_state(state: &Bound<'_, PyAny>) -> PyResult<()> {
-    let rc = unsafe { soac_jit::preserved_state::clear_preserved_state(state.as_ptr()) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(PyErr::fetch(state.py()))
-    }
-}
-
 pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create_module, module)?)?;
     module.add_function(wrap_pyfunction!(exec_module, module)?)?;
@@ -801,6 +791,5 @@ pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(wrap_pyfunction!(resume_async_generator, module)?)?;
     module.add_function(wrap_pyfunction!(make_preserved_state, module)?)?;
     module.add_function(wrap_pyfunction!(load_preserved_state, module)?)?;
-    module.add_function(wrap_pyfunction!(clear_preserved_state, module)?)?;
     Ok(())
 }

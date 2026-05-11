@@ -58,7 +58,6 @@ resume_generator = _soac_ext.resume_generator
 resume_async_generator = _soac_ext.resume_async_generator
 make_preserved_state = _soac_ext.make_preserved_state
 load_preserved_state = _soac_ext.load_preserved_state
-clear_preserved_state = _soac_ext.clear_preserved_state
 
 
 def _index(value, /):
@@ -168,10 +167,8 @@ def _reraise_control_flow(exc):
     raise exc
 
 
-def _mark_closed(owner):
-    clear_preserved_state(owner._preserved_values)
-    owner._is_closed = True
-    owner._resume_function = None
+def _is_generator_closed(owner):
+    return bool(load_preserved_state(owner._preserved_values, owner._closed_slot))
 
 
 def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
@@ -196,6 +193,7 @@ def make_generator_instance(
     slot_kinds,
     yieldfrom_slot,
     throw_context_slot,
+    closed_slot,
 ):
     preserved_values = make_preserved_state(initial_values, slot_kinds)
     is_async_gen = kind == 2
@@ -210,6 +208,7 @@ def make_generator_instance(
             preserved_values,
             yieldfrom_slot,
             throw_context_slot,
+            closed_slot,
         )
     generator = ClosureGenerator(
         resume_function,
@@ -219,6 +218,7 @@ def make_generator_instance(
         preserved_values,
         yieldfrom_slot,
         throw_context_slot,
+        closed_slot,
     )
     if kind == 1:
         return Coroutine(generator)
@@ -810,10 +810,10 @@ class AsyncGenComplete(Exception):
 class ClosureGenerator:
     __slots__ = (
         "_resume_function",
-        "_is_closed",
         "_preserved_values",
         "_yield_from_slot",
         "_throw_context_slot",
+        "_closed_slot",
         "__name__",
         "__qualname__",
         "gi_code",
@@ -828,13 +828,13 @@ class ClosureGenerator:
         preserved_values,
         yieldfrom_slot,
         throw_context_slot,
+        closed_slot,
     ):
-        is_closed = False
         self._resume_function = resume_function
-        self._is_closed = is_closed
         self._preserved_values = preserved_values
         self._yield_from_slot = yieldfrom_slot
         self._throw_context_slot = throw_context_slot
+        self._closed_slot = closed_slot
         self.__name__ = name
         self.__qualname__ = qualname
         self.gi_code = code
@@ -846,15 +846,22 @@ class ClosureGenerator:
         return self.send(None)
 
     def send(self, value):
-        if self._is_closed:
+        if _is_generator_closed(self):
             raise StopIteration
         try:
             return resume_generator(self._resume_function, self, value, NO_DEFAULT)
         except BaseException as exc:
-            _mark_closed(self)
             _reraise_control_flow(exc)
 
     def throw(self, typ=None, val=None, tb=None):
+        if _is_generator_closed(self):
+            exc = _normalize_throw_exc(
+                typ,
+                val,
+                tb,
+                where="ClosureGenerator.throw()",
+            )
+            _reraise_control_flow(exc)
         exc = _normalize_throw_exc(
             typ,
             val,
@@ -862,16 +869,13 @@ class ClosureGenerator:
             where="ClosureGenerator.throw()",
             throw_context=_current_throw_context(self),
         )
-        if self._is_closed:
-            _reraise_control_flow(exc)
         try:
             return resume_generator(self._resume_function, self, NO_DEFAULT, exc)
         except BaseException as exc:
-            _mark_closed(self)
             _reraise_control_flow(exc)
 
     def close(self):
-        if self._is_closed:
+        if _is_generator_closed(self):
             return None
         try:
             self.throw(GeneratorExit)
@@ -930,10 +934,10 @@ class Coroutine(_abc.Coroutine):
 class ClosureAsyncGenerator:
     __slots__ = (
         "_resume_function",
-        "_is_closed",
         "_preserved_values",
         "_yield_from_slot",
         "_throw_context_slot",
+        "_closed_slot",
         "__name__",
         "__qualname__",
         "ag_code",
@@ -948,13 +952,13 @@ class ClosureAsyncGenerator:
         preserved_values,
         yieldfrom_slot,
         throw_context_slot,
+        closed_slot,
     ):
-        is_closed = False
         self._resume_function = resume_function
-        self._is_closed = is_closed
         self._preserved_values = preserved_values
         self._yield_from_slot = yieldfrom_slot
         self._throw_context_slot = throw_context_slot
+        self._closed_slot = closed_slot
         self.__name__ = name
         self.__qualname__ = qualname
         self.ag_code = code
@@ -982,12 +986,15 @@ class ClosureAsyncGenerator:
         return AsyncGenSend(self, value, NO_DEFAULT)
 
     def athrow(self, typ=None, val=None, tb=None):
+        throw_context = None
+        if not _is_generator_closed(self):
+            throw_context = _current_throw_context(self)
         exc = _normalize_throw_exc(
             typ,
             val,
             tb,
             where="ClosureAsyncGenerator.athrow()",
-            throw_context=_current_throw_context(self),
+            throw_context=throw_context,
         )
         return AsyncGenSend(self, NO_DEFAULT, exc)
 
@@ -1018,7 +1025,7 @@ class AsyncGenSend:
         return self.send(None)
 
     def _step(self, transport_sent):
-        if self._generator._is_closed:
+        if _is_generator_closed(self._generator):
             self._is_done = True
             resume_exc = self._resume_exception
             self._resume_exception = NO_DEFAULT
@@ -1041,12 +1048,10 @@ class AsyncGenSend:
         except AsyncGenComplete:
             self._is_done = True
             self._resume_exception = NO_DEFAULT
-            _mark_closed(self._generator)
             raise StopAsyncIteration
         except BaseException as exc:
             self._is_done = True
             self._resume_exception = NO_DEFAULT
-            _mark_closed(self._generator)
             if _is_cancelled_error(exc) or isinstance(exc, GeneratorExit):
                 _reraise_control_flow(exc)
             if isinstance(exc, StopIteration):

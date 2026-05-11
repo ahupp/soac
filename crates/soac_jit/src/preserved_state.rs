@@ -321,16 +321,6 @@ pub unsafe fn clear_preserved_slot(capsule: *mut ffi::PyObject, slot: i64) -> i3
     }
 }
 
-pub unsafe fn clear_preserved_state(capsule: *mut ffi::PyObject) -> i32 {
-    let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
-        return -1;
-    };
-    unsafe {
-        state.clear();
-    }
-    0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,11 +411,9 @@ mod tests {
             );
             ffi::Py_DECREF(reloaded_i64);
 
-            assert_eq!(
-                clear_preserved_state(state),
-                0,
-                "clearing preserved state should succeed"
-            );
+            state_from_capsule(state)
+                .expect("preserved state should remain valid")
+                .clear();
             assert_eq!(
                 ffi::Py_REFCNT(replacement),
                 replacement_before_store,

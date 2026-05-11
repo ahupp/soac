@@ -120,6 +120,7 @@ pub enum ClosureInit {
     EmptyCell,
     RuntimePcUnstarted,
     RuntimeAbruptKindFallthrough,
+    RuntimeZero,
     RuntimeNone,
     Deferred,
 }

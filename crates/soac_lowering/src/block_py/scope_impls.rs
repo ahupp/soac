@@ -472,8 +472,10 @@ where
 }
 
 pub(crate) fn is_runtime_closure_name(name: &str) -> bool {
-    matches!(name, "_dp_pc" | "_dp_yieldfrom" | "_dp_throw_context")
-        || name.starts_with("_dp_try_abrupt_kind_")
+    matches!(
+        name,
+        "_dp_pc" | "_dp_is_closed" | "_dp_yieldfrom" | "_dp_throw_context"
+    ) || name.starts_with("_dp_try_abrupt_kind_")
 }
 
 pub(crate) fn compute_make_function_capture_bindings_from_scope<P>(

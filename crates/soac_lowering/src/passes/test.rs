@@ -3881,6 +3881,7 @@ def make_counter(delta):
             "sent",
             "total",
             "_dp_pc",
+            "_dp_is_closed",
             "_dp_yieldfrom",
             "_dp_throw_context"
         ]

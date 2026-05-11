@@ -2489,6 +2489,15 @@ unsafe fn make_generator_instance_from_vectorcall(
             "generator-like function is missing _dp_throw_context preserved slot",
         );
     };
+    let Some(closed_slot) = layout
+        .preserved_slots
+        .iter()
+        .position(|slot| slot.logical_name == "_dp_is_closed")
+    else {
+        return set_runtime_error(
+            "generator-like function is missing _dp_is_closed preserved slot",
+        );
+    };
 
     let mut bound_args = vec![ptr::null_mut(); data.function_template.binding_plan().param_count()];
     bind_function_args_to_output(
@@ -2550,6 +2559,7 @@ unsafe fn make_generator_instance_from_vectorcall(
             }
             ClosureInit::RuntimePcUnstarted => ffi::PyLong_FromLongLong(1),
             ClosureInit::RuntimeAbruptKindFallthrough => ffi::PyLong_FromLongLong(0),
+            ClosureInit::RuntimeZero => ffi::PyLong_FromLongLong(0),
             ClosureInit::RuntimeNone | ClosureInit::Deferred => {
                 let none = ffi::Py_None();
                 ffi::Py_INCREF(none);
@@ -2601,6 +2611,7 @@ unsafe fn make_generator_instance_from_vectorcall(
             slot_kinds,
             yieldfrom_slot,
             throw_context_slot,
+            closed_slot,
         ))
         .map_err(|err| {
             err.restore(py);

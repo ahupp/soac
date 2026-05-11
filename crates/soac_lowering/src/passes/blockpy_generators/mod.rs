@@ -7,9 +7,9 @@ use crate::block_py::{
     core_runtime_positional_call_expr_with_meta, literal_expr, map_module_functions, BindingKind,
     BindingPurpose, BindingTarget, Block, BlockArg, BlockEdge, BlockLabel, BlockParam,
     BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
-    CallableScopeInfo, CellBindingKind, ClosureInit, ClosureSlot, FunctionKind, FunctionNameGen,
-    GetAttr, Instr, InstrUnresolved, InstrWithConstantNone, InstrWithYield, Load, Mappable,
-    ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, PreservedSlot,
+    CallableScopeInfo, CellBindingKind, ClosureInit, ClosureSlot, Del, FunctionKind,
+    FunctionNameGen, GetAttr, Instr, InstrUnresolved, InstrWithConstantNone, InstrWithYield, Load,
+    Mappable, ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, PreservedSlot,
     PreservedSlotStorage, ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable,
     TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp, UnaryOpKind,
     UnresolvedName,
@@ -112,6 +112,7 @@ fn runtime_init(name: &str) -> Option<ClosureInit> {
         name if name.starts_with("_dp_try_abrupt_kind_") => {
             Some(ClosureInit::RuntimeAbruptKindFallthrough)
         }
+        "_dp_is_closed" => Some(ClosureInit::RuntimeZero),
         "_dp_yieldfrom" => Some(ClosureInit::RuntimeNone),
         "_dp_throw_context" => Some(ClosureInit::RuntimeNone),
         _ => None,
@@ -120,9 +121,9 @@ fn runtime_init(name: &str) -> Option<ClosureInit> {
 
 fn preserved_slot_storage(init: &ClosureInit) -> PreservedSlotStorage {
     match init {
-        ClosureInit::RuntimePcUnstarted | ClosureInit::RuntimeAbruptKindFallthrough => {
-            PreservedSlotStorage::I64
-        }
+        ClosureInit::RuntimePcUnstarted
+        | ClosureInit::RuntimeAbruptKindFallthrough
+        | ClosureInit::RuntimeZero => PreservedSlotStorage::I64,
         ClosureInit::InheritedCapture
         | ClosureInit::Parameter
         | ClosureInit::EmptyCell
@@ -225,6 +226,13 @@ where
     E: Instr<Name = UnresolvedName> + From<Store<E>>,
 {
     unresolved_store_stmt(unresolved_name(target), value)
+}
+
+fn internal_del_quietly_stmt<E>(target: &str) -> E
+where
+    E: Instr<Name = UnresolvedName> + From<Del<E>>,
+{
+    Del::new(unresolved_name(target), true).into()
 }
 
 fn unresolved_store_stmt<E>(target: UnresolvedName, value: E) -> E
@@ -462,7 +470,12 @@ fn build_generator_storage_layout(
             state_vars.push(logical_name);
         }
     }
-    for runtime_name in ["_dp_pc", "_dp_yieldfrom", "_dp_throw_context"] {
+    for runtime_name in [
+        "_dp_pc",
+        "_dp_is_closed",
+        "_dp_yieldfrom",
+        "_dp_throw_context",
+    ] {
         if !state_vars.iter().any(|existing| existing == runtime_name) {
             state_vars.push(runtime_name.to_string());
         }
@@ -674,12 +687,17 @@ fn completion_raise(
 fn push_completion_raise_block(
     state: &mut ResumeLoweringState,
     label: BlockLabel,
-    body: Vec<LinearCoreStmt>,
+    mut body: Vec<LinearCoreStmt>,
     value: Option<InstrUnresolved>,
     params: Vec<BlockParam>,
     exc_target: Option<BlockLabel>,
 ) {
     let completion_label = state.fresh_label("resume_complete");
+    let value = value.map(|value| {
+        let return_value_name = state.fresh_temp("resume_return");
+        body.push(internal_store_stmt(return_value_name.as_str(), value));
+        core_name(return_value_name.as_str())
+    });
     state.push_block(
         BlockPyBlock {
             label,
@@ -691,17 +709,14 @@ fn push_completion_raise_block(
         },
         exc_target,
     );
-    state.push_block(
-        BlockPyBlock {
-            label: completion_label,
-            body: Vec::new(),
-            term: completion_raise(state.kind, value),
-            params,
-            exc_edge: None,
-            extra: Default::default(),
-        },
-        None,
-    );
+    state.push_terminal_block(BlockPyBlock {
+        label: completion_label,
+        body: state.terminal_cleanup_stmts(),
+        term: completion_raise(state.kind, value),
+        params,
+        exc_edge: None,
+        extra: Default::default(),
+    });
 }
 
 fn explicit_jump_args_for_params(params: &[BlockParam]) -> Vec<BlockArg> {
@@ -832,6 +847,8 @@ struct ResumeLoweringState {
     target_arg_indices: HashMap<BlockLabel, Vec<usize>>,
     resume_targets: Vec<(usize, BlockLabel)>,
     exhausted_label: BlockLabel,
+    terminal_exception_label: BlockLabel,
+    terminal_object_slots: Vec<String>,
 }
 
 impl ResumeLoweringState {
@@ -839,8 +856,10 @@ impl ResumeLoweringState {
         name_gen: FunctionNameGen,
         kind: FunctionKind,
         target_arg_indices: HashMap<BlockLabel, Vec<usize>>,
+        terminal_object_slots: Vec<String>,
     ) -> Self {
         let exhausted_label = name_gen.next_block_name();
+        let terminal_exception_label = name_gen.next_block_name();
         Self {
             kind,
             name_gen,
@@ -850,6 +869,8 @@ impl ResumeLoweringState {
             target_arg_indices,
             resume_targets: Vec::new(),
             exhausted_label,
+            terminal_exception_label,
+            terminal_object_slots,
         }
     }
 
@@ -870,6 +891,21 @@ impl ResumeLoweringState {
         self.name_gen.next_tmp_name(base).to_string()
     }
 
+    fn terminal_cleanup_stmts(&self) -> Vec<LinearCoreStmt> {
+        let mut cleanup = vec![
+            internal_store_stmt("_dp_is_closed", core_literal_int(1)),
+            internal_store_stmt("_dp_pc", core_literal_int(0)),
+            internal_store_stmt("_dp_yieldfrom", core_none()),
+            internal_store_stmt("_dp_throw_context", core_none()),
+        ];
+        cleanup.extend(
+            self.terminal_object_slots
+                .iter()
+                .map(|storage_name| internal_del_quietly_stmt(storage_name)),
+        );
+        cleanup
+    }
+
     fn push_block(&mut self, mut block: LinearCoreBlock, exc_target: Option<BlockLabel>) {
         let active_exception = block
             .params
@@ -881,7 +917,15 @@ impl ResumeLoweringState {
             0,
             internal_store_stmt("_dp_throw_context", active_exception),
         );
-        self.exception_edges.insert(block.label.clone(), exc_target);
+        self.exception_edges.insert(
+            block.label.clone(),
+            Some(exc_target.unwrap_or_else(|| self.terminal_exception_label.clone())),
+        );
+        self.blocks.push(block);
+    }
+
+    fn push_terminal_block(&mut self, block: LinearCoreBlock) {
+        self.exception_edges.insert(block.label.clone(), None);
         self.blocks.push(block);
     }
 
@@ -1453,6 +1497,7 @@ fn emit_yield_from_site(
 fn lower_resume_blocks(
     callable: &BlockPyFunction<CoreModuleShapeWithYield>,
     resume_name_gen: FunctionNameGen,
+    public_storage_layout: &StorageLayout,
 ) -> (
     Vec<LinearCoreBlock>,
     HashMap<BlockLabel, Option<BlockLabel>>,
@@ -1553,10 +1598,23 @@ fn lower_resume_blocks(
         .expect("resume relabel should cover entry block")
         .clone();
 
+    let terminal_object_slots = public_storage_layout
+        .preserved_slots
+        .iter()
+        .filter(|slot| {
+            slot.storage != PreservedSlotStorage::I64
+                && !matches!(
+                    slot.logical_name.as_str(),
+                    "_dp_yieldfrom" | "_dp_throw_context"
+                )
+        })
+        .map(|slot| slot.storage_name.clone())
+        .collect();
     let mut state = ResumeLoweringState::new(
         resume_name_gen,
         callable.kind,
         declared_param_indices_by_label,
+        terminal_object_slots,
     );
     state.resume_targets.push((1, resume_entry_target));
 
@@ -1631,6 +1689,20 @@ fn lower_resume_blocks(
     }];
     blocks.append(&mut dispatch_wrappers);
     blocks.append(&mut state.blocks);
+    let terminal_exception_name = state.fresh_temp("terminal_exc");
+    blocks.push(LinearCoreBlock {
+        label: state.terminal_exception_label.clone(),
+        body: state.terminal_cleanup_stmts(),
+        term: BlockTerm::Raise(TermRaise {
+            exc: Some(core_name(terminal_exception_name.as_str())),
+        }),
+        params: vec![BlockParam {
+            name: terminal_exception_name,
+            role: BlockParamRole::Exception,
+        }],
+        exc_edge: None,
+        extra: Default::default(),
+    });
     blocks.push(LinearCoreBlock {
         label: state.exhausted_label.clone(),
         body: Vec::new(),
@@ -1640,6 +1712,9 @@ fn lower_resume_blocks(
         extra: Default::default(),
     });
     state.exception_edges.insert(dispatch_label.clone(), None);
+    state
+        .exception_edges
+        .insert(state.terminal_exception_label.clone(), None);
     state
         .exception_edges
         .insert(state.exhausted_label.clone(), None);
@@ -1675,7 +1750,7 @@ pub(crate) fn lower_generator_like_function(
     let resume_binding_logical_names =
         ordered_resume_binding_logical_names(&callable, &resume_closure_state_order);
     let (resume_blocks, _resume_exception_edges, _resume_entry_label) =
-        lower_resume_blocks(&callable, callable.name_gen.share());
+        lower_resume_blocks(&callable, callable.name_gen.share(), &storage_layout);
     let closure_bindings = resume_closure_bindings(&callable.scope, &resume_binding_logical_names);
 
     let BlockPyFunction {
