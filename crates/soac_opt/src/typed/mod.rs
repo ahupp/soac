@@ -837,6 +837,7 @@ pub enum TypedInlineUnsupportedReason {
     CrossModuleGlobalName(String),
     UnknownBlockName(String),
     TooManyCallerConstants,
+    PreservedOwnerConflict,
 }
 
 #[derive(Clone)]
@@ -1024,10 +1025,6 @@ fn inline_typed_function_direct_call_stores_impl(
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
 ) -> TypedInlineRewriteStats {
-    if direct_calls_by_instr_id.is_empty() {
-        return TypedInlineRewriteStats::default();
-    }
-
     let mut stats = TypedInlineRewriteStats::default();
     let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
     let mut next_inline_instance = 0;
@@ -1096,6 +1093,7 @@ enum TypedInlineCall {
         call: TypedCall<InstrTyped>,
         receiver: InstrTyped,
     },
+    GeneratorResume(TypedCall<InstrTyped>),
 }
 
 impl TypedInlineCall {
@@ -1107,6 +1105,7 @@ impl TypedInlineCall {
             Self::DirectMethod { call, .. } => call.meta(),
             Self::RuntimeProtocolMethod { call, .. } => call.meta(),
             Self::DirectRuntimeProtocolMethod { call, .. } => call.meta(),
+            Self::GeneratorResume(call) => call.meta(),
         }
     }
 
@@ -1118,6 +1117,7 @@ impl TypedInlineCall {
             Self::DirectMethod { call, .. } => call.try_semantic_instr_id(),
             Self::RuntimeProtocolMethod { call, .. } => call.try_semantic_instr_id(),
             Self::DirectRuntimeProtocolMethod { call, .. } => call.try_semantic_instr_id(),
+            Self::GeneratorResume(call) => call.try_semantic_instr_id(),
         }
     }
 
@@ -1133,6 +1133,7 @@ impl TypedInlineCall {
                     .unwrap_or_default()
                     .to_vec()
             }
+            Self::GeneratorResume(call) => call.args.clone(),
         }
     }
 
@@ -1144,6 +1145,7 @@ impl TypedInlineCall {
             Self::DirectMethod { call, .. } => call.keywords.as_slice(),
             Self::RuntimeProtocolMethod { call, .. } => call.keywords.as_slice(),
             Self::DirectRuntimeProtocolMethod { call, .. } => call.keywords.as_slice(),
+            Self::GeneratorResume(call) => call.keywords.as_slice(),
         }
     }
 }
@@ -1181,7 +1183,9 @@ fn build_typed_direct_call_inline_rewrite(
     };
 
     let receiver_temp = match &candidate.call {
-        TypedInlineCall::DirectCallable(_) | TypedInlineCall::Callable(_) => None,
+        TypedInlineCall::DirectCallable(_)
+        | TypedInlineCall::Callable(_)
+        | TypedInlineCall::GeneratorResume(_) => None,
         TypedInlineCall::Method { .. }
         | TypedInlineCall::DirectMethod { .. }
         | TypedInlineCall::RuntimeProtocolMethod { .. }
@@ -1209,7 +1213,8 @@ fn build_typed_direct_call_inline_rewrite(
         TypedInlineCall::Method { .. }
         | TypedInlineCall::DirectMethod { .. }
         | TypedInlineCall::RuntimeProtocolMethod { .. }
-        | TypedInlineCall::DirectRuntimeProtocolMethod { .. } => None,
+        | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+        | TypedInlineCall::GeneratorResume(_) => None,
     };
     let arg_temps = match (0..positional_arg_exprs.len())
         .map(|_| try_allocate_typed_stack_temp(caller, "typed_inline_arg"))
@@ -1254,6 +1259,7 @@ fn build_typed_direct_call_inline_rewrite(
         TypedInlineCall::DirectCallable(_)
             | TypedInlineCall::DirectMethod { .. }
             | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+            | TypedInlineCall::GeneratorResume(_)
     );
     let generic_label = has_generic_fallback.then(|| caller.name_gen.next_block_name());
     let cleanup_label = caller.name_gen.next_block_name();
@@ -1271,6 +1277,7 @@ fn build_typed_direct_call_inline_rewrite(
         .collect::<Vec<_>>();
     let mut instr_id_mappings = Vec::new();
     let mut local_mappings = Vec::new();
+    let mut extra_cleanup_temps = Vec::new();
     let original_caller_module_constants = caller_module_constants
         .as_deref()
         .map(|constants| constants.to_vec());
@@ -1319,9 +1326,10 @@ fn build_typed_direct_call_inline_rewrite(
             before.push(
                 Store::new(receiver_temp.resolved_name(), receiver.clone())
                     .with_meta(Meta::synthetic())
-                    .into(),
+                .into(),
             );
         }
+        TypedInlineCall::GeneratorResume(_) => {}
     }
     for (arg_temp, arg_expr) in arg_temps.iter().zip(positional_arg_exprs) {
         before.push(
@@ -1336,6 +1344,7 @@ fn build_typed_direct_call_inline_rewrite(
         TypedInlineCall::DirectCallable(_)
             | TypedInlineCall::DirectMethod { .. }
             | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+            | TypedInlineCall::GeneratorResume(_)
     ) {
         debug_assert_eq!(candidate.inline_plans.len(), 1);
         BlockTerm::Jump(BlockEdge::new(hot_labels[0]))
@@ -1406,21 +1415,46 @@ fn build_typed_direct_call_inline_rewrite(
                 .expect("constructor callable inline candidate should allocate callable temp");
             provided_values.insert(0, typed_load_temp(&callable_temp.resolved_name()));
         }
-        let Ok(bindings) = bind_typed_direct_call_inline_values(
-            callee.function,
-            &plan.arg_plan,
-            provided_values.as_slice(),
-        ) else {
-            stats.skipped_candidates += 1;
-            if let (Some(constants), Some(original)) = (
-                caller_module_constants.as_deref_mut(),
-                original_caller_module_constants.as_ref(),
-            ) {
-                *constants = original.clone();
-            }
-            caller.storage_layout = original_storage_layout;
-            return TypedInlineBlockRewrite::Unchanged(original_block);
-        };
+        let (bindings, preassigned_locals, prologue, preserved_owner_temp) =
+            match &candidate.call {
+                TypedInlineCall::GeneratorResume(_) => {
+                    let Ok(bound) = bind_typed_generator_resume_inline_values(
+                        caller,
+                        callee.function,
+                        &plan.arg_plan,
+                        provided_values.as_slice(),
+                    ) else {
+                        stats.skipped_candidates += 1;
+                        if let (Some(constants), Some(original)) = (
+                            caller_module_constants.as_deref_mut(),
+                            original_caller_module_constants.as_ref(),
+                        ) {
+                            *constants = original.clone();
+                        }
+                        caller.storage_layout = original_storage_layout;
+                        return TypedInlineBlockRewrite::Unchanged(original_block);
+                    };
+                    bound
+                }
+                _ => {
+                    let Ok(bindings) = bind_typed_direct_call_inline_values(
+                        callee.function,
+                        &plan.arg_plan,
+                        provided_values.as_slice(),
+                    ) else {
+                        stats.skipped_candidates += 1;
+                        if let (Some(constants), Some(original)) = (
+                            caller_module_constants.as_deref_mut(),
+                            original_caller_module_constants.as_ref(),
+                        ) {
+                            *constants = original.clone();
+                        }
+                        caller.storage_layout = original_storage_layout;
+                        return TypedInlineBlockRewrite::Unchanged(original_block);
+                    };
+                    (bindings, HashMap::new(), Vec::new(), None)
+                }
+            };
         let inline_instance = *next_inline_instance;
         *next_inline_instance = next_inline_instance
             .checked_add(1)
@@ -1438,6 +1472,7 @@ fn build_typed_direct_call_inline_rewrite(
             callee.function,
             cleanup_label,
             &bindings,
+            &preassigned_locals,
             return_target.clone(),
             inline_instance,
             instr_id_allocator,
@@ -1458,6 +1493,12 @@ fn build_typed_direct_call_inline_rewrite(
         }
         if let Some(entry) = fragment.blocks.first_mut() {
             entry.label = hot_label;
+            if !prologue.is_empty() {
+                entry.body.splice(0..0, prologue);
+            }
+        }
+        if let Some(preserved_owner_temp) = preserved_owner_temp {
+            extra_cleanup_temps.push(preserved_owner_temp);
         }
         instr_id_mappings.extend(fragment.instr_id_mappings);
         local_mappings.extend(fragment.local_mappings);
@@ -1493,6 +1534,7 @@ fn build_typed_direct_call_inline_rewrite(
     if let Some(callable_temp) = &callable_temp {
         append_typed_cleanup_del_to_body(&mut cleanup_body, &callable_temp.resolved_name());
     }
+    append_typed_cleanup_dels_to_body(&mut cleanup_body, &extra_cleanup_temps);
     blocks.push(Block::new_with_extra(
         cleanup_label,
         cleanup_body,
@@ -1638,6 +1680,7 @@ fn build_typed_constructor_init_body_inline_rewrite(
         callee.function,
         continuation_label,
         &bindings,
+        &HashMap::new(),
         return_temp.resolved_name(),
         inline_instance,
         instr_id_allocator,
@@ -2935,14 +2978,22 @@ fn typed_inline_candidate_for_expr(
             caller_id,
             direct_calls_by_instr_id,
         ),
-        InstrTyped::CallTyped(call) => typed_inline_candidate_for_direct_method_call(
+        InstrTyped::CallTyped(call) => typed_inline_candidate_for_generator_resume_call(
             instr_index,
             result.clone(),
             call,
             caller_id,
-            direct_calls_by_instr_id,
-            trusted_direct_method_calls,
         )
+        .or_else(|| {
+            typed_inline_candidate_for_direct_method_call(
+                instr_index,
+                result.clone(),
+                call,
+                caller_id,
+                direct_calls_by_instr_id,
+                trusted_direct_method_calls,
+            )
+        })
         .or_else(|| {
             typed_inline_candidate_for_runtime_protocol_call(
                 instr_index,
@@ -3137,6 +3188,35 @@ fn typed_inline_candidate_for_direct_method_call(
         inline_plans: vec![TypedInlineDirectCallPlan {
             target: *target,
             arg_plan: arg_plan.clone(),
+            guard: TypedInlineGuardPlan::Direct,
+        }],
+    })
+}
+
+fn typed_inline_candidate_for_generator_resume_call(
+    instr_index: usize,
+    result: TypedInlineResult,
+    call: &TypedCall<InstrTyped>,
+    caller_id: RuntimeFunctionId,
+) -> Option<TypedInlineStoreCandidate> {
+    let plan = call.extra.generator_resume_plan()?;
+    if plan.function_id == caller_id || call.args.len() != 4 || !call.keywords.is_empty() {
+        return None;
+    }
+    typed_positional_arg_exprs(call.args.clone())?;
+    Some(TypedInlineStoreCandidate {
+        instr_index,
+        result,
+        call: TypedInlineCall::GeneratorResume(call.clone()),
+        inline_plans: vec![TypedInlineDirectCallPlan {
+            target: plan.function_id,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![
+                    TypedDirectCallArgSource::Provided(1),
+                    TypedDirectCallArgSource::Provided(2),
+                    TypedDirectCallArgSource::Provided(3),
+                ],
+            },
             guard: TypedInlineGuardPlan::Direct,
         }],
     })
@@ -3348,7 +3428,8 @@ fn typed_inline_guard_term(
             TypedInlineGuardPlan::Direct,
             TypedInlineCall::DirectCallable(_)
             | TypedInlineCall::DirectMethod { .. }
-            | TypedInlineCall::DirectRuntimeProtocolMethod { .. },
+            | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+            | TypedInlineCall::GeneratorResume(_),
         ) => BlockTerm::Jump(BlockEdge::new(then_label)),
         (TypedInlineGuardPlan::Callable, TypedInlineCall::Callable(_)) => {
             let callable_temp = callable_temp
@@ -3431,6 +3512,9 @@ fn typed_inline_generic_fallback_body(
         }
         TypedInlineCall::DirectRuntimeProtocolMethod { .. } => {
             unreachable!("direct runtime-protocol inlining does not emit a generic fallback")
+        }
+        TypedInlineCall::GeneratorResume(_) => {
+            unreachable!("generator-resume inlining does not emit a generic fallback")
         }
         TypedInlineCall::Callable(_) => {
             let callable_temp = callable_temp
@@ -3647,6 +3731,103 @@ fn bind_typed_direct_call_inline_values(
     Ok(bindings)
 }
 
+fn bind_typed_generator_resume_inline_values(
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    callee: &BlockPyFunction<TypedBlockPyModuleShape>,
+    arg_plan: &TypedDirectCallArgPlan,
+    values: &[InstrTyped],
+) -> Result<
+    (
+        TypedInlineValueBindings,
+        HashMap<LocalLocation, TypedTempLocal>,
+        Vec<InstrTyped>,
+        Option<TypedTempLocal>,
+    ),
+    TypedInlineUnsupportedReason,
+> {
+    if arg_plan.sources.len() != callee.body_params().len() {
+        return Err(TypedInlineUnsupportedReason::ArityMismatch);
+    }
+    let callee_layout = callee
+        .storage_layout
+        .as_ref()
+        .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    let needs_preserved_owner = !callee_layout.preserved_slots.is_empty();
+    let mut preassigned_locals = HashMap::new();
+    let mut prologue = Vec::new();
+    let mut owner_local = None;
+    let mut bindings = TypedInlineValueBindings::new();
+    for (param, source) in callee.body_params().iter().zip(&arg_plan.sources) {
+        let location = typed_parameter_local_location(callee, &param.name)?;
+        if needs_preserved_owner && param.name == "_dp_self" {
+            let owner = allocate_typed_preserved_owner_local(caller)?;
+            let value = typed_inline_value_for_arg_source(param.kind, source, values)?;
+            prologue.push(typed_store_temp(owner.resolved_name(), value));
+            preassigned_locals.insert(location, owner.clone());
+            owner_local = Some(owner);
+            continue;
+        }
+        bindings.insert(
+            location,
+            typed_inline_value_for_arg_source(param.kind, source, values)?,
+        );
+    }
+    Ok((bindings, preassigned_locals, prologue, owner_local))
+}
+
+fn typed_inline_value_for_arg_source(
+    param_kind: ParamKind,
+    source: &TypedDirectCallArgSource,
+    values: &[InstrTyped],
+) -> Result<InstrTyped, TypedInlineUnsupportedReason> {
+    match (param_kind, source) {
+        (ParamKind::PosOnly | ParamKind::Any, TypedDirectCallArgSource::Provided(index)) => values
+            .get(*index)
+            .cloned()
+            .ok_or(TypedInlineUnsupportedReason::ArityMismatch),
+        (ParamKind::VarArg, TypedDirectCallArgSource::PackedRest { start }) => {
+            let rest = values
+                .get(*start..)
+                .ok_or(TypedInlineUnsupportedReason::ArityMismatch)?
+                .to_vec();
+            Ok(InstrTyped::Tuple(Tuple::new(rest)))
+        }
+        (_, TypedDirectCallArgSource::DefaultSentinel) => {
+            Err(TypedInlineUnsupportedReason::DefaultArguments)
+        }
+        (_, _) => Err(TypedInlineUnsupportedReason::UnsupportedParameterKind),
+    }
+}
+
+fn allocate_typed_preserved_owner_local(
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+) -> Result<TypedTempLocal, TypedInlineUnsupportedReason> {
+    let layout = caller
+        .storage_layout
+        .as_mut()
+        .ok_or(TypedInlineUnsupportedReason::MissingCallerStorageLayout)?;
+    if let Some(slot) = layout.stack_slots().iter().position(|name| name == "_dp_self") {
+        if !layout.preserved_slots.is_empty() {
+            return Err(TypedInlineUnsupportedReason::PreservedOwnerConflict);
+        }
+        return Ok(TypedTempLocal {
+            name: "_dp_self".to_string(),
+            location: LocalLocation(
+                u32::try_from(slot).expect("typed inline preserved-owner slot should fit in u32"),
+            ),
+        });
+    }
+    let location = LocalLocation(
+        u32::try_from(layout.stack_slots().len())
+            .expect("typed inline preserved-owner slot should fit in u32"),
+    );
+    layout.ensure_stack_slot("_dp_self");
+    Ok(TypedTempLocal {
+        name: "_dp_self".to_string(),
+        location,
+    })
+}
+
 fn typed_parameter_local_location(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     name: &str,
@@ -3672,6 +3853,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
     callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
+    preassigned_locals: &HashMap<LocalLocation, TypedTempLocal>,
     return_target: ResolvedName,
     inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
@@ -3684,6 +3866,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
             callee,
             continuation,
             value_bindings,
+            preassigned_locals,
             return_target,
             inline_instance,
             instr_id_allocator,
@@ -3696,6 +3879,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
         callee,
         continuation,
         value_bindings,
+        preassigned_locals,
         return_target,
         inline_instance,
         instr_id_allocator,
@@ -3715,6 +3899,7 @@ fn build_single_block_typed_inline_fragment_to_target(
     callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
+    preassigned_locals: &HashMap<LocalLocation, TypedTempLocal>,
     return_target: ResolvedName,
     inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
@@ -3747,7 +3932,8 @@ fn build_single_block_typed_inline_fragment_to_target(
         return Err(TypedInlineUnsupportedReason::NonReturnTerm);
     };
 
-    let locals = allocate_typed_inline_locals(caller, callee_layout, value_bindings)?;
+    let locals =
+        allocate_typed_inline_locals(caller, callee_layout, value_bindings, preassigned_locals)?;
     let local_mappings = typed_inline_local_mappings(
         callee.function_id,
         inline_instance,
@@ -3800,6 +3986,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
     callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
+    preassigned_locals: &HashMap<LocalLocation, TypedTempLocal>,
     return_target: ResolvedName,
     inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
@@ -3818,7 +4005,8 @@ fn build_multi_block_typed_inline_fragment_to_target(
             return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
         }
     }
-    let locals = allocate_typed_inline_locals(caller, callee_layout, value_bindings)?;
+    let locals =
+        allocate_typed_inline_locals(caller, callee_layout, value_bindings, preassigned_locals)?;
     let local_mappings = typed_inline_local_mappings(
         callee.function_id,
         inline_instance,
@@ -3908,12 +4096,13 @@ fn allocate_typed_inline_locals(
     caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     callee_layout: &soac_core::block_py::StorageLayout,
     value_bindings: &TypedInlineValueBindings,
+    preassigned_locals: &HashMap<LocalLocation, TypedTempLocal>,
 ) -> Result<HashMap<LocalLocation, TypedTempLocal>, TypedInlineUnsupportedReason> {
-    let mut locals = HashMap::new();
+    let mut locals = preassigned_locals.clone();
     for (slot, _name) in callee_layout.stack_slots().iter().enumerate() {
         let location =
             LocalLocation(u32::try_from(slot).expect("callee stack slot index should fit in u32"));
-        if value_bindings.contains_key(&location) {
+        if value_bindings.contains_key(&location) || locals.contains_key(&location) {
             continue;
         }
         locals.insert(
@@ -6094,6 +6283,71 @@ mod typed_codegen_tests {
         );
         assert_eq!(stats.rewritten_stores, 1);
         typed
+    }
+
+    #[test]
+    fn inlines_generator_resume_calls_with_preserved_owner_storage() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(limit):\n    yield limit\n\n\
+def helper(fn, owner, value, exc):\n    return value\n\n\
+def caller(fn, owner):\n    return helper(fn, owner, None, None)\n",
+        )
+        .expect("source should lower");
+        let values_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "values");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let call_id = first_typed_call_instr_id(caller);
+        struct Marker {
+            call_id: InstrId,
+            function_id: RuntimeFunctionId,
+        }
+        impl VisitMut<InstrTyped> for Marker {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && call.try_semantic_instr_id() == Some(self.call_id)
+                {
+                    call.extra
+                        .set_generator_resume_plan(soac_ir_typed::TypedGeneratorResumePlan {
+                            function_id: self.function_id,
+                            generator_origin: InstrId::new(99),
+                        });
+                    return;
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+        Marker {
+            call_id,
+            function_id: values_id,
+        }
+        .visit_fn_mut(caller);
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(stats.rewritten_returns, 1);
+        let layout = caller
+            .storage_layout
+            .as_ref()
+            .expect("inlined caller should keep a storage layout");
+        assert!(
+            layout.stack_slots().iter().any(|name| name == "_dp_self"),
+            "resume inlining should preserve owner-backed preserved-slot access"
+        );
+        assert!(
+            caller.blocks.iter().flat_map(|block| block.body.iter()).any(
+                |instr| matches!(
+                    instr,
+                    InstrTyped::Store(store) if store.name.id_str() == "_dp_self"
+                )
+            ),
+            "resume inlining should seed _dp_self before the inlined body"
+        );
     }
 
     #[test]

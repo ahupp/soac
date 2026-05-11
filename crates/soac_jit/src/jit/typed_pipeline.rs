@@ -4470,6 +4470,29 @@ fn trusted_generator_resume_plans_for_function(
     plans
 }
 
+fn generator_resume_inline_targets(
+    plans: &HashMap<InstrId, TypedGeneratorResumePlan>,
+) -> TypedInlineTargets {
+    plans
+        .iter()
+        .map(|(source, plan)| {
+            (
+                *source,
+                vec![(
+                    plan.function_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            soac_ir_typed::TypedDirectCallArgSource::Provided(1),
+                            soac_ir_typed::TypedDirectCallArgSource::Provided(2),
+                            soac_ir_typed::TypedDirectCallArgSource::Provided(3),
+                        ],
+                    },
+                )],
+            )
+        })
+        .collect()
+}
+
 fn trusted_runtime_protocol_calls_from_owner_states(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
@@ -5558,6 +5581,7 @@ fn apply_typed_v3_module_rewrites(
             inline_targets.extend(static_protocol_inline_targets);
             inline_targets.extend(static_method_inline_targets);
             inline_targets.extend(static_field_callable_inline_targets);
+            inline_targets.extend(generator_resume_inline_targets(&generator_resume_plans));
             let inline_targets = staged_inline_targets_for_trusted_runtime_protocols(
                 inline_targets,
                 &runtime_protocol_call_instr_ids,
