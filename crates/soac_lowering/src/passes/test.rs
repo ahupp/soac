@@ -3862,18 +3862,28 @@ def make_counter(delta):
     };
     let closure_generator = runtime_call_by_name(bb_module, return_expr, "ClosureGenerator")
         .expect("expected ClosureGenerator");
-    let resume_expr = closure_generator
+    let resume_handle_expr = closure_generator
         .args
         .first()
         .and_then(|arg| match arg {
             CallArgPositional::Positional(value) => Some(value),
             CallArgPositional::Starred(_) => None,
         })
-        .expect("ClosureGenerator should carry resume as its first positional argument");
-    let captures_expr = match resume_expr {
-        InstrResolved::MakeFunctionWithClosure(make_function) => make_function.captures.as_ref(),
-        other => panic!("resume should use MakeFunctionWithClosure, got {other:?}"),
-    };
+        .expect("ClosureGenerator should carry a resume handle as its first positional argument");
+    let resume_handle = runtime_call_by_name(
+        bb_module,
+        resume_handle_expr,
+        "make_generator_resume_handle",
+    )
+    .expect("visible generator should build a native resume handle");
+    let captures_expr = resume_handle
+        .args
+        .get(1)
+        .and_then(|arg| match arg {
+            CallArgPositional::Positional(value) => Some(value),
+            CallArgPositional::Starred(_) => None,
+        })
+        .expect("resume handle should carry explicit closure captures");
     let InstrResolved::Tuple(captures_tuple) = captures_expr else {
         panic!("captures should be Tuple, got {captures_expr:?}");
     };

@@ -29,7 +29,7 @@ unsafe extern "C" {
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
 }
 
-fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
+pub(crate) fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
     unsafe { !obj.is_null() && ffi::Py_TYPE(obj) == std::ptr::addr_of_mut!(PyCell_Type) }
 }
 
@@ -337,7 +337,7 @@ fn code_freevars_match_names(code: &Bound<'_, PyAny>, expected_names: &[String])
     Ok(true)
 }
 
-fn build_ordered_capture_values<'py>(
+pub(crate) fn build_ordered_capture_values<'py>(
     py: Python<'py>,
     captures: &Bound<'py, PyAny>,
     expected_names: &[String],
@@ -987,7 +987,7 @@ fn mark_coroutine_function(py: Python<'_>, func: &Bound<'_, PyAny>) -> PyResult<
     func.setattr("_is_coroutine", marker)
 }
 
-fn lookup_shared_function_template(
+pub(crate) fn lookup_shared_function_template(
     compile_session: &Arc<CompileSession>,
     function_id: RuntimeFunctionId,
 ) -> PyResult<(Arc<SharedModuleState>, Arc<FunctionInstantiationTemplate>)> {

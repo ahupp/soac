@@ -220,6 +220,9 @@ _current_yieldfrom
 _is_cancelled_error
 _reraise_control_flow
 _mark_closed
+make_generator_resume_handle
+resume_generator
+resume_async_generator
 make_preserved_state
 load_preserved_state
 clear_preserved_state

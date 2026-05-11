@@ -76,8 +76,8 @@ fn build_closure_backed_generator_factory_block(
     is_coroutine: bool,
     is_async_generator: bool,
 ) -> Block<InstrRuff> {
-    let resume_entry = py_expr!(
-        "__dp_make_function({function_id:literal}, \"function\", __dp_tuple(), __dp_tuple(), None)",
+    let resume_handle = py_expr!(
+        "runtime.make_generator_resume_handle({function_id:literal}, (), globals())",
         function_id = resume_function_id.to_packed_runtime_u64(),
     );
     let preserved_values = layout
@@ -95,7 +95,7 @@ fn build_closure_backed_generator_factory_block(
     let generator_expr = if is_async_generator {
         py_expr!(
             "runtime.ClosureAsyncGenerator({resume:expr}, {name:literal}, {qualname:literal}, runtime.code_template_async_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), {preserved_values:expr}, 1, 2)",
-            resume = resume_entry,
+            resume = resume_handle,
             name = visible_names.display_name.as_str(),
             qualname = visible_names.qualname.as_str(),
             preserved_values = preserved_values.clone(),
@@ -103,7 +103,7 @@ fn build_closure_backed_generator_factory_block(
     } else {
         py_expr!(
             "runtime.ClosureGenerator({resume:expr}, {name:literal}, {qualname:literal}, runtime.code_template_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), {preserved_values:expr}, 1, 2)",
-            resume = resume_entry,
+            resume = resume_handle,
             name = visible_names.display_name.as_str(),
             qualname = visible_names.qualname.as_str(),
             preserved_values = preserved_values,

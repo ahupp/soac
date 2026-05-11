@@ -29,6 +29,7 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use soac_core::block_py::{
@@ -316,6 +317,19 @@ struct PyFunctionJitExtra {
     module_state: Arc<module_type::SharedModuleState>,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
     previous_vectorcall: Option<ffi::vectorcallfunc>,
+}
+
+struct GeneratorResumeHandle {
+    function_env: Box<FunctionEnv>,
+    function_template: Arc<FunctionInstantiationTemplate>,
+    compile_session: Arc<CompileSession>,
+    module_state: Arc<module_type::SharedModuleState>,
+}
+
+const GENERATOR_RESUME_HANDLE_CAPSULE_NAME: &std::ffi::CStr = c"soac.GeneratorResumeHandle";
+
+unsafe extern "C" {
+    fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
 }
 
 static FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS: AtomicBool = AtomicBool::new(false);
@@ -613,6 +627,106 @@ impl Drop for FunctionEnv {
         let layout = Self::allocation_layout(self.runtime_object_len);
         unsafe { dealloc(self.abi.as_ptr() as *mut u8, layout) };
     }
+}
+
+unsafe extern "C" fn generator_resume_handle_capsule_destructor(capsule: *mut ffi::PyObject) {
+    let handle_ptr = unsafe {
+        ffi::PyCapsule_GetPointer(capsule, GENERATOR_RESUME_HANDLE_CAPSULE_NAME.as_ptr())
+            as *mut GeneratorResumeHandle
+    };
+    if handle_ptr.is_null() {
+        unsafe {
+            ffi::PyErr_Clear();
+        }
+        return;
+    }
+    drop(unsafe { Box::from_raw(handle_ptr) });
+}
+
+unsafe fn generator_resume_handle_from_capsule(
+    capsule: *mut ffi::PyObject,
+) -> Result<&'static mut GeneratorResumeHandle, ()> {
+    let handle_ptr = unsafe {
+        ffi::PyCapsule_GetPointer(capsule, GENERATOR_RESUME_HANDLE_CAPSULE_NAME.as_ptr())
+            as *mut GeneratorResumeHandle
+    };
+    if handle_ptr.is_null() {
+        return Err(());
+    }
+    Ok(unsafe { &mut *handle_ptr })
+}
+
+fn collect_generator_resume_runtime_objects(
+    py: Python<'_>,
+    function_template: &FunctionInstantiationTemplate,
+    captures: &Bound<'_, PyAny>,
+) -> PyResult<Box<[*mut ffi::PyObject]>> {
+    let runtime_layout = function_template.runtime_data_layout();
+    let Some(captured_values) = function_instantiation::build_ordered_capture_values(
+        py,
+        captures,
+        function_template.capture_names(),
+    )?
+    else {
+        return Err(PyRuntimeError::new_err(format!(
+            "generator resume handle captures did not match fn#{}",
+            function_template.function().function_id
+        )));
+    };
+    let mut runtime_objects = vec![ptr::null_mut(); runtime_layout.total_len()].into_boxed_slice();
+    for (slot, value) in captured_values.iter().enumerate() {
+        let cell = if function_instantiation::is_cell_object(value.as_ptr()) {
+            unsafe {
+                ffi::Py_INCREF(value.as_ptr());
+            }
+            value.as_ptr()
+        } else {
+            let cell = unsafe { PyCell_New(value.as_ptr()) };
+            if cell.is_null() {
+                unsafe {
+                    cleanup_state_values(&mut runtime_objects);
+                }
+                return Err(PyErr::fetch(py));
+            }
+            cell
+        };
+        runtime_objects[runtime_layout.closure_cell_slot(slot)] = cell;
+    }
+    Ok(runtime_objects)
+}
+
+pub fn make_generator_resume_handle(
+    py: Python<'_>,
+    function_id: RuntimeFunctionId,
+    captures: &Bound<'_, PyAny>,
+    module_globals: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let compile_session = CompileSession::process();
+    let (module_state, function_template) =
+        function_instantiation::lookup_shared_function_template(&compile_session, function_id)?;
+    let runtime_objects =
+        collect_generator_resume_runtime_objects(py, function_template.as_ref(), captures)?;
+    let function_env = unsafe { FunctionEnv::new(module_globals.as_ptr(), runtime_objects) }
+        .map_err(|()| PyErr::fetch(py))?;
+    let handle = Box::new(GeneratorResumeHandle {
+        function_env: Box::new(function_env),
+        function_template,
+        compile_session,
+        module_state,
+    });
+    let handle_ptr = Box::into_raw(handle);
+    let capsule = unsafe {
+        ffi::PyCapsule_New(
+            handle_ptr.cast::<c_void>(),
+            GENERATOR_RESUME_HANDLE_CAPSULE_NAME.as_ptr(),
+            Some(generator_resume_handle_capsule_destructor),
+        )
+    };
+    if capsule.is_null() {
+        drop(unsafe { Box::from_raw(handle_ptr) });
+        return Err(PyErr::fetch(py));
+    }
+    Ok(unsafe { Bound::from_owned_ptr(py, capsule) }.unbind())
 }
 
 impl PyFunctionJitExtra {
@@ -1515,55 +1629,12 @@ unsafe fn ensure_clif_direct_entries_compiled(
             let function = data.function()?;
             let function_block_count = function.blocks.len();
             let function_qualname = function.names.qualname.clone();
-            let module_state = Arc::clone(&data.module_state);
-            let compile_session = Arc::clone(&data.compile_session);
-            let compile_start = Instant::now();
-            let compiled_function_result = match module_state
-                .lookup_or_compile_direct_function_handle(&compile_session, function.function_id)
-            {
-                Ok(Some((handle, _compiled))) => Ok(handle),
-                Ok(None) => {
-                    let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
-                    let module_constant_ptrs = module_state.module_constant_ptrs();
-                    let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
-                        &compile_session,
-                        block_ptrs.as_slice(),
-                        &module_state.lowered_module,
-                        function,
-                        &module_state.codegen_constants,
-                        &module_state.lowered_module.counter_defs,
-                        &module_constant_ptrs,
-                        Some(module_state.as_ref()),
-                    );
-                    match compile_result {
-                        Ok(result) => {
-                            if result.compiled {
-                                module_state.append_jit_codegen_log(
-                                    function,
-                                    "vectorcall_function_body",
-                                    compile_start.elapsed(),
-                                    "ok",
-                                    None,
-                                    result.stats.as_ref(),
-                                );
-                            }
-                            Ok(result.handle)
-                        }
-                        Err(err) => {
-                            module_state.append_jit_codegen_log(
-                                function,
-                                "vectorcall_function_body",
-                                compile_start.elapsed(),
-                                "error",
-                                Some(&err),
-                                None,
-                            );
-                            Err(err)
-                        }
-                    }
-                }
-                Err(err) => Err(err),
-            };
+            let compiled_function_result = lookup_or_compile_direct_function_handle(
+                &data.compile_session,
+                &data.module_state,
+                function,
+                "vectorcall_function_body",
+            );
             let compiled_function = match compiled_function_result {
                 Ok(handle) => handle,
                 Err(err) => {
@@ -1610,6 +1681,168 @@ unsafe fn ensure_clif_direct_entries_compiled(
         return Err(());
     }
     Ok(())
+}
+
+fn lookup_or_compile_direct_function_handle(
+    compile_session: &Arc<CompileSession>,
+    module_state: &Arc<module_type::SharedModuleState>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    log_event: &str,
+) -> Result<Arc<jit::CompiledFunctionHandle>, String> {
+    let compile_start = Instant::now();
+    match module_state
+        .lookup_or_compile_direct_function_handle(compile_session, function.function_id)
+    {
+        Ok(Some((handle, _compiled))) => Ok(handle),
+        Ok(None) => {
+            let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
+            let module_constant_ptrs = module_state.module_constant_ptrs();
+            let compile_result = unsafe {
+                jit::compile_cranelift_run_bb_specialized_cached(
+                    compile_session,
+                    block_ptrs.as_slice(),
+                    &module_state.lowered_module,
+                    function,
+                    &module_state.codegen_constants,
+                    &module_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    Some(module_state.as_ref()),
+                )
+            };
+            match compile_result {
+                Ok(result) => {
+                    if result.compiled {
+                        module_state.append_jit_codegen_log(
+                            function,
+                            log_event,
+                            compile_start.elapsed(),
+                            "ok",
+                            None,
+                            result.stats.as_ref(),
+                        );
+                    }
+                    Ok(result.handle)
+                }
+                Err(err) => {
+                    module_state.append_jit_codegen_log(
+                        function,
+                        log_event,
+                        compile_start.elapsed(),
+                        "error",
+                        Some(&err),
+                        None,
+                    );
+                    Err(err)
+                }
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+unsafe fn ensure_generator_resume_direct_entry(
+    handle: &mut GeneratorResumeHandle,
+) -> Result<(), ()> {
+    if handle.function_env.compiled_function.is_none() {
+        let function = handle.function_template.function();
+        let compiled_function = lookup_or_compile_direct_function_handle(
+            &handle.compile_session,
+            &handle.module_state,
+            function,
+            "generator_resume_function_body",
+        )
+        .map_err(|err| set_runtime_error_message(&err))?;
+        attach_compiled_function_to_env(&mut handle.function_env, compiled_function)?;
+    }
+    if handle.function_env.direct_code_ptr().is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"compiled generator resume function is missing a direct entry pointer".as_ptr(),
+        );
+        return Err(());
+    }
+    Ok(())
+}
+
+pub unsafe fn resume_generator(
+    handle_capsule: *mut ffi::PyObject,
+    owner: *mut ffi::PyObject,
+    send_value: *mut ffi::PyObject,
+    resume_exc: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let Ok(handle) = (unsafe { generator_resume_handle_from_capsule(handle_capsule) }) else {
+        return ptr::null_mut();
+    };
+    if handle.function_template.function().params.len() != 3 {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"generator resume handle expected a 3-argument resume body".as_ptr(),
+            );
+        }
+        return ptr::null_mut();
+    }
+    if unsafe { ensure_generator_resume_direct_entry(handle) }.is_err() {
+        return ptr::null_mut();
+    }
+    let entry: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut ffi::PyObject,
+        *mut ffi::PyObject,
+        *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject = unsafe { mem::transmute(handle.function_env.direct_code_ptr()) };
+    unsafe {
+        entry(
+            handle.function_env.as_mut_ptr(),
+            ffi::PyThreadState_Get().cast(),
+            owner,
+            send_value,
+            resume_exc,
+        )
+    }
+}
+
+pub unsafe fn resume_async_generator(
+    handle_capsule: *mut ffi::PyObject,
+    owner: *mut ffi::PyObject,
+    send_value: *mut ffi::PyObject,
+    resume_exc: *mut ffi::PyObject,
+    transport_sent: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let Ok(handle) = (unsafe { generator_resume_handle_from_capsule(handle_capsule) }) else {
+        return ptr::null_mut();
+    };
+    if handle.function_template.function().params.len() != 4 {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"async-generator resume handle expected a 4-argument resume body".as_ptr(),
+            );
+        }
+        return ptr::null_mut();
+    }
+    if unsafe { ensure_generator_resume_direct_entry(handle) }.is_err() {
+        return ptr::null_mut();
+    }
+    let entry: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut ffi::PyObject,
+        *mut ffi::PyObject,
+        *mut ffi::PyObject,
+        *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject = unsafe { mem::transmute(handle.function_env.direct_code_ptr()) };
+    unsafe {
+        entry(
+            handle.function_env.as_mut_ptr(),
+            ffi::PyThreadState_Get().cast(),
+            owner,
+            send_value,
+            resume_exc,
+            transport_sent,
+        )
+    }
 }
 
 fn attach_compiled_function_to_env(

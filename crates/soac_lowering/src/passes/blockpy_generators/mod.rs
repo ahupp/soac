@@ -9,10 +9,10 @@ use crate::block_py::{
     BlockParam, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     CallArgPositional, CallableScopeInfo, CellBindingKind, ClosureInit, ClosureSlot, FunctionKind,
     FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved, InstrWithConstantNone,
-    InstrWithYield, Load, MakeFunction, Mappable, ModuleNameGen, NameLike, NumberLiteral,
-    NumberLiteralValue, PreservedSlot, PreservedSlotStorage, RuntimeFunctionId, ScopeExprNode,
-    StorageLayout, Store, StringLiteral, TermBranchTable, TermIf, TermRaise, TryMapFunction,
-    TryMapInstr, TryMapTerm, Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
+    InstrWithYield, Load, MakeGeneratorResumeHandle, Mappable, ModuleNameGen, NameLike,
+    NumberLiteral, NumberLiteralValue, PreservedSlot, PreservedSlotStorage, RuntimeFunctionId,
+    ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable, TermIf, TermRaise,
+    TryMapFunction, TryMapInstr, TryMapTerm, Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
 };
 use crate::block_py::{Param, ParamKind, ParamSpec};
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
@@ -466,21 +466,6 @@ fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> InstrUnre
     )
 }
 
-fn core_make_function(
-    function_id: RuntimeFunctionId,
-    kind: FunctionKind,
-    param_defaults: InstrUnresolved,
-    annotate_fn: InstrUnresolved,
-) -> InstrUnresolved {
-    MakeFunction::new(
-        function_id,
-        kind,
-        Box::new(param_defaults),
-        Box::new(annotate_fn),
-    )
-    .into()
-}
-
 fn is_generator_like(kind: FunctionKind) -> bool {
     matches!(
         kind,
@@ -690,12 +675,7 @@ fn build_factory_block(
     kind: FunctionKind,
     storage_layout: &StorageLayout,
 ) -> LinearCoreBlock {
-    let resume_entry = core_make_function(
-        resume_function_id,
-        FunctionKind::Function,
-        core_tuple(Vec::new()),
-        core_none(),
-    );
+    let resume_handle: InstrUnresolved = MakeGeneratorResumeHandle::new(resume_function_id).into();
     let preserved_values = core_call_expr(
         core_runtime_attr("make_preserved_state"),
         vec![
@@ -723,7 +703,7 @@ fn build_factory_block(
         FunctionKind::Generator | FunctionKind::Coroutine => core_call_expr(
             core_runtime_attr("ClosureGenerator"),
             vec![
-                resume_entry,
+                resume_handle,
                 core_string_literal(visible_names.display_name.as_str()),
                 core_string_literal(visible_names.qualname.as_str()),
                 core_generator_code(
@@ -740,7 +720,7 @@ fn build_factory_block(
         FunctionKind::AsyncGenerator => core_call_expr(
             core_runtime_attr("ClosureAsyncGenerator"),
             vec![
-                resume_entry,
+                resume_handle,
                 core_string_literal(visible_names.display_name.as_str()),
                 core_string_literal(visible_names.qualname.as_str()),
                 core_generator_code(
@@ -1906,8 +1886,6 @@ pub(crate) fn lower_generator_like_function(
         ..
     } = callable;
 
-    let factory_block = build_factory_block(&names, resume_function_id, kind, &storage_layout);
-
     let mut resume_semantic = scope.clone();
     augment_resume_semantic_for_standard_name_binding(&mut resume_semantic, &closure_bindings);
 
@@ -1937,6 +1915,8 @@ pub(crate) fn lower_generator_like_function(
         storage_layout: Some(resume_storage_layout),
         ..resume_function
     };
+
+    let factory_block = build_factory_block(&names, resume_function_id, kind, &storage_layout);
 
     let visible_function = BlockPyFunction {
         function_id,

@@ -6,10 +6,10 @@ use crate::block_py::{
     CallableScopeInfo, CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation,
     CellRef, CellRefForName, ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del,
     DelItem, EffectiveBinding, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved,
-    IntLiteral, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
-    MapTerm, Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName,
-    RuntimeFunctionId, RuntimeName, SetItem, StorageLayout, Store, StringLiteral, Tuple,
-    UnresolvedName, Visit, VisitMut, WithMeta,
+    IntLiteral, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MakeGeneratorResumeHandle,
+    MapFunction, MapInstr, MapTerm, Mappable, NameLike, NameLocation, NumberLiteral,
+    NumberLiteralValue, ResolvedName, RuntimeFunctionId, RuntimeName, SetItem, StorageLayout,
+    Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -679,14 +679,14 @@ struct NameBindingMapper<'a> {
 }
 
 impl NameBindingMapper<'_> {
-    fn materialize_make_function_expr(
+    fn materialize_capture_tuple(
         &mut self,
+        function_id: RuntimeFunctionId,
         meta: crate::block_py::Meta,
-        op: MakeFunction<InstrUnresolved>,
     ) -> InstrUnresolved {
         let captures: Vec<InstrUnresolved> = self
             .callee_make_function_captures
-            .get(&op.function_id)
+            .get(&function_id)
             .into_iter()
             .flat_map(|captures| captures.iter())
             .map(|capture| {
@@ -707,7 +707,15 @@ impl NameBindingMapper<'_> {
                 .into()
             })
             .collect::<Vec<_>>();
-        let captures_expr: InstrUnresolved = Tuple::new(captures).with_meta(meta.clone()).into();
+        Tuple::new(captures).with_meta(meta).into()
+    }
+
+    fn materialize_make_function_expr(
+        &mut self,
+        meta: crate::block_py::Meta,
+        op: MakeFunction<InstrUnresolved>,
+    ) -> InstrUnresolved {
+        let captures_expr = self.materialize_capture_tuple(op.function_id, meta.clone());
         MakeFunctionWithClosure::new(
             op.function_id,
             op.kind,
@@ -717,6 +725,32 @@ impl NameBindingMapper<'_> {
         )
         .with_meta(meta)
         .into()
+    }
+
+    fn materialize_generator_resume_handle_expr(
+        &mut self,
+        meta: crate::block_py::Meta,
+        op: MakeGeneratorResumeHandle,
+    ) -> InstrUnresolved {
+        let function_id_expr = literal_expr(
+            NumberLiteral {
+                value: NumberLiteralValue::Int(IntLiteral::from_i64(
+                    op.function_id().to_packed_runtime_u64() as i64,
+                )),
+            },
+            meta.clone(),
+        );
+        let captures_expr = self.materialize_capture_tuple(op.function_id(), meta.clone());
+        core_runtime_positional_call_expr_with_meta(
+            "make_generator_resume_handle",
+            meta.node_index.clone(),
+            meta.range,
+            vec![
+                function_id_expr,
+                captures_expr,
+                globals_expr(meta.node_index, meta.range),
+            ],
+        )
     }
 }
 
@@ -794,6 +828,9 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
             },
             InstrUnresolved::Literal(literal) => InstrUnresolved::Literal(literal),
             InstrUnresolved::MakeFunction(op) => self.materialize_make_function_expr(op.meta(), op),
+            InstrUnresolved::MakeGeneratorResumeHandle(op) => {
+                self.materialize_generator_resume_handle_expr(op.meta(), op)
+            },
             InstrUnresolved::Call(call)
                 if call.args.is_empty()
                     && call.keywords.is_empty()
@@ -927,6 +964,7 @@ fn rewrite_raw_cell_loads_in_expr(
         | InstrUnresolved::CellRefForName(_)
         | InstrUnresolved::CellRef(_)
         | InstrUnresolved::MakeFunction(_)
+        | InstrUnresolved::MakeGeneratorResumeHandle(_)
         | InstrUnresolved::MakeFunctionWithClosure(_) => {
             if let InstrUnresolved::Load(op) = expr {
                 if let UnresolvedName::SourceName(name) = &op.name {
@@ -1158,6 +1196,7 @@ fn collect_remaining_names_in_expr(expr: &InstrUnresolved, names: &mut HashSet<S
         | InstrUnresolved::CellRefForName(_)
         | InstrUnresolved::CellRef(_)
         | InstrUnresolved::MakeFunction(_)
+        | InstrUnresolved::MakeGeneratorResumeHandle(_)
         | InstrUnresolved::MakeFunctionWithClosure(_) => {}
     }
 
@@ -1886,6 +1925,9 @@ impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
             InstrLow::MakeFunction(_) => {
                 panic!("MakeFunction should lower to MakeFunctionWithClosure before name location")
             },
+            InstrLow::MakeGeneratorResumeHandle(_) => {
+                panic!("MakeGeneratorResumeHandle should lower before name location")
+            },
             rest => rest.map_children(self).into(),
         })
     }
@@ -1922,9 +1964,8 @@ fn collect_make_function_callee_ids_in_expr(
 ) {
     match expr {
         InstrUnresolved::Literal(_) => {}
-        InstrUnresolved::MakeFunction(op) => {
-            out.push(op.function_id);
-        }
+        InstrUnresolved::MakeFunction(op) => out.push(op.function_id),
+        InstrUnresolved::MakeGeneratorResumeHandle(op) => out.push(op.function_id()),
         _ => {
             struct CalleeVisitor<'a> {
                 out: &'a mut Vec<RuntimeFunctionId>,
