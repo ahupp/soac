@@ -235,6 +235,22 @@ pub(super) fn plan_direct_call_args_for_target<P: ModuleShape>(
     if *target_function.lowered_kind() != soac_core::block_py::FunctionKind::Function {
         return Err(DirectCallIncompatibility::NonFunctionTarget);
     }
+    plan_public_call_args_for_target(
+        target_function,
+        explicit_positional_arg_count,
+        implicit_positional_arg_count,
+        has_starred_arguments,
+        has_keywords,
+    )
+}
+
+pub(super) fn plan_public_call_args_for_target<P: ModuleShape>(
+    target_function: &BlockPyFunction<P>,
+    explicit_positional_arg_count: usize,
+    implicit_positional_arg_count: usize,
+    has_starred_arguments: bool,
+    has_keywords: bool,
+) -> Result<DirectCallArgPlan, DirectCallIncompatibility> {
     if has_starred_arguments {
         return Err(DirectCallIncompatibility::StarredArguments);
     }

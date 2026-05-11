@@ -31,9 +31,9 @@ use soac_ir_typed::{
     TypedConstructorInitPlan, TypedConstructorInitPlanSource, TypedDirectCallArgPlan,
     TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
     TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactListItemAccessPlan,
-    TypedExactListItemCounterSource, TypedExactListItemPlanSource, TypedIndexedFieldCounterSource,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
-    assign_missing_typed_function_instr_ids,
+    TypedExactListItemCounterSource, TypedExactListItemPlanSource, TypedGeneratorInstancePlan,
+    TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
+    TypedIndexedGlobalPlanSource, assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -90,6 +90,8 @@ struct StaticDirectCallTarget {
 
 type StaticRuntimeDirectCallTargets = HashMap<RuntimeName, StaticDirectCallTarget>;
 type StaticModuleGlobalDirectCallTargets = HashMap<u32, HashMap<String, StaticDirectCallTarget>>;
+type StaticModuleGlobalGeneratorTargets =
+    HashMap<u32, HashMap<String, BlockPyFunction<BlockPyModuleShape>>>;
 type StaticStrictMethodTargets =
     HashMap<(String, String, String), BlockPyFunction<BlockPyModuleShape>>;
 
@@ -97,6 +99,7 @@ type StaticStrictMethodTargets =
 struct StaticDirectCallTargets {
     runtime_names: StaticRuntimeDirectCallTargets,
     module_globals: StaticModuleGlobalDirectCallTargets,
+    module_global_generators: StaticModuleGlobalGeneratorTargets,
     strict_methods: StaticStrictMethodTargets,
 }
 
@@ -367,6 +370,28 @@ fn strict_module_global_direct_call_targets_for_module(
     targets
 }
 
+fn strict_module_global_generator_targets_for_module(
+    module: &BlockPyModule<BlockPyModuleShape>,
+) -> HashMap<String, BlockPyFunction<BlockPyModuleShape>> {
+    let writes = summarize_strict_module_global_writes(module);
+    module
+        .callable_defs
+        .iter()
+        .filter(|function| {
+            function.names.qualname == function.names.bind_name
+                && !function.names.bind_name.starts_with("_dp_")
+                && matches!(
+                    function.lowered_kind(),
+                    FunctionKind::Generator
+                        | FunctionKind::Coroutine
+                        | FunctionKind::AsyncGenerator
+                )
+                && is_strict_module_final_global(&writes, function.names.bind_name.as_str())
+        })
+        .map(|function| (function.names.bind_name.clone(), function.clone()))
+        .collect()
+}
+
 fn strict_module_method_targets_for_module(
     module: &BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
@@ -434,17 +459,23 @@ fn static_direct_call_targets(
     compile_session: Option<&crate::session::CompileSession>,
 ) -> Result<StaticDirectCallTargets, String> {
     let mut module_globals = HashMap::new();
+    let mut module_global_generators = HashMap::new();
     let mut strict_methods = HashMap::new();
+    let current_module_id = shared_state
+        .lowered_module
+        .module_name_gen
+        .runtime_module_id()
+        .as_u32();
     module_globals.insert(
-        shared_state
-            .lowered_module
-            .module_name_gen
-            .runtime_module_id()
-            .as_u32(),
+        current_module_id,
         strict_module_global_direct_call_targets_for_module(
             &shared_state.lowered_module,
             shared_state.module_name.as_str(),
         ),
+    );
+    module_global_generators.insert(
+        current_module_id,
+        strict_module_global_generator_targets_for_module(&shared_state.lowered_module),
     );
     strict_methods.extend(strict_module_method_targets_for_module(
         &shared_state.lowered_module,
@@ -469,6 +500,17 @@ fn static_direct_call_targets(
                     &state.lowered_module,
                     state.module_name.as_str(),
                 )
+            });
+        module_global_generators
+            .entry(
+                state
+                    .lowered_module
+                    .module_name_gen
+                    .runtime_module_id()
+                    .as_u32(),
+            )
+            .or_insert_with(|| {
+                strict_module_global_generator_targets_for_module(&state.lowered_module)
             });
         strict_methods.extend(strict_module_method_targets_for_module(
             &state.lowered_module,
@@ -510,6 +552,7 @@ fn static_direct_call_targets(
     Ok(StaticDirectCallTargets {
         runtime_names,
         module_globals,
+        module_global_generators,
         strict_methods,
     })
 }
@@ -700,6 +743,161 @@ fn static_direct_calls_for_external_callees(
             (!direct_calls.is_empty()).then_some((callee.function.function_id, direct_calls))
         })
         .collect()
+}
+
+fn static_generator_instance_plan_for_expr(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    expr: &InstrTyped,
+    targets: &StaticDirectCallTargets,
+    explicit_positional_arg_count: usize,
+    has_starred_arguments: bool,
+    has_keywords: bool,
+) -> Option<TypedGeneratorInstancePlan> {
+    let InstrTyped::Load(load) = expr else {
+        return None;
+    };
+    if function.scope.scope_kind == CallableScopeKind::Module || !load.name.location.is_global() {
+        return None;
+    }
+    let module_id = function.function_id.runtime_module_id().as_u32();
+    let target = targets
+        .module_global_generators
+        .get(&module_id)?
+        .get(load.name.id_str())?;
+    let arg_plan = super::direct_function::plan_public_call_args_for_target(
+        target,
+        explicit_positional_arg_count,
+        0,
+        has_starred_arguments,
+        has_keywords,
+    )
+    .ok()?;
+    Some(TypedGeneratorInstancePlan {
+        function_id: target.function_id,
+        kind: *target.lowered_kind(),
+        arg_plan: typed_direct_call_arg_plan_from_direct_plan(arg_plan),
+    })
+}
+
+fn static_generator_instance_plans_for_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    targets: &StaticDirectCallTargets,
+) -> HashMap<InstrId, TypedGeneratorInstancePlan> {
+    struct Collector<'a> {
+        function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
+        targets: &'a StaticDirectCallTargets,
+        plans: HashMap<InstrId, TypedGeneratorInstancePlan>,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && let Some(instr_id) = call.try_semantic_instr_id()
+            {
+                let has_starred_arguments = call
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg, soac_core::block_py::CallArgPositional::Starred(_)));
+                let explicit_positional_arg_count = call
+                    .args
+                    .iter()
+                    .filter(|arg| {
+                        matches!(arg, soac_core::block_py::CallArgPositional::Positional(_))
+                    })
+                    .count();
+                if let Some(plan) = static_generator_instance_plan_for_expr(
+                    self.function,
+                    call.func.as_ref(),
+                    self.targets,
+                    explicit_positional_arg_count,
+                    has_starred_arguments,
+                    !call.keywords.is_empty(),
+                ) {
+                    self.plans.insert(instr_id, plan);
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        function,
+        targets,
+        plans: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.plans
+}
+
+fn static_generator_instance_plans_for_module(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    targets: &StaticDirectCallTargets,
+) -> HashMap<RuntimeFunctionId, HashMap<InstrId, TypedGeneratorInstancePlan>> {
+    module
+        .callable_defs
+        .iter()
+        .filter_map(|function| {
+            let plans = static_generator_instance_plans_for_function(function, targets);
+            (!plans.is_empty()).then_some((function.function_id, plans))
+        })
+        .collect()
+}
+
+fn annotate_typed_generator_instance_plans(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    plans: Option<&HashMap<InstrId, TypedGeneratorInstancePlan>>,
+) -> Result<usize, String> {
+    let Some(plans) = plans else {
+        return Ok(0);
+    };
+    if plans.is_empty() {
+        return Ok(0);
+    }
+    let live_instr_ids = collect_typed_semantic_instr_ids(function);
+    let expected = plans
+        .keys()
+        .filter(|instr_id| live_instr_ids.contains(instr_id))
+        .count();
+
+    struct Annotator<'a> {
+        plans: &'a HashMap<InstrId, TypedGeneratorInstancePlan>,
+        used: HashSet<InstrId>,
+        count: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && let Some(instr_id) = call.try_semantic_instr_id()
+                && let Some(plan) = self.plans.get(&instr_id)
+            {
+                call.extra.set_generator_instance_plan(plan.clone());
+                self.used.insert(instr_id);
+                self.count += 1;
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        plans,
+        used: HashSet::new(),
+        count: 0,
+    };
+    annotator.visit_fn_mut(function);
+    if annotator.used.len() != expected {
+        let missing = plans
+            .keys()
+            .filter(|instr_id| live_instr_ids.contains(instr_id))
+            .filter(|instr_id| !annotator.used.contains(instr_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "typed generator-instance plans were not attached to call nodes: {missing}"
+        ));
+    }
+    Ok(annotator.count)
 }
 
 type StaticConstructorCalls = HashMap<RuntimeFunctionId, HashMap<InstrId, TypedAttrOwnerRef>>;
@@ -3534,6 +3732,11 @@ fn trusted_owner_state_for_store_value(
     trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
     trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
 ) -> Option<TypedAttrOwnerRef> {
+    if let Some(plan) = value.generator_instance_plan()
+        && let Some(owner_type_ref) = trusted_generator_instance_owner(plan)
+    {
+        return Some(owner_type_ref);
+    }
     if let Some(instr_id) = value.try_semantic_instr_id()
         && let Some(owner_type_ref) = trusted_constructor_calls.get(&instr_id)
     {
@@ -3558,6 +3761,9 @@ fn trusted_object_origin_for_store_value(
     state: &TrustedOwnerState,
     trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
 ) -> Option<InstrId> {
+    if value.generator_instance_plan().is_some() {
+        return value.try_semantic_instr_id();
+    }
     if let Some(instr_id) = value.try_semantic_instr_id()
         && trusted_constructor_calls.contains_key(&instr_id)
     {
@@ -3584,6 +3790,21 @@ fn trusted_function_id_for_expr(
             .copied(),
         _ => None,
     }
+}
+
+fn trusted_generator_instance_owner(
+    plan: &TypedGeneratorInstancePlan,
+) -> Option<TypedAttrOwnerRef> {
+    let qualname = match plan.kind {
+        FunctionKind::Generator => "ClosureGenerator",
+        FunctionKind::Coroutine => "Coroutine",
+        FunctionKind::AsyncGenerator => "ClosureAsyncGenerator",
+        FunctionKind::Function => return None,
+    };
+    Some(TypedAttrOwnerRef::TypeKey {
+        module_name: "soac.runtime".to_string(),
+        qualname: qualname.to_string(),
+    })
 }
 
 fn trusted_object_origins_in_expr(
@@ -3752,6 +3973,13 @@ fn transfer_trusted_owner_instr(
                 state.local_functions.insert(location, function_id);
             } else {
                 state.local_functions.remove(&location);
+            }
+            if let Some(origin) = store.value.try_semantic_instr_id()
+                && let Some(plan) = store.value.generator_instance_plan()
+            {
+                state
+                    .function_fields
+                    .insert((origin, "_resume_function".to_string()), plan.function_id);
             }
         }
         InstrTyped::Del(del) => {
@@ -4913,6 +5141,14 @@ fn optimize_blockpy_with_external_inline_callees(
         module,
         env_config,
         |typed_module, _value_facts| {
+            let static_generator_instances =
+                static_generator_instance_plans_for_module(typed_module, &static_targets);
+            for function in &mut typed_module.callable_defs {
+                annotate_typed_generator_instance_plans(
+                    function,
+                    static_generator_instances.get(&function.function_id),
+                )?;
+            }
             if let Some(profile) = profile {
                 let mut static_direct_calls =
                     static_direct_calls_for_module(typed_module, &static_targets);
@@ -4997,7 +5233,13 @@ fn external_typed_inline_callees(
             |typed_module, _value_facts| {
                 let static_direct_calls =
                     static_direct_calls_for_module(typed_module, static_targets);
+                let static_generator_instances =
+                    static_generator_instance_plans_for_module(typed_module, static_targets);
                 for function in &mut typed_module.callable_defs {
+                    annotate_typed_generator_instance_plans(
+                        function,
+                        static_generator_instances.get(&function.function_id),
+                    )?;
                     apply_call_emission_plans_to_typed_function(
                         function,
                         profile,
@@ -6047,6 +6289,137 @@ def caller():
     }
 
     #[test]
+    fn generator_instance_plans_seed_trusted_owner_and_resume_field_state() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def values(limit):
+    yield limit
+
+def caller(limit):
+    gen = values(limit)
+    return next(gen)
+"#,
+        )
+        .expect("source should lower")
+        .blockpy_module;
+        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+        let target_function_id = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "values")
+            .expect("generator target should exist")
+            .function_id;
+        let generator_targets = strict_module_global_generator_targets_for_module(&lowered);
+        let typed = lower_blockpy_module_to_typed(lowered);
+        let mut caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .cloned()
+            .expect("typed caller should exist");
+        let targets = StaticDirectCallTargets {
+            runtime_names: HashMap::new(),
+            module_globals: HashMap::new(),
+            module_global_generators: HashMap::from([(module_id, generator_targets)]),
+            strict_methods: HashMap::new(),
+        };
+        let plans = static_generator_instance_plans_for_function(&caller, &targets);
+        annotate_typed_generator_instance_plans(&mut caller, Some(&plans))
+            .expect("instance-plan annotation should succeed");
+
+        let analysis = analyze_trusted_owner_states(
+            &caller,
+            &typed.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let (next_instr_id, state) = caller
+            .blocks
+            .iter()
+            .find_map(|block| {
+                let BlockTerm::Return(InstrTyped::CallTyped(call)) = &block.term else {
+                    return None;
+                };
+                typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::Next,
+                    &typed.module_constants,
+                )
+                .then_some((
+                    call.try_semantic_instr_id()
+                        .expect("next() call should have an instruction id"),
+                    analysis
+                        .block_before_term
+                        .get(&block.label)
+                        .expect("next() term should have owner state"),
+                ))
+            })
+            .expect("caller should return next(gen)");
+        let owner_type_ref = TypedAttrOwnerRef::TypeKey {
+            module_name: "soac.runtime".to_string(),
+            qualname: "ClosureGenerator".to_string(),
+        };
+        let gen_location = state
+            .locals
+            .iter()
+            .find_map(|(location, owner)| (owner == &owner_type_ref).then_some(*location))
+            .expect("generator local should be trusted");
+        let origin = state
+            .object_origins
+            .get(&gen_location)
+            .copied()
+            .expect("trusted generator should retain its origin");
+        assert_eq!(
+            state
+                .function_fields
+                .get(&(origin, "_resume_function".to_string())),
+            Some(&target_function_id),
+        );
+
+        let runtime_lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class ClosureGenerator:\n    def __next__(self):\n        return 1\n",
+        )
+        .expect("runtime source should lower");
+        let next_function = runtime_lowered
+            .blockpy_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "ClosureGenerator.__next__")
+            .cloned()
+            .expect("runtime next function should exist");
+        let (owners, inline_targets) = trusted_static_runtime_protocol_inlines_for_function(
+            &caller,
+            &typed.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+            &StaticDirectCallTargets {
+                strict_methods: HashMap::from([(
+                    (
+                        "soac.runtime".to_string(),
+                        "ClosureGenerator".to_string(),
+                        "__next__".to_string(),
+                    ),
+                    next_function.clone(),
+                )]),
+                ..StaticDirectCallTargets::default()
+            },
+        );
+        assert_eq!(owners, HashMap::from([(next_instr_id, owner_type_ref)]));
+        assert_eq!(
+            inline_targets,
+            HashMap::from([(
+                next_instr_id,
+                vec![(
+                    next_function.function_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+    }
+
+    #[test]
     fn trusted_owner_edge_remap_preserves_object_and_function_facts() {
         let source_location = LocalLocation(7);
         let target_location = LocalLocation(8);
@@ -6244,6 +6617,81 @@ def values(limit):
     }
 
     #[test]
+    fn strict_module_generator_calls_build_instance_plans_without_direct_calling() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def values(limit):
+    yield limit
+
+def caller(limit):
+    return values(limit)
+"#,
+        )
+        .expect("source should lower")
+        .blockpy_module;
+        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+        let target_function_id = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "values")
+            .expect("generator target should exist")
+            .function_id;
+        let targets = StaticDirectCallTargets {
+            runtime_names: HashMap::new(),
+            module_globals: HashMap::from([(
+                module_id,
+                strict_module_global_direct_call_targets_for_module(&lowered, "pkg.mod"),
+            )]),
+            module_global_generators: HashMap::from([(
+                module_id,
+                strict_module_global_generator_targets_for_module(&lowered),
+            )]),
+            strict_methods: HashMap::new(),
+        };
+        let typed = lower_blockpy_module_to_typed(lowered);
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+
+        assert!(
+            static_direct_call_plans_for_function(caller, &typed.module_constants, &targets)
+                .is_empty(),
+            "generator public calls must keep factory/vectorcall semantics"
+        );
+        let plans = static_generator_instance_plans_for_function(caller, &targets);
+        let (source, plan) = plans
+            .iter()
+            .next()
+            .expect("generator call should receive an instance plan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plan.function_id, target_function_id);
+        assert_eq!(plan.kind, FunctionKind::Generator);
+        assert_eq!(
+            plan.arg_plan,
+            TypedDirectCallArgPlan {
+                sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
+            }
+        );
+
+        let mut annotated = caller.clone();
+        annotate_typed_generator_instance_plans(&mut annotated, Some(&plans))
+            .expect("instance-plan annotation should succeed");
+        let annotated_plan = annotated
+            .blocks
+            .iter()
+            .find_map(|block| match &block.term {
+                BlockTerm::Return(expr) if expr.try_semantic_instr_id() == Some(*source) => {
+                    expr.generator_instance_plan()
+                }
+                _ => None,
+            })
+            .expect("generator call should carry typed metadata");
+        assert_eq!(annotated_plan, plan);
+    }
+
+    #[test]
     fn strict_module_protocol_methods_build_static_targets() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
@@ -6348,6 +6796,7 @@ class IterRange:
                     },
                 )]),
                 module_globals: HashMap::new(),
+                module_global_generators: HashMap::new(),
                 strict_methods: HashMap::new(),
             },
         );
@@ -6409,6 +6858,7 @@ class IterRange:
                     },
                 )]),
                 module_globals: HashMap::new(),
+                module_global_generators: HashMap::new(),
                 strict_methods: HashMap::new(),
             },
         );
@@ -6447,6 +6897,7 @@ def caller(value):
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "soac.runtime"),
             )]),
+            module_global_generators: HashMap::new(),
             strict_methods: HashMap::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
@@ -6491,6 +6942,7 @@ def caller(value):
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "soac.runtime"),
             )]),
+            module_global_generators: HashMap::new(),
             strict_methods: HashMap::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
@@ -6550,6 +7002,7 @@ def caller(value):
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "pkg.mod"),
             )]),
+            module_global_generators: HashMap::new(),
             strict_methods: HashMap::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
@@ -6588,6 +7041,7 @@ helper(1)
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "pkg.mod"),
             )]),
+            module_global_generators: HashMap::new(),
             strict_methods: HashMap::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);

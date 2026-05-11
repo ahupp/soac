@@ -21,11 +21,12 @@ pub use typed::{
     TypedDirectCallableCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCall,
     TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
     TypedExactIntReturnPlan, TypedExactListItemAccessPlan, TypedExactListItemCounterSource,
-    TypedExactListItemPlanSource, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
-    TypedIndexedFieldCounterSource, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
-    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource, TypedInstrExtra,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand, TypedSetAttr, TypedTruthy,
-    lower_blockpy_function_to_typed, lower_blockpy_module_to_typed,
+    TypedExactListItemPlanSource, TypedGeneratorInstancePlan, TypedGetAttr,
+    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldCounterSource,
+    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
+    TypedIndexedGlobalPlanSource, TypedInstrExtra, TypedPlannedResult, TypedPyObjectOwnershipPlan,
+    TypedResultDemand, TypedSetAttr, TypedTruthy, lower_blockpy_function_to_typed,
+    lower_blockpy_module_to_typed,
 };
 pub use value_facts::{
     BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore, I32Facts, I64Facts, NoneFact,

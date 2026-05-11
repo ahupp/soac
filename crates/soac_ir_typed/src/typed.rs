@@ -1239,6 +1239,13 @@ pub struct TypedConstructorInitPlan {
     pub init_function_id: RuntimeFunctionId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedGeneratorInstancePlan {
+    pub function_id: RuntimeFunctionId,
+    pub kind: block_py::FunctionKind,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
@@ -1249,6 +1256,7 @@ pub struct TypedInstrExtra {
     pub exact_int_branch: Option<TypedExactIntBranchPlan>,
     pub exact_int_return: Option<TypedExactIntReturnPlan>,
     pub constructor_init: Option<TypedConstructorInitPlan>,
+    pub generator_instance: Option<TypedGeneratorInstancePlan>,
     pub guard_miss_deopt: bool,
 }
 
@@ -1403,6 +1411,22 @@ impl TypedInstrExtra {
         self.constructor_init.take().is_some()
     }
 
+    pub fn generator_instance_plan(&self) -> Option<&TypedGeneratorInstancePlan> {
+        self.generator_instance.as_ref()
+    }
+
+    pub fn set_generator_instance_plan(&mut self, plan: TypedGeneratorInstancePlan) -> bool {
+        if self.generator_instance.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.generator_instance = Some(plan);
+        true
+    }
+
+    pub fn clear_generator_instance_plan(&mut self) -> bool {
+        self.generator_instance.take().is_some()
+    }
+
     pub fn guard_miss_deopt_enabled(&self) -> bool {
         self.guard_miss_deopt
     }
@@ -1483,6 +1507,11 @@ impl InstrTyped {
 
     pub fn planned_result(&self) -> Option<TypedPlannedResult> {
         self.typed_extra().and_then(TypedInstrExtra::planned_result)
+    }
+
+    pub fn generator_instance_plan(&self) -> Option<&TypedGeneratorInstancePlan> {
+        self.typed_extra()
+            .and_then(TypedInstrExtra::generator_instance_plan)
     }
 
     pub fn guard_miss_deopt_enabled(&self) -> bool {
