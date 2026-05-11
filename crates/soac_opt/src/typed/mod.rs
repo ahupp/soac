@@ -11,9 +11,9 @@ use soac_core::block_py::{
     CalleeFunctionId, ChildVisitable, ConstantExpr, Del, HasMeta, HasSemanticInstrId, Instr,
     InstrId, InstrKey, InstrWithConstantNone, IntLiteral, Literal, LiteralValue, Load,
     LocalLocation, MapInstr, Mappable, Meta, NameLike, NameLocation, NumberLiteral,
-    NumberLiteralValue, ParamKind, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId,
-    RuntimeName, SetAttr, Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOpKind,
-    Visit, VisitMut, WithMeta,
+    NumberLiteralValue, ParamKind, PreservedLocation, PreservedSlotStorage, PrettyPrint,
+    PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, Store, TermIf,
+    TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
@@ -804,6 +804,27 @@ pub struct TypedConstructorFieldBindings {
     pub fields: Vec<TypedConstructorFieldBinding>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TypedGeneratorStateLoweringPlan {
+    pub generator_origin: InstrId,
+    pub function_id: RuntimeFunctionId,
+    pub body_instr_ids: HashSet<InstrId>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct TypedGeneratorStateLoweringStats {
+    pub lowered_generators: usize,
+    pub initialized_slots: usize,
+    pub remapped_instrs: usize,
+    pub removed_owner_stores: usize,
+}
+
+impl TypedGeneratorStateLoweringStats {
+    pub fn changed(&self) -> bool {
+        self.lowered_generators != 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TypedExternalInlineCallee {
     pub function: BlockPyFunction<TypedBlockPyModuleShape>,
@@ -1326,7 +1347,7 @@ fn build_typed_direct_call_inline_rewrite(
             before.push(
                 Store::new(receiver_temp.resolved_name(), receiver.clone())
                     .with_meta(Meta::synthetic())
-                .into(),
+                    .into(),
             );
         }
         TypedInlineCall::GeneratorResume(_) => {}
@@ -1415,46 +1436,45 @@ fn build_typed_direct_call_inline_rewrite(
                 .expect("constructor callable inline candidate should allocate callable temp");
             provided_values.insert(0, typed_load_temp(&callable_temp.resolved_name()));
         }
-        let (bindings, preassigned_locals, prologue, preserved_owner_temp) =
-            match &candidate.call {
-                TypedInlineCall::GeneratorResume(_) => {
-                    let Ok(bound) = bind_typed_generator_resume_inline_values(
-                        caller,
-                        callee.function,
-                        &plan.arg_plan,
-                        provided_values.as_slice(),
-                    ) else {
-                        stats.skipped_candidates += 1;
-                        if let (Some(constants), Some(original)) = (
-                            caller_module_constants.as_deref_mut(),
-                            original_caller_module_constants.as_ref(),
-                        ) {
-                            *constants = original.clone();
-                        }
-                        caller.storage_layout = original_storage_layout;
-                        return TypedInlineBlockRewrite::Unchanged(original_block);
-                    };
-                    bound
-                }
-                _ => {
-                    let Ok(bindings) = bind_typed_direct_call_inline_values(
-                        callee.function,
-                        &plan.arg_plan,
-                        provided_values.as_slice(),
-                    ) else {
-                        stats.skipped_candidates += 1;
-                        if let (Some(constants), Some(original)) = (
-                            caller_module_constants.as_deref_mut(),
-                            original_caller_module_constants.as_ref(),
-                        ) {
-                            *constants = original.clone();
-                        }
-                        caller.storage_layout = original_storage_layout;
-                        return TypedInlineBlockRewrite::Unchanged(original_block);
-                    };
-                    (bindings, HashMap::new(), Vec::new(), None)
-                }
-            };
+        let (bindings, preassigned_locals, prologue, preserved_owner_temp) = match &candidate.call {
+            TypedInlineCall::GeneratorResume(_) => {
+                let Ok(bound) = bind_typed_generator_resume_inline_values(
+                    caller,
+                    callee.function,
+                    &plan.arg_plan,
+                    provided_values.as_slice(),
+                ) else {
+                    stats.skipped_candidates += 1;
+                    if let (Some(constants), Some(original)) = (
+                        caller_module_constants.as_deref_mut(),
+                        original_caller_module_constants.as_ref(),
+                    ) {
+                        *constants = original.clone();
+                    }
+                    caller.storage_layout = original_storage_layout;
+                    return TypedInlineBlockRewrite::Unchanged(original_block);
+                };
+                bound
+            }
+            _ => {
+                let Ok(bindings) = bind_typed_direct_call_inline_values(
+                    callee.function,
+                    &plan.arg_plan,
+                    provided_values.as_slice(),
+                ) else {
+                    stats.skipped_candidates += 1;
+                    if let (Some(constants), Some(original)) = (
+                        caller_module_constants.as_deref_mut(),
+                        original_caller_module_constants.as_ref(),
+                    ) {
+                        *constants = original.clone();
+                    }
+                    caller.storage_layout = original_storage_layout;
+                    return TypedInlineBlockRewrite::Unchanged(original_block);
+                };
+                (bindings, HashMap::new(), Vec::new(), None)
+            }
+        };
         let inline_instance = *next_inline_instance;
         *next_inline_instance = next_inline_instance
             .checked_add(1)
@@ -3806,7 +3826,11 @@ fn allocate_typed_preserved_owner_local(
         .storage_layout
         .as_mut()
         .ok_or(TypedInlineUnsupportedReason::MissingCallerStorageLayout)?;
-    if let Some(slot) = layout.stack_slots().iter().position(|name| name == "_dp_self") {
+    if let Some(slot) = layout
+        .stack_slots()
+        .iter()
+        .position(|name| name == "_dp_self")
+    {
         if !layout.preserved_slots.is_empty() {
             return Err(TypedInlineUnsupportedReason::PreservedOwnerConflict);
         }
@@ -4975,6 +4999,359 @@ fn typed_i64_constant_load(
         .with_extra(extra)
         .with_meta(meta),
     )
+}
+
+pub fn lower_typed_generator_state_to_locals_with_plan(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &mut Vec<ConstantExpr>,
+    callee_module: &BlockPyModule<TypedBlockPyModuleShape>,
+    plans: &[TypedGeneratorStateLoweringPlan],
+) -> TypedGeneratorStateLoweringStats {
+    let mut stats = TypedGeneratorStateLoweringStats::default();
+    for plan in plans {
+        let Some(next_stats) = lower_typed_generator_state_origin_to_locals(
+            function,
+            module_constants,
+            callee_module,
+            plan,
+        ) else {
+            continue;
+        };
+        stats.lowered_generators += next_stats.lowered_generators;
+        stats.initialized_slots += next_stats.initialized_slots;
+        stats.remapped_instrs += next_stats.remapped_instrs;
+        stats.removed_owner_stores += next_stats.removed_owner_stores;
+    }
+    stats
+}
+
+fn lower_typed_generator_state_origin_to_locals(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &mut Vec<ConstantExpr>,
+    callee_module: &BlockPyModule<TypedBlockPyModuleShape>,
+    plan: &TypedGeneratorStateLoweringPlan,
+) -> Option<TypedGeneratorStateLoweringStats> {
+    let callee = callee_module
+        .callable_defs
+        .iter()
+        .find(|callee| callee.function_id == plan.function_id)?;
+    let public_layout = callee.public_storage_layout()?;
+    if public_layout
+        .preserved_slots
+        .iter()
+        .any(|slot| slot.storage == PreservedSlotStorage::PyCellObject)
+    {
+        return None;
+    }
+    let (constructor_block_index, constructor_instr_index, constructor_target, constructor_call) =
+        find_typed_generator_constructor_store(function, plan.generator_origin)?;
+    let generator_location = constructor_target.local_location()?;
+    if typed_generator_local_has_residual_uses(function, generator_location) {
+        return None;
+    }
+
+    let values = typed_positional_arg_exprs(constructor_call.args.clone())?;
+    if constructor_call
+        .args
+        .iter()
+        .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
+        || !constructor_call.keywords.is_empty()
+    {
+        return None;
+    }
+    let generator_instance = constructor_call.extra.generator_instance_plan()?;
+    if generator_instance.function_id != plan.function_id
+        || generator_instance.arg_plan.sources.len() != callee.params.len()
+    {
+        return None;
+    }
+
+    let mut arg_temps = Vec::with_capacity(values.len());
+    let mut replacement = Vec::new();
+    for value in values {
+        let temp = try_allocate_typed_stack_temp(function, "typed_gen_arg").ok()?;
+        replacement.push(typed_store_temp(temp.resolved_name(), value));
+        arg_temps.push(temp);
+    }
+    let arg_values = arg_temps
+        .iter()
+        .map(|temp| typed_load_temp(&temp.resolved_name()))
+        .collect::<Vec<_>>();
+    let public_params = callee.params.iter().collect::<Vec<_>>();
+    let public_param_indices = public_params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| (param.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+
+    let mut preserved_locals = HashMap::new();
+    for (slot_index, slot) in public_layout.preserved_slots.iter().enumerate() {
+        let temp = try_allocate_typed_stack_temp(function, "typed_gen_state").ok()?;
+        let value = match slot.init {
+            soac_core::block_py::ClosureInit::Parameter => {
+                let param_index = *public_param_indices.get(slot.logical_name.as_str())?;
+                typed_inline_value_for_arg_source(
+                    public_params[param_index].kind,
+                    generator_instance.arg_plan.sources.get(param_index)?,
+                    arg_values.as_slice(),
+                )
+                .ok()?
+            }
+            soac_core::block_py::ClosureInit::RuntimePcUnstarted => {
+                typed_i64_constant_load(module_constants, 1, constructor_call.meta())
+            }
+            soac_core::block_py::ClosureInit::RuntimeAbruptKindFallthrough => {
+                typed_i64_constant_load(module_constants, 0, constructor_call.meta())
+            }
+            soac_core::block_py::ClosureInit::RuntimeNone
+            | soac_core::block_py::ClosureInit::Deferred => InstrTyped::constant_none(),
+            soac_core::block_py::ClosureInit::InheritedCapture
+            | soac_core::block_py::ClosureInit::EmptyCell => return None,
+        };
+        replacement.push(typed_store_temp(temp.resolved_name(), value));
+        preserved_locals.insert(
+            PreservedLocation(
+                u32::try_from(slot_index).expect("preserved slot index should fit in u32"),
+            ),
+            temp,
+        );
+    }
+    append_typed_cleanup_dels_to_body(&mut replacement, &arg_temps);
+    function.blocks[constructor_block_index].body.splice(
+        constructor_instr_index..=constructor_instr_index,
+        replacement,
+    );
+
+    let removed_owner_stores =
+        remove_typed_generator_owner_seed_stores(function, generator_location);
+    let remapped_instrs =
+        remap_typed_generator_preserved_instrs(function, &plan.body_instr_ids, &preserved_locals);
+    Some(TypedGeneratorStateLoweringStats {
+        lowered_generators: 1,
+        initialized_slots: preserved_locals.len(),
+        remapped_instrs,
+        removed_owner_stores,
+    })
+}
+
+fn find_typed_generator_constructor_store(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    generator_origin: InstrId,
+) -> Option<(usize, usize, ResolvedName, TypedCall<InstrTyped>)> {
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(block_index, block)| {
+            block
+                .body
+                .iter()
+                .enumerate()
+                .find_map(|(instr_index, instr)| {
+                    let InstrTyped::Store(store) = instr else {
+                        return None;
+                    };
+                    let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+                        return None;
+                    };
+                    (call.try_semantic_instr_id() == Some(generator_origin)
+                        && call.extra.generator_instance_plan().is_some())
+                    .then(|| (block_index, instr_index, store.name.clone(), call.clone()))
+                })
+        })
+}
+
+fn typed_generator_local_has_residual_uses(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    generator_location: LocalLocation,
+) -> bool {
+    struct Uses {
+        generator_location: LocalLocation,
+        residual: bool,
+    }
+
+    impl Visit<InstrTyped> for Uses {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.residual {
+                return;
+            }
+            if let InstrTyped::Store(store) = expr
+                && store.name.id_str() == "_dp_self"
+                && matches!(
+                    store.value.as_ref(),
+                    InstrTyped::Load(load)
+                        if load.name.local_location() == Some(self.generator_location)
+                )
+            {
+                return;
+            }
+            if let InstrTyped::Load(load) = expr
+                && load.name.local_location() == Some(self.generator_location)
+            {
+                self.residual = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut uses = Uses {
+        generator_location,
+        residual: false,
+    };
+    uses.visit_fn(function);
+    uses.residual
+}
+
+fn remove_typed_generator_owner_seed_stores(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    generator_location: LocalLocation,
+) -> usize {
+    let mut removed = 0;
+    for block in &mut function.blocks {
+        let before = block.body.len();
+        block.body.retain(|instr| {
+            !matches!(
+                instr,
+                InstrTyped::Store(store)
+                    if store.name.id_str() == "_dp_self"
+                        && matches!(
+                            store.value.as_ref(),
+                            InstrTyped::Load(load)
+                                if load.name.local_location() == Some(generator_location)
+                        )
+            )
+        });
+        removed += before - block.body.len();
+    }
+    removed
+}
+
+fn remap_typed_generator_preserved_instrs(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    body_instr_ids: &HashSet<InstrId>,
+    preserved_locals: &HashMap<PreservedLocation, TypedTempLocal>,
+) -> usize {
+    let mut remapped = 0;
+    for block in &mut function.blocks {
+        for instr in &mut block.body {
+            if instr
+                .try_semantic_instr_id()
+                .is_none_or(|instr_id| !body_instr_ids.contains(&instr_id))
+            {
+                continue;
+            }
+            let mut mapper = TypedGeneratorPreservedLocalRemapper { preserved_locals };
+            let old = std::mem::replace(instr, InstrTyped::constant_none());
+            *instr = mapper
+                .try_map_instr(old)
+                .expect("generator preserved-local remapping should be total");
+            remapped += 1;
+        }
+        if typed_term_contains_any_instr_id(&block.term, body_instr_ids) {
+            let mut mapper = TypedGeneratorPreservedLocalRemapper { preserved_locals };
+            let old = std::mem::replace(
+                &mut block.term,
+                BlockTerm::Return(InstrTyped::constant_none()),
+            );
+            block.term = mapper
+                .try_map_term(old)
+                .expect("generator preserved-local term remapping should be total");
+            remapped += 1;
+        }
+    }
+    remapped
+}
+
+fn typed_term_contains_any_instr_id(
+    term: &BlockTerm<InstrTyped>,
+    instr_ids: &HashSet<InstrId>,
+) -> bool {
+    struct Collector<'a> {
+        instr_ids: &'a HashSet<InstrId>,
+        found: bool,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if expr
+                .try_semantic_instr_id()
+                .is_some_and(|instr_id| self.instr_ids.contains(&instr_id))
+            {
+                self.found = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        instr_ids,
+        found: false,
+    };
+    collector.visit_term(term);
+    collector.found
+}
+
+struct TypedGeneratorPreservedLocalRemapper<'a> {
+    preserved_locals: &'a HashMap<PreservedLocation, TypedTempLocal>,
+}
+
+impl TryMapInstr<InstrTyped, InstrTyped, ()> for TypedGeneratorPreservedLocalRemapper<'_> {
+    fn try_map_instr(&mut self, instr: InstrTyped) -> Result<InstrTyped, ()> {
+        Ok(match instr {
+            InstrTyped::Truthy(op) => InstrTyped::Truthy(op.try_map_children(self)?),
+            InstrTyped::Load(op) => InstrTyped::Load(op.try_map_children(self)?),
+            InstrTyped::BinOp(op) => InstrTyped::BinOp(op.try_map_children(self)?),
+            InstrTyped::Tuple(op) => InstrTyped::Tuple(op.try_map_children(self)?),
+            InstrTyped::UnaryOp(op) => InstrTyped::UnaryOp(op.try_map_children(self)?),
+            InstrTyped::CalleeFunctionId(op) => {
+                InstrTyped::CalleeFunctionId(op.try_map_children(self)?)
+            }
+            InstrTyped::CallTyped(op) => InstrTyped::CallTyped(op.try_map_children(self)?),
+            InstrTyped::GuardedCallableCallTyped(op) => {
+                InstrTyped::GuardedCallableCallTyped(op.try_map_children(self)?)
+            }
+            InstrTyped::GuardedMethodCallTyped(op) => {
+                InstrTyped::GuardedMethodCallTyped(op.try_map_children(self)?)
+            }
+            InstrTyped::DirectCallableCallTyped(op) => {
+                InstrTyped::DirectCallableCallTyped(op.try_map_children(self)?)
+            }
+            InstrTyped::DirectMethodCallTyped(op) => {
+                InstrTyped::DirectMethodCallTyped(op.try_map_children(self)?)
+            }
+            InstrTyped::DirectCallGuardTest(op) => {
+                InstrTyped::DirectCallGuardTest(op.try_map_children(self)?)
+            }
+            InstrTyped::CallDirect(op) => InstrTyped::CallDirect(op.try_map_children(self)?),
+            InstrTyped::GetAttrTyped(op) => InstrTyped::GetAttrTyped(op.try_map_children(self)?),
+            InstrTyped::SetAttrTyped(op) => InstrTyped::SetAttrTyped(op.try_map_children(self)?),
+            InstrTyped::GetItem(op) => InstrTyped::GetItem(op.try_map_children(self)?),
+            InstrTyped::SetItem(op) => InstrTyped::SetItem(op.try_map_children(self)?),
+            InstrTyped::DelItem(op) => InstrTyped::DelItem(op.try_map_children(self)?),
+            InstrTyped::Store(op) => InstrTyped::Store(op.try_map_children(self)?),
+            InstrTyped::Del(op) => InstrTyped::Del(op.try_map_children(self)?),
+            InstrTyped::MakeCell(op) => InstrTyped::MakeCell(op.try_map_children(self)?),
+            InstrTyped::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
+            InstrTyped::CellRef(op) => InstrTyped::CellRef(op),
+            InstrTyped::MakeFunctionWithClosure(op) => {
+                InstrTyped::MakeFunctionWithClosure(op.try_map_children(self)?)
+            }
+        })
+    }
+
+    fn try_map_name(&mut self, mut name: ResolvedName) -> Result<ResolvedName, ()> {
+        let Some(location) = name.location.as_preserved() else {
+            return Ok(name);
+        };
+        let Some(local) = self.preserved_locals.get(&location) else {
+            return Ok(name);
+        };
+        name.id = local.name.clone().into();
+        name.location = NameLocation::Local(local.location);
+        Ok(name)
+    }
 }
 
 #[derive(Clone)]
@@ -6340,13 +6717,145 @@ def caller(fn, owner):\n    return helper(fn, owner, None, None)\n",
             "resume inlining should preserve owner-backed preserved-slot access"
         );
         assert!(
-            caller.blocks.iter().flat_map(|block| block.body.iter()).any(
-                |instr| matches!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| matches!(
                     instr,
                     InstrTyped::Store(store) if store.name.id_str() == "_dp_self"
-                )
-            ),
+                )),
             "resume inlining should seed _dp_self before the inlined body"
+        );
+    }
+
+    #[test]
+    fn lowers_inlined_generator_preserved_state_to_caller_locals() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    gen = values(limit)\n    return None\n",
+        )
+        .expect("source should lower");
+        let values_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "values");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let (origin, generator_name) = caller
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.body.iter_mut())
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::CallTyped(call) = store.value.as_mut() else {
+                    return None;
+                };
+                let origin = call.try_semantic_instr_id()?;
+                call.extra
+                    .set_generator_instance_plan(soac_ir_typed::TypedGeneratorInstancePlan {
+                        function_id: values_id,
+                        kind: soac_core::block_py::FunctionKind::Generator,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    });
+                Some((origin, store.name.clone()))
+            })
+            .expect("caller should construct the generator");
+        let remapped_instr_id = InstrId::new(900);
+        let owner_location = {
+            let layout = caller
+                .storage_layout
+                .as_mut()
+                .expect("caller should have storage");
+            let location = LocalLocation(
+                u32::try_from(layout.stack_slots().len())
+                    .expect("test owner slot index should fit in u32"),
+            );
+            layout.ensure_stack_slot("_dp_self");
+            location
+        };
+        let entry = caller
+            .blocks
+            .first_mut()
+            .expect("caller should have an entry block");
+        entry.body.push(typed_store_temp(
+            ResolvedName {
+                id: "_dp_self".into(),
+                location: NameLocation::Local(owner_location),
+            },
+            typed_load_temp(&generator_name),
+        ));
+        entry.body.push(
+            Load::new(ResolvedName {
+                id: "limit".into(),
+                location: NameLocation::preserved(0),
+            })
+            .with_meta(Meta {
+                instr_id: Some(remapped_instr_id),
+                ..Meta::synthetic()
+            })
+            .into(),
+        );
+
+        let callee_module = typed.clone();
+        let caller_index = typed
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        let stats = {
+            let (module_constants, callable_defs) =
+                (&mut typed.module_constants, &mut typed.callable_defs);
+            lower_typed_generator_state_to_locals_with_plan(
+                &mut callable_defs[caller_index],
+                module_constants,
+                &callee_module,
+                &[TypedGeneratorStateLoweringPlan {
+                    generator_origin: origin,
+                    function_id: values_id,
+                    body_instr_ids: HashSet::from([remapped_instr_id]),
+                }],
+            )
+        };
+        let caller = &typed.callable_defs[caller_index];
+        assert_eq!(stats.lowered_generators, 1);
+        assert_eq!(stats.removed_owner_stores, 1);
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .all(|instr| !matches!(
+                    instr,
+                    InstrTyped::Store(store) if store.name.id_str() == "_dp_self"
+                )),
+            "scalarized generator state should not keep the wrapper-owner seed"
+        );
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| matches!(
+                    instr,
+                    InstrTyped::Load(load)
+                        if load.try_semantic_instr_id() == Some(remapped_instr_id)
+                            && load.name.local_location().is_some()
+                )),
+            "inlined preserved-state loads should become ordinary caller-local loads"
+        );
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| matches!(
+                    instr,
+                    InstrTyped::Del(del)
+                        if del.name.id_str().starts_with("_dp_typed_gen_arg_")
+                )),
+            "generator-call argument spills should be cleaned immediately after state init"
         );
     }
 

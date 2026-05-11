@@ -45,14 +45,15 @@ use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_p
 #[cfg(test)]
 use soac_opt::passes::TypedVirtualObjectId;
 use soac_opt::passes::{
-    TypedConstructorFieldBindings, TypedExternalInlineCallee, TypedInlineInstrIdMapping,
-    TypedInlineLocalMapping, TypedVirtualBodyInstr, TypedVirtualFieldRef,
-    TypedVirtualFieldStateAnalysis, TypedVirtualState, TypedVirtualizationPlan,
-    inline_typed_constructor_init_bodies_with_external_callees,
+    TypedConstructorFieldBindings, TypedExternalInlineCallee, TypedGeneratorStateLoweringPlan,
+    TypedInlineInstrIdMapping, TypedInlineLocalMapping, TypedVirtualBodyInstr,
+    TypedVirtualFieldRef, TypedVirtualFieldStateAnalysis, TypedVirtualState,
+    TypedVirtualizationPlan, inline_typed_constructor_init_bodies_with_external_callees,
     inline_typed_function_direct_call_stores_with_external_callees_and_trusted_calls,
     lower_typed_fully_virtual_objects_to_locals_with_plan,
-    lower_typed_function_call_emission_plans, lower_typed_virtual_objects_to_locals_with_plan,
-    plan_module_inlining, plan_typed_fully_virtual_objects, plan_typed_virtual_objects,
+    lower_typed_function_call_emission_plans, lower_typed_generator_state_to_locals_with_plan,
+    lower_typed_virtual_objects_to_locals_with_plan, plan_module_inlining,
+    plan_typed_fully_virtual_objects, plan_typed_virtual_objects,
     refresh_typed_function_value_facts, rewrite_typed_stop_iteration_raises_to_handler_jumps,
     simplify_typed_virtual_tuple_ops, split_typed_alias_hot_continuations_with_budget,
     split_typed_constructor_hot_continuations_with_budget,
@@ -4493,6 +4494,48 @@ fn generator_resume_inline_targets(
         .collect()
 }
 
+fn collect_generator_state_lowering_instr_ids(
+    plans: &HashMap<InstrId, TypedGeneratorResumePlan>,
+    inline_stats: &soac_opt::passes::TypedInlineRewriteStats,
+    instr_ids_by_origin: &mut HashMap<InstrId, (RuntimeFunctionId, HashSet<InstrId>)>,
+) {
+    let instances_by_origin = inline_stats
+        .inline_instance_sources
+        .iter()
+        .filter_map(|source| {
+            let plan = plans.get(&source.source_instr_id)?;
+            Some((source.inline_instance, plan))
+        })
+        .collect::<HashMap<_, _>>();
+    for mapping in &inline_stats.instr_id_mappings {
+        let Some(plan) = instances_by_origin.get(&mapping.inline_instance) else {
+            continue;
+        };
+        let entry = instr_ids_by_origin
+            .entry(plan.generator_origin)
+            .or_insert_with(|| (plan.function_id, HashSet::new()));
+        if entry.0 != plan.function_id {
+            continue;
+        }
+        entry.1.insert(mapping.caller_instr_id);
+    }
+}
+
+fn typed_generator_state_lowering_plans(
+    instr_ids_by_origin: HashMap<InstrId, (RuntimeFunctionId, HashSet<InstrId>)>,
+) -> Vec<TypedGeneratorStateLoweringPlan> {
+    instr_ids_by_origin
+        .into_iter()
+        .map(
+            |(generator_origin, (function_id, body_instr_ids))| TypedGeneratorStateLoweringPlan {
+                generator_origin,
+                function_id,
+                body_instr_ids,
+            },
+        )
+        .collect()
+}
+
 fn trusted_runtime_protocol_calls_from_owner_states(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
@@ -5510,6 +5553,8 @@ fn apply_typed_v3_module_rewrites(
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedConstructorFieldBindings>>::new();
     for function in &mut module.callable_defs {
         let mut hot_state_cleanup_labels = HashSet::<BlockLabel>::new();
+        let mut generator_state_instr_ids_by_origin =
+            HashMap::<InstrId, (RuntimeFunctionId, HashSet<InstrId>)>::new();
         seed_profile_exact_int_selections_for_function(
             function,
             profile,
@@ -5649,6 +5694,11 @@ fn apply_typed_v3_module_rewrites(
                 }
                 break;
             }
+            collect_generator_state_lowering_instr_ids(
+                &generator_resume_plans,
+                &stats,
+                &mut generator_state_instr_ids_by_origin,
+            );
             hot_state_cleanup_labels.extend(stats.hot_state_cleanup_labels.iter().copied());
             let init_plans = typed_constructor_init_plans_from_inline_stats_with_external_callees(
                 &callee_module,
@@ -5896,6 +5946,16 @@ fn apply_typed_v3_module_rewrites(
                     function.function_id
                 ));
             }
+        }
+        let generator_state_stats = lower_typed_generator_state_to_locals_with_plan(
+            function,
+            &mut module.module_constants,
+            &callee_module,
+            typed_generator_state_lowering_plans(generator_state_instr_ids_by_origin).as_slice(),
+        );
+        if generator_state_stats.changed() {
+            assign_missing_typed_function_instr_ids(function);
+            refresh_typed_function_value_facts(function);
         }
         split_typed_post_inline_hot_continuations(
             function,
@@ -6618,7 +6678,9 @@ def caller(limit):
 
     #[test]
     fn trusted_generator_resume_plans_follow_unescaped_generator_instances() {
-        fn typed_caller_with_resume_call(source: &str) -> (
+        fn typed_caller_with_resume_call(
+            source: &str,
+        ) -> (
             BlockPyModule<TypedBlockPyModuleShape>,
             BlockPyFunction<TypedBlockPyModuleShape>,
             RuntimeFunctionId,
@@ -6726,6 +6788,54 @@ def caller(limit):
                 &HashMap::new(),
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn generator_state_lowering_plans_follow_inlined_resume_body_instrs() {
+        let generator_origin = InstrId::new(3);
+        let resume_source = InstrId::new(4);
+        let function_id = RuntimeFunctionId::new(RuntimeModuleId::new(1), LocalFunctionId::new(2));
+        let mut instr_ids_by_origin = HashMap::new();
+        collect_generator_state_lowering_instr_ids(
+            &HashMap::from([(
+                resume_source,
+                TypedGeneratorResumePlan {
+                    function_id,
+                    generator_origin,
+                },
+            )]),
+            &soac_opt::passes::TypedInlineRewriteStats {
+                inline_instance_sources: vec![soac_opt::passes::TypedInlineInstanceSource {
+                    inline_instance: 7,
+                    source_instr_id: resume_source,
+                }],
+                instr_id_mappings: vec![
+                    soac_opt::passes::TypedInlineInstrIdMapping {
+                        callee: function_id,
+                        inline_instance: 7,
+                        callee_instr_id: InstrId::new(8),
+                        caller_instr_id: InstrId::new(9),
+                    },
+                    soac_opt::passes::TypedInlineInstrIdMapping {
+                        callee: function_id,
+                        inline_instance: 6,
+                        callee_instr_id: InstrId::new(10),
+                        caller_instr_id: InstrId::new(11),
+                    },
+                ],
+                ..soac_opt::passes::TypedInlineRewriteStats::default()
+            },
+            &mut instr_ids_by_origin,
+        );
+
+        assert_eq!(
+            typed_generator_state_lowering_plans(instr_ids_by_origin),
+            vec![TypedGeneratorStateLoweringPlan {
+                generator_origin,
+                function_id,
+                body_instr_ids: HashSet::from([InstrId::new(9)]),
+            }]
         );
     }
 
