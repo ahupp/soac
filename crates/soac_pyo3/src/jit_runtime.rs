@@ -716,6 +716,39 @@ fn import_attr(
     soac_jit::import_helpers::import_from(py, module, name)
 }
 
+#[pyfunction]
+fn make_preserved_state(
+    py: Python<'_>,
+    initial_values: &Bound<'_, PyTuple>,
+    slot_kinds: &Bound<'_, PyTuple>,
+) -> PyResult<Py<PyAny>> {
+    let state = unsafe {
+        soac_jit::preserved_state::new_preserved_state(initial_values.as_ptr(), slot_kinds.as_ptr())
+    };
+    unsafe { Bound::from_owned_ptr_or_err(py, state) }.map(Bound::unbind)
+}
+
+#[pyfunction]
+fn load_preserved_state(
+    py: Python<'_>,
+    state: &Bound<'_, PyAny>,
+    slot: i64,
+) -> PyResult<Py<PyAny>> {
+    let value =
+        unsafe { soac_jit::preserved_state::load_preserved_state_owned(state.as_ptr(), slot) };
+    unsafe { Bound::from_owned_ptr_or_err(py, value) }.map(Bound::unbind)
+}
+
+#[pyfunction]
+fn clear_preserved_state(state: &Bound<'_, PyAny>) -> PyResult<()> {
+    let rc = unsafe { soac_jit::preserved_state::clear_preserved_state(state.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(PyErr::fetch(state.py()))
+    }
+}
+
 pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create_module, module)?)?;
     module.add_function(wrap_pyfunction!(exec_module, module)?)?;
@@ -724,5 +757,8 @@ pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(wrap_pyfunction!(force_entry_interpreter_for_tests, module)?)?;
     module.add_function(wrap_pyfunction!(import_, module)?)?;
     module.add_function(wrap_pyfunction!(import_attr, module)?)?;
+    module.add_function(wrap_pyfunction!(make_preserved_state, module)?)?;
+    module.add_function(wrap_pyfunction!(load_preserved_state, module)?)?;
+    module.add_function(wrap_pyfunction!(clear_preserved_state, module)?)?;
     Ok(())
 }

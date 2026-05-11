@@ -3907,14 +3907,18 @@ def make_counter(delta):
             CallArgPositional::Starred(_) => None,
         })
         .expect("ClosureGenerator should carry preserved activation state");
-    let preserved_values_list = runtime_call_by_name(bb_module, preserved_values_expr, "list")
-        .expect("generator wrapper should own preserved activation state as a list");
+    let preserved_state_call =
+        runtime_call_by_name(bb_module, preserved_values_expr, "make_preserved_state")
+            .expect("generator wrapper should own native preserved activation state");
     assert!(
         matches!(
-            preserved_values_list.args.as_slice(),
-            [CallArgPositional::Positional(InstrResolved::Tuple(_))]
+            preserved_state_call.args.as_slice(),
+            [
+                CallArgPositional::Positional(InstrResolved::Tuple(_)),
+                CallArgPositional::Positional(InstrResolved::Tuple(_)),
+            ]
         ),
-        "generator wrapper should initialize preserved activation state from a tuple:\n{}",
+        "generator wrapper should initialize preserved activation state from value and kind tuples:\n{}",
         lowering.name_binding_text(),
     );
     assert!(

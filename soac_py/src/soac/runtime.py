@@ -54,6 +54,9 @@ TypeError = _builtins.TypeError
 ValueError = _builtins.ValueError
 import_ = _soac_ext.import_
 import_attr = _soac_ext.import_attr
+make_preserved_state = _soac_ext.make_preserved_state
+load_preserved_state = _soac_ext.load_preserved_state
+clear_preserved_state = _soac_ext.clear_preserved_state
 
 
 def _index(value, /):
@@ -146,7 +149,7 @@ def bb_trace_enter(function_qualname, block_label, params=None):
 
 
 def _current_yieldfrom(owner):
-    return owner._preserved_values[owner._yield_from_slot]
+    return load_preserved_state(owner._preserved_values, owner._yield_from_slot)
 
 
 def _is_cancelled_error(exc):
@@ -164,7 +167,7 @@ def _reraise_control_flow(exc):
 
 
 def _mark_closed(owner):
-    owner._preserved_values = []
+    clear_preserved_state(owner._preserved_values)
     owner._is_closed = True
     owner._resume_fn = None
 
@@ -179,7 +182,7 @@ def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
 
 
 def _current_throw_context(owner):
-    return owner._preserved_values[owner._throw_context_slot]
+    return load_preserved_state(owner._preserved_values, owner._throw_context_slot)
 
 def complex_from_parts(real, imag):
     return _builtins.complex(real, imag)

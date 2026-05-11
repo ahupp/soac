@@ -87,7 +87,7 @@ fn build_closure_backed_generator_factory_block(
         .collect::<Vec<_>>();
     let preserved_values = match preserved_values.as_slice() {
         ["_dp_pc", "_dp_yieldfrom", "_dp_throw_context"] => {
-            py_expr!("runtime.list((1, None, None))")
+            py_expr!("runtime.make_preserved_state((1, None, None), (1, 0, 0))")
         }
         other => panic!("unexpected preserved test slots {other:?}"),
     };

@@ -18,6 +18,7 @@ pub use jit::*;
 pub mod counter;
 pub mod module_constants;
 pub mod module_type;
+pub mod preserved_state;
 pub mod session;
 
 pub use session::{CompileSession, CompileSessionId, allocate_compile_session_id};

@@ -3,6 +3,7 @@
 use super::RuntimeJitDeoptInvocation;
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::module_constants::{load_runtime_name_owned, load_runtime_name_owned_by_id};
+use crate::preserved_state;
 use cranelift_jit::JITBuilder;
 use libc;
 use pyo3::ffi;
@@ -599,53 +600,31 @@ unsafe fn preserved_values_owned(owner: ObjPtr) -> ObjPtr {
 }
 
 unsafe extern "C" fn load_preserved_hook(owner: ObjPtr, slot: i64) -> ObjPtr {
-    if slot < 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            c"invalid negative preserved-state slot".as_ptr(),
-        );
-        return ptr::null_mut();
-    }
     let values = preserved_values_owned(owner);
     if values.is_null() {
         return ptr::null_mut();
     }
-    let key = ffi::PyLong_FromLongLong(slot);
-    if key.is_null() {
-        ffi::Py_DECREF(values.cast::<ffi::PyObject>());
-        return ptr::null_mut();
-    }
-    let result = ffi::PyObject_GetItem(values.cast::<ffi::PyObject>(), key) as ObjPtr;
-    ffi::Py_DECREF(key);
+    let result = unsafe {
+        preserved_state::load_preserved_state_owned(values.cast::<ffi::PyObject>(), slot)
+    } as ObjPtr;
     ffi::Py_DECREF(values.cast::<ffi::PyObject>());
     result
 }
 
 unsafe extern "C" fn store_preserved_hook(owner: ObjPtr, slot: i64, value: ObjPtr) -> ObjPtr {
-    if slot < 0 || value.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            c"invalid preserved-state store arguments".as_ptr(),
-        );
-        return ptr::null_mut();
-    }
     let values = preserved_values_owned(owner);
     if values.is_null() {
         return ptr::null_mut();
     }
-    let key = ffi::PyLong_FromLongLong(slot);
-    if key.is_null() {
-        ffi::Py_DECREF(values.cast::<ffi::PyObject>());
-        return ptr::null_mut();
-    }
-    let rc = ffi::PyObject_SetItem(
-        values.cast::<ffi::PyObject>(),
-        key,
-        value.cast::<ffi::PyObject>(),
-    );
-    ffi::Py_DECREF(key);
+    let result = unsafe {
+        preserved_state::store_preserved_state(
+            values.cast::<ffi::PyObject>(),
+            slot,
+            value.cast::<ffi::PyObject>(),
+        )
+    } as ObjPtr;
     ffi::Py_DECREF(values.cast::<ffi::PyObject>());
-    if rc == 0 { new_none() } else { ptr::null_mut() }
+    result
 }
 unsafe extern "C" fn pyobject_delitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() {

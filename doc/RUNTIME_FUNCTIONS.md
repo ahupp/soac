@@ -89,6 +89,8 @@ dp_jit_pyobject_to_i64
 dp_jit_make_cell
 dp_jit_raise_unbound_local_error
 dp_jit_raise_missing_required_argument
+dp_jit_load_preserved
+dp_jit_store_preserved
 dp_jit_load_cell
 dp_jit_store_cell
 dp_jit_del_deref
@@ -218,6 +220,9 @@ _current_yieldfrom
 _is_cancelled_error
 _reraise_control_flow
 _mark_closed
+make_preserved_state
+load_preserved_state
+clear_preserved_state
 _normalize_throw_exc
 _current_throw_context
 complex_from_parts

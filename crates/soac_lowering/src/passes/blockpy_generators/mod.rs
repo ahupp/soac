@@ -592,6 +592,13 @@ fn preserved_slot_init_expr(slot: &PreservedSlot) -> InstrUnresolved {
     }
 }
 
+fn preserved_slot_kind_expr(slot: &PreservedSlot) -> InstrUnresolved {
+    match slot.storage {
+        PreservedSlotStorage::PyObjectOrNull => core_literal_int(0),
+        PreservedSlotStorage::I64 => core_literal_int(1),
+    }
+}
+
 fn preserved_slot_index(layout: &StorageLayout, logical_name: &str) -> usize {
     layout
         .preserved_slots
@@ -690,14 +697,23 @@ fn build_factory_block(
         core_none(),
     );
     let preserved_values = core_call_expr(
-        core_runtime_attr("list"),
-        vec![core_tuple(
-            storage_layout
-                .preserved_slots
-                .iter()
-                .map(preserved_slot_init_expr)
-                .collect(),
-        )],
+        core_runtime_attr("make_preserved_state"),
+        vec![
+            core_tuple(
+                storage_layout
+                    .preserved_slots
+                    .iter()
+                    .map(preserved_slot_init_expr)
+                    .collect(),
+            ),
+            core_tuple(
+                storage_layout
+                    .preserved_slots
+                    .iter()
+                    .map(preserved_slot_kind_expr)
+                    .collect(),
+            ),
+        ],
         Vec::new(),
     );
     let yieldfrom_slot = core_literal_int(preserved_slot_index(storage_layout, "_dp_yieldfrom"));
