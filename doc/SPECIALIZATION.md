@@ -512,14 +512,17 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   sentinels and resolved by the callee's default-resolving direct entry.
   Visible generator factories may inline when their only non-stack layout is
   wrapper-owned preserved activation state; true lexical `freevars` or
-  `cellvars` still keep the callee out of the typed inliner. After trusted
-  generator-resume inlining, typed planning can replace a nonescaping
-  generator wrapper with explicit caller locals for preserved activation slots,
-  initializing those locals from the original public-call arguments and runtime
-  slot defaults. The first slice only lowers generators whose preserved state
-  has no preserved cell slots and whose wrapper has no remaining observable uses
-  after the resume body is inlined; synthetic alias/setup temps introduced while
-  inlining trusted `next`/`send` paths are consumed with the wrapper.
+  `cellvars` still keep the callee out of the typed inliner. Generator-instance
+  planning recognizes both strict module-global generator names and locally
+  proven generator function values such as nested generator helpers carried
+  through local slots. After trusted generator-resume inlining, typed planning
+  can replace a nonescaping generator wrapper with explicit caller locals for
+  preserved activation slots, initializing those locals from the original
+  public-call arguments and runtime slot defaults. The first slice only lowers
+  generators whose preserved state has no preserved cell slots and whose wrapper
+  has no remaining observable uses after the resume body is inlined; synthetic
+  alias/setup temps introduced while inlining trusted `next`/`send` paths are
+  consumed with the wrapper.
   Constructor-entry targets currently require all user arguments to be explicit
   because their type-stored metadata does not yet refresh `__init__` defaults.
 - In apply/verify mode, JIT module planning consumes the cached pre-opt module
