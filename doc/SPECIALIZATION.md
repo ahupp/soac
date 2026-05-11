@@ -517,8 +517,9 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   generator wrapper with explicit caller locals for preserved activation slots,
   initializing those locals from the original public-call arguments and runtime
   slot defaults. The first slice only lowers generators whose preserved state
-  has no preserved cell slots and whose wrapper local has no remaining uses
-  after the resume body is inlined.
+  has no preserved cell slots and whose wrapper has no remaining observable uses
+  after the resume body is inlined; synthetic alias/setup temps introduced while
+  inlining trusted `next`/`send` paths are consumed with the wrapper.
   Constructor-entry targets currently require all user arguments to be explicit
   because their type-stored metadata does not yet refresh `__init__` defaults.
 - In apply/verify mode, JIT module planning consumes the cached pre-opt module

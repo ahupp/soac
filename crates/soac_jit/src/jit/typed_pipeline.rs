@@ -6840,6 +6840,167 @@ def caller(limit):
     }
 
     #[test]
+    fn normal_next_calls_inline_generator_resume_state_to_caller_locals() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def values(limit):
+    yield limit
+
+class ClosureGenerator:
+    def __next__(self):
+        return self.send(None)
+
+    def send(self, value):
+        return resume_generator(self._resume_function, self, value, None)
+
+def caller(limit):
+    gen = values(limit)
+    return next(gen)
+"#,
+        )
+        .expect("source should lower")
+        .blockpy_module;
+        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+        let generator_targets = strict_module_global_generator_targets_for_module(&lowered);
+        let next_function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "ClosureGenerator.__next__")
+            .cloned()
+            .expect("test runtime next method should exist");
+        let send_function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "ClosureGenerator.send")
+            .cloned()
+            .expect("test runtime send method should exist");
+        let mut typed = lower_blockpy_module_to_typed(lowered);
+        for function in &mut typed.callable_defs {
+            if function.names.qualname != "ClosureGenerator.send" {
+                continue;
+            }
+            struct RuntimeResumeMarker;
+            impl VisitMut<InstrTyped> for RuntimeResumeMarker {
+                fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                    if let InstrTyped::CallTyped(call) = expr
+                        && matches!(
+                            call.func.as_ref(),
+                            InstrTyped::Load(load) if load.name.id_str() == "resume_generator"
+                        )
+                    {
+                        call.func = Box::new(
+                            Load::new(ResolvedName::runtime_name("resume_generator")).into(),
+                        );
+                        return;
+                    }
+                    expr.visit_children_mut(self);
+                }
+            }
+            RuntimeResumeMarker.visit_fn_mut(function);
+        }
+        let static_targets = StaticDirectCallTargets {
+            runtime_names: HashMap::new(),
+            module_globals: HashMap::new(),
+            module_global_generators: HashMap::from([(module_id, generator_targets)]),
+            strict_methods: HashMap::from([
+                (
+                    (
+                        "soac.runtime".to_string(),
+                        "ClosureGenerator".to_string(),
+                        "__next__".to_string(),
+                    ),
+                    next_function,
+                ),
+                (
+                    (
+                        "soac.runtime".to_string(),
+                        "ClosureGenerator".to_string(),
+                        "send".to_string(),
+                    ),
+                    send_function,
+                ),
+            ]),
+        };
+        let static_generator_instances =
+            static_generator_instance_plans_for_module(&typed, &static_targets);
+        for function in &mut typed.callable_defs {
+            annotate_typed_generator_instance_plans(
+                function,
+                static_generator_instances.get(&function.function_id),
+            )
+            .expect("generator instance plans should attach");
+        }
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        apply_typed_v3_module_rewrites(
+            &mut typed,
+            &profile,
+            None,
+            &HashMap::new(),
+            &static_targets,
+            &HashMap::new(),
+        )
+        .expect("typed rewrite loop should inline the normal next() path");
+
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .all(|instr| !matches!(
+                    instr,
+                    InstrTyped::Store(store)
+                        if matches!(
+                            store.value.as_ref(),
+                            InstrTyped::CallTyped(call)
+                                if call.extra.generator_instance_plan().is_some()
+                        )
+                )),
+            "normal next() inlining should remove the generator construction"
+        );
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .all(|instr| {
+                    struct PreservedFinder(bool);
+                    impl Visit<InstrTyped> for PreservedFinder {
+                        fn visit_instr(&mut self, expr: &InstrTyped) {
+                            if let InstrTyped::Load(load) = expr
+                                && load.name.preserved_location().is_some()
+                            {
+                                self.0 = true;
+                                return;
+                            }
+                            expr.visit_children(self);
+                        }
+                    }
+                    let mut finder = PreservedFinder(false);
+                    finder.visit_instr(instr);
+                    !finder.0
+                }),
+            "normal next() inlining should remap preserved state to caller locals"
+        );
+    }
+
+    #[test]
     fn trusted_owner_edge_remap_preserves_object_and_function_facts() {
         let source_location = LocalLocation(7);
         let target_location = LocalLocation(8);

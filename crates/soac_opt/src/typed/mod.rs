@@ -5046,9 +5046,8 @@ fn lower_typed_generator_state_origin_to_locals(
     let (constructor_block_index, constructor_instr_index, constructor_target, constructor_call) =
         find_typed_generator_constructor_store(function, plan.generator_origin)?;
     let generator_location = constructor_target.local_location()?;
-    if typed_generator_local_has_residual_uses(function, generator_location) {
-        return None;
-    }
+    let alias_cleanup =
+        typed_generator_alias_cleanup(function, module_constants, generator_location)?;
 
     let values = typed_positional_arg_exprs(constructor_call.args.clone())?;
     if constructor_call
@@ -5123,7 +5122,7 @@ fn lower_typed_generator_state_origin_to_locals(
     );
 
     let removed_owner_stores =
-        remove_typed_generator_owner_seed_stores(function, generator_location);
+        remove_typed_generator_alias_setup(function, module_constants, &alias_cleanup);
     let remapped_instrs =
         remap_typed_generator_preserved_instrs(function, &plan.body_instr_ids, &preserved_locals);
     Some(TypedGeneratorStateLoweringStats {
@@ -5161,32 +5160,109 @@ fn find_typed_generator_constructor_store(
         })
 }
 
-fn typed_generator_local_has_residual_uses(
+struct TypedGeneratorAliasCleanup {
+    alias_locations: HashSet<LocalLocation>,
+    resume_function_locations: HashSet<LocalLocation>,
+    owner_locations: HashSet<LocalLocation>,
+}
+
+fn typed_generator_alias_cleanup(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
     generator_location: LocalLocation,
-) -> bool {
-    struct Uses {
-        generator_location: LocalLocation,
+) -> Option<TypedGeneratorAliasCleanup> {
+    let alias_locations = collect_typed_generator_alias_locations(function, generator_location);
+    let loaded_locations = collect_typed_loaded_local_locations(function);
+    let resume_function_locations = function
+        .blocks
+        .iter()
+        .flat_map(|block| block.body.iter())
+        .filter_map(|instr| {
+            let InstrTyped::Store(store) = instr else {
+                return None;
+            };
+            let location = store.name.local_location()?;
+            (!loaded_locations.contains(&location)
+                && typed_generator_resume_function_attr_load(
+                    store.value.as_ref(),
+                    module_constants,
+                    &alias_locations,
+                ))
+            .then_some(location)
+        })
+        .collect::<HashSet<_>>();
+
+    struct Uses<'a> {
+        alias_locations: HashSet<LocalLocation>,
+        resume_function_locations: HashSet<LocalLocation>,
+        owner_locations: HashSet<LocalLocation>,
+        module_constants: &'a [ConstantExpr],
         residual: bool,
     }
 
-    impl Visit<InstrTyped> for Uses {
+    impl Uses<'_> {
+        fn visit_top_level_instr(&mut self, expr: &InstrTyped) {
+            match expr {
+                InstrTyped::Store(store)
+                    if store
+                        .name
+                        .local_location()
+                        .is_some_and(|location| self.alias_locations.contains(&location))
+                        && typed_generator_alias_load(
+                            store.value.as_ref(),
+                            &self.alias_locations,
+                        ) =>
+                {
+                    return;
+                }
+                InstrTyped::Store(store)
+                    if store.name.local_location().is_some_and(|location| {
+                        self.resume_function_locations.contains(&location)
+                    }) && typed_generator_resume_function_attr_load(
+                        store.value.as_ref(),
+                        &self.module_constants,
+                        &self.alias_locations,
+                    ) =>
+                {
+                    return;
+                }
+                InstrTyped::Store(store)
+                    if store.name.id_str() == "_dp_self"
+                        && typed_generator_alias_load(
+                            store.value.as_ref(),
+                            &self.alias_locations,
+                        ) =>
+                {
+                    if let Some(location) = store.name.local_location() {
+                        self.owner_locations.insert(location);
+                    }
+                    return;
+                }
+                InstrTyped::Del(del)
+                    if del.name.local_location().is_some_and(|location| {
+                        self.alias_locations.contains(&location)
+                            || self.resume_function_locations.contains(&location)
+                            || self.owner_locations.contains(&location)
+                    }) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+            self.visit_instr(expr);
+        }
+    }
+
+    impl Visit<InstrTyped> for Uses<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped) {
             if self.residual {
                 return;
             }
-            if let InstrTyped::Store(store) = expr
-                && store.name.id_str() == "_dp_self"
-                && matches!(
-                    store.value.as_ref(),
-                    InstrTyped::Load(load)
-                        if load.name.local_location() == Some(self.generator_location)
-                )
-            {
-                return;
-            }
             if let InstrTyped::Load(load) = expr
-                && load.name.local_location() == Some(self.generator_location)
+                && load
+                    .name
+                    .local_location()
+                    .is_some_and(|location| self.alias_locations.contains(&location))
             {
                 self.residual = true;
                 return;
@@ -5196,35 +5272,128 @@ fn typed_generator_local_has_residual_uses(
     }
 
     let mut uses = Uses {
-        generator_location,
+        alias_locations,
+        resume_function_locations,
+        owner_locations: HashSet::new(),
+        module_constants,
         residual: false,
     };
-    uses.visit_fn(function);
-    uses.residual
+    for block in &function.blocks {
+        for instr in &block.body {
+            uses.visit_top_level_instr(instr);
+        }
+        uses.visit_term(&block.term);
+    }
+    (!uses.residual).then_some(TypedGeneratorAliasCleanup {
+        alias_locations: uses.alias_locations,
+        resume_function_locations: uses.resume_function_locations,
+        owner_locations: uses.owner_locations,
+    })
 }
 
-fn remove_typed_generator_owner_seed_stores(
-    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+fn collect_typed_generator_alias_locations(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     generator_location: LocalLocation,
-) -> usize {
-    let mut removed = 0;
-    for block in &mut function.blocks {
-        let before = block.body.len();
-        block.body.retain(|instr| {
-            !matches!(
-                instr,
-                InstrTyped::Store(store)
-                    if store.name.id_str() == "_dp_self"
-                        && matches!(
-                            store.value.as_ref(),
-                            InstrTyped::Load(load)
-                                if load.name.local_location() == Some(generator_location)
-                        )
-            )
-        });
-        removed += before - block.body.len();
+) -> HashSet<LocalLocation> {
+    let mut aliases = HashSet::from([generator_location]);
+    loop {
+        let mut changed = false;
+        for instr in function.blocks.iter().flat_map(|block| block.body.iter()) {
+            let InstrTyped::Store(store) = instr else {
+                continue;
+            };
+            if store.name.id_str() == "_dp_self" {
+                continue;
+            }
+            let Some(target) = store.name.local_location() else {
+                continue;
+            };
+            changed |= typed_generator_alias_load(store.value.as_ref(), &aliases)
+                && aliases.insert(target);
+        }
+        if !changed {
+            return aliases;
+        }
     }
-    removed
+}
+
+fn typed_generator_alias_load(expr: &InstrTyped, aliases: &HashSet<LocalLocation>) -> bool {
+    matches!(
+        expr,
+        InstrTyped::Load(load)
+            if load.name.local_location().is_some_and(|location| aliases.contains(&location))
+    )
+}
+
+fn typed_generator_resume_function_attr_load(
+    expr: &InstrTyped,
+    module_constants: &[ConstantExpr],
+    aliases: &HashSet<LocalLocation>,
+) -> bool {
+    let InstrTyped::GetAttrTyped(get_attr) = expr else {
+        return false;
+    };
+    typed_constant_string(get_attr.attr.as_ref(), module_constants) == Some("_resume_function")
+        && typed_generator_alias_load(get_attr.value.as_ref(), aliases)
+}
+
+fn remove_typed_generator_alias_setup(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    cleanup: &TypedGeneratorAliasCleanup,
+) -> usize {
+    let mut removed_owner_stores = 0;
+    for block in &mut function.blocks {
+        block.body.retain(|instr| {
+            let remove =
+                match instr {
+                    InstrTyped::Store(store)
+                        if store.name.local_location().is_some_and(|location| {
+                            cleanup.alias_locations.contains(&location)
+                        }) && typed_generator_alias_load(
+                            store.value.as_ref(),
+                            &cleanup.alias_locations,
+                        ) =>
+                    {
+                        true
+                    }
+                    InstrTyped::Store(store)
+                        if store.name.local_location().is_some_and(|location| {
+                            cleanup.resume_function_locations.contains(&location)
+                        }) && typed_generator_resume_function_attr_load(
+                            store.value.as_ref(),
+                            module_constants,
+                            &cleanup.alias_locations,
+                        ) =>
+                    {
+                        true
+                    }
+                    InstrTyped::Store(store)
+                        if store.name.local_location().is_some_and(|location| {
+                            cleanup.owner_locations.contains(&location)
+                        }) && typed_generator_alias_load(
+                            store.value.as_ref(),
+                            &cleanup.alias_locations,
+                        ) =>
+                    {
+                        removed_owner_stores += 1;
+                        true
+                    }
+                    InstrTyped::Del(del)
+                        if del.name.local_location().is_some_and(|location| {
+                            cleanup.alias_locations.contains(&location)
+                                || cleanup.resume_function_locations.contains(&location)
+                                || cleanup.owner_locations.contains(&location)
+                        }) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+            !remove
+        });
+    }
+    removed_owner_stores
 }
 
 fn remap_typed_generator_preserved_instrs(
