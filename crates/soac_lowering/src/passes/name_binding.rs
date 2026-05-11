@@ -6,9 +6,9 @@ use crate::block_py::{
     CallableScopeInfo, CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation,
     CellRef, CellRefForName, ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del,
     DelItem, EffectiveBinding, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved,
-    IntLiteral, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MakeGeneratorResumeHandle,
-    MapFunction, MapInstr, MapTerm, Mappable, NameLike, NameLocation, NumberLiteral,
-    NumberLiteralValue, ResolvedName, RuntimeFunctionId, RuntimeName, SetItem, StorageLayout,
+    IntLiteral, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
+    MapTerm, Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue,
+    PreservedSlotStorage, ResolvedName, RuntimeFunctionId, RuntimeName, SetItem, StorageLayout,
     Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
@@ -726,32 +726,6 @@ impl NameBindingMapper<'_> {
         .with_meta(meta)
         .into()
     }
-
-    fn materialize_generator_resume_handle_expr(
-        &mut self,
-        meta: crate::block_py::Meta,
-        op: MakeGeneratorResumeHandle,
-    ) -> InstrUnresolved {
-        let function_id_expr = literal_expr(
-            NumberLiteral {
-                value: NumberLiteralValue::Int(IntLiteral::from_i64(
-                    op.function_id().to_packed_runtime_u64() as i64,
-                )),
-            },
-            meta.clone(),
-        );
-        let captures_expr = self.materialize_capture_tuple(op.function_id(), meta.clone());
-        core_runtime_positional_call_expr_with_meta(
-            "make_generator_resume_handle",
-            meta.node_index.clone(),
-            meta.range,
-            vec![
-                function_id_expr,
-                captures_expr,
-                globals_expr(meta.node_index, meta.range),
-            ],
-        )
-    }
 }
 
 fn rewrite_binding_assign_by_name(
@@ -828,9 +802,6 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
             },
             InstrUnresolved::Literal(literal) => InstrUnresolved::Literal(literal),
             InstrUnresolved::MakeFunction(op) => self.materialize_make_function_expr(op.meta(), op),
-            InstrUnresolved::MakeGeneratorResumeHandle(op) => {
-                self.materialize_generator_resume_handle_expr(op.meta(), op)
-            },
             InstrUnresolved::Call(call)
                 if call.args.is_empty()
                     && call.keywords.is_empty()
@@ -964,7 +935,6 @@ fn rewrite_raw_cell_loads_in_expr(
         | InstrUnresolved::CellRefForName(_)
         | InstrUnresolved::CellRef(_)
         | InstrUnresolved::MakeFunction(_)
-        | InstrUnresolved::MakeGeneratorResumeHandle(_)
         | InstrUnresolved::MakeFunctionWithClosure(_) => {
             if let InstrUnresolved::Load(op) = expr {
                 if let UnresolvedName::SourceName(name) = &op.name {
@@ -1196,7 +1166,6 @@ fn collect_remaining_names_in_expr(expr: &InstrUnresolved, names: &mut HashSet<S
         | InstrUnresolved::CellRefForName(_)
         | InstrUnresolved::CellRef(_)
         | InstrUnresolved::MakeFunction(_)
-        | InstrUnresolved::MakeGeneratorResumeHandle(_)
         | InstrUnresolved::MakeFunctionWithClosure(_) => {}
     }
 
@@ -1274,11 +1243,7 @@ fn collect_captured_cell_slot_locations(
 fn collect_owned_cell_storage_bindings(
     callable: &BlockPyFunction<CoreModuleShape>,
 ) -> Vec<(String, String)> {
-    if let Some(layout) = callable
-        .storage_layout
-        .as_ref()
-        .filter(|layout| !layout.cellvars.is_empty())
-    {
+    if let Some(layout) = callable.storage_layout.as_ref() {
         return layout
             .cellvars
             .iter()
@@ -1304,6 +1269,22 @@ fn collect_owned_cell_storage_bindings(
         .collect()
 }
 
+fn collect_preserved_cell_slot_locations(
+    callable: &BlockPyFunction<CoreModuleShape>,
+) -> HashMap<String, u32> {
+    let mut slots = HashMap::new();
+    if let Some(layout) = callable.storage_layout.as_ref() {
+        for (slot, preserved_slot) in layout.preserved_slots.iter().enumerate() {
+            if preserved_slot.storage != PreservedSlotStorage::PyCellObject {
+                continue;
+            }
+            slots.insert(preserved_slot.storage_name.clone(), slot as u32);
+            slots.insert(preserved_slot.logical_name.clone(), slot as u32);
+        }
+    }
+    slots
+}
+
 fn collect_owned_cell_slot_locations(
     callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, u32> {
@@ -1322,9 +1303,6 @@ fn collect_preserved_slot_locations(
     callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, u32> {
     let mut slots = HashMap::new();
-    if callable.kind != FunctionKind::Function {
-        return slots;
-    }
     if let Some(layout) = callable.storage_layout.as_ref() {
         for (slot, preserved_slot) in layout.preserved_slots.iter().enumerate() {
             slots.insert(preserved_slot.storage_name.clone(), slot as u32);
@@ -1451,15 +1429,27 @@ fn compute_local_slot_locations_from_analysis(
     callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, u32> {
     let mut slots = HashMap::new();
-    for (slot, param_name) in callable.params.names().into_iter().enumerate() {
+    for (slot, param_name) in callable.body_params().names().into_iter().enumerate() {
         slots.insert(param_name, slot as u32);
     }
     let mut next_slot = slots.len() as u32;
     let mut owned_cell_storage_names = callable
-        .scope
-        .owned_cell_storage_names()
-        .into_iter()
-        .collect::<Vec<_>>();
+        .storage_layout
+        .as_ref()
+        .map(|layout| {
+            layout
+                .cellvars
+                .iter()
+                .map(|slot| slot.storage_name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            callable
+                .scope
+                .owned_cell_storage_names()
+                .into_iter()
+                .collect::<Vec<_>>()
+        });
     owned_cell_storage_names.sort();
     for storage_name in owned_cell_storage_names {
         if slots.contains_key(storage_name.as_str()) {
@@ -1573,6 +1563,7 @@ struct NameLocator<'a> {
     local_slots: HashMap<String, u32>,
     captured_cell_slots: HashMap<String, u32>,
     owned_cell_slots: HashMap<String, u32>,
+    preserved_cell_slots: HashMap<String, u32>,
     preserved_slots: HashMap<String, u32>,
     cell_bindings: HashMap<String, (String, CellBindingKind)>,
 }
@@ -1613,22 +1604,31 @@ impl NameLocator<'_> {
             kind: func.kind,
             execution_mode: func.execution_mode,
             params: func.params,
+            body_params: func.body_params,
+            public_scope: func.public_scope,
             blocks: func
                 .blocks
                 .into_iter()
                 .map(|block| self.map_block_with_current_params(block))
                 .collect(),
             doc: func.doc,
+            public_storage_layout: func.public_storage_layout,
             storage_layout: func.storage_layout,
             scope: func.scope,
         }
     }
 
     fn resolve_raw_cell_location(&self, name_text: &str) -> CellLocation {
+        if let Some(slot) = self.preserved_cell_slots.get(name_text).copied() {
+            return CellLocation::Preserved(slot);
+        }
         if let Some(slot) = self.owned_cell_slots.get(name_text).copied() {
             return CellLocation::Owned(slot);
         }
         if let Some(storage_name) = name_text.strip_prefix("_dp_cell_") {
+            if let Some(slot) = self.preserved_cell_slots.get(storage_name).copied() {
+                return CellLocation::Preserved(slot);
+            }
             if let Some(slot) = self.owned_cell_slots.get(storage_name).copied() {
                 return CellLocation::Owned(slot);
             }
@@ -1651,6 +1651,13 @@ impl NameLocator<'_> {
         if let Some((storage_name, binding_kind)) = self.cell_bindings.get(name_text) {
             return match binding_kind {
                 CellBindingKind::Owner => {
+                    if let Some(slot) = self
+                        .preserved_cell_slots
+                        .get(storage_name.as_str())
+                        .copied()
+                    {
+                        return CellLocation::Preserved(slot);
+                    }
                     let slot = self
                         .owned_cell_slots
                         .get(storage_name.as_str())
@@ -1725,6 +1732,16 @@ impl NameLocator<'_> {
         {
             match binding_kind {
                 CellBindingKind::Owner => {
+                    if let Some(slot) = self
+                        .preserved_cell_slots
+                        .get(storage_name.as_str())
+                        .copied()
+                    {
+                        return ResolvedName {
+                            id: name,
+                            location: NameLocation::preserved_cell(slot),
+                        };
+                    }
                     let slot = self
                         .owned_cell_slots
                         .get(storage_name.as_str())
@@ -1925,9 +1942,6 @@ impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
             InstrLow::MakeFunction(_) => {
                 panic!("MakeFunction should lower to MakeFunctionWithClosure before name location")
             },
-            InstrLow::MakeGeneratorResumeHandle(_) => {
-                panic!("MakeGeneratorResumeHandle should lower before name location")
-            },
             rest => rest.map_children(self).into(),
         })
     }
@@ -1944,6 +1958,7 @@ fn locate_names_in_callable(
     let local_slots = collect_local_slot_locations(&callable);
     let captured_cell_slots = collect_captured_cell_slot_locations(&callable);
     let owned_cell_slots = collect_owned_cell_slot_locations(&callable);
+    let preserved_cell_slots = collect_preserved_cell_slot_locations(&callable);
     let preserved_slots = collect_preserved_slot_locations(&callable);
     let cell_bindings = collect_cell_bindings(&callable);
     let mut mapper = NameLocator {
@@ -1952,6 +1967,7 @@ fn locate_names_in_callable(
         local_slots,
         captured_cell_slots,
         owned_cell_slots,
+        preserved_cell_slots,
         preserved_slots,
         cell_bindings,
     };
@@ -1965,7 +1981,6 @@ fn collect_make_function_callee_ids_in_expr(
     match expr {
         InstrUnresolved::Literal(_) => {}
         InstrUnresolved::MakeFunction(op) => out.push(op.function_id),
-        InstrUnresolved::MakeGeneratorResumeHandle(op) => out.push(op.function_id()),
         _ => {
             struct CalleeVisitor<'a> {
                 out: &'a mut Vec<RuntimeFunctionId>,
@@ -2237,11 +2252,37 @@ fn ensure_module_storage_layouts(
                 .cloned()
                 .flatten()
             {
+                synchronize_generator_public_storage_layout(&mut callable, &layout);
                 callable.storage_layout = Some(layout);
             }
             callable
         })
         .collect()
+}
+
+fn synchronize_generator_public_storage_layout(
+    callable: &mut BlockPyFunction<CoreModuleShape>,
+    body_layout: &StorageLayout,
+) {
+    if !matches!(
+        callable.kind,
+        FunctionKind::Generator | FunctionKind::Coroutine | FunctionKind::AsyncGenerator
+    ) {
+        return;
+    }
+    let Some(public_layout) = callable.public_storage_layout.as_mut() else {
+        return;
+    };
+    let mut public_freevars = public_layout
+        .freevars
+        .iter()
+        .map(|slot| slot.logical_name.clone())
+        .collect::<HashSet<_>>();
+    for slot in &body_layout.freevars {
+        if public_freevars.insert(slot.logical_name.clone()) {
+            public_layout.freevars.push(slot.clone());
+        }
+    }
 }
 
 fn compute_module_make_function_capture_names(
@@ -2304,8 +2345,7 @@ fn compute_module_make_function_capture_names(
             .unwrap_or_else(|| panic!("missing callable for function id {:?}", function_id));
         let layout_capture_bindings = || {
             callable
-                .storage_layout
-                .as_ref()
+                .public_storage_layout()
                 .map(|layout| {
                     layout
                         .freevars
@@ -2313,7 +2353,7 @@ fn compute_module_make_function_capture_names(
                         .map(|slot| CellCaptureBinding {
                             logical_name: slot.logical_name.clone(),
                             source_name: make_function_capture_source_name(
-                                &callable.scope,
+                                callable.public_scope(),
                                 slot.logical_name.as_str(),
                             ),
                         })
@@ -2431,8 +2471,7 @@ fn compute_module_make_function_capture_names(
                 )
             } else {
                 callable
-                    .storage_layout
-                    .as_ref()
+                    .public_storage_layout()
                     .map(|layout| {
                         layout
                             .freevars
@@ -2440,7 +2479,7 @@ fn compute_module_make_function_capture_names(
                             .map(|slot| CellCaptureBinding {
                                 logical_name: slot.logical_name.clone(),
                                 source_name: make_function_capture_source_name(
-                                    &callable.scope,
+                                    callable.public_scope(),
                                     slot.logical_name.as_str(),
                                 ),
                             })
@@ -2463,8 +2502,11 @@ fn refresh_bb_callable_block_params(
         kind,
         execution_mode,
         params,
+        body_params,
+        public_scope,
         blocks,
         doc,
+        public_storage_layout,
         storage_layout,
         scope,
     } = callable;
@@ -2491,8 +2533,11 @@ fn refresh_bb_callable_block_params(
         kind,
         execution_mode,
         params,
+        body_params,
+        public_scope,
         blocks,
         doc,
+        public_storage_layout,
         storage_layout,
         scope,
     }

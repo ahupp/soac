@@ -717,21 +717,6 @@ fn import_attr(
 }
 
 #[pyfunction]
-fn make_generator_resume_handle(
-    py: Python<'_>,
-    function_id: u64,
-    captures: &Bound<'_, PyAny>,
-    module_globals: &Bound<'_, PyAny>,
-) -> PyResult<Py<PyAny>> {
-    soac_jit::make_generator_resume_handle(
-        py,
-        RuntimeFunctionId::from_packed_runtime_u64(function_id),
-        captures,
-        module_globals,
-    )
-}
-
-#[pyfunction]
 fn resume_generator(
     py: Python<'_>,
     handle: &Bound<'_, PyAny>,
@@ -812,7 +797,6 @@ pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(wrap_pyfunction!(force_entry_interpreter_for_tests, module)?)?;
     module.add_function(wrap_pyfunction!(import_, module)?)?;
     module.add_function(wrap_pyfunction!(import_attr, module)?)?;
-    module.add_function(wrap_pyfunction!(make_generator_resume_handle, module)?)?;
     module.add_function(wrap_pyfunction!(resume_generator, module)?)?;
     module.add_function(wrap_pyfunction!(resume_async_generator, module)?)?;
     module.add_function(wrap_pyfunction!(make_preserved_state, module)?)?;

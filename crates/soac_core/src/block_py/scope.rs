@@ -30,8 +30,9 @@ pub enum BindingKind {
 pub struct StorageLayout {
     pub freevars: Vec<ClosureSlot>,
     pub cellvars: Vec<ClosureSlot>,
-    // Private activation state that survives suspension but is not a Python
-    // lexical cell.
+    // Per-instance activation state that survives suspension. Most slots hold
+    // private locals; PyCellObject slots own lexical cells that the removed
+    // generator factory frame used to own.
     pub preserved_slots: Vec<PreservedSlot>,
     pub stack_slots: Vec<String>,
 }
@@ -106,6 +107,8 @@ pub struct PreservedSlot {
 pub enum PreservedSlotStorage {
     // Raw Python-object pointer. Null is reserved for the future unbound state.
     PyObjectOrNull,
+    // Raw Python cell object pointer for a generator-owned lexical cell.
+    PyCellObject,
     // Raw machine integer for compiler-private always-initialized state.
     I64,
 }

@@ -1058,6 +1058,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             CellLocation::Owned(slot) => unsafe {
                 self.execute_owned_raw_cell_object_for_slot_owned(slot, debug_name)
             },
+            CellLocation::Preserved(slot) => unsafe {
+                self.execute_preserved_raw_cell_object_for_slot_owned(slot, debug_name)
+            },
             CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => unsafe {
                 self.execute_closure_raw_cell_object_for_slot_owned(slot, debug_name)
             },
@@ -1110,6 +1113,23 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_INCREF(value.cast::<ffi::PyObject>());
         }
         Ok(value)
+    }
+
+    #[cold]
+    unsafe fn execute_preserved_raw_cell_object_for_slot_owned(
+        &self,
+        slot: u32,
+        debug_name: &str,
+    ) -> Result<ObjPtr, String> {
+        let owner = self.preserved_owner()?;
+        let cell =
+            unsafe { super::specialized_helpers::dp_jit_load_preserved(owner, i64::from(slot)) };
+        if cell.is_null() {
+            return Err(format!(
+                "deopt continuation expected non-null preserved cell slot {slot} for {debug_name}"
+            ));
+        }
+        Ok(cell.cast())
     }
 
     #[cold]
@@ -1829,6 +1849,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             NameLocation::Cell(location) => unsafe {
                 self.execute_cell_del_owned(del.name.id.as_str(), location, del.quietly)
             },
+            NameLocation::Preserved(location) => unsafe {
+                self.execute_preserved_del_owned(del.name.id.as_str(), location, del.quietly)
+            },
             location => Err(format!(
                 "deopt continuation does not support deleting {location:?} for {:?}",
                 del.name.id.as_str()
@@ -1886,6 +1909,44 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         };
         unsafe {
             ffi::Py_DECREF(cell.cast::<ffi::PyObject>());
+        }
+        Ok(result)
+    }
+
+    #[cold]
+    unsafe fn execute_preserved_del_owned(
+        &self,
+        name: &str,
+        location: PreservedLocation,
+        quietly: bool,
+    ) -> Result<ObjPtr, String> {
+        let owner = self.preserved_owner()?;
+        let name_len = ffi::Py_ssize_t::try_from(name.len()).map_err(|_| {
+            format!("preserved-delete deopt name {name:?} is too large to materialize as PyUnicode")
+        })?;
+        let name_obj = unsafe { ffi::PyUnicode_FromStringAndSize(name.as_ptr().cast(), name_len) };
+        if name_obj.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let result = if quietly {
+            unsafe {
+                super::specialized_helpers::dp_jit_del_preserved_quietly(
+                    owner,
+                    i64::from(location.slot()),
+                    name_obj.cast(),
+                )
+            }
+        } else {
+            unsafe {
+                super::specialized_helpers::dp_jit_del_preserved(
+                    owner,
+                    i64::from(location.slot()),
+                    name_obj.cast(),
+                )
+            }
+        };
+        unsafe {
+            ffi::Py_DECREF(name_obj);
         }
         Ok(result)
     }

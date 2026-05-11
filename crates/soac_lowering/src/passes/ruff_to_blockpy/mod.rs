@@ -555,8 +555,11 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
         kind: blockpy_kind,
         execution_mode,
         params,
+        body_params: None,
+        public_scope: None,
         blocks,
         doc,
+        public_storage_layout: None,
         storage_layout: None,
         scope: scope.clone(),
     }

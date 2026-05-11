@@ -32,6 +32,8 @@ fn lowers_await_to_yield_from_await_iter() {
             kind: FunctionKind::Coroutine,
             execution_mode: Default::default(),
             params: Default::default(),
+            body_params: None,
+            public_scope: None,
             blocks: vec![Block {
                 label: structured_block.label,
                 body: structured_block.body,
@@ -41,6 +43,7 @@ fn lowers_await_to_yield_from_await_iter() {
                 extra: Default::default(),
             }],
             doc: None,
+            public_storage_layout: None,
             storage_layout: None,
             scope: CallableScopeInfo::default(),
         }],

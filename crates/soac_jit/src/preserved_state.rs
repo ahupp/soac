@@ -290,6 +290,37 @@ pub unsafe fn store_preserved_state(
     unsafe { owned_none() }
 }
 
+pub unsafe fn clear_preserved_slot(capsule: *mut ffi::PyObject, slot: i64) -> i32 {
+    let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
+        return -1;
+    };
+    let Ok(slot) = (unsafe { slot_index(state.values.len(), slot) }) else {
+        return -1;
+    };
+    match state.kinds[slot] {
+        PreservedSlotKind::PyObjectOrNull => {
+            let old_value = state.values[slot] as usize as *mut ffi::PyObject;
+            if old_value.is_null() {
+                return 0;
+            }
+            state.values[slot] = 0;
+            unsafe {
+                ffi::Py_DECREF(old_value);
+            }
+            1
+        }
+        PreservedSlotKind::I64 => {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"cannot clear scalar preserved-state slot".as_ptr(),
+                );
+            }
+            -1
+        }
+    }
+}
+
 pub unsafe fn clear_preserved_state(capsule: *mut ffi::PyObject) -> i32 {
     let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
         return -1;
@@ -408,6 +439,35 @@ mod tests {
             ffi::Py_DECREF(replacement);
             ffi::Py_DECREF(initial_i64);
             ffi::Py_DECREF(replacement_i64);
+            ffi::Py_DECREF(pyobject_kind);
+            ffi::Py_DECREF(i64_kind);
+        });
+    }
+
+    #[test]
+    fn clear_preserved_slot_tracks_empty_object_slots_and_rejects_scalar_slots() {
+        soac_cpython::initialize_test_python("soac_jit-preserved-state-clear-slot-test")
+            .expect("test Python should initialize");
+        Python::attach(|_| unsafe {
+            let object = ffi::PyList_New(0);
+            let initial_i64 = ffi::PyLong_FromLongLong(7);
+            let pyobject_kind = ffi::PyLong_FromLongLong(PYOBJECT_OR_NULL_KIND_TAG);
+            let i64_kind = ffi::PyLong_FromLongLong(I64_KIND_TAG);
+            let initial_values = ffi::PyTuple_Pack(2, object, initial_i64);
+            let kinds = ffi::PyTuple_Pack(2, pyobject_kind, i64_kind);
+            let state = new_preserved_state(initial_values, kinds);
+
+            assert_eq!(clear_preserved_slot(state, 0), 1);
+            assert_eq!(clear_preserved_slot(state, 0), 0);
+            assert_eq!(clear_preserved_slot(state, 1), -1);
+            assert!(!ffi::PyErr_Occurred().is_null());
+            ffi::PyErr_Clear();
+
+            ffi::Py_DECREF(state);
+            ffi::Py_DECREF(initial_values);
+            ffi::Py_DECREF(kinds);
+            ffi::Py_DECREF(object);
+            ffi::Py_DECREF(initial_i64);
             ffi::Py_DECREF(pyobject_kind);
             ffi::Py_DECREF(i64_kind);
         });

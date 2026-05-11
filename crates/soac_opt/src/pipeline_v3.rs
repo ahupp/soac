@@ -22,10 +22,11 @@ use anyhow::Result;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
-    ConstantExpr, FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId,
-    LocalLocation, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
-    ResolvedName, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
-    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Tuple, Visit,
+    ConstantExpr, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId,
+    LocalFunctionId, LocalLocation, ModuleContentId, NameLike, NameLocation, ParamKind,
+    PersistentFunctionId, ResolvedName, RuntimeName, SerializedFunctionDebugName,
+    SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
+    Tuple, Visit,
 };
 use soac_ir_blockpy::is_constructor_entry_function;
 use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
@@ -1288,6 +1289,15 @@ fn direct_call_requests_from_evidence_v3(
                 });
                 continue;
             }
+            if target_function.lowered_kind() != &FunctionKind::Function {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 direct-call declined target {serialized_target}: generator-like targets require public factory semantics, not direct resume-body calls"
+                    ),
+                });
+                continue;
+            }
             let callee = match &source_callee {
                 DirectCallSourceCallee::Function => DirectCallCallee::Function,
                 DirectCallSourceCallee::Method { method_name } => DirectCallCallee::Method {
@@ -2187,8 +2197,11 @@ mod tests {
             kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec::default(),
+            body_params: None,
+            public_scope: None,
             blocks,
             doc: None,
+            public_storage_layout: None,
             storage_layout: None,
             scope: Default::default(),
         }
@@ -2689,6 +2702,84 @@ mod tests {
             diagnostics[0]
                 .message
                 .contains("missing required argument value")
+        );
+    }
+
+    #[test]
+    fn direct_call_requests_decline_generator_like_targets() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let source = instr_id(9);
+        let call = with_instr_id(
+            InstrBlockPy::Call(Call::new(local("coro", 0), Vec::new(), Vec::new())),
+            9,
+        );
+        let mut caller = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "caller",
+            "caller",
+            vec![Block::new(
+                label(0),
+                vec![InstrBlockPy::Store(Store::new(
+                    local_name("result", 1),
+                    call,
+                ))],
+                BlockTerm::Return(local("result", 1)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        set_stack_slots(&mut caller, &["coro", "result"]);
+        let mut coroutine = simple_arg_return_callee(&[("_dp_self", false)]);
+        coroutine.names = FunctionName::new("coro", "coro", "coro", "coro");
+        coroutine.kind = FunctionKind::Coroutine;
+        let caller_id = caller.function_id;
+        let coroutine_id = coroutine.function_id;
+        let module = BlockPyModule {
+            module_name_gen,
+            global_names: Vec::new(),
+            callable_defs: vec![caller.clone(), coroutine],
+            module_constants: Vec::new(),
+            counter_defs: Vec::new(),
+        };
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: vec![row(
+                "call_hot_targets",
+                caller_id,
+                source,
+                1,
+                Some(coroutine_id.to_packed_runtime_u64()),
+            )],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+        let module_identity = module_identity();
+        let target_index = DirectCallTargetIndex::from_current_module(&module_identity, &module);
+        let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(&module_identity);
+
+        let (requests, diagnostics) = direct_call_requests_from_evidence_v3(
+            &module,
+            &module_identity,
+            &caller,
+            &evidence_store,
+            &target_index,
+            &mut identity_builder,
+        );
+
+        assert!(requests.is_empty(), "{requests:?}");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("generator-like targets require public factory semantics"),
+            "{diagnostics:?}"
         );
     }
 

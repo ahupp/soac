@@ -905,7 +905,7 @@ impl ProcessJitFunctionShape {
     fn for_function(function: &BlockPyFunction<BlockPyModuleShape>) -> Self {
         Self {
             qualname: function.names.qualname.clone(),
-            param_count: function.params.len(),
+            param_count: function.body_params().len(),
         }
     }
 }
@@ -1830,7 +1830,7 @@ impl ProcessJitState {
         Ok(CompiledJitFunction {
             function_id: function.function_id,
             function_qualname: function.names.qualname.clone(),
-            param_count: function.params.len(),
+            param_count: function.body_params().len(),
             main_id,
             main_symbol,
             default_adapter_id,
@@ -3409,8 +3409,11 @@ mod tests {
             kind: FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec::default(),
+            body_params: None,
+            public_scope: None,
             blocks: vec![],
             doc: None,
+            public_storage_layout: None,
             storage_layout: None,
             scope: Default::default(),
         }

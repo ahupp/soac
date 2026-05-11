@@ -193,7 +193,7 @@ impl FunctionRuntimeDataLayout {
         }
         let closure_start = positional_default_count + kwonly_default_slots.len();
         let storage_layout_closure_len = function
-            .storage_layout()
+            .public_storage_layout()
             .as_ref()
             .map(|layout| layout.freevars.len())
             .unwrap_or(0);
@@ -263,7 +263,7 @@ fn max_referenced_function_closure_slot(function: &BlockPyFunction<BlockPyModule
                 CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
                     self.max_slot_plus_one = self.max_slot_plus_one.max(slot as usize + 1);
                 }
-                CellLocation::Owned(_) => {}
+                CellLocation::Owned(_) | CellLocation::Preserved(_) => {}
             }
         }
 
@@ -306,7 +306,7 @@ fn max_referenced_typed_function_closure_slot(
                 CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
                     self.max_slot_plus_one = self.max_slot_plus_one.max(slot as usize + 1);
                 }
-                CellLocation::Owned(_) => {}
+                CellLocation::Owned(_) | CellLocation::Preserved(_) => {}
             }
         }
 

@@ -329,6 +329,16 @@ pub(super) static DP_JIT_STORE_PRESERVED_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::I64, SigType::Pointer],
     &[SigType::Pointer],
 );
+pub(super) static DP_JIT_DEL_PRESERVED_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_del_preserved",
+    &[SigType::Pointer, SigType::I64, SigType::Pointer],
+    &[SigType::Pointer],
+);
+pub(super) static DP_JIT_DEL_PRESERVED_QUIETLY_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_del_preserved_quietly",
+    &[SigType::Pointer, SigType::I64, SigType::Pointer],
+    &[SigType::Pointer],
+);
 pub(super) static DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_pytype_generic_alloc",
     &[SigType::Pointer, SigType::I64],
@@ -531,6 +541,8 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PYOBJECT_SETITEM_IMPORT,
     &DP_JIT_LOAD_PRESERVED_IMPORT,
     &DP_JIT_STORE_PRESERVED_IMPORT,
+    &DP_JIT_DEL_PRESERVED_IMPORT,
+    &DP_JIT_DEL_PRESERVED_QUIETLY_IMPORT,
     &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
     &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     &DP_JIT_PYOBJECT_TO_I64_IMPORT,

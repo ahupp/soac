@@ -1050,18 +1050,6 @@ impl<E: Instr> MakeFunction<E> {
 }
 
 define_instr! {
-    pub struct MakeGeneratorResumeHandle {
-        function_id: RuntimeFunctionId,
-    }
-}
-
-impl MakeGeneratorResumeHandle {
-    pub fn function_id(&self) -> RuntimeFunctionId {
-        self.function_id
-    }
-}
-
-define_instr! {
     pub struct MakeFunctionWithClosure<E> {
         function_id: RuntimeFunctionId,
         kind: FunctionKind,

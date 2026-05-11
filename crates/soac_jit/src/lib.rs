@@ -29,11 +29,11 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use soac_core::block_py::{
-    BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
+    BlockPyFunction, ClosureInit, FunctionExecutionMode, FunctionKind, ParamKind,
+    PreservedSlotStorage, RuntimeFunctionId,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
@@ -87,6 +87,7 @@ pub(crate) fn run_test_in_isolated_process_if_needed(module_path: &str, test_nam
 }
 
 unsafe extern "C" {
+    fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyFunction_SetVectorcall(
         func: *mut ffi::PyFunctionObject,
         vectorcall: Option<ffi::vectorcallfunc>,
@@ -319,19 +320,6 @@ struct PyFunctionJitExtra {
     previous_vectorcall: Option<ffi::vectorcallfunc>,
 }
 
-struct GeneratorResumeHandle {
-    function_env: Box<FunctionEnv>,
-    function_template: Arc<FunctionInstantiationTemplate>,
-    compile_session: Arc<CompileSession>,
-    module_state: Arc<module_type::SharedModuleState>,
-}
-
-const GENERATOR_RESUME_HANDLE_CAPSULE_NAME: &std::ffi::CStr = c"soac.GeneratorResumeHandle";
-
-unsafe extern "C" {
-    fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
-}
-
 static FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS: AtomicBool = AtomicBool::new(false);
 
 struct DirectArgParamBinding {
@@ -425,8 +413,7 @@ impl FunctionInstantiationTemplate {
         function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<Self, String> {
         let capture_names = function
-            .storage_layout
-            .as_ref()
+            .public_storage_layout()
             .map(|layout| {
                 layout
                     .freevars
@@ -627,106 +614,6 @@ impl Drop for FunctionEnv {
         let layout = Self::allocation_layout(self.runtime_object_len);
         unsafe { dealloc(self.abi.as_ptr() as *mut u8, layout) };
     }
-}
-
-unsafe extern "C" fn generator_resume_handle_capsule_destructor(capsule: *mut ffi::PyObject) {
-    let handle_ptr = unsafe {
-        ffi::PyCapsule_GetPointer(capsule, GENERATOR_RESUME_HANDLE_CAPSULE_NAME.as_ptr())
-            as *mut GeneratorResumeHandle
-    };
-    if handle_ptr.is_null() {
-        unsafe {
-            ffi::PyErr_Clear();
-        }
-        return;
-    }
-    drop(unsafe { Box::from_raw(handle_ptr) });
-}
-
-unsafe fn generator_resume_handle_from_capsule(
-    capsule: *mut ffi::PyObject,
-) -> Result<&'static mut GeneratorResumeHandle, ()> {
-    let handle_ptr = unsafe {
-        ffi::PyCapsule_GetPointer(capsule, GENERATOR_RESUME_HANDLE_CAPSULE_NAME.as_ptr())
-            as *mut GeneratorResumeHandle
-    };
-    if handle_ptr.is_null() {
-        return Err(());
-    }
-    Ok(unsafe { &mut *handle_ptr })
-}
-
-fn collect_generator_resume_runtime_objects(
-    py: Python<'_>,
-    function_template: &FunctionInstantiationTemplate,
-    captures: &Bound<'_, PyAny>,
-) -> PyResult<Box<[*mut ffi::PyObject]>> {
-    let runtime_layout = function_template.runtime_data_layout();
-    let Some(captured_values) = function_instantiation::build_ordered_capture_values(
-        py,
-        captures,
-        function_template.capture_names(),
-    )?
-    else {
-        return Err(PyRuntimeError::new_err(format!(
-            "generator resume handle captures did not match fn#{}",
-            function_template.function().function_id
-        )));
-    };
-    let mut runtime_objects = vec![ptr::null_mut(); runtime_layout.total_len()].into_boxed_slice();
-    for (slot, value) in captured_values.iter().enumerate() {
-        let cell = if function_instantiation::is_cell_object(value.as_ptr()) {
-            unsafe {
-                ffi::Py_INCREF(value.as_ptr());
-            }
-            value.as_ptr()
-        } else {
-            let cell = unsafe { PyCell_New(value.as_ptr()) };
-            if cell.is_null() {
-                unsafe {
-                    cleanup_state_values(&mut runtime_objects);
-                }
-                return Err(PyErr::fetch(py));
-            }
-            cell
-        };
-        runtime_objects[runtime_layout.closure_cell_slot(slot)] = cell;
-    }
-    Ok(runtime_objects)
-}
-
-pub fn make_generator_resume_handle(
-    py: Python<'_>,
-    function_id: RuntimeFunctionId,
-    captures: &Bound<'_, PyAny>,
-    module_globals: &Bound<'_, PyAny>,
-) -> PyResult<Py<PyAny>> {
-    let compile_session = CompileSession::process();
-    let (module_state, function_template) =
-        function_instantiation::lookup_shared_function_template(&compile_session, function_id)?;
-    let runtime_objects =
-        collect_generator_resume_runtime_objects(py, function_template.as_ref(), captures)?;
-    let function_env = unsafe { FunctionEnv::new(module_globals.as_ptr(), runtime_objects) }
-        .map_err(|()| PyErr::fetch(py))?;
-    let handle = Box::new(GeneratorResumeHandle {
-        function_env: Box::new(function_env),
-        function_template,
-        compile_session,
-        module_state,
-    });
-    let handle_ptr = Box::into_raw(handle);
-    let capsule = unsafe {
-        ffi::PyCapsule_New(
-            handle_ptr.cast::<c_void>(),
-            GENERATOR_RESUME_HANDLE_CAPSULE_NAME.as_ptr(),
-            Some(generator_resume_handle_capsule_destructor),
-        )
-    };
-    if capsule.is_null() {
-        drop(unsafe { Box::from_raw(handle_ptr) });
-        return Err(PyErr::fetch(py));
-    }
-    Ok(unsafe { Bound::from_owned_ptr(py, capsule) }.unbind())
 }
 
 impl PyFunctionJitExtra {
@@ -1740,49 +1627,26 @@ fn lookup_or_compile_direct_function_handle(
     }
 }
 
-unsafe fn ensure_generator_resume_direct_entry(
-    handle: &mut GeneratorResumeHandle,
-) -> Result<(), ()> {
-    if handle.function_env.compiled_function.is_none() {
-        let function = handle.function_template.function();
-        let compiled_function = lookup_or_compile_direct_function_handle(
-            &handle.compile_session,
-            &handle.module_state,
-            function,
-            "generator_resume_function_body",
-        )
-        .map_err(|err| set_runtime_error_message(&err))?;
-        attach_compiled_function_to_env(&mut handle.function_env, compiled_function)?;
-    }
-    if handle.function_env.direct_code_ptr().is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            c"compiled generator resume function is missing a direct entry pointer".as_ptr(),
-        );
-        return Err(());
-    }
-    Ok(())
-}
-
 pub unsafe fn resume_generator(
-    handle_capsule: *mut ffi::PyObject,
+    resume_function: *mut ffi::PyObject,
     owner: *mut ffi::PyObject,
     send_value: *mut ffi::PyObject,
     resume_exc: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
-    let Ok(handle) = (unsafe { generator_resume_handle_from_capsule(handle_capsule) }) else {
+    let Ok(data) = (unsafe { py_function_jit_extra(resume_function) }) else {
         return ptr::null_mut();
     };
-    if handle.function_template.function().params.len() != 3 {
+    if data.function_template.function().body_params().len() != 3 {
         unsafe {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                c"generator resume handle expected a 3-argument resume body".as_ptr(),
+                c"generator resume function expected a 3-argument resume body".as_ptr(),
             );
         }
         return ptr::null_mut();
     }
-    if unsafe { ensure_generator_resume_direct_entry(handle) }.is_err() {
+    let py = unsafe { Python::assume_attached() };
+    if unsafe { ensure_clif_direct_entries_compiled(py, data) }.is_err() {
         return ptr::null_mut();
     }
     let entry: unsafe extern "C" fn(
@@ -1791,10 +1655,10 @@ pub unsafe fn resume_generator(
         *mut ffi::PyObject,
         *mut ffi::PyObject,
         *mut ffi::PyObject,
-    ) -> *mut ffi::PyObject = unsafe { mem::transmute(handle.function_env.direct_code_ptr()) };
+    ) -> *mut ffi::PyObject = unsafe { mem::transmute(data.function_env.direct_code_ptr()) };
     unsafe {
         entry(
-            handle.function_env.as_mut_ptr(),
+            data.function_env.as_mut_ptr(),
             ffi::PyThreadState_Get().cast(),
             owner,
             send_value,
@@ -1804,25 +1668,26 @@ pub unsafe fn resume_generator(
 }
 
 pub unsafe fn resume_async_generator(
-    handle_capsule: *mut ffi::PyObject,
+    resume_function: *mut ffi::PyObject,
     owner: *mut ffi::PyObject,
     send_value: *mut ffi::PyObject,
     resume_exc: *mut ffi::PyObject,
     transport_sent: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
-    let Ok(handle) = (unsafe { generator_resume_handle_from_capsule(handle_capsule) }) else {
+    let Ok(data) = (unsafe { py_function_jit_extra(resume_function) }) else {
         return ptr::null_mut();
     };
-    if handle.function_template.function().params.len() != 4 {
+    if data.function_template.function().body_params().len() != 4 {
         unsafe {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                c"async-generator resume handle expected a 4-argument resume body".as_ptr(),
+                c"async-generator resume function expected a 4-argument resume body".as_ptr(),
             );
         }
         return ptr::null_mut();
     }
-    if unsafe { ensure_generator_resume_direct_entry(handle) }.is_err() {
+    let py = unsafe { Python::assume_attached() };
+    if unsafe { ensure_clif_direct_entries_compiled(py, data) }.is_err() {
         return ptr::null_mut();
     }
     let entry: unsafe extern "C" fn(
@@ -1832,10 +1697,10 @@ pub unsafe fn resume_async_generator(
         *mut ffi::PyObject,
         *mut ffi::PyObject,
         *mut ffi::PyObject,
-    ) -> *mut ffi::PyObject = unsafe { mem::transmute(handle.function_env.direct_code_ptr()) };
+    ) -> *mut ffi::PyObject = unsafe { mem::transmute(data.function_env.direct_code_ptr()) };
     unsafe {
         entry(
-            handle.function_env.as_mut_ptr(),
+            data.function_env.as_mut_ptr(),
             ffi::PyThreadState_Get().cast(),
             owner,
             send_value,
@@ -1901,6 +1766,9 @@ unsafe fn ensure_clif_vectorcall_compiled(
     data: &mut PyFunctionJitExtra,
 ) -> Result<(), ()> {
     unsafe { ensure_clif_direct_entries_compiled(py, data)? };
+    if *data.function()?.lowered_kind() != FunctionKind::Function {
+        return Ok(());
+    }
     if data.compiled_vectorcall_entry.is_none() {
         let param_count = data.function_template.binding_plan().param_count();
         let entry = match data
@@ -2364,6 +2232,11 @@ pub unsafe fn register_clif_vectorcall(
     let func = function as *mut ffi::PyFunctionObject;
     if !PyFunction_GetSoacMetadata(function).is_null() {
         let data = unsafe { py_function_jit_extra(function)? };
+        if *data.function()?.lowered_kind() != FunctionKind::Function {
+            data.compiled_vectorcall_entry = None;
+            PyFunction_SetVectorcall(func, Some(generator_factory_vectorcall));
+            return Ok(());
+        }
         if entry_interpreter_vectorcall_requested(data.function()?) {
             data.compiled_vectorcall_entry = None;
             PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall));
@@ -2402,6 +2275,21 @@ pub unsafe fn register_clif_vectorcall(
         })?;
     let blockpy_function_kind = *blockpy_function.lowered_kind();
     let blockpy_function_param_count = blockpy_function.params.len();
+    if blockpy_function_kind != FunctionKind::Function {
+        let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+        if PyFunction_SetSoacMetadata(
+            function,
+            function_id.to_packed_runtime_u64(),
+            data_ptr,
+            Some(free_clif_function_data),
+        ) != 0
+        {
+            free_clif_function_data(data_ptr);
+            return Err(());
+        }
+        PyFunction_SetVectorcall(func, Some(generator_factory_vectorcall));
+        return Ok(());
+    }
     if entry_interpreter_vectorcall_requested(blockpy_function) {
         let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
         if PyFunction_SetSoacMetadata(
@@ -2535,6 +2423,217 @@ unsafe extern "C" fn entry_interpreter_vectorcall(
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
                     c"panic in entry_interpreter_vectorcall".as_ptr(),
+                );
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+fn generator_kind_tag(kind: FunctionKind) -> Option<i64> {
+    match kind {
+        FunctionKind::Generator => Some(0),
+        FunctionKind::Coroutine => Some(1),
+        FunctionKind::AsyncGenerator => Some(2),
+        FunctionKind::Function => None,
+    }
+}
+
+unsafe fn tuple_set_owned(
+    tuple: *mut ffi::PyObject,
+    index: usize,
+    value: *mut ffi::PyObject,
+) -> Result<(), ()> {
+    if value.is_null() {
+        return Err(());
+    }
+    if ffi::PyTuple_SetItem(tuple, index as ffi::Py_ssize_t, value) != 0 {
+        ffi::Py_DECREF(value);
+        return Err(());
+    }
+    Ok(())
+}
+
+unsafe fn make_generator_instance_from_vectorcall(
+    function_obj: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargsf: usize,
+    kwnames: *mut ffi::PyObject,
+) -> Result<*mut ffi::PyObject, ()> {
+    let py = Python::assume_attached();
+    let data = py_function_jit_extra(function_obj)?;
+    let function = data.function()?;
+    let Some(kind_tag) = generator_kind_tag(*function.lowered_kind()) else {
+        return set_runtime_error(
+            "generator factory vectorcall expected a generator-like function",
+        );
+    };
+    let Some(layout) = function.public_storage_layout() else {
+        return set_runtime_error("generator-like function is missing preserved-state layout");
+    };
+    let Some(yieldfrom_slot) = layout
+        .preserved_slots
+        .iter()
+        .position(|slot| slot.logical_name == "_dp_yieldfrom")
+    else {
+        return set_runtime_error(
+            "generator-like function is missing _dp_yieldfrom preserved slot",
+        );
+    };
+    let Some(throw_context_slot) = layout
+        .preserved_slots
+        .iter()
+        .position(|slot| slot.logical_name == "_dp_throw_context")
+    else {
+        return set_runtime_error(
+            "generator-like function is missing _dp_throw_context preserved slot",
+        );
+    };
+
+    let mut bound_args = vec![ptr::null_mut(); data.function_template.binding_plan().param_count()];
+    bind_function_args_to_output(
+        data,
+        args,
+        nargsf,
+        kwnames,
+        bound_args.as_mut_ptr(),
+        bound_args.len(),
+    )?;
+
+    let initial_values = ffi::PyTuple_New(layout.preserved_slots.len() as ffi::Py_ssize_t);
+    if initial_values.is_null() {
+        cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+        return Err(());
+    }
+    let slot_kinds = ffi::PyTuple_New(layout.preserved_slots.len() as ffi::Py_ssize_t);
+    if slot_kinds.is_null() {
+        ffi::Py_DECREF(initial_values);
+        cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+        return Err(());
+    }
+    for (slot_index, slot) in layout.preserved_slots.iter().enumerate() {
+        let value = match slot.init {
+            ClosureInit::Parameter => {
+                let Some(param_index) = data
+                    .function_template
+                    .binding_plan()
+                    .param_index(slot.logical_name.as_str())
+                else {
+                    ffi::Py_DECREF(initial_values);
+                    ffi::Py_DECREF(slot_kinds);
+                    cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                    return set_runtime_error("preserved parameter slot has no public parameter");
+                };
+                let value = bound_args[param_index];
+                if value.is_null() {
+                    ffi::Py_DECREF(initial_values);
+                    ffi::Py_DECREF(slot_kinds);
+                    cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                    return set_runtime_error("preserved parameter slot was not bound");
+                }
+                match slot.storage {
+                    PreservedSlotStorage::PyCellObject => {
+                        let cell = PyCell_New(value);
+                        if cell.is_null() {
+                            ffi::Py_DECREF(initial_values);
+                            ffi::Py_DECREF(slot_kinds);
+                            cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                            return Err(());
+                        }
+                        cell
+                    }
+                    PreservedSlotStorage::PyObjectOrNull | PreservedSlotStorage::I64 => {
+                        ffi::Py_INCREF(value);
+                        value
+                    }
+                }
+            }
+            ClosureInit::RuntimePcUnstarted => ffi::PyLong_FromLongLong(1),
+            ClosureInit::RuntimeAbruptKindFallthrough => ffi::PyLong_FromLongLong(0),
+            ClosureInit::RuntimeNone | ClosureInit::Deferred => {
+                let none = ffi::Py_None();
+                ffi::Py_INCREF(none);
+                none
+            }
+            ClosureInit::EmptyCell if slot.storage == PreservedSlotStorage::PyCellObject => {
+                let cell = PyCell_New(ptr::null_mut());
+                if cell.is_null() {
+                    ffi::Py_DECREF(initial_values);
+                    ffi::Py_DECREF(slot_kinds);
+                    cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                    return Err(());
+                }
+                cell
+            }
+            ClosureInit::InheritedCapture | ClosureInit::EmptyCell => {
+                ffi::Py_DECREF(initial_values);
+                ffi::Py_DECREF(slot_kinds);
+                cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                return set_runtime_error("closure-only init reached preserved-state layout");
+            }
+        };
+        tuple_set_owned(initial_values, slot_index, value)?;
+        let kind = match slot.storage {
+            PreservedSlotStorage::PyObjectOrNull => 0,
+            PreservedSlotStorage::PyCellObject => 0,
+            PreservedSlotStorage::I64 => 1,
+        };
+        tuple_set_owned(slot_kinds, slot_index, ffi::PyLong_FromLongLong(kind))?;
+    }
+    cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+
+    let runtime = py.import("soac.runtime").map_err(|err| {
+        err.restore(py);
+    })?;
+    let make_instance = runtime.getattr("make_generator_instance").map_err(|err| {
+        err.restore(py);
+    })?;
+    let initial_values = Bound::from_owned_ptr(py, initial_values);
+    let slot_kinds = Bound::from_owned_ptr(py, slot_kinds);
+    let function_obj = Bound::from_borrowed_ptr(py, function_obj);
+    let result = make_instance
+        .call1((
+            function_obj,
+            kind_tag,
+            function.names.display_name.as_str(),
+            function.names.qualname.as_str(),
+            initial_values,
+            slot_kinds,
+            yieldfrom_slot,
+            throw_context_slot,
+        ))
+        .map_err(|err| {
+            err.restore(py);
+        })?;
+    Ok(result.into_ptr())
+}
+
+unsafe extern "C" fn generator_factory_vectorcall(
+    callable: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargsf: usize,
+    kwnames: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    if ffi::Py_EnterRecursiveCall(c" while calling a Python object".as_ptr()) != 0 {
+        return ptr::null_mut();
+    }
+    let _recursive_call = EntryInterpreterRecursiveCallGuard;
+    match panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        make_generator_instance_from_vectorcall(callable, args, nargsf, kwnames)
+    })) {
+        Ok(Ok(result)) => result,
+        Ok(Err(())) => ptr::null_mut(),
+        Err(payload) => {
+            let message = format!(
+                "panic in generator_factory_vectorcall: {}",
+                panic_payload_to_string(payload)
+            );
+            if let Ok(c_msg) = CString::new(message) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"panic in generator_factory_vectorcall".as_ptr(),
                 );
             }
             ptr::null_mut()

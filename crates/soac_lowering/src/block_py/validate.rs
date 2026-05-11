@@ -257,6 +257,13 @@ where
     };
 
     for expected_slot in &expected_layout.cellvars {
+        if layout.preserved_slots.iter().any(|slot| {
+            slot.storage == crate::block_py::PreservedSlotStorage::PyCellObject
+                && slot.logical_name == expected_slot.logical_name
+                && slot.storage_name == expected_slot.storage_name
+        }) {
+            continue;
+        }
         let Some(actual_slot) = layout
             .cellvars
             .iter()

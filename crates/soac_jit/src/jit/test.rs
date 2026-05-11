@@ -1998,10 +1998,7 @@ def add_default(left, right=9):
             return None;
         }
         let qualname = function.names.qualname.as_str();
-        if qualname == "_dp_module_init"
-            || function.names.fn_name == "_dp_resume"
-            || is_synthetic_class_helper_for_original_code(function)
-        {
+        if qualname == "_dp_module_init" || is_synthetic_class_helper_for_original_code(function) {
             return None;
         }
         Some(qualname)
@@ -3936,8 +3933,11 @@ def build(values):
             kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec::default(),
+            body_params: None,
+            public_scope: None,
             blocks: vec![],
             doc: None,
+            public_storage_layout: None,
             storage_layout: None,
             scope: Default::default(),
         }
@@ -22690,6 +22690,8 @@ class Point:
             kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: caller_params,
+            body_params: None,
+            public_scope: None,
             blocks: vec![BlockPyBlock {
                 label: BlockLabel::from_index(0),
                 body: vec![],
@@ -22706,6 +22708,7 @@ class Point:
                 extra: Default::default(),
             }],
             doc: None,
+            public_storage_layout: None,
             storage_layout: None,
             scope: Default::default(),
         };
@@ -22906,6 +22909,8 @@ class Point:
                         has_default: false,
                     }],
                 },
+                body_params: None,
+                public_scope: None,
                 blocks: vec![BlockPyBlock {
                     label: BlockLabel::from_index(0),
                     body: vec![],
@@ -22922,6 +22927,7 @@ class Point:
                     extra: Default::default(),
                 }],
                 doc: None,
+                public_storage_layout: None,
                 storage_layout: None,
                 scope: Default::default(),
             };

@@ -13,8 +13,9 @@ use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable,
     CounterDef, CounterId, Del, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId,
-    InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ParamKind, ResolvedName,
-    RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, current_instr_locations,
+    InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ParamKind,
+    PreservedLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit,
+    current_instr_locations,
 };
 use soac_instrument::RUNTIME_DECREF_LOCATION_COUNTER_KIND;
 use soac_ir_blockpy::{
@@ -274,31 +275,32 @@ thread_local! {
 use imports::predeclare_typed_direct_call_imports;
 use imports::{
     DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT, DP_JIT_DECREF_IMPORT,
-    DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
-    DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
-    DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT, DP_JIT_LOAD_CELL_IMPORT,
-    DP_JIT_LOAD_PRESERVED_IMPORT, DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
-    DP_JIT_POP_HANDLED_EXCEPTION_IMPORT, DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT,
-    DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT, DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
-    DP_JIT_PY_CALL_OBJECT_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
-    DP_JIT_PY_CALL_WITH_KW_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT,
-    DP_JIT_PYOBJECT_GETITEM_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT,
-    DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
-    DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
-    DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT, DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
-    DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, DP_JIT_STORE_PRESERVED_IMPORT,
-    ImportSpec, ModuleFuncImports, PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT,
-    PYNUMBER_ADD_IMPORT, PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT,
-    PYNUMBER_SUBTRACT_IMPORT, PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT,
-    PYUNICODE_COMPARE_IMPORT, SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
-    SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT,
-    SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
-    SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
-    SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
-    SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT, SOAC_RUNTIME_TUPLE_NEW_IMPORT,
-    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType, predeclare_specialization_type_imports,
+    DP_JIT_DEL_PRESERVED_IMPORT, DP_JIT_DEL_PRESERVED_QUIETLY_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT,
+    DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT, DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
+    DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT,
+    DP_JIT_LOAD_CELL_IMPORT, DP_JIT_LOAD_PRESERVED_IMPORT, DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
+    DP_JIT_MAKE_CELL_IMPORT, DP_JIT_POP_HANDLED_EXCEPTION_IMPORT,
+    DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT, DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
+    DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT, DP_JIT_PY_CALL_OBJECT_IMPORT,
+    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_CALL_WITH_KW_IMPORT,
+    DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT, DP_JIT_PYOBJECT_GETITEM_IMPORT,
+    DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT, DP_JIT_PYOBJECT_TO_I64_IMPORT,
+    DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT, DP_JIT_RAISE_FROM_EXC_IMPORT,
+    DP_JIT_RAISE_I64_OVERFLOW_IMPORT, DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
+    DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT, DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
+    DP_JIT_STORE_CELL_IMPORT, DP_JIT_STORE_PRESERVED_IMPORT, ImportSpec, ModuleFuncImports,
+    PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT,
+    PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT,
+    PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
+    SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
+    SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
+    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
+    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
+    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
+    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT,
+    SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType,
+    predeclare_specialization_type_imports,
 };
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
@@ -524,7 +526,19 @@ fn emit_preserved_owner_with_local_env(
 ) -> ir::Value {
     local_env
         .load_name(fb, "_dp_self", ctx, true)
-        .expect("preserved slots require the generator resume owner local _dp_self")
+        .unwrap_or_else(|| {
+            let qualname = ctx
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == ctx.function_id)
+                .map(|function| function.names.qualname.as_str())
+                .unwrap_or("<unknown>");
+            panic!(
+                "preserved slots require the generator resume owner local _dp_self [function={qualname} id={}]",
+                ctx.function_id
+            )
+        })
 }
 
 fn emit_codegen_non_local_name_load(
@@ -1584,6 +1598,8 @@ struct JitEmitCtx<'mc> {
     pyobject_setitem_ref: ir::FuncRef,
     load_preserved_ref: ir::FuncRef,
     store_preserved_ref: ir::FuncRef,
+    del_preserved_ref: ir::FuncRef,
+    del_preserved_quietly_ref: ir::FuncRef,
     py_long_from_i64_ref: ir::FuncRef,
     raise_unbound_local_error_ref: ir::FuncRef,
     make_function_with_closure_ref: ir::FuncRef,
@@ -4749,6 +4765,82 @@ fn emit_typed_cell_delete_result_with_local_env(
     ))
 }
 
+fn emit_preserved_delete_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &Del<InstrBlockPy>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> Option<EmitResult> {
+    let location = op.name.preserved_location()?;
+    Some(emit_preserved_delete_result(
+        fb,
+        op.name.id.as_str(),
+        location,
+        op.quietly,
+        local_env,
+        emit_ctx,
+        demand,
+    ))
+}
+
+fn emit_typed_preserved_delete_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &Del<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> Option<EmitResult> {
+    let location = op.name.preserved_location()?;
+    Some(emit_preserved_delete_result(
+        fb,
+        op.name.id.as_str(),
+        location,
+        op.quietly,
+        local_env,
+        emit_ctx,
+        demand,
+    ))
+}
+
+fn emit_preserved_delete_result(
+    fb: &mut FunctionBuilder<'_>,
+    name: &str,
+    location: PreservedLocation,
+    quietly: bool,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    let owner = emit_preserved_owner_with_local_env(fb, local_env, emit_ctx);
+    let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
+    let name_obj = emit_owned_module_constant(
+        fb,
+        emit_ctx.module_constants.require_unicode_constant_id(name),
+        emit_ctx,
+    );
+    let func_ref = if quietly {
+        emit_ctx.del_preserved_quietly_ref
+    } else {
+        emit_ctx.del_preserved_ref
+    };
+    let call_inst = fb.ins().call(func_ref, &[owner, slot, name_obj]);
+    emit_ctx.emit_decref_for_family(
+        fb,
+        name_obj,
+        Some(PyObjFacts::exact_type(PyExactType::Str)),
+        RefcountFamily::OwnedTemporary,
+    );
+    let result = emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], emit_ctx);
+    emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::none_singleton(),
+        emit_ctx,
+        demand,
+    )
+}
+
 fn emit_local_delete_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     op: &Del<InstrBlockPy>,
@@ -6454,6 +6546,12 @@ fn emit_raw_cell_object_for_location_with_local_env(
                 "missing owned cell {} in direct JIT state via names {:?} (slot {slot})",
                 debug_name, candidate_names
             );
+        }
+        CellLocation::Preserved(slot) => {
+            let owner = emit_preserved_owner_with_local_env(fb, local_env, ctx);
+            let slot = fb.ins().iconst(ir::types::I64, i64::from(slot));
+            let call_inst = fb.ins().call(ctx.load_preserved_ref, &[owner, slot]);
+            emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], ctx)
         }
         CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
             emit_raw_closure_cell_object_for_slot(fb, slot, ctx)
@@ -10779,6 +10877,20 @@ fn emit_typed_codegen_expr_value_with_local_env(
 
     if let InstrTyped::Del(op) = expr {
         assert!(!borrowed, "typed Del must not request a borrowed result");
+        if let Some(result) = emit_typed_preserved_delete_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        ) {
+            let (value, ownership, facts) = result.expect_pyobject("typed preserved delete result");
+            assert!(
+                ownership.is_owned(),
+                "typed preserved delete expression should produce an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
         if let Some(result) = emit_typed_local_delete_result_with_local_env(
             fb,
             op,
@@ -13012,6 +13124,20 @@ fn emit_codegen_expr_with_local_env(
         );
     }
     if let InstrBlockPy::Del(op) = expr {
+        if let Some(result) = emit_preserved_delete_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        ) {
+            let (value, ownership, _) = result.expect_pyobject("legacy preserved delete");
+            assert!(
+                ownership.is_owned(),
+                "legacy preserved delete should produce an owned PyObject"
+            );
+            return value;
+        }
         if let Some(value) = emit_local_delete_with_local_env(fb, op, local_env, emit_ctx) {
             return value;
         }
@@ -15968,6 +16094,20 @@ fn emit_codegen_stmt_with_local_env(
             }
         }
         InstrBlockPy::Del(op) => {
+            if let Some(result) = emit_preserved_delete_result_with_local_env(
+                fb,
+                op,
+                local_env,
+                emit_ctx,
+                ResultDemand::PYOBJECT_OWNED,
+            ) {
+                let (value, ownership, _) = result.expect_pyobject("legacy preserved delete");
+                assert!(
+                    ownership.is_owned(),
+                    "legacy preserved delete should produce an owned PyObject"
+                );
+                return value;
+            }
             if let Some(value) = emit_local_delete_with_local_env(fb, op, local_env, emit_ctx) {
                 return value;
             }
@@ -16064,6 +16204,20 @@ fn emit_typed_codegen_stmt_with_local_env(
         }
     }
     if let InstrTyped::Del(op) = expr {
+        if let Some(result) = emit_typed_preserved_delete_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        ) {
+            let (value, ownership, _) = result.expect_pyobject("typed statement preserved delete");
+            assert!(
+                ownership.is_owned(),
+                "typed statement preserved delete should produce an owned PyObject"
+            );
+            return Ok(value);
+        }
         if let Some(result) = emit_typed_local_delete_result_with_local_env(
             fb,
             op,
@@ -16458,6 +16612,11 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         }
     }
     if let InstrTyped::Del(op) = expr {
+        if let Some(result) =
+            emit_typed_preserved_delete_result_with_local_env(fb, op, local_env, emit_ctx, demand)
+        {
+            return Ok(result);
+        }
         if let Some(result) =
             emit_typed_local_delete_result_with_local_env(fb, op, local_env, emit_ctx, demand)
         {
@@ -21092,6 +21251,13 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_LOAD_PRESERVED_IMPORT);
         let store_preserved_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_STORE_PRESERVED_IMPORT);
+        let del_preserved_ref =
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEL_PRESERVED_IMPORT);
+        let del_preserved_quietly_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_DEL_PRESERVED_QUIETLY_IMPORT,
+        );
         let pyobject_to_i64_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_TO_I64_IMPORT);
         let py_long_from_i64_ref =
@@ -21164,7 +21330,7 @@ fn build_cranelift_run_bb_specialized_function(
         let entry_failure_args = Vec::new();
         assert_eq!(
             direct_entry_args.len(),
-            function.params.len(),
+            function.body_params().len(),
             "direct JIT entry arity does not match entry params",
         );
         let entry_runtime_param_names = runtime_block_params[0]
@@ -21189,7 +21355,7 @@ fn build_cranelift_run_bb_specialized_function(
             .cleanup_root_slot_states
             .entry_state_for_block(function.entry_block().label);
         let mut entry_param_values = HashMap::new();
-        for (param, value) in function.params.iter().zip(direct_entry_args.iter()) {
+        for (param, value) in function.body_params().iter().zip(direct_entry_args.iter()) {
             let needs_runtime_arg = entry_runtime_param_names.contains(param.name.as_str());
             let needs_stack_seed = entry_stack_seed_param_names.contains(param.name.as_str());
             let needs_cleanup_root = stack_slots.has_cleanup_root_name(param.name.as_str());
@@ -21452,6 +21618,8 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_setitem_ref,
                 load_preserved_ref,
                 store_preserved_ref,
+                del_preserved_ref,
+                del_preserved_quietly_ref,
                 py_long_from_i64_ref,
                 raise_unbound_local_error_ref,
                 make_function_with_closure_ref,

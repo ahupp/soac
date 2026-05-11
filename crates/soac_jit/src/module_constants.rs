@@ -598,7 +598,9 @@ impl ModuleConstantCollector {
             InstrBlockPy::Store(op) => {
                 op.visit_children(self);
             }
-            InstrBlockPy::Del(op) if op.name.location.is_global() => {
+            InstrBlockPy::Del(op)
+                if op.name.location.is_global() || op.name.preserved_location().is_some() =>
+            {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
             }
@@ -727,7 +729,9 @@ impl ModuleConstantCollector {
             InstrTyped::Store(op) => {
                 op.visit_children(self);
             }
-            InstrTyped::Del(op) if op.name.location.is_global() => {
+            InstrTyped::Del(op)
+                if op.name.location.is_global() || op.name.preserved_location().is_some() =>
+            {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
             }

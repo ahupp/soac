@@ -149,7 +149,7 @@ impl RuntimeFunctionEntryPlan {
     pub(crate) fn from_function(
         function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<Self, String> {
-        let layout = function.storage_layout.as_ref().ok_or_else(|| {
+        let layout = function.public_storage_layout().ok_or_else(|| {
             format!(
                 "entry interpreter expected storage layout for function {}",
                 function.function_id
@@ -1007,6 +1007,14 @@ impl<'a> RuntimeJitDeoptSupportCtx<'a> {
     fn closure_cell_supported(&self, slot: u32) -> bool {
         (slot as usize) < self.runtime_layout.closure_len()
     }
+
+    fn preserved_cell_supported(&self, slot: u32) -> bool {
+        self.storage_layout
+            .and_then(|layout| layout.preserved_slot(slot))
+            .is_some_and(|slot| {
+                slot.storage == soac_core::block_py::PreservedSlotStorage::PyCellObject
+            })
+    }
 }
 
 fn runtime_jit_deopt_expr_supported(
@@ -1016,6 +1024,9 @@ fn runtime_jit_deopt_expr_supported(
     match expr {
         InstrBlockPy::Load(load) => match load.name.location {
             NameLocation::Cell(CellLocation::Owned(slot)) => support.owned_cell_supported(slot),
+            NameLocation::Cell(CellLocation::Preserved(slot)) => {
+                support.preserved_cell_supported(slot)
+            }
             NameLocation::Cell(CellLocation::Closure(slot))
             | NameLocation::Cell(CellLocation::CapturedSource(slot)) => {
                 support.closure_cell_supported(slot)
@@ -1078,6 +1089,7 @@ fn runtime_jit_deopt_expr_supported(
         }
         InstrBlockPy::CellRef(cell_ref) => match cell_ref.location {
             CellLocation::Owned(slot) => support.owned_cell_supported(slot),
+            CellLocation::Preserved(slot) => support.preserved_cell_supported(slot),
             CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
                 support.closure_cell_supported(slot)
             }
@@ -1091,6 +1103,7 @@ fn runtime_jit_deopt_name_location_supported(
 ) -> bool {
     match location {
         NameLocation::Cell(CellLocation::Owned(slot)) => support.owned_cell_supported(slot),
+        NameLocation::Cell(CellLocation::Preserved(slot)) => support.preserved_cell_supported(slot),
         NameLocation::Cell(CellLocation::Closure(slot))
         | NameLocation::Cell(CellLocation::CapturedSource(slot)) => {
             support.closure_cell_supported(slot)

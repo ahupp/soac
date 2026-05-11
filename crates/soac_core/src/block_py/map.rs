@@ -425,12 +425,15 @@ where
             kind: func.kind,
             execution_mode: func.execution_mode,
             params: func.params,
+            body_params: func.body_params,
+            public_scope: func.public_scope,
             blocks: func
                 .blocks
                 .into_iter()
                 .map(|block| self.map_block(block))
                 .collect(),
             doc: func.doc,
+            public_storage_layout: func.public_storage_layout,
             storage_layout: func.storage_layout,
             scope: func.scope,
         }
@@ -490,8 +493,11 @@ where
         kind: func.kind,
         execution_mode: func.execution_mode,
         params: func.params,
+        body_params: func.body_params,
+        public_scope: func.public_scope,
         blocks: func.blocks.into_iter().map(&mut map_block).collect(),
         doc: func.doc,
+        public_storage_layout: func.public_storage_layout,
         storage_layout: func.storage_layout,
         scope: func.scope,
     }
@@ -600,12 +606,15 @@ where
             kind: func.kind,
             execution_mode: func.execution_mode,
             params: func.params,
+            body_params: func.body_params,
+            public_scope: func.public_scope,
             blocks: func
                 .blocks
                 .into_iter()
                 .map(|block| self.try_map_block(block))
                 .collect::<Result<_, _>>()?,
             doc: func.doc,
+            public_storage_layout: func.public_storage_layout,
             storage_layout: func.storage_layout,
             scope: func.scope,
         })

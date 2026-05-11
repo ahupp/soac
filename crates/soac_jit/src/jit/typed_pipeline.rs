@@ -6361,7 +6361,7 @@ class IterRange:
     }
 
     #[test]
-    fn generated_closure_generator_calls_build_inline_constructor_plans() {
+    fn generated_generator_functions_do_not_emit_runtime_constructor_calls() {
         let caller_lowered =
             soac_lowering::lower_python_to_blockpy_for_testing("def gen():\n    yield 1\n")
                 .expect("caller source should lower");
@@ -6412,13 +6412,10 @@ class IterRange:
                 strict_methods: HashMap::new(),
             },
         );
-        let plans = plans
-            .values()
-            .next()
-            .expect("generated ClosureGenerator call should receive a static direct-call plan");
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].target, entry_function_id);
-        assert_eq!(plans[0].body.kind, CallBodyKind::Inline);
+        assert!(
+            plans.is_empty(),
+            "single-callable generators should be instantiated by vectorcall, not by a generated ClosureGenerator constructor call: {plans:?}"
+        );
     }
 
     #[test]

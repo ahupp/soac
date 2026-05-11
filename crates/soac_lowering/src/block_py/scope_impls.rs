@@ -558,7 +558,7 @@ where
     let mut local_cell_slots = owned_cell_slot_names.iter().cloned().collect::<Vec<_>>();
     local_cell_slots.sort();
     let param_name_set = callable_def
-        .params
+        .body_params()
         .names()
         .into_iter()
         .collect::<HashSet<_>>();

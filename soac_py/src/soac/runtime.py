@@ -54,7 +54,6 @@ TypeError = _builtins.TypeError
 ValueError = _builtins.ValueError
 import_ = _soac_ext.import_
 import_attr = _soac_ext.import_attr
-make_generator_resume_handle = _soac_ext.make_generator_resume_handle
 resume_generator = _soac_ext.resume_generator
 resume_async_generator = _soac_ext.resume_async_generator
 make_preserved_state = _soac_ext.make_preserved_state
@@ -172,7 +171,7 @@ def _reraise_control_flow(exc):
 def _mark_closed(owner):
     clear_preserved_state(owner._preserved_values)
     owner._is_closed = True
-    owner._resume_handle = None
+    owner._resume_function = None
 
 
 def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
@@ -186,6 +185,45 @@ def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
 
 def _current_throw_context(owner):
     return load_preserved_state(owner._preserved_values, owner._throw_context_slot)
+
+
+def make_generator_instance(
+    resume_function,
+    kind,
+    name,
+    qualname,
+    initial_values,
+    slot_kinds,
+    yieldfrom_slot,
+    throw_context_slot,
+):
+    preserved_values = make_preserved_state(initial_values, slot_kinds)
+    is_async_gen = kind == 2
+    template = code_template_async_gen if is_async_gen else code_template_gen
+    code = template.__code__.replace(co_name=name, co_qualname=qualname)
+    if is_async_gen:
+        return ClosureAsyncGenerator(
+            resume_function,
+            name,
+            qualname,
+            code,
+            preserved_values,
+            yieldfrom_slot,
+            throw_context_slot,
+        )
+    generator = ClosureGenerator(
+        resume_function,
+        name,
+        qualname,
+        code,
+        preserved_values,
+        yieldfrom_slot,
+        throw_context_slot,
+    )
+    if kind == 1:
+        return Coroutine(generator)
+    return generator
+
 
 def complex_from_parts(real, imag):
     return _builtins.complex(real, imag)
@@ -771,7 +809,7 @@ class AsyncGenComplete(Exception):
 
 class ClosureGenerator:
     __slots__ = (
-        "_resume_handle",
+        "_resume_function",
         "_is_closed",
         "_preserved_values",
         "_yield_from_slot",
@@ -783,7 +821,7 @@ class ClosureGenerator:
 
     def __init__(
         self,
-        resume_handle,
+        resume_function,
         name,
         qualname,
         code,
@@ -792,7 +830,7 @@ class ClosureGenerator:
         throw_context_slot,
     ):
         is_closed = False
-        self._resume_handle = resume_handle
+        self._resume_function = resume_function
         self._is_closed = is_closed
         self._preserved_values = preserved_values
         self._yield_from_slot = yieldfrom_slot
@@ -811,7 +849,7 @@ class ClosureGenerator:
         if self._is_closed:
             raise StopIteration
         try:
-            return resume_generator(self._resume_handle, self, value, NO_DEFAULT)
+            return resume_generator(self._resume_function, self, value, NO_DEFAULT)
         except BaseException as exc:
             _mark_closed(self)
             _reraise_control_flow(exc)
@@ -827,7 +865,7 @@ class ClosureGenerator:
         if self._is_closed:
             _reraise_control_flow(exc)
         try:
-            return resume_generator(self._resume_handle, self, NO_DEFAULT, exc)
+            return resume_generator(self._resume_function, self, NO_DEFAULT, exc)
         except BaseException as exc:
             _mark_closed(self)
             _reraise_control_flow(exc)
@@ -891,7 +929,7 @@ class Coroutine(_abc.Coroutine):
 
 class ClosureAsyncGenerator:
     __slots__ = (
-        "_resume_handle",
+        "_resume_function",
         "_is_closed",
         "_preserved_values",
         "_yield_from_slot",
@@ -903,7 +941,7 @@ class ClosureAsyncGenerator:
 
     def __init__(
         self,
-        resume_handle,
+        resume_function,
         name,
         qualname,
         code,
@@ -912,7 +950,7 @@ class ClosureAsyncGenerator:
         throw_context_slot,
     ):
         is_closed = False
-        self._resume_handle = resume_handle
+        self._resume_function = resume_function
         self._is_closed = is_closed
         self._preserved_values = preserved_values
         self._yield_from_slot = yieldfrom_slot
@@ -994,7 +1032,7 @@ class AsyncGenSend:
         )
         try:
             result = resume_async_generator(
-                self._generator._resume_handle,
+                self._generator._resume_function,
                 self._generator,
                 step_send_value,
                 self._resume_exception,

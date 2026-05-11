@@ -310,8 +310,8 @@ def exercise():
     let gen_function = normalized
         .callable_defs
         .iter()
-        .find(|function| function.names.bind_name == "gen_resume")
-        .expect("missing lowered generator resume function");
+        .find(|function| function.names.bind_name == "gen")
+        .expect("missing lowered generator function");
     let registered_function = gen_function;
     let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module(
         &normalized,

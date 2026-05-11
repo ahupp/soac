@@ -196,6 +196,8 @@ fn storage_layout_semantics_collects_structured_cell_ref_logical_names() {
         kind: FunctionKind::Function,
         execution_mode: Default::default(),
         params: ParamSpec::default(),
+        body_params: None,
+        public_scope: None,
         blocks: vec![Block {
             label: BlockLabel::from_index(0),
             body: vec![CellRefForName::new("captured".to_string()).into()],
@@ -205,6 +207,7 @@ fn storage_layout_semantics_collects_structured_cell_ref_logical_names() {
             extra: (),
         }],
         doc: None,
+        public_storage_layout: None,
         storage_layout: None,
         scope: CallableScopeInfo::default(),
     };

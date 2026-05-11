@@ -476,6 +476,7 @@ fn closure_init_name(init: &crate::block_py::ClosureInit) -> &'static str {
 fn preserved_slot_storage_name(storage: crate::block_py::PreservedSlotStorage) -> &'static str {
     match storage {
         crate::block_py::PreservedSlotStorage::PyObjectOrNull => "pyobject_or_null",
+        crate::block_py::PreservedSlotStorage::PyCellObject => "pycell_object",
         crate::block_py::PreservedSlotStorage::I64 => "i64",
     }
 }

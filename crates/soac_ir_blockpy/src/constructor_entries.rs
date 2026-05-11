@@ -165,6 +165,8 @@ fn build_constructor_entry_function(
         kind: FunctionKind::Function,
         execution_mode: FunctionExecutionMode::Jit,
         params,
+        body_params: None,
+        public_scope: None,
         blocks: vec![Block {
             label,
             body: Vec::new(),
@@ -174,6 +176,7 @@ fn build_constructor_entry_function(
             extra: Default::default(),
         }],
         doc: None,
+        public_storage_layout: None,
         storage_layout: Some(storage_layout),
         scope: constructor_entry_scope(names),
     }

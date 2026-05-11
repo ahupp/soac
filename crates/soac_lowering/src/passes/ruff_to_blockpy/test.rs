@@ -218,11 +218,9 @@ def gen(n):
     yield n
 "#,
     );
-    let gen_wrapper = function_by_name(&blockpy, "gen");
-    let gen_resume = function_by_name(&blockpy, "gen_resume");
-    assert_eq!(gen_wrapper.kind, FunctionKind::Generator);
-    assert!(function_has_root_load(gen_wrapper, "ClosureGenerator"));
-    assert!(gen_resume
+    let gen = function_by_name(&blockpy, "gen");
+    assert_eq!(gen.kind, FunctionKind::Generator);
+    assert!(gen
         .blocks
         .iter()
         .any(|block| matches!(block.term, BlockTerm::BranchTable(_))));
@@ -236,11 +234,10 @@ def gen(flag):
     yield flag and 1
 "#,
     );
-    let gen_wrapper = function_by_name(&blockpy, "gen");
-    assert_eq!(gen_wrapper.kind, FunctionKind::Generator);
-    let gen_resume = function_by_name(&blockpy, "gen_resume");
-    let entry_label = gen_resume.entry_block().label;
-    assert!(!gen_resume.blocks.iter().any(|block| matches!(
+    let gen = function_by_name(&blockpy, "gen");
+    assert_eq!(gen.kind, FunctionKind::Generator);
+    let entry_label = gen.entry_block().label;
+    assert!(!gen.blocks.iter().any(|block| matches!(
         &block.term,
         BlockTerm::Jump(edge) if edge.target == entry_label
     )));
@@ -2190,15 +2187,15 @@ def gen(it):
     yield from it
 "#,
     );
-    let gen_resume = function_by_name(&blockpy, "gen_resume");
-    assert!(gen_resume
+    let gen = function_by_name(&blockpy, "gen");
+    assert!(gen
         .blocks
         .iter()
         .any(|block| matches!(block.term, BlockTerm::BranchTable(_))));
-    assert!(function_has_root_load(gen_resume, "exception_matches"));
-    assert!(function_has_root_load(gen_resume, "getattr"));
+    assert!(function_has_root_load(gen, "exception_matches"));
+    assert!(function_has_root_load(gen, "getattr"));
     assert!(!function_has_root_load(
-        gen_resume,
+        gen,
         "__dp_generator_yield_from_step"
     ));
 }
@@ -2211,14 +2208,9 @@ async def agen(n):
     yield n
 "#,
     );
-    let agen_wrapper = function_by_name(&blockpy, "agen");
-    let agen_resume = function_by_name(&blockpy, "agen_resume");
-    assert_eq!(agen_wrapper.kind, FunctionKind::AsyncGenerator);
-    assert!(function_has_root_load(
-        agen_wrapper,
-        "ClosureAsyncGenerator"
-    ));
-    assert!(agen_resume
+    let agen = function_by_name(&blockpy, "agen");
+    assert_eq!(agen.kind, FunctionKind::AsyncGenerator);
+    assert!(agen
         .blocks
         .iter()
         .any(|block| matches!(block.term, BlockTerm::BranchTable(_))));
@@ -2237,7 +2229,7 @@ async def outer(inner):
 "#,
     );
     let rendered = crate::block_py::blockpy_module_to_string(&blockpy);
-    let resume = function_by_name(&blockpy, "outer_resume");
+    let resume = function_by_name(&blockpy, "outer");
     let stop_iteration_raise_labels = resume
         .blocks
         .iter()

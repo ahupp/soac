@@ -249,8 +249,8 @@ pub fn lower_source_to_blockpy_module_with_tracker(
      Convert generators into a state machine backed by an internal resume body.
 
      Suspension state is modeled separately from lexical closure cells as preserved slots. The
-     runtime wrapper owns those values across suspension, and a native resume handle reloads them
-     into the internal resume body without instantiating a second Python function object.
+     runtime wrapper owns those values across suspension, and the single lowered function reloads
+     them into its internal resume body without instantiating a second Python function object.
 
     */
     let core_blockpy_without_await_or_yield: BlockPyModule<CoreModuleShape> = pass_tracker

@@ -265,7 +265,7 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
         session,
         code_ptr,
         default_code_ptr,
-        function.params.len(),
+        function.body_params().len(),
         deopt_table,
     ))))
 }

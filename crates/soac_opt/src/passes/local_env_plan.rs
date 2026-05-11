@@ -706,16 +706,21 @@ pub fn plan_function_locals(
     };
     let live_ins = compute_function_local_live_ins(function);
     let must_bound_ins = compute_function_local_must_bound_ins(function);
+    let preserved_owner_location = preserved_owner_location(storage_layout);
     let entry_label = function.entry_block().label;
     let mut blocks = HashMap::with_capacity(function.blocks.len());
     for block in &function.blocks {
         let entry_facts = facts.block_entry_fact(function.function_id, block.label);
         let is_entry_block = block.label == entry_label;
-        let live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
-        let must_bound_locations = must_bound_ins
+        let mut live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
+        let mut must_bound_locations = must_bound_ins
             .get(&block.label)
             .cloned()
             .unwrap_or_default();
+        if let Some(location) = preserved_owner_location {
+            live_in_locations.insert(location);
+            must_bound_locations.insert(location);
+        }
         let explicit_param_names = block.param_names().collect::<HashSet<_>>();
         let entry_locals = storage_layout
             .stack_slots()
@@ -727,7 +732,7 @@ pub fn plan_function_locals(
                 );
                 let is_function_param_on_entry = is_entry_block
                     && function
-                        .params
+                        .body_params()
                         .iter()
                         .any(|param| param.name == name.as_str());
                 let is_must_bound_on_entry = must_bound_locations.contains(&location);
@@ -819,6 +824,7 @@ pub fn plan_typed_function_locals(
     };
     let live_ins = compute_typed_function_local_live_ins(function);
     let must_bound_ins = compute_typed_function_local_must_bound_ins(function);
+    let preserved_owner_location = preserved_owner_location(storage_layout);
     let precise_entry_states =
         compute_typed_function_precise_immortal_local_entry_states(function, facts);
     let entry_label = function.entry_block().label;
@@ -826,11 +832,15 @@ pub fn plan_typed_function_locals(
     for block in &function.blocks {
         let entry_facts = facts.block_entry_fact(function.function_id, block.label);
         let is_entry_block = block.label == entry_label;
-        let live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
-        let must_bound_locations = must_bound_ins
+        let mut live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
+        let mut must_bound_locations = must_bound_ins
             .get(&block.label)
             .cloned()
             .unwrap_or_default();
+        if let Some(location) = preserved_owner_location {
+            live_in_locations.insert(location);
+            must_bound_locations.insert(location);
+        }
         let explicit_param_names = block.param_names().collect::<HashSet<_>>();
         let entry_locals = storage_layout
             .stack_slots()
@@ -842,7 +852,7 @@ pub fn plan_typed_function_locals(
                 );
                 let is_function_param_on_entry = is_entry_block
                     && function
-                        .params
+                        .body_params()
                         .iter()
                         .any(|param| param.name == name.as_str());
                 let is_must_bound_on_entry = must_bound_locations.contains(&location);
@@ -1249,8 +1259,14 @@ fn local_ref_kind_for_block_entry(
     is_must_bound_on_entry: bool,
     facts: Option<PyObjFacts>,
 ) -> LocalRefKind {
-    let is_function_param =
-        is_entry_block && function.params.iter().any(|param| param.name == name);
+    if name == "_dp_self" {
+        return LocalRefKind::Borrowed;
+    }
+    let is_function_param = is_entry_block
+        && function
+            .body_params()
+            .iter()
+            .any(|param| param.name == name);
     match facts {
         Some(facts) if facts.is_immortal() => return LocalRefKind::Immortal,
         Some(_) if !is_function_param => return LocalRefKind::Owned,
@@ -1278,11 +1294,17 @@ fn local_ref_kind_for_typed_block_entry(
     facts: Option<PyObjFacts>,
     precise_entry_state: Option<LocalRefState>,
 ) -> LocalRefKind {
+    if name == "_dp_self" {
+        return LocalRefKind::Borrowed;
+    }
     if precise_entry_state == Some(LocalRefState::Immortal) {
         return LocalRefKind::Immortal;
     }
-    let is_function_param =
-        is_entry_block && function.params.iter().any(|param| param.name == name);
+    let is_function_param = is_entry_block
+        && function
+            .body_params()
+            .iter()
+            .any(|param| param.name == name);
     match facts {
         Some(facts) if facts.is_immortal() => return LocalRefKind::Immortal,
         Some(_) if !is_function_param => return LocalRefKind::Owned,
@@ -1303,6 +1325,19 @@ fn local_ref_kind_for_typed_block_entry(
 
 fn is_try_exception_alias_name(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")
+}
+
+fn preserved_owner_location(
+    storage_layout: &soac_core::block_py::StorageLayout,
+) -> Option<LocalLocation> {
+    if storage_layout.preserved_slots.is_empty() {
+        return None;
+    }
+    storage_layout
+        .stack_slots()
+        .iter()
+        .position(|name| name == "_dp_self")
+        .map(|slot| LocalLocation(slot as u32))
 }
 
 #[cfg(test)]
@@ -1347,6 +1382,41 @@ def f(flag):
             })
         });
         assert!(has_immortal_x, "LocalEnv plan should carry value facts");
+    }
+
+    #[test]
+    fn local_env_plan_uses_generator_body_params_for_entry_bindings() {
+        let lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def gen(it):
+    while True:
+        yield next(it)
+"#,
+        )
+        .expect("transform should succeed")
+        .blockpy_module;
+        let facts = infer_module_value_facts(&lowered);
+        let plan = plan_local_env_module(&lowered, &facts);
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "gen")
+            .expect("lowered generator should exist");
+        let function_plan = plan
+            .function(function.function_id)
+            .expect("generator should have a LocalEnv plan");
+
+        for block in function_plan.blocks.values() {
+            let owner = block.binding_for_name("_dp_self").expect(
+                "generator body owner should stay materialized across preserved-state blocks",
+            );
+            assert_eq!(owner.storage, PlannedLocalStorage::BlockParam);
+            assert_eq!(
+                owner.param_facts.binding,
+                ParamBindingFacts::DefinitelyBound
+            );
+            assert_eq!(owner.param_facts.ownership, LocalRefKind::Borrowed);
+        }
     }
 
     #[test]

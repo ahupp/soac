@@ -5,14 +5,14 @@ use crate::block_py::cfg::RelabelBlockTargets;
 use crate::block_py::{
     compute_storage_layout_from_scope, core_call_expr_with_meta, core_runtime_name_expr_with_meta,
     core_runtime_positional_call_expr_with_meta, literal_expr, map_module_functions, BindingKind,
-    BindingPurpose, BindingTarget, Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel,
-    BlockParam, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    CallArgPositional, CallableScopeInfo, CellBindingKind, ClosureInit, ClosureSlot, FunctionKind,
-    FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved, InstrWithConstantNone,
-    InstrWithYield, Load, MakeGeneratorResumeHandle, Mappable, ModuleNameGen, NameLike,
-    NumberLiteral, NumberLiteralValue, PreservedSlot, PreservedSlotStorage, RuntimeFunctionId,
-    ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable, TermIf, TermRaise,
-    TryMapFunction, TryMapInstr, TryMapTerm, Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
+    BindingPurpose, BindingTarget, Block, BlockArg, BlockEdge, BlockLabel, BlockParam,
+    BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
+    CallableScopeInfo, CellBindingKind, ClosureInit, ClosureSlot, FunctionKind, FunctionNameGen,
+    GetAttr, Instr, InstrUnresolved, InstrWithConstantNone, InstrWithYield, Load, Mappable,
+    ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, PreservedSlot,
+    PreservedSlotStorage, ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable,
+    TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp, UnaryOpKind,
+    UnresolvedName,
 };
 use crate::block_py::{Param, ParamKind, ParamSpec};
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
@@ -131,6 +131,10 @@ fn preserved_slot_storage(init: &ClosureInit) -> PreservedSlotStorage {
     }
 }
 
+fn preserved_cell_slot_storage() -> PreservedSlotStorage {
+    PreservedSlotStorage::PyCellObject
+}
+
 pub(crate) fn build_blockpy_storage_layout(
     scope: &CallableScopeInfo,
     param_names: &[String],
@@ -143,7 +147,7 @@ pub(crate) fn build_blockpy_storage_layout(
     let mut seen_storage_names = HashSet::new();
 
     let mut freevars = Vec::new();
-    let mut cellvars = Vec::new();
+    let cellvars = Vec::new();
     let mut preserved_slots = Vec::new();
 
     for name in state_vars {
@@ -180,10 +184,15 @@ pub(crate) fn build_blockpy_storage_layout(
             ClosureInit::Deferred
         };
         if semantic_cell_storage_names.contains(storage_name.as_str()) {
-            cellvars.push(ClosureSlot {
+            preserved_slots.push(PreservedSlot {
                 logical_name,
                 storage_name,
-                init,
+                storage: preserved_cell_slot_storage(),
+                init: if matches!(init, ClosureInit::Parameter) {
+                    ClosureInit::Parameter
+                } else {
+                    ClosureInit::EmptyCell
+                },
             });
         } else {
             preserved_slots.push(PreservedSlot {
@@ -330,56 +339,6 @@ where
     expr.visit_children(&mut NamedExprTargetVisitor { names });
 }
 
-fn collect_deleted_names<E>(blocks: &[Block<E>]) -> HashSet<String>
-where
-    E: ScopeExprNode + Instr,
-{
-    struct DeletedNamesVisitor<'a> {
-        names: &'a mut HashSet<String>,
-    }
-
-    impl<E> crate::block_py::Visit<E> for DeletedNamesVisitor<'_>
-    where
-        E: ScopeExprNode + Instr,
-    {
-        fn visit_instr(&mut self, expr: &E) {
-            collect_deleted_expr_names(expr, self.names);
-        }
-    }
-
-    let mut names = HashSet::new();
-    for block in blocks {
-        for stmt in &block.body {
-            collect_deleted_expr_names(stmt, &mut names);
-        }
-        crate::block_py::walk_term(&mut DeletedNamesVisitor { names: &mut names }, &block.term);
-    }
-    names
-}
-
-fn collect_deleted_expr_names<E>(expr: &E, names: &mut HashSet<String>)
-where
-    E: ScopeExprNode + Instr,
-{
-    struct DeletedNamesVisitor<'a> {
-        names: &'a mut HashSet<String>,
-    }
-
-    impl<E> crate::block_py::Visit<E> for DeletedNamesVisitor<'_>
-    where
-        E: ScopeExprNode + Instr,
-    {
-        fn visit_instr(&mut self, expr: &E) {
-            collect_deleted_expr_names(expr, self.names);
-        }
-    }
-
-    expr.walk_root_deleted_names(&mut |name| {
-        names.insert(name.to_string());
-    });
-    expr.visit_children(&mut DeletedNamesVisitor { names });
-}
-
 fn core_literal_int(value: usize) -> InstrUnresolved {
     let text = value.to_string();
     literal_expr(
@@ -412,10 +371,6 @@ fn core_call(func_name: &str, args: Vec<InstrUnresolved>) -> InstrUnresolved {
     )
 }
 
-fn core_tuple(values: Vec<InstrUnresolved>) -> InstrUnresolved {
-    Tuple::new(values).with_meta(Default::default()).into()
-}
-
 fn core_call_expr(
     func: InstrUnresolved,
     args: Vec<InstrUnresolved>,
@@ -444,26 +399,6 @@ fn core_runtime_attr(attr: &str) -> InstrUnresolved {
 
 fn core_get_attr(value: InstrUnresolved, attr: &str) -> InstrUnresolved {
     GetAttr::new(Box::new(value), Box::new(core_string_literal(attr))).into()
-}
-
-fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> InstrUnresolved {
-    let template_attr = if async_gen {
-        "code_template_async_gen"
-    } else {
-        "code_template_gen"
-    };
-    let replace = core_get_attr(
-        core_get_attr(core_runtime_attr(template_attr), "__code__"),
-        "replace",
-    );
-    core_call_expr(
-        replace,
-        Vec::new(),
-        vec![
-            ("co_name", core_string_literal(name)),
-            ("co_qualname", core_string_literal(qualname)),
-        ],
-    )
 }
 
 fn is_generator_like(kind: FunctionKind) -> bool {
@@ -503,22 +438,7 @@ fn build_generator_storage_layout(
         .iter()
         .map(|slot| slot.storage_name.clone())
         .collect::<Vec<_>>();
-    let mut semantic_cell_storage_names = local_cell_slots.iter().cloned().collect::<HashSet<_>>();
-    for deleted_name in collect_deleted_names(&callable.blocks) {
-        if callable
-            .scope
-            .binding_target_for_name(deleted_name.as_str(), BindingPurpose::Store)
-            == BindingTarget::Local
-        {
-            // Preserved value tuples currently carry only Python objects. A local
-            // that can be deleted needs to preserve the unbound state too, so keep
-            // it cell-backed until preserved activation state can encode that.
-            semantic_cell_storage_names.insert(generator_state_storage_name(
-                &callable.scope,
-                deleted_name.as_str(),
-            ));
-        }
-    }
+    let semantic_cell_storage_names = local_cell_slots.iter().cloned().collect::<HashSet<_>>();
 
     let mut state_vars = collect_state_vars(&callable.scope, &param_names, &callable.blocks);
     for capture_name in &capture_names {
@@ -559,37 +479,11 @@ fn build_generator_storage_layout(
 }
 
 fn resume_closure_state_order(layout: &StorageLayout) -> Vec<String> {
-    let mut order = Vec::new();
-    order.extend(layout.freevars.iter().map(|slot| slot.logical_name.clone()));
-    order.extend(layout.cellvars.iter().map(|slot| slot.logical_name.clone()));
-    order
-}
-
-fn preserved_slot_init_expr(slot: &PreservedSlot) -> InstrUnresolved {
-    match slot.init {
-        ClosureInit::InheritedCapture | ClosureInit::EmptyCell => {
-            panic!("preserved slots should not use closure-only init {slot:?}")
-        }
-        ClosureInit::Parameter => core_name(slot.logical_name.as_str()),
-        ClosureInit::RuntimePcUnstarted => core_literal_int(1),
-        ClosureInit::RuntimeAbruptKindFallthrough => core_literal_int(0),
-        ClosureInit::RuntimeNone | ClosureInit::Deferred => core_none(),
-    }
-}
-
-fn preserved_slot_kind_expr(slot: &PreservedSlot) -> InstrUnresolved {
-    match slot.storage {
-        PreservedSlotStorage::PyObjectOrNull => core_literal_int(0),
-        PreservedSlotStorage::I64 => core_literal_int(1),
-    }
-}
-
-fn preserved_slot_index(layout: &StorageLayout, logical_name: &str) -> usize {
     layout
-        .preserved_slots
+        .freevars
         .iter()
-        .position(|slot| slot.logical_name == logical_name)
-        .unwrap_or_else(|| panic!("missing preserved slot {logical_name} in {layout:?}"))
+        .map(|slot| slot.logical_name.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,94 +561,6 @@ fn generator_resume_declared_param_indices(
         })
         .map(|(index, _)| index)
         .collect()
-}
-
-fn build_factory_block(
-    visible_names: &FunctionName,
-    resume_function_id: RuntimeFunctionId,
-    kind: FunctionKind,
-    storage_layout: &StorageLayout,
-) -> LinearCoreBlock {
-    let resume_handle: InstrUnresolved = MakeGeneratorResumeHandle::new(resume_function_id).into();
-    let preserved_values = core_call_expr(
-        core_runtime_attr("make_preserved_state"),
-        vec![
-            core_tuple(
-                storage_layout
-                    .preserved_slots
-                    .iter()
-                    .map(preserved_slot_init_expr)
-                    .collect(),
-            ),
-            core_tuple(
-                storage_layout
-                    .preserved_slots
-                    .iter()
-                    .map(preserved_slot_kind_expr)
-                    .collect(),
-            ),
-        ],
-        Vec::new(),
-    );
-    let yieldfrom_slot = core_literal_int(preserved_slot_index(storage_layout, "_dp_yieldfrom"));
-    let throw_context_slot =
-        core_literal_int(preserved_slot_index(storage_layout, "_dp_throw_context"));
-    let generator = match kind {
-        FunctionKind::Generator | FunctionKind::Coroutine => core_call_expr(
-            core_runtime_attr("ClosureGenerator"),
-            vec![
-                resume_handle,
-                core_string_literal(visible_names.display_name.as_str()),
-                core_string_literal(visible_names.qualname.as_str()),
-                core_generator_code(
-                    false,
-                    visible_names.display_name.as_str(),
-                    visible_names.qualname.as_str(),
-                ),
-                preserved_values.clone(),
-                yieldfrom_slot.clone(),
-                throw_context_slot.clone(),
-            ],
-            Vec::new(),
-        ),
-        FunctionKind::AsyncGenerator => core_call_expr(
-            core_runtime_attr("ClosureAsyncGenerator"),
-            vec![
-                resume_handle,
-                core_string_literal(visible_names.display_name.as_str()),
-                core_string_literal(visible_names.qualname.as_str()),
-                core_generator_code(
-                    true,
-                    visible_names.display_name.as_str(),
-                    visible_names.qualname.as_str(),
-                ),
-                preserved_values,
-                yieldfrom_slot,
-                throw_context_slot,
-            ],
-            Vec::new(),
-        ),
-        FunctionKind::Function => {
-            unreachable!("plain functions do not use generator factories")
-        }
-    };
-    let factory_value = match kind {
-        FunctionKind::Coroutine => {
-            core_call_expr(core_runtime_attr("Coroutine"), vec![generator], Vec::new())
-        }
-        FunctionKind::Generator | FunctionKind::AsyncGenerator => generator,
-        FunctionKind::Function => {
-            unreachable!("plain functions do not use generator factories")
-        }
-    };
-
-    Block::from_builder(
-        BlockLabel::from_index(0),
-        BlockBuilder::with_term(Vec::new(), Some(BlockTerm::Return(factory_value))),
-        Vec::new(),
-        None,
-        None,
-    )
 }
 
 fn resume_param_spec(kind: FunctionKind) -> ParamSpec {
@@ -1858,20 +1664,18 @@ fn ordered_resume_binding_logical_names(
 
 pub(crate) fn lower_generator_like_function(
     callable: BlockPyFunction<CoreModuleShapeWithYield>,
-    module_name_gen: &ModuleNameGen,
+    _module_name_gen: &ModuleNameGen,
 ) -> Vec<BlockPyFunction<CoreModuleShape>> {
     assert!(
         is_generator_like(callable.kind),
         "generator lowering only applies to generator-like callables"
     );
-    let resume_name_gen = module_name_gen.next_function_name_gen();
-    let resume_function_id = resume_name_gen.function_id();
-    let storage_layout = build_generator_storage_layout(&callable);
+    let mut storage_layout = build_generator_storage_layout(&callable);
     let resume_closure_state_order = resume_closure_state_order(&storage_layout);
     let resume_binding_logical_names =
         ordered_resume_binding_logical_names(&callable, &resume_closure_state_order);
     let (resume_blocks, _resume_exception_edges, _resume_entry_label) =
-        lower_resume_blocks(&callable, resume_name_gen.share());
+        lower_resume_blocks(&callable, callable.name_gen.share());
     let closure_bindings = resume_closure_bindings(&callable.scope, &resume_binding_logical_names);
 
     let BlockPyFunction {
@@ -1885,56 +1689,48 @@ pub(crate) fn lower_generator_like_function(
         scope,
         ..
     } = callable;
+    storage_layout.set_stack_slots(params.names());
 
     let mut resume_semantic = scope.clone();
     augment_resume_semantic_for_standard_name_binding(&mut resume_semantic, &closure_bindings);
 
     let resume_params = resume_param_spec(kind);
-    let resume_names = FunctionName::new(
-        format!("{}_resume", names.bind_name),
-        "_dp_resume",
-        names.display_name.clone(),
-        names.qualname.clone(),
-    );
-    let resume_function = BlockPyFunction {
-        function_id: resume_function_id,
-        name_gen: resume_name_gen,
-        names: resume_names,
-        kind: FunctionKind::Function,
-        execution_mode: Default::default(),
-        params: resume_params.clone(),
+    let mut lowered_function = BlockPyFunction {
+        function_id,
+        name_gen,
+        names,
+        kind,
+        execution_mode,
+        params,
+        body_params: Some(resume_params),
+        public_scope: Some(scope.clone()),
         blocks: resume_blocks.clone(),
-        doc: None,
+        doc,
+        public_storage_layout: Some(storage_layout),
         storage_layout: None,
         scope: resume_semantic,
     };
     let mut resume_storage_layout =
-        compute_storage_layout_from_scope(&resume_function).unwrap_or_default();
-    resume_storage_layout.preserved_slots = storage_layout.preserved_slots.clone();
-    let resume_function = BlockPyFunction {
-        storage_layout: Some(resume_storage_layout),
-        ..resume_function
-    };
+        compute_storage_layout_from_scope(&lowered_function).unwrap_or_default();
+    let preserved_cell_storage_names = lowered_function
+        .public_storage_layout()
+        .expect("generator public layout should exist")
+        .preserved_slots
+        .iter()
+        .filter(|slot| slot.storage == PreservedSlotStorage::PyCellObject)
+        .map(|slot| slot.storage_name.as_str())
+        .collect::<HashSet<_>>();
+    resume_storage_layout
+        .cellvars
+        .retain(|slot| !preserved_cell_storage_names.contains(slot.storage_name.as_str()));
+    resume_storage_layout.preserved_slots = lowered_function
+        .public_storage_layout()
+        .expect("generator public layout should exist")
+        .preserved_slots
+        .clone();
+    lowered_function.storage_layout = Some(resume_storage_layout);
 
-    let factory_block = build_factory_block(&names, resume_function_id, kind, &storage_layout);
-
-    let visible_function = BlockPyFunction {
-        function_id,
-        name_gen,
-        names: names.clone(),
-        kind,
-        execution_mode,
-        params: params.clone(),
-        blocks: attach_exception_edges_to_blocks(
-            vec![factory_block.clone()],
-            &HashMap::from([(factory_block.label.clone(), None)]),
-        ),
-        doc,
-        storage_layout: Some(storage_layout.clone()),
-        scope: scope.clone(),
-    };
-
-    vec![visible_function, resume_function]
+    vec![lowered_function]
 }
 
 pub(crate) fn lower_yield_in_lowered_core_blockpy_module_bundle(

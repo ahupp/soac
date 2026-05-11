@@ -6,11 +6,11 @@ pub use self::instr::{
     ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
     ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
     ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, Load, MakeCell, MakeFunction,
-    MakeFunctionWithClosure, MakeGeneratorResumeHandle, SetAttr, SetItem, StmtAnnAssign,
-    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
-    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, Tuple, UnaryOp, UnaryOpKind, Yield, YieldFrom,
+    MakeFunctionWithClosure, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
+    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
+    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, Tuple, UnaryOp, UnaryOpKind, Yield, YieldFrom,
 };
 pub use self::literal::{
     BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
@@ -306,7 +306,6 @@ define_runtime_names! {
     IsCancelledError => "_is_cancelled_error",
     ReraiseControlFlow => "_reraise_control_flow",
     MarkClosed => "_mark_closed",
-    MakeGeneratorResumeHandle => "make_generator_resume_handle",
     ResumeGenerator => "resume_generator",
     ResumeAsyncGenerator => "resume_async_generator",
     MakePreservedState => "make_preserved_state",
@@ -403,6 +402,7 @@ impl GlobalSlot {
 )]
 pub enum CellLocation {
     Owned(u32),
+    Preserved(u32),
     Closure(u32),
     CapturedSource(u32),
 }
@@ -410,12 +410,19 @@ pub enum CellLocation {
 impl CellLocation {
     pub fn slot(self) -> u32 {
         match self {
-            Self::Owned(slot) | Self::Closure(slot) | Self::CapturedSource(slot) => slot,
+            Self::Owned(slot)
+            | Self::Preserved(slot)
+            | Self::Closure(slot)
+            | Self::CapturedSource(slot) => slot,
         }
     }
 
     pub fn is_owned(self) -> bool {
         matches!(self, Self::Owned(_))
+    }
+
+    pub fn is_preserved(self) -> bool {
+        matches!(self, Self::Preserved(_))
     }
 
     pub fn is_closure(self) -> bool {
@@ -463,6 +470,10 @@ impl NameLocation {
 
     pub fn owned_cell(slot: u32) -> Self {
         Self::Cell(CellLocation::Owned(slot))
+    }
+
+    pub fn preserved_cell(slot: u32) -> Self {
+        Self::Cell(CellLocation::Preserved(slot))
     }
 
     pub fn closure_cell(slot: u32) -> Self {
@@ -1156,9 +1167,22 @@ pub struct BlockPyFunction<P: ModuleShape> {
     pub names: FunctionName,
     pub kind: FunctionKind,
     pub execution_mode: FunctionExecutionMode,
+    /// Python-visible call parameters. These are also the executable body
+    /// parameters for ordinary functions.
     pub params: ParamSpec,
+    /// Alternate executable-body parameters for callables whose public call
+    /// interface differs from the code body entry ABI.
+    pub body_params: Option<ParamSpec>,
+    /// Alternate Python-visible scope metadata for callables whose public call
+    /// interface differs from the executable body. Ordinary functions use
+    /// `scope` for both views.
+    pub public_scope: Option<CallableScopeInfo>,
     pub blocks: Vec<Block<P::Instr, P::BlockExtra>>,
     pub doc: Option<String>,
+    /// Alternate Python-visible storage layout for callables whose public call
+    /// interface differs from the executable body. Ordinary functions use
+    /// `storage_layout` for both views.
+    pub public_storage_layout: Option<StorageLayout>,
     pub storage_layout: Option<StorageLayout>,
     pub scope: CallableScopeInfo,
 }
@@ -1174,8 +1198,11 @@ impl<P: ModuleShape> Clone for BlockPyFunction<P> {
             kind: self.kind,
             execution_mode: self.execution_mode,
             params: self.params.clone(),
+            body_params: self.body_params.clone(),
+            public_scope: self.public_scope.clone(),
             blocks: self.blocks.clone(),
             doc: self.doc.clone(),
+            public_storage_layout: self.public_storage_layout.clone(),
             storage_layout: self.storage_layout.clone(),
             scope: self.scope.clone(),
         }
@@ -1183,6 +1210,20 @@ impl<P: ModuleShape> Clone for BlockPyFunction<P> {
 }
 
 impl<P: ModuleShape> BlockPyFunction<P> {
+    pub fn body_params(&self) -> &ParamSpec {
+        self.body_params.as_ref().unwrap_or(&self.params)
+    }
+
+    pub fn public_scope(&self) -> &CallableScopeInfo {
+        self.public_scope.as_ref().unwrap_or(&self.scope)
+    }
+
+    pub fn public_storage_layout(&self) -> Option<&StorageLayout> {
+        self.public_storage_layout
+            .as_ref()
+            .or(self.storage_layout.as_ref())
+    }
+
     pub fn lowered_kind(&self) -> &FunctionKind {
         &self.kind
     }

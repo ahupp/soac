@@ -91,6 +91,8 @@ dp_jit_raise_unbound_local_error
 dp_jit_raise_missing_required_argument
 dp_jit_load_preserved
 dp_jit_store_preserved
+dp_jit_del_preserved
+dp_jit_del_preserved_quietly
 dp_jit_load_cell
 dp_jit_store_cell
 dp_jit_del_deref
@@ -220,7 +222,6 @@ _current_yieldfrom
 _is_cancelled_error
 _reraise_control_flow
 _mark_closed
-make_generator_resume_handle
 resume_generator
 resume_async_generator
 make_preserved_state

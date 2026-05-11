@@ -275,14 +275,6 @@ fn function_by_name<'a>(
     bb_module: &'a BlockPyModule<ResolvedStorageModuleShape>,
     bind_name: &str,
 ) -> &'a BlockPyFunction<ResolvedStorageModuleShape> {
-    let resume_name = format!("{bind_name}_resume");
-    if let Some(resume) = bb_module
-        .callable_defs
-        .iter()
-        .find(|func| func.names.bind_name == resume_name)
-    {
-        return resume;
-    }
     bb_module
         .callable_defs
         .iter()
@@ -521,6 +513,27 @@ fn resolved_function_uses_captured_source(
             .cell_location()
             .is_some_and(CellLocation::is_captured_source),
         InstrResolved::CellRef(cell_ref) => cell_ref.location.is_captured_source(),
+        _ => false,
+    })
+}
+
+fn resolved_function_uses_preserved_cell(
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+) -> bool {
+    blockpy_function_instr_any(function, |expr| match expr {
+        InstrResolved::Load(load) => load
+            .name
+            .cell_location()
+            .is_some_and(CellLocation::is_preserved),
+        InstrResolved::Store(store) => store
+            .name
+            .cell_location()
+            .is_some_and(CellLocation::is_preserved),
+        InstrResolved::Del(del) => del
+            .name
+            .cell_location()
+            .is_some_and(CellLocation::is_preserved),
+        InstrResolved::CellRef(cell_ref) => cell_ref.location.is_preserved(),
         _ => false,
     })
 }
@@ -2071,7 +2084,7 @@ def delegator():
 }
 
 #[test]
-fn generator_resume_yield_from_blocks_drop_cell_storage_alias_params() {
+fn generator_yield_from_blocks_drop_cell_storage_alias_params() {
     let source = r#"
 def child():
     yield "start"
@@ -2087,12 +2100,12 @@ def delegator():
         .pass_tracker
         .pass_core_blockpy()
         .expect("expected core no-yield pass");
-    let resume_function = core_module
+    let generator_function = core_module
         .callable_defs
         .iter()
-        .find(|func| func.names.bind_name == "delegator_resume")
-        .expect("expected hidden generator resume function");
-    let yield_from_except = resume_function
+        .find(|func| func.names.bind_name == "delegator")
+        .expect("expected lowered generator function");
+    let yield_from_except = generator_function
         .blocks
         .iter()
         .find(|block| {
@@ -2146,7 +2159,7 @@ def gen():
 }
 
 #[test]
-fn generator_resume_yieldfrom_keeps_deleted_private_state_cell_backed() {
+fn generator_yieldfrom_keeps_deleted_private_state_preserved() {
     let source = r#"
 def child():
     yield "start"
@@ -2164,7 +2177,10 @@ def delegator():
             && !entry_params.iter().any(|name| name == "_dp_yieldfrom"),
         "{resume:?}"
     );
-    assert!(resolved_function_uses_captured_source(resume), "{resume:?}");
+    assert!(
+        !resolved_function_uses_captured_source(resume),
+        "{resume:?}"
+    );
     assert!(
         resolved_function_uses_preserved_slots(resume)
             && !resolved_function_uses_preserved_values_container(resume),
@@ -3171,6 +3187,13 @@ def outer(scale):
         .expect("transform should succeed")
         .expect("bb module should be available");
     let gen = blockpy_function_by_name(&bb_module, "gen");
+    let public_layout = gen
+        .public_storage_layout()
+        .expect("sync generator should record public closure layout");
+    let public_factor = slot_by_name(&public_layout.freevars, "factor");
+    assert_eq!(public_factor.storage_name, "factor");
+    assert_eq!(public_factor.init, ClosureInit::InheritedCapture);
+
     let layout = gen
         .storage_layout()
         .as_ref()
@@ -3268,13 +3291,14 @@ def outer(scale):
     let pc = preserved_slot_by_name(&layout.preserved_slots, "_dp_pc");
     assert_eq!(pc.storage_name, "_dp_cell__dp_pc");
     assert_eq!(pc.init, ClosureInit::RuntimePcUnstarted);
-    let deleted_eval = slot_by_name(&layout.cellvars, "_dp_eval_7");
+    let deleted_eval = preserved_slot_by_name(&layout.preserved_slots, "_dp_eval_7");
     assert_eq!(deleted_eval.storage_name, "_dp_cell__dp_eval_7");
     assert_eq!(deleted_eval.init, ClosureInit::Deferred);
+    assert_eq!(deleted_eval.storage, PreservedSlotStorage::PyObjectOrNull);
 }
 
 #[test]
-fn closure_backed_coroutine_keeps_deleted_private_state_cell_backed() {
+fn closure_backed_coroutine_keeps_deleted_private_state_preserved() {
     let source = r#"
 class Once:
     def __await__(self):
@@ -3298,15 +3322,15 @@ async def run():
         .expect("coroutine should record closure layout");
 
     assert!(
-        layout.cellvars.iter().any(|slot| slot.logical_name == "x"),
-        "delete-able suspended locals need cell storage until preserved state can encode unbound values: {layout:#?}"
+        layout.cellvars.iter().all(|slot| slot.logical_name != "x"),
+        "delete-able suspended locals should not need lexical cell storage: {layout:#?}"
     );
     assert!(
         layout
             .preserved_slots
             .iter()
-            .all(|slot| slot.logical_name != "x"),
-        "delete-able suspended locals should not use value-only preserved slots: {layout:#?}"
+            .any(|slot| slot.logical_name == "x"),
+        "delete-able suspended locals should use nullable preserved slots: {layout:#?}"
     );
 }
 
@@ -3327,17 +3351,52 @@ def outer():
         .expect("transform should succeed")
         .expect("bb module should be available");
     let method = function_by_name(&bb_module, "test_leaking_task");
+    let public_layout = method
+        .public_storage_layout()
+        .expect("closure-backed coroutine should record public closure layout");
     let layout = method
         .storage_layout()
         .as_ref()
         .expect("closure-backed coroutine should record closure layout");
-
+    assert!(
+        public_layout
+            .freevars
+            .iter()
+            .any(|slot| slot.logical_name == "cancelled"),
+        "visible coroutine should carry nonlocals needed by its resume body: {public_layout:#?}"
+    );
     assert!(
         layout
             .freevars
             .iter()
             .any(|slot| slot.logical_name == "cancelled"),
         "visible coroutine should capture nonlocals needed by nested coroutine construction: {layout:#?}"
+    );
+}
+
+#[test]
+fn closure_backed_coroutine_does_not_promote_body_only_nested_capture_to_public_layout() {
+    let source = r#"
+async def asynciter(items):
+    for item in items:
+        yield item
+
+async def nested():
+    return [[i + j async for i in asynciter([1, 2])] for j in [10, 20]]
+"#;
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let nested = function_by_name(&bb_module, "nested");
+    let public_layout = nested
+        .public_storage_layout()
+        .expect("coroutine should record public storage");
+    assert!(
+        public_layout
+            .freevars
+            .iter()
+            .all(|slot| slot.logical_name != "j"),
+        "body-only nested captures should not become public coroutine captures: {public_layout:#?}"
     );
 }
 
@@ -3715,7 +3774,7 @@ class Field:
 }
 
 #[test]
-fn closure_backed_simple_generator_records_one_resume_per_yield() {
+fn closure_backed_simple_generator_uses_one_callable() {
     let source = r#"
 def make_counter(delta):
     outer_capture = delta
@@ -3735,12 +3794,23 @@ def make_counter(delta):
         .callable_defs
         .iter()
         .find(|func| func.names.bind_name == "gen")
-        .expect("missing visible generator factory");
+        .expect("missing lowered generator function");
     assert_eq!(gen.lowered_kind(), &FunctionKind::Generator);
+    assert!(
+        gen.body_params.is_some(),
+        "generator callable should carry distinct public and resume-body params: {gen:#?}"
+    );
+    assert!(
+        bb_module
+            .callable_defs
+            .iter()
+            .all(|func| func.names.bind_name != "gen_resume"),
+        "generator lowering should not synthesize a second callable: {bb_module:#?}"
+    );
 }
 
 #[test]
-fn closure_backed_simple_generator_preserves_outer_capture_on_visible_factory() {
+fn closure_backed_simple_generator_preserves_outer_capture_on_public_callable() {
     let source = r#"
 def make_counter(delta):
     outer_capture = delta
@@ -3760,17 +3830,17 @@ def make_counter(delta):
         .callable_defs
         .iter()
         .find(|func| func.names.bind_name == "gen")
-        .expect("missing visible generator factory");
+        .expect("missing lowered generator function");
     let layout = gen
-        .storage_layout
+        .public_storage_layout
         .as_ref()
-        .expect("visible generator should have a storage layout");
+        .expect("generator should have a public storage layout");
     assert!(
         layout
             .freevars
             .iter()
             .any(|slot| slot.logical_name == "outer_capture"),
-        "visible generator should still capture outer_capture for resume closure materialization: {layout:#?}"
+        "generator public layout should retain lexical captures: {layout:#?}"
     );
 }
 
@@ -3791,15 +3861,15 @@ def make_counter(delta):
     let bb_module = tracked_name_binding_module(source)
         .expect("transform should succeed")
         .expect("bb module should be available");
-    let visible_gen = bb_module
+    let gen = bb_module
         .callable_defs
         .iter()
         .find(|func| func.names.bind_name == "gen")
-        .expect("missing visible generator factory");
-    let layout = visible_gen
+        .expect("missing lowered generator function");
+    let layout = gen
         .storage_layout
         .as_ref()
-        .expect("visible generator should have a storage layout");
+        .expect("generator body should have a storage layout");
 
     let preserved_names = layout
         .preserved_slots
@@ -3828,7 +3898,7 @@ def make_counter(delta):
 }
 
 #[test]
-fn closure_backed_simple_generator_resume_closure_only_captures_lexical_state() {
+fn closure_backed_simple_generator_body_only_captures_lexical_state() {
     let source = r#"
 def make_counter(delta):
     outer_capture = delta
@@ -3843,104 +3913,109 @@ def make_counter(delta):
 
     let lowering = TrackedLowering::new(source);
     let bb_module = lowering.bb_module();
-    let visible_gen = bb_module
+    let gen = bb_module
         .callable_defs
         .iter()
         .find(|func| func.names.bind_name == "gen")
-        .expect("missing visible generator factory");
-    let resume = bb_module
-        .callable_defs
-        .iter()
-        .find(|func| func.names.bind_name == "gen_resume")
-        .expect("missing synthetic resume function");
-    let resume_layout = resume
+        .expect("missing lowered generator function");
+    let public_layout = gen
+        .public_storage_layout
+        .as_ref()
+        .expect("generator should have a public storage layout");
+    let body_layout = gen
         .storage_layout
         .as_ref()
-        .expect("resume function should have a storage layout");
-    let BlockTerm::Return(return_expr) = &visible_gen.blocks[0].term else {
-        panic!("visible generator factory should return a generator wrapper");
-    };
-    let closure_generator = runtime_call_by_name(bb_module, return_expr, "ClosureGenerator")
-        .expect("expected ClosureGenerator");
-    let resume_handle_expr = closure_generator
-        .args
-        .first()
-        .and_then(|arg| match arg {
-            CallArgPositional::Positional(value) => Some(value),
-            CallArgPositional::Starred(_) => None,
-        })
-        .expect("ClosureGenerator should carry a resume handle as its first positional argument");
-    let resume_handle = runtime_call_by_name(
-        bb_module,
-        resume_handle_expr,
-        "make_generator_resume_handle",
-    )
-    .expect("visible generator should build a native resume handle");
-    let captures_expr = resume_handle
-        .args
-        .get(1)
-        .and_then(|arg| match arg {
-            CallArgPositional::Positional(value) => Some(value),
-            CallArgPositional::Starred(_) => None,
-        })
-        .expect("resume handle should carry explicit closure captures");
-    let InstrResolved::Tuple(captures_tuple) = captures_expr else {
-        panic!("captures should be Tuple, got {captures_expr:?}");
-    };
-    assert_eq!(
-        captures_tuple.values.len(),
-        resume_layout.freevars.len(),
-        "visible generator should materialize one closure capture per resume freevar:\n{}",
-        lowering.name_binding_text(),
-    );
+        .expect("generator body should have a storage layout");
     assert!(
-        resume_layout
+        public_layout
             .freevars
             .iter()
             .any(|slot| slot.logical_name == "outer_capture"),
-        "resume layout should preserve lexical captures:\n{}",
+        "public layout should preserve lexical captures:\n{}",
         lowering.name_binding_text(),
     );
     assert!(
-        resume_layout
+        body_layout
+            .freevars
+            .iter()
+            .any(|slot| slot.logical_name == "outer_capture"),
+        "resume body should preserve lexical captures:\n{}",
+        lowering.name_binding_text(),
+    );
+    assert!(
+        body_layout
             .freevars
             .iter()
             .all(|slot| !matches!(slot.logical_name.as_str(), "_dp_pc" | "_dp_yieldfrom")),
-        "resume layout should not capture private preserved state:\n{}",
-        lowering.name_binding_text(),
-    );
-    let preserved_values_expr = closure_generator
-        .args
-        .get(4)
-        .and_then(|arg| match arg {
-            CallArgPositional::Positional(value) => Some(value),
-            CallArgPositional::Starred(_) => None,
-        })
-        .expect("ClosureGenerator should carry preserved activation state");
-    let preserved_state_call =
-        runtime_call_by_name(bb_module, preserved_values_expr, "make_preserved_state")
-            .expect("generator wrapper should own native preserved activation state");
-    assert!(
-        matches!(
-            preserved_state_call.args.as_slice(),
-            [
-                CallArgPositional::Positional(InstrResolved::Tuple(_)),
-                CallArgPositional::Positional(InstrResolved::Tuple(_)),
-            ]
-        ),
-        "generator wrapper should initialize preserved activation state from value and kind tuples:\n{}",
+        "resume body should not capture private preserved state:\n{}",
         lowering.name_binding_text(),
     );
     assert!(
-        resolved_function_uses_preserved_slots(resume)
-            && !resolved_function_uses_preserved_values_container(resume),
+        public_layout
+            .preserved_slots
+            .iter()
+            .any(|slot| slot.logical_name == "_dp_pc"),
+        "public layout should describe preserved activation state:\n{}",
+        lowering.name_binding_text(),
+    );
+    assert!(
+        resolved_function_uses_preserved_slots(gen)
+            && !resolved_function_uses_preserved_values_container(gen),
         "resume body should use first-class preserved slots rather than wrapper list traffic:\n{}",
         lowering.name_binding_text(),
     );
 }
 
 #[test]
-fn generator_resume_preserved_parameter_is_not_rewritten_as_always_unbound() {
+fn generator_owned_nested_capture_uses_preserved_cell_state() {
+    let source = r#"
+def outer():
+    def gen():
+        total = 1
+        def inner():
+            return total
+        yield inner
+    return gen()
+"#;
+
+    let lowering = TrackedLowering::new(source);
+    let bb_module = lowering.bb_module();
+    let gen = bb_module
+        .callable_defs
+        .iter()
+        .find(|func| func.names.bind_name == "gen")
+        .expect("missing lowered generator function");
+    let public_layout = gen
+        .public_storage_layout()
+        .expect("generator should have public preserved state");
+    let body_layout = gen
+        .storage_layout()
+        .as_ref()
+        .expect("generator body should have storage layout");
+
+    assert!(
+        public_layout.preserved_slots.iter().any(|slot| {
+            slot.logical_name == "total" && slot.storage == PreservedSlotStorage::PyCellObject
+        }),
+        "generator-owned lexical cells should live in preserved state:\n{}",
+        lowering.name_binding_text(),
+    );
+    assert!(
+        public_layout.cellvars.is_empty()
+            && body_layout.cellvars.is_empty()
+            && body_layout.freevars.is_empty(),
+        "generator-owned lexical cells should not require factory-era closure storage:\n{}",
+        lowering.name_binding_text(),
+    );
+    assert!(
+        resolved_function_uses_preserved_cell(gen),
+        "generator body should access its owned lexical cell through preserved state:\n{}",
+        lowering.name_binding_text(),
+    );
+}
+
+#[test]
+fn generator_preserved_parameter_is_not_rewritten_as_always_unbound() {
     let source = r#"
 def code_template_gen(_it):
     while True:
@@ -3949,17 +4024,17 @@ def code_template_gen(_it):
 
     let lowering = TrackedLowering::new(source);
     let bb_module = lowering.bb_module();
-    let resume = bb_module
+    let gen = bb_module
         .callable_defs
         .iter()
-        .find(|func| func.names.bind_name == "code_template_gen_resume")
-        .expect("missing synthetic resume function");
+        .find(|func| func.names.bind_name == "code_template_gen")
+        .expect("missing lowered generator function");
 
     assert!(
-        !resolved_function_uses_captured_source(resume)
-            && resolved_function_uses_preserved_slots(resume)
-            && !resolved_function_uses_preserved_values_container(resume),
-        "resume should access _it through preserved activation slots:\n{}",
+        !resolved_function_uses_captured_source(gen)
+            && resolved_function_uses_preserved_slots(gen)
+            && !resolved_function_uses_preserved_values_container(gen),
+        "generator should access _it through preserved activation slots:\n{}",
         lowering.name_binding_text()
     );
 }

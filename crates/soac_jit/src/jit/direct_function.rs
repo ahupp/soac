@@ -126,6 +126,7 @@ pub(super) fn direct_method_specialization_from_typed_call(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DirectCallIncompatibility {
+    NonFunctionTarget,
     StarredArguments,
     Keywords,
     UnsupportedParameterKind { kind: ParamKind },
@@ -231,6 +232,9 @@ pub(super) fn plan_direct_call_args_for_target<P: ModuleShape>(
     has_starred_arguments: bool,
     has_keywords: bool,
 ) -> Result<DirectCallArgPlan, DirectCallIncompatibility> {
+    if *target_function.lowered_kind() != soac_core::block_py::FunctionKind::Function {
+        return Err(DirectCallIncompatibility::NonFunctionTarget);
+    }
     if has_starred_arguments {
         return Err(DirectCallIncompatibility::StarredArguments);
     }
@@ -303,7 +307,7 @@ pub(super) fn function_has_default_resolving_direct_entry(
 ) -> bool {
     // The adapter is also needed for parameters without source defaults:
     // __defaults__ / __kwdefaults__ can be assigned after function creation.
-    function.params.iter().any(|param| {
+    function.body_params().iter().any(|param| {
         matches!(
             param.kind,
             ParamKind::PosOnly | ParamKind::Any | ParamKind::KwOnly
@@ -353,6 +357,7 @@ pub(super) fn record_profiled_direct_call_incompatibility(
         }
         DirectCallIncompatibility::StarredArguments
         | DirectCallIncompatibility::Keywords
+        | DirectCallIncompatibility::NonFunctionTarget
         | DirectCallIncompatibility::UnsupportedParameterKind { .. } => {
             stats.record_profiled_unsupported_shape_candidate();
         }
@@ -367,7 +372,7 @@ pub(super) fn make_direct_function_signature(
     let mut sig = codegen_env.codegen_make_signature();
     sig.params.push(ir::AbiParam::new(ptr_ty));
     sig.params.push(ir::AbiParam::new(ptr_ty));
-    for _ in function.params.iter() {
+    for _ in function.body_params().iter() {
         sig.params.push(ir::AbiParam::new(ptr_ty));
     }
     sig.returns.push(ir::AbiParam::new(ptr_ty));
@@ -464,13 +469,13 @@ pub(super) fn build_default_resolving_direct_adapter(
         );
         let missing_block = fb.create_block();
         let call_core_block = fb.create_block();
-        for _ in function.params.iter() {
+        for _ in function.body_params().iter() {
             fb.append_block_param(call_core_block, ptr_ty);
         }
 
-        let mut selected_args = Vec::with_capacity(function.params.len());
+        let mut selected_args = Vec::with_capacity(function.body_params().len());
         for (param_index, (param, arg_value)) in function
-            .params
+            .body_params()
             .iter()
             .zip(direct_entry_args.iter().copied())
             .enumerate()
@@ -533,7 +538,7 @@ pub(super) fn build_default_resolving_direct_adapter(
         fb.seal_block(call_core_block);
 
         fb.switch_to_block(call_core_block);
-        let mut call_args = Vec::with_capacity(function.params.len() + 2);
+        let mut call_args = Vec::with_capacity(function.body_params().len() + 2);
         call_args.push(function_env_value);
         call_args.push(thread_state_value);
         call_args.extend(fb.block_params(call_core_block).iter().copied());

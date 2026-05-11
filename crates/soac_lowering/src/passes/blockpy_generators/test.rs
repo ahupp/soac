@@ -4,14 +4,12 @@ use super::{
     resume_closure_state_order, yield_from_method_lookup_expr, yield_from_send_expr, ErrOnYield,
 };
 use crate::block_py::{
-    core_call_expr_with_meta, BinOpKind, BindingKind, BindingPurpose, Block, BlockBuilder,
-    BlockLabel, BlockTerm, CallArgPositional, CallableScopeInfo, CallableScopeKind,
-    CellBindingKind, ClosureInit, ClosureSlot, FunctionName, HasMeta, InstrUnresolved,
-    InstrWithYield, Literal, Meta, NameLike, PreservedSlot, PreservedSlotStorage,
-    RuntimeFunctionId, StorageLayout, TryMapTerm, UnaryOpKind, WithMeta, Yield,
+    core_call_expr_with_meta, BinOpKind, BindingKind, BindingPurpose, BlockTerm, CallArgPositional,
+    CallableScopeInfo, CallableScopeKind, CellBindingKind, ClosureInit, ClosureSlot, FunctionName,
+    HasMeta, InstrUnresolved, InstrWithYield, Literal, Meta, NameLike, PreservedSlot,
+    PreservedSlotStorage, StorageLayout, TryMapTerm, UnaryOpKind, WithMeta, Yield,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
-use crate::passes::InstrRuff;
 use crate::template::py_expr;
 use ruff_python_ast::{self as ast, Expr};
 use ruff_text_size::TextRange;
@@ -44,6 +42,15 @@ fn preserved_slot(logical_name: &str, storage_name: &str, init: ClosureInit) -> 
     }
 }
 
+fn preserved_cell_slot(logical_name: &str, storage_name: &str, init: ClosureInit) -> PreservedSlot {
+    PreservedSlot {
+        logical_name: logical_name.to_string(),
+        storage_name: storage_name.to_string(),
+        init,
+        storage: PreservedSlotStorage::PyCellObject,
+    }
+}
+
 fn generator_resume_source_semantic(layout: &StorageLayout) -> CallableScopeInfo {
     let mut scope = generator_test_semantic();
     for slot in &layout.freevars {
@@ -65,69 +72,6 @@ fn generator_resume_source_semantic(layout: &StorageLayout) -> CallableScopeInfo
         );
     }
     scope
-}
-
-fn build_closure_backed_generator_factory_block(
-    _factory_label: &str,
-    visible_names: &FunctionName,
-    resume_function_id: RuntimeFunctionId,
-    _resume_state_order: &[String],
-    layout: &StorageLayout,
-    is_coroutine: bool,
-    is_async_generator: bool,
-) -> Block<InstrRuff> {
-    let resume_handle = py_expr!(
-        "runtime.make_generator_resume_handle({function_id:literal}, (), globals())",
-        function_id = resume_function_id.to_packed_runtime_u64(),
-    );
-    let preserved_values = layout
-        .preserved_slots
-        .iter()
-        .map(|slot| slot.logical_name.as_str())
-        .collect::<Vec<_>>();
-    let preserved_values = match preserved_values.as_slice() {
-        ["_dp_pc", "_dp_yieldfrom", "_dp_throw_context"] => {
-            py_expr!("runtime.make_preserved_state((1, None, None), (1, 0, 0))")
-        }
-        other => panic!("unexpected preserved test slots {other:?}"),
-    };
-
-    let generator_expr = if is_async_generator {
-        py_expr!(
-            "runtime.ClosureAsyncGenerator({resume:expr}, {name:literal}, {qualname:literal}, runtime.code_template_async_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), {preserved_values:expr}, 1, 2)",
-            resume = resume_handle,
-            name = visible_names.display_name.as_str(),
-            qualname = visible_names.qualname.as_str(),
-            preserved_values = preserved_values.clone(),
-        )
-    } else {
-        py_expr!(
-            "runtime.ClosureGenerator({resume:expr}, {name:literal}, {qualname:literal}, runtime.code_template_gen.__code__.replace(co_name={name:literal}, co_qualname={qualname:literal}), {preserved_values:expr}, 1, 2)",
-            resume = resume_handle,
-            name = visible_names.display_name.as_str(),
-            qualname = visible_names.qualname.as_str(),
-            preserved_values = preserved_values,
-        )
-    };
-
-    let return_value = if is_coroutine {
-        py_expr!("runtime.Coroutine({gen:expr})", gen = generator_expr)
-    } else {
-        generator_expr
-    };
-
-    Block::from_builder(
-        BlockLabel::from_index(0),
-        BlockBuilder::with_term(
-            Vec::new(),
-            Some(BlockTerm::Return(
-                crate::passes::ast_to_instr::from_ast_expr(return_value),
-            )),
-        ),
-        Vec::new(),
-        None,
-        None,
-    )
 }
 
 fn name_expr(name: &str) -> ast::ExprName {
@@ -242,36 +186,23 @@ fn current_exception_value_helper_builds_value_attr_lookup() {
 }
 
 #[test]
-fn resume_closure_bindings_keep_cell_backed_eval_state_on_closure_path() {
+fn resume_closure_bindings_keep_only_outer_captures_on_closure_path() {
     let layout = StorageLayout {
         freevars: vec![ClosureSlot {
             logical_name: "captured".to_string(),
             storage_name: "_dp_cell_captured".to_string(),
             init: ClosureInit::InheritedCapture,
         }],
-        cellvars: vec![
-            ClosureSlot {
-                logical_name: "total".to_string(),
-                storage_name: "_dp_cell_total".to_string(),
-                init: ClosureInit::Deferred,
-            },
-            ClosureSlot {
-                logical_name: "_dp_eval_1".to_string(),
-                storage_name: "_dp_cell__dp_eval_1".to_string(),
-                init: ClosureInit::Deferred,
-            },
-            ClosureSlot {
-                logical_name: "_dp_eval_2".to_string(),
-                storage_name: "_dp_cell__dp_eval_2".to_string(),
-                init: ClosureInit::Deferred,
-            },
-            ClosureSlot {
-                logical_name: "_dp_try_exc_0".to_string(),
-                storage_name: "_dp_cell__dp_try_exc_0".to_string(),
-                init: ClosureInit::EmptyCell,
-            },
-        ],
+        cellvars: vec![],
         preserved_slots: vec![
+            preserved_cell_slot("total", "_dp_cell_total", ClosureInit::EmptyCell),
+            preserved_cell_slot("_dp_eval_1", "_dp_cell__dp_eval_1", ClosureInit::EmptyCell),
+            preserved_cell_slot("_dp_eval_2", "_dp_cell__dp_eval_2", ClosureInit::EmptyCell),
+            preserved_cell_slot(
+                "_dp_try_exc_0",
+                "_dp_cell__dp_try_exc_0",
+                ClosureInit::EmptyCell,
+            ),
             preserved_slot(
                 "_dp_yieldfrom",
                 "_dp_cell__dp_yieldfrom",
@@ -287,16 +218,7 @@ fn resume_closure_bindings_keep_cell_backed_eval_state_on_closure_path() {
 
     assert_eq!(
         closure_bindings.runtime_state_bindings,
-        vec![
-            ("captured".to_string(), "_dp_cell_captured".to_string()),
-            ("total".to_string(), "_dp_cell_total".to_string()),
-            ("_dp_eval_1".to_string(), "_dp_cell__dp_eval_1".to_string()),
-            ("_dp_eval_2".to_string(), "_dp_cell__dp_eval_2".to_string()),
-            (
-                "_dp_try_exc_0".to_string(),
-                "_dp_cell__dp_try_exc_0".to_string()
-            ),
-        ]
+        vec![("captured".to_string(), "_dp_cell_captured".to_string())]
     );
 }
 
@@ -308,22 +230,17 @@ fn resume_closure_state_order_omits_preserved_slots() {
             storage_name: "_dp_cell_captured".to_string(),
             init: ClosureInit::InheritedCapture,
         }],
-        cellvars: vec![ClosureSlot {
-            logical_name: "total".to_string(),
-            storage_name: "_dp_cell_total".to_string(),
-            init: ClosureInit::Deferred,
-        }],
-        preserved_slots: vec![preserved_slot(
-            "_dp_pc",
-            "_dp_cell__dp_pc",
-            ClosureInit::RuntimePcUnstarted,
-        )],
+        cellvars: vec![],
+        preserved_slots: vec![
+            preserved_cell_slot("total", "_dp_cell_total", ClosureInit::EmptyCell),
+            preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
+        ],
         stack_slots: Vec::new(),
     };
 
     assert_eq!(
         resume_closure_state_order(&layout),
-        vec!["captured".to_string(), "total".to_string()]
+        vec!["captured".to_string()]
     );
 }
 
@@ -439,60 +356,22 @@ fn build_blockpy_storage_layout_uses_semantic_classcell_storage_mapping() {
 
     assert_eq!(
         layout
-            .cellvars
+            .preserved_slots
             .iter()
-            .map(|slot| (slot.logical_name.as_str(), slot.storage_name.as_str()))
+            .map(|slot| {
+                (
+                    slot.logical_name.as_str(),
+                    slot.storage_name.as_str(),
+                    slot.storage,
+                )
+            })
             .collect::<Vec<_>>(),
-        vec![("__class__", "_dp_classcell")]
+        vec![(
+            "__class__",
+            "_dp_classcell",
+            PreservedSlotStorage::PyCellObject
+        )]
     );
-}
-
-#[test]
-fn builds_closure_backed_generator_factory_block() {
-    let layout = StorageLayout {
-        freevars: vec![ClosureSlot {
-            logical_name: "captured".to_string(),
-            storage_name: "_dp_cell_captured".to_string(),
-            init: ClosureInit::InheritedCapture,
-        }],
-        cellvars: vec![ClosureSlot {
-            logical_name: "x".to_string(),
-            storage_name: "_dp_cell_x".to_string(),
-            init: ClosureInit::Parameter,
-        }],
-        preserved_slots: vec![
-            preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
-            preserved_slot(
-                "_dp_yieldfrom",
-                "_dp_cell__dp_yieldfrom",
-                ClosureInit::RuntimeNone,
-            ),
-            preserved_slot(
-                "_dp_throw_context",
-                "_dp_cell__dp_throw_context",
-                ClosureInit::RuntimeNone,
-            ),
-        ],
-        stack_slots: Vec::new(),
-    };
-
-    let block = build_closure_backed_generator_factory_block(
-        "_dp_bb_demo_factory",
-        &FunctionName::new("gen", "gen", "gen", "gen"),
-        RuntimeFunctionId::from_raw_parts(0, 1),
-        &[
-            "_dp_cell_captured".to_string(),
-            "_dp_cell_x".to_string(),
-            "_dp_cell__dp_pc".to_string(),
-        ],
-        &layout,
-        false,
-        false,
-    );
-
-    assert_eq!(block.label, BlockLabel::from_index(0));
-    assert!(block.body.is_empty(), "{block:?}");
-    assert!(matches!(block.term, BlockTerm::Return(_)));
 }
 
 #[test]
@@ -503,12 +382,9 @@ fn resume_closure_bindings_use_semantic_capture_sources_for_cell_backed_state() 
             storage_name: "_dp_cell_captured".to_string(),
             init: ClosureInit::InheritedCapture,
         }],
-        cellvars: vec![ClosureSlot {
-            logical_name: "total".to_string(),
-            storage_name: "_dp_cell_total".to_string(),
-            init: ClosureInit::Deferred,
-        }],
+        cellvars: vec![],
         preserved_slots: vec![
+            preserved_cell_slot("total", "_dp_cell_total", ClosureInit::EmptyCell),
             preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
             preserved_slot(
                 "_dp_throw_context",
@@ -524,10 +400,7 @@ fn resume_closure_bindings_use_semantic_capture_sources_for_cell_backed_state() 
 
     assert_eq!(
         closure_bindings.runtime_state_bindings,
-        vec![
-            ("captured".to_string(), "_dp_cell_captured".to_string()),
-            ("total".to_string(), "_dp_cell_total".to_string()),
-        ]
+        vec![("captured".to_string(), "_dp_cell_captured".to_string())]
     );
 }
 
@@ -568,12 +441,9 @@ fn resume_semantic_marks_only_closure_state_as_cell_captures() {
             storage_name: "_dp_cell_captured".to_string(),
             init: ClosureInit::InheritedCapture,
         }],
-        cellvars: vec![ClosureSlot {
-            logical_name: "total".to_string(),
-            storage_name: "_dp_cell_total".to_string(),
-            init: ClosureInit::Deferred,
-        }],
+        cellvars: vec![],
         preserved_slots: vec![
+            preserved_cell_slot("total", "_dp_cell_total", ClosureInit::EmptyCell),
             preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
             preserved_slot(
                 "_dp_throw_context",
@@ -584,11 +454,11 @@ fn resume_semantic_marks_only_closure_state_as_cell_captures() {
         stack_slots: Vec::new(),
     };
     let mut scope = CallableScopeInfo {
-        names: FunctionName::new("gen_resume", "_dp_resume", "gen", "gen"),
+        names: FunctionName::new("gen", "gen", "gen", "gen"),
         scope_kind: CallableScopeKind::Function,
         ..Default::default()
     };
-    for slot in layout.freevars.iter().chain(layout.cellvars.iter()) {
+    for slot in &layout.freevars {
         scope.insert_binding(
             slot.logical_name.clone(),
             BindingKind::Cell(CellBindingKind::Capture),
@@ -597,15 +467,12 @@ fn resume_semantic_marks_only_closure_state_as_cell_captures() {
         );
     }
 
-    assert_eq!(scope.names.bind_name, "gen_resume");
+    assert_eq!(scope.names.bind_name, "gen");
     assert_eq!(
         scope.binding_kind("captured"),
         Some(BindingKind::Cell(CellBindingKind::Capture))
     );
-    assert_eq!(
-        scope.binding_kind("total"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
+    assert_eq!(scope.binding_kind("total"), None);
     assert_eq!(
         scope.resolved_load_binding_kind("_dp_pc"),
         BindingKind::Local
@@ -628,29 +495,16 @@ fn resume_semantic_overlay_marks_only_closure_state_for_standard_name_binding() 
             storage_name: "_dp_cell_captured".to_string(),
             init: ClosureInit::InheritedCapture,
         }],
-        cellvars: vec![
-            ClosureSlot {
-                logical_name: "total".to_string(),
-                storage_name: "_dp_cell_total".to_string(),
-                init: ClosureInit::Deferred,
-            },
-            ClosureSlot {
-                logical_name: "_dp_eval_1".to_string(),
-                storage_name: "_dp_cell__dp_eval_1".to_string(),
-                init: ClosureInit::Deferred,
-            },
-            ClosureSlot {
-                logical_name: "_dp_eval_2".to_string(),
-                storage_name: "_dp_cell__dp_eval_2".to_string(),
-                init: ClosureInit::Deferred,
-            },
-            ClosureSlot {
-                logical_name: "_dp_try_exc_0".to_string(),
-                storage_name: "_dp_cell__dp_try_exc_0".to_string(),
-                init: ClosureInit::EmptyCell,
-            },
-        ],
+        cellvars: vec![],
         preserved_slots: vec![
+            preserved_cell_slot("total", "_dp_cell_total", ClosureInit::EmptyCell),
+            preserved_cell_slot("_dp_eval_1", "_dp_cell__dp_eval_1", ClosureInit::EmptyCell),
+            preserved_cell_slot("_dp_eval_2", "_dp_cell__dp_eval_2", ClosureInit::EmptyCell),
+            preserved_cell_slot(
+                "_dp_try_exc_0",
+                "_dp_cell__dp_try_exc_0",
+                ClosureInit::EmptyCell,
+            ),
             preserved_slot(
                 "_dp_yieldfrom",
                 "_dp_cell__dp_yieldfrom",
@@ -669,45 +523,36 @@ fn resume_semantic_overlay_marks_only_closure_state_for_standard_name_binding() 
     let closure_bindings =
         resume_closure_bindings(&semantic_for_bindings, &resume_closure_state_order(&layout));
     let mut scope = CallableScopeInfo {
-        names: FunctionName::new("gen_resume", "_dp_resume", "gen", "gen"),
+        names: FunctionName::new("gen", "gen", "gen", "gen"),
         scope_kind: CallableScopeKind::Function,
         ..Default::default()
     };
 
     augment_resume_semantic_for_standard_name_binding(&mut scope, &closure_bindings);
 
-    assert_eq!(
-        scope.binding_kind("total"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
+    assert_eq!(scope.binding_kind("total"), None);
     assert_eq!(
         scope.resolved_load_binding_kind("total"),
-        BindingKind::Cell(CellBindingKind::Capture)
+        BindingKind::Global
     );
-    assert_eq!(scope.cell_storage_name("total"), "total");
+    assert_eq!(scope.cell_storage_name("total"), "_dp_cell_total");
     assert_eq!(scope.cell_capture_source_name("total"), "_dp_cell_total");
-    assert_eq!(
-        scope.binding_kind("_dp_eval_1"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
+    assert_eq!(scope.binding_kind("_dp_eval_1"), None);
     assert_eq!(
         scope.resolved_load_binding_kind("_dp_eval_1"),
-        BindingKind::Cell(CellBindingKind::Capture)
+        BindingKind::Local
     );
-    assert_eq!(scope.cell_storage_name("_dp_eval_1"), "_dp_eval_1");
+    assert_eq!(scope.cell_storage_name("_dp_eval_1"), "_dp_cell__dp_eval_1");
     assert_eq!(
         scope.cell_capture_source_name("_dp_eval_1"),
         "_dp_cell__dp_eval_1"
     );
-    assert_eq!(
-        scope.binding_kind("_dp_eval_2"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
+    assert_eq!(scope.binding_kind("_dp_eval_2"), None);
     assert_eq!(
         scope.resolved_load_binding_kind("_dp_eval_2"),
-        BindingKind::Cell(CellBindingKind::Capture)
+        BindingKind::Local
     );
-    assert_eq!(scope.cell_storage_name("_dp_eval_2"), "_dp_eval_2");
+    assert_eq!(scope.cell_storage_name("_dp_eval_2"), "_dp_cell__dp_eval_2");
     assert_eq!(
         scope.cell_capture_source_name("_dp_eval_2"),
         "_dp_cell__dp_eval_2"
@@ -727,15 +572,15 @@ fn resume_semantic_overlay_marks_only_closure_state_for_standard_name_binding() 
         scope.resolved_load_binding_kind("_dp_throw_context"),
         BindingKind::Local
     );
-    assert_eq!(
-        scope.binding_kind("_dp_try_exc_0"),
-        Some(BindingKind::Cell(CellBindingKind::Capture))
-    );
+    assert_eq!(scope.binding_kind("_dp_try_exc_0"), None);
     assert_eq!(
         scope.resolved_load_binding_kind("_dp_try_exc_0"),
-        BindingKind::Cell(CellBindingKind::Capture)
+        BindingKind::Local
     );
-    assert_eq!(scope.cell_storage_name("_dp_try_exc_0"), "_dp_try_exc_0");
+    assert_eq!(
+        scope.cell_storage_name("_dp_try_exc_0"),
+        "_dp_cell__dp_try_exc_0"
+    );
     assert_eq!(
         scope.cell_capture_source_name("_dp_try_exc_0"),
         "_dp_cell__dp_try_exc_0"

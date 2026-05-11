@@ -493,8 +493,11 @@ mod tests {
             kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec::default(),
+            body_params: None,
+            public_scope: None,
             blocks,
             doc: None,
+            public_storage_layout: None,
             storage_layout: None,
             scope: Default::default(),
         }

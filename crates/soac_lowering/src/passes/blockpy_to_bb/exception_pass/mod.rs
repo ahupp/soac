@@ -32,8 +32,11 @@ fn lower_function_try_jump_exception_flow(
         kind: function.kind,
         execution_mode: function.execution_mode,
         params: function.params,
+        body_params: function.body_params,
+        public_scope: function.public_scope,
         blocks: function.blocks,
         doc: function.doc,
+        public_storage_layout: function.public_storage_layout,
         storage_layout: function.storage_layout,
         scope: function.scope,
     };

@@ -47,6 +47,14 @@ unsafe extern "C" {
 
 pub type ObjPtr = *mut c_void;
 
+unsafe fn owned_none_hook() -> ObjPtr {
+    let none = unsafe { ffi::Py_None() };
+    unsafe {
+        ffi::Py_INCREF(none);
+    }
+    none.cast()
+}
+
 #[repr(C)]
 struct RawPyRangeIterObject {
     ob_base: ffi::PyObject,
@@ -595,8 +603,10 @@ unsafe fn preserved_values_owned(owner: ObjPtr) -> ObjPtr {
         );
         return ptr::null_mut();
     }
-    ffi::PyObject_GetAttrString(owner.cast::<ffi::PyObject>(), c"_preserved_values".as_ptr())
-        as ObjPtr
+    let values =
+        ffi::PyObject_GetAttrString(owner.cast::<ffi::PyObject>(), c"_preserved_values".as_ptr())
+            as ObjPtr;
+    values
 }
 
 unsafe extern "C" fn load_preserved_hook(owner: ObjPtr, slot: i64) -> ObjPtr {
@@ -773,6 +783,28 @@ unsafe extern "C" fn raise_unbound_local_error_hook(name_obj: ObjPtr) {
         ffi::PyExc_UnboundLocalError,
         b"cannot access local variable before assignment\0".as_ptr() as *const i8,
     );
+}
+
+unsafe extern "C" fn del_preserved_hook(
+    owner: ObjPtr,
+    slot: i64,
+    name_obj: ObjPtr,
+    quietly: bool,
+) -> ObjPtr {
+    let values = preserved_values_owned(owner);
+    if values.is_null() {
+        return ptr::null_mut();
+    }
+    let result = preserved_state::clear_preserved_slot(values.cast(), slot);
+    ffi::Py_DECREF(values.cast::<ffi::PyObject>());
+    if result < 0 {
+        return ptr::null_mut();
+    }
+    if result == 0 && !quietly {
+        raise_unbound_local_error_hook(name_obj);
+        return ptr::null_mut();
+    }
+    owned_none_hook()
 }
 
 unsafe extern "C" fn raise_missing_required_argument_hook() {
@@ -1082,6 +1114,8 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_pyobject_setitem(obj: ObjPtr, key: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_load_preserved(owner: ObjPtr, slot: i64));
     panic_obj_export!(dp_jit_store_preserved(owner: ObjPtr, slot: i64, value: ObjPtr));
+    panic_obj_export!(dp_jit_del_preserved(owner: ObjPtr, slot: i64, name: ObjPtr));
+    panic_obj_export!(dp_jit_del_preserved_quietly(owner: ObjPtr, slot: i64, name: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_delitem(obj: ObjPtr, key: ObjPtr));
     panic_obj_export!(dp_jit_load_global_obj(
         globals_obj: ObjPtr,
@@ -1267,6 +1301,18 @@ pub unsafe extern "C" fn dp_jit_load_preserved(owner: ObjPtr, slot: i64) -> ObjP
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_store_preserved(owner: ObjPtr, slot: i64, value: ObjPtr) -> ObjPtr {
     store_preserved_hook(owner, slot, value)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_del_preserved(owner: ObjPtr, slot: i64, name: ObjPtr) -> ObjPtr {
+    del_preserved_hook(owner, slot, name, false)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_del_preserved_quietly(
+    owner: ObjPtr,
+    slot: i64,
+    name: ObjPtr,
+) -> ObjPtr {
+    del_preserved_hook(owner, slot, name, true)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pytype_generic_alloc(callable: ObjPtr, nitems: i64) -> ObjPtr {
@@ -1609,6 +1655,11 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_store_preserved",
         dp_jit_store_preserved as *const u8,
+    );
+    builder.symbol("dp_jit_del_preserved", dp_jit_del_preserved as *const u8);
+    builder.symbol(
+        "dp_jit_del_preserved_quietly",
+        dp_jit_del_preserved_quietly as *const u8,
     );
     builder.symbol(
         "dp_jit_pytype_generic_alloc",

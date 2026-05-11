@@ -17,12 +17,12 @@ use crate::block_py::{
     ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred,
     ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, Instr,
     InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure,
-    MakeGeneratorResumeHandle, MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName,
-    SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak,
-    StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf,
-    StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise,
-    StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, Tuple, UnaryOp,
-    UnresolvedName, WithMeta, Yield, YieldFrom,
+    MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign,
+    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
+    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, Tuple, UnaryOp, UnresolvedName,
+    WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -249,7 +249,6 @@ pub(crate) enum InstrLow<N: NameLike> {
     CellRefForName(CellRefForName),
     CellRef(CellRef),
     MakeFunction(MakeFunction<Self>),
-    MakeGeneratorResumeHandle(MakeGeneratorResumeHandle),
     MakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
 }
 

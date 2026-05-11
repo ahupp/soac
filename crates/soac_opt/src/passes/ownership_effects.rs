@@ -1964,7 +1964,7 @@ fn initial_block_env(
         .collect::<HashMap<_, _>>();
 
     if is_entry_block {
-        for param in function.params.iter() {
+        for param in function.body_params().iter() {
             if let Some(location) = location_by_name.get(&param.name) {
                 env.insert(*location, LocalRefState::Borrowed);
             }
@@ -1975,7 +1975,7 @@ fn initial_block_env(
         if let Some(location) = location_by_name.get(name) {
             let is_entry_param = is_entry_block
                 && function
-                    .params
+                    .body_params()
                     .iter()
                     .any(|param| param.name.as_str() == name);
             env.insert(
@@ -1991,7 +1991,7 @@ fn initial_block_env(
 
     let entry_param_locations = if is_entry_block {
         function
-            .params
+            .body_params()
             .iter()
             .filter_map(|param| location_by_name.get(&param.name).copied())
             .collect::<HashSet<_>>()
@@ -2051,7 +2051,7 @@ fn initial_typed_block_env(
         .collect::<HashMap<_, _>>();
 
     if is_entry_block {
-        for param in function.params.iter() {
+        for param in function.body_params().iter() {
             if let Some(location) = location_by_name.get(&param.name) {
                 env.insert(*location, LocalRefState::Borrowed);
             }
@@ -2062,7 +2062,7 @@ fn initial_typed_block_env(
         if let Some(location) = location_by_name.get(name) {
             let is_entry_param = is_entry_block
                 && function
-                    .params
+                    .body_params()
                     .iter()
                     .any(|param| param.name.as_str() == name);
             env.insert(
@@ -2078,7 +2078,7 @@ fn initial_typed_block_env(
 
     let entry_param_locations = if is_entry_block {
         function
-            .params
+            .body_params()
             .iter()
             .filter_map(|param| location_by_name.get(&param.name).copied())
             .collect::<HashSet<_>>()
