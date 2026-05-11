@@ -1862,7 +1862,9 @@ impl ExtractedRegion {
                     expected_index: plan.expected_index,
                 })
             }
-            NameLocation::GlobalName | NameLocation::RuntimeName(_) => None,
+            NameLocation::GlobalName
+            | NameLocation::RuntimeName(_)
+            | NameLocation::Preserved(_) => None,
         }
     }
 

@@ -31,9 +31,8 @@ pub struct StorageLayout {
     pub freevars: Vec<ClosureSlot>,
     pub cellvars: Vec<ClosureSlot>,
     // Private activation state that survives suspension but is not a Python
-    // lexical cell. Generator lowering spills these into the runtime wrapper
-    // across suspension and reloads them as ordinary locals on resume.
-    pub preserved_slots: Vec<ClosureSlot>,
+    // lexical cell.
+    pub preserved_slots: Vec<PreservedSlot>,
     pub stack_slots: Vec<String>,
 }
 
@@ -44,6 +43,10 @@ impl StorageLayout {
 
     pub fn owned_slot(&self, slot: u32) -> Option<&ClosureSlot> {
         self.cellvars.get(slot as usize)
+    }
+
+    pub fn preserved_slot(&self, slot: u32) -> Option<&PreservedSlot> {
+        self.preserved_slots.get(slot as usize)
     }
 
     pub fn has_freevar_storage_name(&self, storage_name: &str) -> bool {
@@ -89,6 +92,22 @@ pub struct ClosureSlot {
     pub logical_name: String,
     pub storage_name: String,
     pub init: ClosureInit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct PreservedSlot {
+    pub logical_name: String,
+    pub storage_name: String,
+    pub init: ClosureInit,
+    pub storage: PreservedSlotStorage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum PreservedSlotStorage {
+    // Raw Python-object pointer. Null is reserved for the future unbound state.
+    PyObjectOrNull,
+    // Raw machine integer for compiler-private always-initialized state.
+    I64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

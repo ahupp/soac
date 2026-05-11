@@ -8,11 +8,11 @@ use crate::block_py::{
     BindingPurpose, BindingTarget, Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel,
     BlockParam, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     CallArgPositional, CallableScopeInfo, CellBindingKind, ClosureInit, ClosureSlot, FunctionKind,
-    FunctionName, FunctionNameGen, GetAttr, GetItem, Instr, InstrUnresolved, InstrWithConstantNone,
+    FunctionName, FunctionNameGen, GetAttr, Instr, InstrUnresolved, InstrWithConstantNone,
     InstrWithYield, Load, MakeFunction, Mappable, ModuleNameGen, NameLike, NumberLiteral,
-    NumberLiteralValue, RuntimeFunctionId, ScopeExprNode, SetItem, StorageLayout, Store,
-    StringLiteral, TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm,
-    Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
+    NumberLiteralValue, PreservedSlot, PreservedSlotStorage, RuntimeFunctionId, ScopeExprNode,
+    StorageLayout, Store, StringLiteral, TermBranchTable, TermIf, TermRaise, TryMapFunction,
+    TryMapInstr, TryMapTerm, Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
 };
 use crate::block_py::{Param, ParamKind, ParamSpec};
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
@@ -118,6 +118,19 @@ fn runtime_init(name: &str) -> Option<ClosureInit> {
     }
 }
 
+fn preserved_slot_storage(init: &ClosureInit) -> PreservedSlotStorage {
+    match init {
+        ClosureInit::RuntimePcUnstarted | ClosureInit::RuntimeAbruptKindFallthrough => {
+            PreservedSlotStorage::I64
+        }
+        ClosureInit::InheritedCapture
+        | ClosureInit::Parameter
+        | ClosureInit::EmptyCell
+        | ClosureInit::RuntimeNone
+        | ClosureInit::Deferred => PreservedSlotStorage::PyObjectOrNull,
+    }
+}
+
 pub(crate) fn build_blockpy_storage_layout(
     scope: &CallableScopeInfo,
     param_names: &[String],
@@ -140,9 +153,10 @@ pub(crate) fn build_blockpy_storage_layout(
             continue;
         }
         if let Some(init) = runtime_init(logical_name.as_str()) {
-            preserved_slots.push(ClosureSlot {
+            preserved_slots.push(PreservedSlot {
                 logical_name,
                 storage_name,
+                storage: preserved_slot_storage(&init),
                 init,
             });
             continue;
@@ -165,16 +179,20 @@ pub(crate) fn build_blockpy_storage_layout(
         } else {
             ClosureInit::Deferred
         };
-        let slots = if semantic_cell_storage_names.contains(storage_name.as_str()) {
-            &mut cellvars
+        if semantic_cell_storage_names.contains(storage_name.as_str()) {
+            cellvars.push(ClosureSlot {
+                logical_name,
+                storage_name,
+                init,
+            });
         } else {
-            &mut preserved_slots
-        };
-        slots.push(ClosureSlot {
-            logical_name,
-            storage_name,
-            init,
-        });
+            preserved_slots.push(PreservedSlot {
+                logical_name,
+                storage_name,
+                storage: preserved_slot_storage(&init),
+                init,
+            });
+        }
     }
 
     StorageLayout {
@@ -428,18 +446,6 @@ fn core_get_attr(value: InstrUnresolved, attr: &str) -> InstrUnresolved {
     GetAttr::new(Box::new(value), Box::new(core_string_literal(attr))).into()
 }
 
-fn core_get_item(value: InstrUnresolved, index: InstrUnresolved) -> InstrUnresolved {
-    GetItem::new(Box::new(value), Box::new(index)).into()
-}
-
-fn core_set_item_stmt(
-    value: InstrUnresolved,
-    index: InstrUnresolved,
-    replacement: InstrUnresolved,
-) -> InstrUnresolved {
-    SetItem::new(Box::new(value), Box::new(index), Box::new(replacement)).into()
-}
-
 fn core_generator_code(async_gen: bool, name: &str, qualname: &str) -> InstrUnresolved {
     let template_attr = if async_gen {
         "code_template_async_gen"
@@ -574,7 +580,7 @@ fn resume_closure_state_order(layout: &StorageLayout) -> Vec<String> {
     order
 }
 
-fn preserved_slot_init_expr(slot: &ClosureSlot) -> InstrUnresolved {
+fn preserved_slot_init_expr(slot: &PreservedSlot) -> InstrUnresolved {
     match slot.init {
         ClosureInit::InheritedCapture | ClosureInit::EmptyCell => {
             panic!("preserved slots should not use closure-only init {slot:?}")
@@ -592,37 +598,6 @@ fn preserved_slot_index(layout: &StorageLayout, logical_name: &str) -> usize {
         .iter()
         .position(|slot| slot.logical_name == logical_name)
         .unwrap_or_else(|| panic!("missing preserved slot {logical_name} in {layout:?}"))
-}
-
-fn preserved_values_expr() -> InstrUnresolved {
-    core_get_attr(core_name("_dp_self"), "_preserved_values")
-}
-
-fn preserved_slot_reload_stmts(preserved_slots: &[ClosureSlot]) -> Vec<LinearCoreStmt> {
-    preserved_slots
-        .iter()
-        .enumerate()
-        .map(|(slot, preserved)| {
-            internal_store_stmt(
-                preserved.logical_name.as_str(),
-                core_get_item(preserved_values_expr(), core_literal_int(slot)),
-            )
-        })
-        .collect()
-}
-
-fn preserved_slot_spill_stmts(preserved_slots: &[ClosureSlot]) -> Vec<LinearCoreStmt> {
-    preserved_slots
-        .iter()
-        .enumerate()
-        .map(|(slot, preserved)| {
-            core_set_item_stmt(
-                preserved_values_expr(),
-                core_literal_int(slot),
-                core_name(preserved.logical_name.as_str()),
-            )
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1676,7 +1651,6 @@ fn emit_yield_from_site(
 fn lower_resume_blocks(
     callable: &BlockPyFunction<CoreModuleShapeWithYield>,
     resume_name_gen: FunctionNameGen,
-    preserved_slots: &[ClosureSlot],
 ) -> (
     Vec<LinearCoreBlock>,
     HashMap<BlockLabel, Option<BlockLabel>>,
@@ -1843,7 +1817,7 @@ fn lower_resume_blocks(
 
     let mut blocks = vec![LinearCoreBlock {
         label: dispatch_label.clone(),
-        body: preserved_slot_reload_stmts(preserved_slots),
+        body: Vec::new(),
         term: BlockTerm::BranchTable(TermBranchTable {
             index: core_name("_dp_pc"),
             targets,
@@ -1863,13 +1837,6 @@ fn lower_resume_blocks(
         exc_edge: None,
         extra: Default::default(),
     });
-    for block in &mut blocks {
-        if matches!(block.term, BlockTerm::Return(_)) {
-            block
-                .body
-                .extend(preserved_slot_spill_stmts(preserved_slots));
-        }
-    }
     state.exception_edges.insert(dispatch_label.clone(), None);
     state
         .exception_edges
@@ -1907,11 +1874,8 @@ pub(crate) fn lower_generator_like_function(
     let resume_closure_state_order = resume_closure_state_order(&storage_layout);
     let resume_binding_logical_names =
         ordered_resume_binding_logical_names(&callable, &resume_closure_state_order);
-    let (resume_blocks, _resume_exception_edges, _resume_entry_label) = lower_resume_blocks(
-        &callable,
-        resume_name_gen.share(),
-        &storage_layout.preserved_slots,
-    );
+    let (resume_blocks, _resume_exception_edges, _resume_entry_label) =
+        lower_resume_blocks(&callable, resume_name_gen.share());
     let closure_bindings = resume_closure_bindings(&callable.scope, &resume_binding_logical_names);
 
     let BlockPyFunction {
@@ -1950,8 +1914,11 @@ pub(crate) fn lower_generator_like_function(
         storage_layout: None,
         scope: resume_semantic,
     };
+    let mut resume_storage_layout =
+        compute_storage_layout_from_scope(&resume_function).unwrap_or_default();
+    resume_storage_layout.preserved_slots = storage_layout.preserved_slots.clone();
     let resume_function = BlockPyFunction {
-        storage_layout: compute_storage_layout_from_scope(&resume_function),
+        storage_layout: Some(resume_storage_layout),
         ..resume_function
     };
 

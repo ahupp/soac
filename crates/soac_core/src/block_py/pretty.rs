@@ -233,7 +233,7 @@ impl BlockPyFormatter {
                 if !layout.preserved_slots.is_empty() {
                     this.line(format!(
                         "preserved_slots: [{}]",
-                        render_closure_slots(&layout.preserved_slots)
+                        render_preserved_slots(&layout.preserved_slots)
                     ));
                 }
             }
@@ -445,6 +445,22 @@ fn render_closure_slots(slots: &[crate::block_py::ClosureSlot]) -> String {
         .join(", ")
 }
 
+fn render_preserved_slots(slots: &[crate::block_py::PreservedSlot]) -> String {
+    slots
+        .iter()
+        .map(|slot| {
+            format!(
+                "{}->{}@{}/{}",
+                slot.logical_name,
+                slot.storage_name,
+                closure_init_name(&slot.init),
+                preserved_slot_storage_name(slot.storage),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn closure_init_name(init: &crate::block_py::ClosureInit) -> &'static str {
     match init {
         crate::block_py::ClosureInit::InheritedCapture => "inherited",
@@ -454,6 +470,13 @@ fn closure_init_name(init: &crate::block_py::ClosureInit) -> &'static str {
         crate::block_py::ClosureInit::RuntimeAbruptKindFallthrough => "abrupt_kind_fallthrough",
         crate::block_py::ClosureInit::RuntimeNone => "none",
         crate::block_py::ClosureInit::Deferred => "deferred",
+    }
+}
+
+fn preserved_slot_storage_name(storage: crate::block_py::PreservedSlotStorage) -> &'static str {
+    match storage {
+        crate::block_py::PreservedSlotStorage::PyObjectOrNull => "pyobject_or_null",
+        crate::block_py::PreservedSlotStorage::I64 => "i64",
     }
 }
 

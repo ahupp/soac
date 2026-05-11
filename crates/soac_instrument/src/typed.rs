@@ -333,12 +333,7 @@ impl PreparedTraceNameLocator {
             .as_ref()
             .map(|layout| {
                 let mut slots = HashMap::new();
-                for (slot, closure_slot) in layout
-                    .cellvars
-                    .iter()
-                    .chain(layout.preserved_slots.iter())
-                    .enumerate()
-                {
+                for (slot, closure_slot) in layout.cellvars.iter().enumerate() {
                     slots.insert(closure_slot.storage_name.clone(), slot as u32);
                     slots.insert(closure_slot.logical_name.clone(), slot as u32);
                 }

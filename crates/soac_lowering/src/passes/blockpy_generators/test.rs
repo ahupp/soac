@@ -7,8 +7,8 @@ use crate::block_py::{
     core_call_expr_with_meta, BinOpKind, BindingKind, BindingPurpose, Block, BlockBuilder,
     BlockLabel, BlockTerm, CallArgPositional, CallableScopeInfo, CallableScopeKind,
     CellBindingKind, ClosureInit, ClosureSlot, FunctionName, HasMeta, InstrUnresolved,
-    InstrWithYield, Literal, Meta, NameLike, RuntimeFunctionId, StorageLayout, TryMapTerm,
-    UnaryOpKind, WithMeta, Yield,
+    InstrWithYield, Literal, Meta, NameLike, PreservedSlot, PreservedSlotStorage,
+    RuntimeFunctionId, StorageLayout, TryMapTerm, UnaryOpKind, WithMeta, Yield,
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::InstrRuff;
@@ -22,6 +22,25 @@ fn generator_test_semantic() -> CallableScopeInfo {
         names: FunctionName::new("gen", "gen", "gen", "gen"),
         scope_kind: CallableScopeKind::Function,
         ..Default::default()
+    }
+}
+
+fn preserved_slot(logical_name: &str, storage_name: &str, init: ClosureInit) -> PreservedSlot {
+    let storage = match init {
+        ClosureInit::RuntimePcUnstarted | ClosureInit::RuntimeAbruptKindFallthrough => {
+            PreservedSlotStorage::I64
+        }
+        ClosureInit::InheritedCapture
+        | ClosureInit::Parameter
+        | ClosureInit::EmptyCell
+        | ClosureInit::RuntimeNone
+        | ClosureInit::Deferred => PreservedSlotStorage::PyObjectOrNull,
+    };
+    PreservedSlot {
+        logical_name: logical_name.to_string(),
+        storage_name: storage_name.to_string(),
+        init,
+        storage,
     }
 }
 
@@ -253,16 +272,12 @@ fn resume_closure_bindings_keep_cell_backed_eval_state_on_closure_path() {
             },
         ],
         preserved_slots: vec![
-            ClosureSlot {
-                logical_name: "_dp_yieldfrom".to_string(),
-                storage_name: "_dp_cell__dp_yieldfrom".to_string(),
-                init: ClosureInit::RuntimeNone,
-            },
-            ClosureSlot {
-                logical_name: "_dp_pc".to_string(),
-                storage_name: "_dp_cell__dp_pc".to_string(),
-                init: ClosureInit::RuntimePcUnstarted,
-            },
+            preserved_slot(
+                "_dp_yieldfrom",
+                "_dp_cell__dp_yieldfrom",
+                ClosureInit::RuntimeNone,
+            ),
+            preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
         ],
         stack_slots: Vec::new(),
     };
@@ -298,11 +313,11 @@ fn resume_closure_state_order_omits_preserved_slots() {
             storage_name: "_dp_cell_total".to_string(),
             init: ClosureInit::Deferred,
         }],
-        preserved_slots: vec![ClosureSlot {
-            logical_name: "_dp_pc".to_string(),
-            storage_name: "_dp_cell__dp_pc".to_string(),
-            init: ClosureInit::RuntimePcUnstarted,
-        }],
+        preserved_slots: vec![preserved_slot(
+            "_dp_pc",
+            "_dp_cell__dp_pc",
+            ClosureInit::RuntimePcUnstarted,
+        )],
         stack_slots: Vec::new(),
     };
 
@@ -446,21 +461,17 @@ fn builds_closure_backed_generator_factory_block() {
             init: ClosureInit::Parameter,
         }],
         preserved_slots: vec![
-            ClosureSlot {
-                logical_name: "_dp_pc".to_string(),
-                storage_name: "_dp_cell__dp_pc".to_string(),
-                init: ClosureInit::RuntimePcUnstarted,
-            },
-            ClosureSlot {
-                logical_name: "_dp_yieldfrom".to_string(),
-                storage_name: "_dp_cell__dp_yieldfrom".to_string(),
-                init: ClosureInit::RuntimeNone,
-            },
-            ClosureSlot {
-                logical_name: "_dp_throw_context".to_string(),
-                storage_name: "_dp_cell__dp_throw_context".to_string(),
-                init: ClosureInit::RuntimeNone,
-            },
+            preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
+            preserved_slot(
+                "_dp_yieldfrom",
+                "_dp_cell__dp_yieldfrom",
+                ClosureInit::RuntimeNone,
+            ),
+            preserved_slot(
+                "_dp_throw_context",
+                "_dp_cell__dp_throw_context",
+                ClosureInit::RuntimeNone,
+            ),
         ],
         stack_slots: Vec::new(),
     };
@@ -498,16 +509,12 @@ fn resume_closure_bindings_use_semantic_capture_sources_for_cell_backed_state() 
             init: ClosureInit::Deferred,
         }],
         preserved_slots: vec![
-            ClosureSlot {
-                logical_name: "_dp_pc".to_string(),
-                storage_name: "_dp_cell__dp_pc".to_string(),
-                init: ClosureInit::RuntimePcUnstarted,
-            },
-            ClosureSlot {
-                logical_name: "_dp_throw_context".to_string(),
-                storage_name: "_dp_cell__dp_throw_context".to_string(),
-                init: ClosureInit::RuntimeNone,
-            },
+            preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
+            preserved_slot(
+                "_dp_throw_context",
+                "_dp_cell__dp_throw_context",
+                ClosureInit::RuntimeNone,
+            ),
         ],
         stack_slots: Vec::new(),
     };
@@ -534,16 +541,12 @@ fn resume_closure_bindings_use_logical_names_for_shared_storage() {
         }],
         cellvars: vec![],
         preserved_slots: vec![
-            ClosureSlot {
-                logical_name: "_dp_pc".to_string(),
-                storage_name: "_dp_cell__dp_pc".to_string(),
-                init: ClosureInit::RuntimePcUnstarted,
-            },
-            ClosureSlot {
-                logical_name: "_dp_throw_context".to_string(),
-                storage_name: "_dp_cell__dp_throw_context".to_string(),
-                init: ClosureInit::RuntimeNone,
-            },
+            preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
+            preserved_slot(
+                "_dp_throw_context",
+                "_dp_cell__dp_throw_context",
+                ClosureInit::RuntimeNone,
+            ),
         ],
         stack_slots: Vec::new(),
     };
@@ -571,16 +574,12 @@ fn resume_semantic_marks_only_closure_state_as_cell_captures() {
             init: ClosureInit::Deferred,
         }],
         preserved_slots: vec![
-            ClosureSlot {
-                logical_name: "_dp_pc".to_string(),
-                storage_name: "_dp_cell__dp_pc".to_string(),
-                init: ClosureInit::RuntimePcUnstarted,
-            },
-            ClosureSlot {
-                logical_name: "_dp_throw_context".to_string(),
-                storage_name: "_dp_cell__dp_throw_context".to_string(),
-                init: ClosureInit::RuntimeNone,
-            },
+            preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
+            preserved_slot(
+                "_dp_throw_context",
+                "_dp_cell__dp_throw_context",
+                ClosureInit::RuntimeNone,
+            ),
         ],
         stack_slots: Vec::new(),
     };
@@ -652,21 +651,17 @@ fn resume_semantic_overlay_marks_only_closure_state_for_standard_name_binding() 
             },
         ],
         preserved_slots: vec![
-            ClosureSlot {
-                logical_name: "_dp_yieldfrom".to_string(),
-                storage_name: "_dp_cell__dp_yieldfrom".to_string(),
-                init: ClosureInit::RuntimeNone,
-            },
-            ClosureSlot {
-                logical_name: "_dp_throw_context".to_string(),
-                storage_name: "_dp_cell__dp_throw_context".to_string(),
-                init: ClosureInit::RuntimeNone,
-            },
-            ClosureSlot {
-                logical_name: "_dp_pc".to_string(),
-                storage_name: "_dp_cell__dp_pc".to_string(),
-                init: ClosureInit::RuntimePcUnstarted,
-            },
+            preserved_slot(
+                "_dp_yieldfrom",
+                "_dp_cell__dp_yieldfrom",
+                ClosureInit::RuntimeNone,
+            ),
+            preserved_slot(
+                "_dp_throw_context",
+                "_dp_cell__dp_throw_context",
+                ClosureInit::RuntimeNone,
+            ),
+            preserved_slot("_dp_pc", "_dp_cell__dp_pc", ClosureInit::RuntimePcUnstarted),
         ],
         stack_slots: Vec::new(),
     };

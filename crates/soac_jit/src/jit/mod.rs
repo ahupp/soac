@@ -277,7 +277,7 @@ use imports::{
     DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
     DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT, DP_JIT_LOAD_CELL_IMPORT,
-    DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
+    DP_JIT_LOAD_PRESERVED_IMPORT, DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
     DP_JIT_POP_HANDLED_EXCEPTION_IMPORT, DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT,
     DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT, DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
     DP_JIT_PY_CALL_OBJECT_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
@@ -286,19 +286,19 @@ use imports::{
     DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
     DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
     DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT, DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
-    DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
-    PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT,
-    PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT,
-    PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
-    SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
-    SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
-    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
-    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
-    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
-    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT,
-    SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType,
-    predeclare_specialization_type_imports,
+    DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, DP_JIT_STORE_PRESERVED_IMPORT,
+    ImportSpec, ModuleFuncImports, PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT,
+    PYNUMBER_ADD_IMPORT, PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT,
+    PYNUMBER_SUBTRACT_IMPORT, PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT,
+    PYUNICODE_COMPARE_IMPORT, SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
+    SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT,
+    SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
+    SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT, SOAC_RUNTIME_TUPLE_NEW_IMPORT,
+    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType, predeclare_specialization_type_imports,
 };
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
@@ -517,11 +517,21 @@ fn local_name_for_location<'a>(
         .unwrap_or_else(|| panic!("missing stack slot for local location {}", location.slot()))
 }
 
+fn emit_preserved_owner_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    local_env
+        .load_name(fb, "_dp_self", ctx, true)
+        .expect("preserved slots require the generator resume owner local _dp_self")
+}
+
 fn emit_codegen_non_local_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
     _load_instr_id: Option<InstrId>,
-    _local_env: &LocalEnv,
+    local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     _borrowed: bool,
 ) -> Option<ir::Value> {
@@ -573,6 +583,24 @@ fn emit_codegen_non_local_name_load(
             let value_inst = fb
                 .ins()
                 .call(ctx.load_runtime_obj_by_id_ref, &[runtime_name_id]);
+            let value = fb.inst_results(value_inst)[0];
+            let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+            let value_ok_block = fb.create_block();
+            fb.append_block_param(value_ok_block, ptr_ty);
+            fb.ins().brif(
+                value_is_null,
+                ctx.consts.step_null_block,
+                &step_null_block_args(ctx),
+                value_ok_block,
+                &[ir::BlockArg::Value(value)],
+            );
+            fb.switch_to_block(value_ok_block);
+            Some(fb.block_params(value_ok_block)[0])
+        }
+        NameLocation::Preserved(location) => {
+            let owner = emit_preserved_owner_with_local_env(fb, local_env, ctx);
+            let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
+            let value_inst = fb.ins().call(ctx.load_preserved_ref, &[owner, slot]);
             let value = fb.inst_results(value_inst)[0];
             let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
             let value_ok_block = fb.create_block();
@@ -1554,6 +1582,8 @@ struct JitEmitCtx<'mc> {
     pyobject_setattr_ref: ir::FuncRef,
     pyobject_getitem_ref: ir::FuncRef,
     pyobject_setitem_ref: ir::FuncRef,
+    load_preserved_ref: ir::FuncRef,
+    store_preserved_ref: ir::FuncRef,
     py_long_from_i64_ref: ir::FuncRef,
     raise_unbound_local_error_ref: ir::FuncRef,
     make_function_with_closure_ref: ir::FuncRef,
@@ -4381,6 +4411,81 @@ fn emit_typed_local_store_result_with_local_env(
         emit_ctx.refcount_emitter(),
     );
     Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)))
+}
+
+fn emit_preserved_store_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &Store<InstrBlockPy>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<EmitResult> {
+    let location = op.name.preserved_location()?;
+    let owner = emit_preserved_owner_with_local_env(fb, local_env, emit_ctx);
+    let value = emit_codegen_expr_with_local_env(
+        fb,
+        &op.value,
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    );
+    let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
+    let call_inst = fb
+        .ins()
+        .call(emit_ctx.store_preserved_ref, &[owner, slot, value]);
+    emit_ctx.emit_decref_for_family(fb, value, None, RefcountFamily::OwnedTemporary);
+    let result = emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], emit_ctx);
+    Some(emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::none_singleton(),
+        emit_ctx,
+        demand,
+    ))
+}
+
+fn emit_typed_preserved_store_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &Store<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let Some(location) = op.name.preserved_location() else {
+        return Ok(None);
+    };
+    let owner = emit_preserved_owner_with_local_env(fb, local_env, emit_ctx);
+    let value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        &op.value,
+        local_env,
+        emit_ctx,
+        typed_expr_pyobject_input_is_borrowed_from_local_env(&op.value, local_env, emit_ctx),
+        codegen_env,
+        func_imports,
+    )?;
+    let (value, ownership, _) = value.expect_pyobject("typed preserved store value");
+    let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
+    let call_inst = fb
+        .ins()
+        .call(emit_ctx.store_preserved_ref, &[owner, slot, value]);
+    if ownership.is_owned() {
+        emit_ctx.emit_decref_for_family(fb, value, None, RefcountFamily::OwnedTemporary);
+    }
+    let result = emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], emit_ctx);
+    Ok(Some(emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::none_singleton(),
+        emit_ctx,
+        demand,
+    )))
 }
 
 fn typed_local_store_prefers_scalar_repr(
@@ -10603,6 +10708,22 @@ fn emit_typed_codegen_expr_value_with_local_env(
 
     if let InstrTyped::Store(op) = expr {
         assert!(!borrowed, "typed Store must not request a borrowed result");
+        if let Some(result) = emit_typed_preserved_store_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, facts) = result.expect_pyobject("typed preserved store result");
+            assert!(
+                ownership.is_owned(),
+                "typed preserved store expression should produce an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
         if let Some(result) = emit_typed_local_store_result_with_local_env(
             fb,
             expr,
@@ -15503,6 +15624,17 @@ fn emit_codegen_stmt_result_with_local_env(
     }
     match expr {
         InstrBlockPy::Store(op) => {
+            if let Some(result) = emit_preserved_store_result_with_local_env(
+                fb,
+                op,
+                local_env,
+                emit_ctx,
+                demand,
+                codegen_env,
+                func_imports,
+            ) {
+                return Ok(result);
+            }
             if let Some(result) = emit_local_store_result_with_local_env(
                 fb,
                 expr,
@@ -15807,6 +15939,22 @@ fn emit_codegen_stmt_with_local_env(
 ) -> ir::Value {
     match expr {
         InstrBlockPy::Store(op) => {
+            if let Some(result) = emit_preserved_store_result_with_local_env(
+                fb,
+                op,
+                local_env,
+                emit_ctx,
+                ResultDemand::PYOBJECT_OWNED,
+                codegen_env,
+                func_imports,
+            ) {
+                let (value, ownership, _) = result.expect_pyobject("legacy preserved store");
+                assert!(
+                    ownership.is_owned(),
+                    "legacy preserved store should produce an owned PyObject"
+                );
+                return value;
+            }
             if let Some(value) = emit_local_store_with_local_env(
                 fb,
                 expr,
@@ -15847,6 +15995,22 @@ fn emit_typed_codegen_stmt_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
     if let InstrTyped::Store(op) = expr {
+        if let Some(result) = emit_typed_preserved_store_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, _) = result.expect_pyobject("typed statement preserved store");
+            assert!(
+                ownership.is_owned(),
+                "typed statement preserved store should produce an owned PyObject"
+            );
+            return Ok(value);
+        }
         if let Some(result) = emit_typed_local_store_result_with_local_env(
             fb,
             expr,
@@ -16228,6 +16392,17 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         );
     }
     if let InstrTyped::Store(op) = expr {
+        if let Some(result) = emit_typed_preserved_store_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )? {
+            return Ok(result);
+        }
         if let Some(result) = emit_typed_local_store_result_with_local_env(
             fb,
             expr,
@@ -20913,6 +21088,10 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_GETITEM_IMPORT);
         let pyobject_setitem_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_SETITEM_IMPORT);
+        let load_preserved_ref =
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_LOAD_PRESERVED_IMPORT);
+        let store_preserved_ref =
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_STORE_PRESERVED_IMPORT);
         let pyobject_to_i64_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_TO_I64_IMPORT);
         let py_long_from_i64_ref =
@@ -21271,6 +21450,8 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_setattr_ref,
                 pyobject_getitem_ref,
                 pyobject_setitem_ref,
+                load_preserved_ref,
+                store_preserved_ref,
                 py_long_from_i64_ref,
                 raise_unbound_local_error_ref,
                 make_function_with_closure_ref,

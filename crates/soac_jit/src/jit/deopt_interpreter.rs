@@ -15,7 +15,7 @@ use pyo3::{Bound, Python};
 use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, Block, BlockArg, BlockEdge, BlockLabel, BlockTerm,
     CallArgKeyword, CallArgPositional, CellLocation, LocalLocation, NameLocation, ParamKind,
-    RuntimeName, UnaryOp, UnaryOpKind,
+    PreservedLocation, RuntimeName, UnaryOp, UnaryOpKind,
 };
 use soac_core::block_py::{BlockPyFunction, FunctionKind};
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
@@ -1720,6 +1720,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     ) -> Result<ObjPtr, String> {
         match location {
             NameLocation::Local(location) => self.execute_return_local(name, location),
+            NameLocation::Preserved(location) => unsafe {
+                self.execute_preserved_load_owned(location)
+            },
             NameLocation::Global(slot) => unsafe {
                 self.execute_return_global(name, i64::from(slot.slot()))
             },
@@ -1730,6 +1733,34 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             NameLocation::Constant(constant_index) => self.execute_module_constant(constant_index),
             NameLocation::Cell(location) => unsafe { self.execute_cell_load_owned(name, location) },
         }
+    }
+
+    #[cold]
+    fn preserved_owner(&self) -> Result<ObjPtr, String> {
+        let owner = self.locals.get_by_name("_dp_self").ok_or_else(|| {
+            format!(
+                "deopt continuation expected generator resume owner _dp_self for preserved state: {}",
+                self.locals.describe()
+            )
+        })?;
+        let value = owner.value();
+        if value.is_null() {
+            return Err(
+                "deopt continuation found null generator resume owner _dp_self".to_string(),
+            );
+        }
+        Ok(value)
+    }
+
+    #[cold]
+    unsafe fn execute_preserved_load_owned(
+        &self,
+        location: PreservedLocation,
+    ) -> Result<ObjPtr, String> {
+        let owner = self.preserved_owner()?;
+        Ok(unsafe {
+            super::specialized_helpers::dp_jit_load_preserved(owner, i64::from(location.slot()))
+        })
     }
 
     #[cold]
@@ -1918,11 +1949,38 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
                     store.value.as_ref(),
                 )
             },
+            NameLocation::Preserved(location) => unsafe {
+                self.execute_preserved_store_owned(location, store.value.as_ref())
+            },
             location => Err(format!(
                 "deopt continuation does not support storing {location:?} for {:?}",
                 store.name.id.as_str()
             )),
         }
+    }
+
+    #[cold]
+    unsafe fn execute_preserved_store_owned(
+        &mut self,
+        location: PreservedLocation,
+        value_expr: &InstrBlockPy,
+    ) -> Result<ObjPtr, String> {
+        let value = unsafe { self.execute_expr_owned(value_expr)? };
+        if value.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let owner = self.preserved_owner()?;
+        let result = unsafe {
+            super::specialized_helpers::dp_jit_store_preserved(
+                owner,
+                i64::from(location.slot()),
+                value,
+            )
+        };
+        unsafe {
+            ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+        }
+        Ok(result)
     }
 
     #[cold]

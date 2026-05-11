@@ -1065,10 +1065,39 @@ fn sync_block_param_cell_in_block(
     ))
 }
 
-fn sync_cell_backed_block_params_in_block(
+fn sync_block_param_preserved_slot_in_block(
+    param: &crate::block_py::BlockParam,
+    should_sync: bool,
+    storage_layout: Option<&crate::block_py::StorageLayout>,
+    resolver: &NameBindingMapper<'_>,
+) -> Option<CoreStmt> {
+    if !should_sync {
+        return None;
+    }
+    let storage_name = storage_layout?
+        .preserved_slots
+        .iter()
+        .find(|slot| slot.logical_name == param.name)
+        .map(|slot| slot.storage_name.clone())?;
+
+    let node_index = compat_node_index();
+    let range = compat_range();
+    let param_load = ast::name::Name::new(param.name.clone());
+    let meta = crate::block_py::Meta::new(node_index.clone(), range);
+    Some(op_stmt(
+        Store::new(
+            ast::name::Name::new(storage_name),
+            Box::new(rewrite_local_name_load(param_load, meta.clone(), resolver)),
+        )
+        .with_meta(crate::block_py::Meta::new(node_index, range)),
+    ))
+}
+
+fn sync_backed_block_params_in_block(
     block: &mut crate::block_py::Block<InstrUnresolved>,
     normal_predecessor_exc_names: &[Option<String>],
     scope: &CallableScopeInfo,
+    storage_layout: Option<&crate::block_py::StorageLayout>,
     resolver: &NameBindingMapper<'_>,
 ) {
     let active_exception_name = block.exception_param().map(ToString::to_string);
@@ -1082,10 +1111,20 @@ fn sync_cell_backed_block_params_in_block(
     let sync_stmts = block
         .params
         .iter()
-        .filter_map(|param| {
+        .flat_map(|param| {
             let should_sync =
                 param.role != crate::block_py::BlockParamRole::Exception || should_sync_exception;
-            sync_block_param_cell_in_block(param, should_sync, scope, resolver)
+            [
+                sync_block_param_cell_in_block(param, should_sync, scope, resolver),
+                sync_block_param_preserved_slot_in_block(
+                    param,
+                    should_sync,
+                    storage_layout,
+                    resolver,
+                ),
+            ]
+            .into_iter()
+            .flatten()
         })
         .collect::<Vec<_>>();
     if sync_stmts.is_empty() {
@@ -1240,6 +1279,62 @@ fn collect_owned_cell_slot_locations(
     slots
 }
 
+fn collect_preserved_slot_locations(
+    callable: &BlockPyFunction<CoreModuleShape>,
+) -> HashMap<String, u32> {
+    let mut slots = HashMap::new();
+    if callable.kind != FunctionKind::Function {
+        return slots;
+    }
+    if let Some(layout) = callable.storage_layout.as_ref() {
+        for (slot, preserved_slot) in layout.preserved_slots.iter().enumerate() {
+            slots.insert(preserved_slot.storage_name.clone(), slot as u32);
+            slots.insert(preserved_slot.logical_name.clone(), slot as u32);
+        }
+    }
+    slots
+}
+
+fn materialize_preserved_block_arg_sources(callable: &mut BlockPyFunction<CoreModuleShape>) {
+    let preserved_slots = collect_preserved_slot_locations(callable);
+    if preserved_slots.is_empty() {
+        return;
+    }
+    let name_gen = callable.name_gen.share();
+    for block in &mut callable.blocks {
+        let current_param_names = block
+            .param_names()
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>();
+        let BlockTerm::Jump(edge) = &mut block.term else {
+            continue;
+        };
+        for arg in &mut edge.args {
+            let BlockArg::Name(source_name) = arg else {
+                continue;
+            };
+            if !preserved_slots.contains_key(source_name.as_str())
+                || current_param_names.contains(source_name)
+            {
+                continue;
+            }
+            let local_name = name_gen.next_tmp_name("preserved_arg").to_string();
+            let meta = crate::block_py::Meta::new(compat_node_index(), compat_range());
+            block.body.push(op_stmt(
+                Store::new(
+                    ast::name::Name::new(local_name.clone()),
+                    Box::new(rewrite_global_name_load(
+                        ast::name::Name::new(source_name.clone()),
+                        meta.clone(),
+                    )),
+                )
+                .with_meta(meta),
+            ));
+            *source_name = local_name;
+        }
+    }
+}
+
 fn collect_cell_bindings(
     callable: &BlockPyFunction<CoreModuleShape>,
 ) -> HashMap<String, (String, CellBindingKind)> {
@@ -1362,9 +1457,11 @@ fn compute_local_slot_locations_from_analysis(
         collect_remaining_names_in_term(&block.term, &mut remaining);
     }
 
+    let preserved_slot_names = collect_preserved_slot_locations(callable);
     let mut non_param_locals = remaining
         .into_iter()
         .filter(|name| !slots.contains_key(name))
+        .filter(|name| !preserved_slot_names.contains_key(name))
         .filter(|name| {
             is_remaining_local_name(
                 name,
@@ -1437,6 +1534,7 @@ struct NameLocator<'a> {
     local_slots: HashMap<String, u32>,
     captured_cell_slots: HashMap<String, u32>,
     owned_cell_slots: HashMap<String, u32>,
+    preserved_slots: HashMap<String, u32>,
     cell_bindings: HashMap<String, (String, CellBindingKind)>,
 }
 
@@ -1612,6 +1710,8 @@ impl NameLocator<'_> {
                     NameLocation::closure_cell(slot)
                 }
             }
+        } else if let Some(slot) = self.preserved_slots.get(name_text.as_str()).copied() {
+            NameLocation::preserved(slot)
         } else if let Some(slot) = self.local_slots.get(name_text.as_str()).copied() {
             NameLocation::local(slot)
         } else {
@@ -1802,6 +1902,7 @@ fn locate_names_in_callable(
     let local_slots = collect_local_slot_locations(&callable);
     let captured_cell_slots = collect_captured_cell_slot_locations(&callable);
     let owned_cell_slots = collect_owned_cell_slot_locations(&callable);
+    let preserved_slots = collect_preserved_slot_locations(&callable);
     let cell_bindings = collect_cell_bindings(&callable);
     let mut mapper = NameLocator {
         scope: &scope,
@@ -1809,6 +1910,7 @@ fn locate_names_in_callable(
         local_slots,
         captured_cell_slots,
         owned_cell_slots,
+        preserved_slots,
         cell_bindings,
     };
     mapper.map_callable(callable)
@@ -2404,12 +2506,13 @@ fn populate_jump_edge_args(blocks: &mut [crate::block_py::ResolvedStorageBlock])
 }
 
 fn lower_name_binding_callable(
-    callable: BlockPyFunction<CoreModuleShape>,
+    mut callable: BlockPyFunction<CoreModuleShape>,
     callee_make_function_captures: &HashMap<
         crate::block_py::RuntimeFunctionId,
         Vec<CellCaptureBinding>,
     >,
 ) -> BlockPyFunction<ResolvedStorageModuleShape> {
+    materialize_preserved_block_arg_sources(&mut callable);
     let scope = callable.scope.clone();
     let local_slots = collect_local_slot_locations(&callable);
     let mut mapper = NameBindingMapper {
@@ -2421,12 +2524,19 @@ fn lower_name_binding_callable(
     populate_stack_slots_in_storage_layout(&mut lowered, local_slots);
     rewrite_current_exception_in_core_blocks(&mut lowered.blocks);
     let normal_predecessors = normal_predecessor_exc_param_names(&lowered.blocks);
+    let storage_layout = lowered.storage_layout.clone();
     for block in &mut lowered.blocks {
         let predecessor_exc_names = normal_predecessors
             .get(&block.label)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        sync_cell_backed_block_params_in_block(block, predecessor_exc_names, &scope, &mapper);
+        sync_backed_block_params_in_block(
+            block,
+            predecessor_exc_names,
+            &scope,
+            storage_layout.as_ref(),
+            &mapper,
+        );
         for stmt in &mut block.body {
             rewrite_raw_cell_loads_in_stmt(stmt, &scope, &mapper);
         }

@@ -585,6 +585,68 @@ unsafe extern "C" fn pyobject_setitem_hook(obj: ObjPtr, key: ObjPtr, value: ObjP
     );
     if rc == 0 { new_none() } else { ptr::null_mut() }
 }
+
+unsafe fn preserved_values_owned(owner: ObjPtr) -> ObjPtr {
+    if owner.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"invalid null preserved-state owner".as_ptr(),
+        );
+        return ptr::null_mut();
+    }
+    ffi::PyObject_GetAttrString(owner.cast::<ffi::PyObject>(), c"_preserved_values".as_ptr())
+        as ObjPtr
+}
+
+unsafe extern "C" fn load_preserved_hook(owner: ObjPtr, slot: i64) -> ObjPtr {
+    if slot < 0 {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"invalid negative preserved-state slot".as_ptr(),
+        );
+        return ptr::null_mut();
+    }
+    let values = preserved_values_owned(owner);
+    if values.is_null() {
+        return ptr::null_mut();
+    }
+    let key = ffi::PyLong_FromLongLong(slot);
+    if key.is_null() {
+        ffi::Py_DECREF(values.cast::<ffi::PyObject>());
+        return ptr::null_mut();
+    }
+    let result = ffi::PyObject_GetItem(values.cast::<ffi::PyObject>(), key) as ObjPtr;
+    ffi::Py_DECREF(key);
+    ffi::Py_DECREF(values.cast::<ffi::PyObject>());
+    result
+}
+
+unsafe extern "C" fn store_preserved_hook(owner: ObjPtr, slot: i64, value: ObjPtr) -> ObjPtr {
+    if slot < 0 || value.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"invalid preserved-state store arguments".as_ptr(),
+        );
+        return ptr::null_mut();
+    }
+    let values = preserved_values_owned(owner);
+    if values.is_null() {
+        return ptr::null_mut();
+    }
+    let key = ffi::PyLong_FromLongLong(slot);
+    if key.is_null() {
+        ffi::Py_DECREF(values.cast::<ffi::PyObject>());
+        return ptr::null_mut();
+    }
+    let rc = ffi::PyObject_SetItem(
+        values.cast::<ffi::PyObject>(),
+        key,
+        value.cast::<ffi::PyObject>(),
+    );
+    ffi::Py_DECREF(key);
+    ffi::Py_DECREF(values.cast::<ffi::PyObject>());
+    if rc == 0 { new_none() } else { ptr::null_mut() }
+}
 unsafe extern "C" fn pyobject_delitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() {
         ffi::PyErr_SetString(
@@ -1039,6 +1101,8 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_pyobject_setattr(obj: ObjPtr, attr: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_getitem(obj: ObjPtr, key: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_setitem(obj: ObjPtr, key: ObjPtr, value: ObjPtr));
+    panic_obj_export!(dp_jit_load_preserved(owner: ObjPtr, slot: i64));
+    panic_obj_export!(dp_jit_store_preserved(owner: ObjPtr, slot: i64, value: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_delitem(obj: ObjPtr, key: ObjPtr));
     panic_obj_export!(dp_jit_load_global_obj(
         globals_obj: ObjPtr,
@@ -1216,6 +1280,14 @@ pub unsafe extern "C" fn dp_jit_pyobject_setitem(
     value: ObjPtr,
 ) -> ObjPtr {
     pyobject_setitem_hook(obj, key, value)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_load_preserved(owner: ObjPtr, slot: i64) -> ObjPtr {
+    load_preserved_hook(owner, slot)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_store_preserved(owner: ObjPtr, slot: i64, value: ObjPtr) -> ObjPtr {
+    store_preserved_hook(owner, slot, value)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pytype_generic_alloc(callable: ObjPtr, nitems: i64) -> ObjPtr {
@@ -1553,6 +1625,11 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_pyobject_setitem",
         dp_jit_pyobject_setitem as *const u8,
+    );
+    builder.symbol("dp_jit_load_preserved", dp_jit_load_preserved as *const u8);
+    builder.symbol(
+        "dp_jit_store_preserved",
+        dp_jit_store_preserved as *const u8,
     );
     builder.symbol(
         "dp_jit_pytype_generic_alloc",

@@ -380,8 +380,11 @@ def exercise():
         .as_ref()
         .expect("hidden resume should preserve closure layout");
     assert!(
-        storage_layout.stack_slots.iter().any(|slot| slot == "exc"),
-        "expected hidden resume layout to preserve the user-visible exception binding as a local slot: {:?}",
+        storage_layout
+            .preserved_slots
+            .iter()
+            .any(|slot| slot.logical_name == "exc"),
+        "expected hidden resume layout to preserve the user-visible exception binding as activation state: {:?}",
         storage_layout
     );
     assert!(

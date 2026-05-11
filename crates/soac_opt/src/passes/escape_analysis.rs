@@ -467,6 +467,7 @@ impl ConstructorBuilder<'_> {
             NameLocation::GlobalName
             | NameLocation::Global(_)
             | NameLocation::RuntimeName(_)
+            | NameLocation::Preserved(_)
             | NameLocation::Cell(_) => None,
         }
     }
@@ -557,6 +558,7 @@ impl ConstructorBuilder<'_> {
             NameLocation::GlobalName
             | NameLocation::Global(_)
             | NameLocation::RuntimeName(_)
+            | NameLocation::Preserved(_)
             | NameLocation::Cell(_) => None,
         }
     }

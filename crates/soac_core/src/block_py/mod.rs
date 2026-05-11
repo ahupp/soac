@@ -30,7 +30,8 @@ pub use self::param_specs::{Param, ParamDefaultSource, ParamKind, ParamSpec};
 pub use self::scope::{
     BindingKind, BindingPurpose, BindingTarget, CallableScopeInfo, CallableScopeKind,
     CellBindingKind, CellCaptureBinding, ClassBodyFallback, ClosureInit, ClosureSlot,
-    EffectiveBinding, StorageLayout, derive_effective_binding_for_name,
+    EffectiveBinding, PreservedSlot, PreservedSlotStorage, StorageLayout,
+    derive_effective_binding_for_name,
 };
 #[allow(unused_imports)]
 pub use self::visit::{
@@ -371,6 +372,18 @@ impl LocalLocation {
     Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 #[rkyv(derive(Hash, PartialEq, Eq, Debug))]
+pub struct PreservedLocation(pub u32);
+
+impl PreservedLocation {
+    pub fn slot(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+#[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct GlobalSlot(pub u32);
 
 impl GlobalSlot {
@@ -413,6 +426,7 @@ impl CellLocation {
 )]
 pub enum NameLocation {
     Local(LocalLocation),
+    Preserved(PreservedLocation),
     GlobalName,
     Global(GlobalSlot),
     RuntimeName(RuntimeName),
@@ -423,6 +437,10 @@ pub enum NameLocation {
 impl NameLocation {
     pub fn local(slot: u32) -> Self {
         Self::Local(LocalLocation(slot))
+    }
+
+    pub fn preserved(slot: u32) -> Self {
+        Self::Preserved(PreservedLocation(slot))
     }
 
     pub fn global(slot: u32) -> Self {
@@ -456,7 +474,20 @@ impl NameLocation {
     pub fn as_local(self) -> Option<LocalLocation> {
         match self {
             Self::Local(location) => Some(location),
-            Self::GlobalName
+            Self::Preserved(_)
+            | Self::GlobalName
+            | Self::Global(_)
+            | Self::RuntimeName(_)
+            | Self::Cell(_)
+            | Self::Constant(_) => None,
+        }
+    }
+
+    pub fn as_preserved(self) -> Option<PreservedLocation> {
+        match self {
+            Self::Preserved(location) => Some(location),
+            Self::Local(_)
+            | Self::GlobalName
             | Self::Global(_)
             | Self::RuntimeName(_)
             | Self::Cell(_)
@@ -468,6 +499,7 @@ impl NameLocation {
         match self {
             Self::Cell(location) => Some(location),
             Self::Local(_)
+            | Self::Preserved(_)
             | Self::GlobalName
             | Self::Global(_)
             | Self::RuntimeName(_)
@@ -479,6 +511,7 @@ impl NameLocation {
         match self {
             Self::Constant(index) => Some(index),
             Self::Local(_)
+            | Self::Preserved(_)
             | Self::GlobalName
             | Self::Global(_)
             | Self::RuntimeName(_)
@@ -490,6 +523,7 @@ impl NameLocation {
         match self {
             Self::Global(slot) => Some(slot),
             Self::Local(_)
+            | Self::Preserved(_)
             | Self::GlobalName
             | Self::RuntimeName(_)
             | Self::Cell(_)
@@ -513,6 +547,7 @@ impl NameLocation {
         match self {
             Self::RuntimeName(name) => Some(name),
             Self::Local(_)
+            | Self::Preserved(_)
             | Self::GlobalName
             | Self::Global(_)
             | Self::Cell(_)
@@ -523,6 +558,7 @@ impl NameLocation {
     pub fn pretty_id(self, unresolved_name: &str) -> String {
         match self {
             Self::Local(location) => format!("{location:?}"),
+            Self::Preserved(location) => format!("{location:?}"),
             Self::GlobalName => format!("{unresolved_name}@global"),
             Self::Global(slot) => format!("{unresolved_name}@g{}", slot.slot()),
             Self::RuntimeName(name) => name.name().to_string(),
@@ -674,6 +710,10 @@ impl ResolvedName {
 
     pub fn local_location(&self) -> Option<LocalLocation> {
         self.location.as_local()
+    }
+
+    pub fn preserved_location(&self) -> Option<PreservedLocation> {
+        self.location.as_preserved()
     }
 
     pub fn cell_location(&self) -> Option<CellLocation> {

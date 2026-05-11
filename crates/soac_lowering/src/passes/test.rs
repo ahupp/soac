@@ -5,7 +5,9 @@ use crate::block_py::{
     FunctionExecutionMode, FunctionKind, InstrResolved, NameLike, NameLocation,
     ResolvedStorageBlock, ScopeExprNode,
 };
-use crate::block_py::{ClosureInit, ClosureSlot, ModuleNameGen};
+use crate::block_py::{
+    ClosureInit, ClosureSlot, ModuleNameGen, PreservedSlot, PreservedSlotStorage,
+};
 use crate::pass_tracker::LoweringPassTrackerInternalExt;
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
@@ -152,6 +154,66 @@ fn tracked_name_binding_module(
         .cloned())
 }
 
+#[test]
+fn async_with_return_after_awaiting_aexit_keeps_return_payload_explicit_in_resume_cfg() {
+    let source = r#"
+import asyncio
+
+class AwaitingExit:
+    async def __aenter__(self):
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await asyncio.sleep(0)
+        return None
+
+async def inner():
+    async with AwaitingExit():
+        for _ in range(1):
+            await asyncio.sleep(0)
+        result = 9.5
+        return result
+"#;
+
+    let module = tracked_name_binding_module(source)
+        .expect("name binding should succeed")
+        .expect("name binding pass should be tracked");
+    let resume = function_by_name(&module, "inner");
+
+    let abrupt_payload_param_block = resume
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .params
+                .iter()
+                .any(|param| param.role == BlockParamRole::AbruptPayload)
+        })
+        .expect("resume function should carry an abrupt payload block param");
+    let abrupt_payload_param = abrupt_payload_param_block
+        .params
+        .iter()
+        .find(|param| param.role == BlockParamRole::AbruptPayload)
+        .expect("abrupt payload param should exist");
+    assert!(
+        abrupt_payload_param_block.body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                InstrResolved::Store(store)
+                    if store.name.preserved_location().is_some()
+                        && matches!(
+                            store.value.as_ref(),
+                            InstrResolved::Load(load)
+                                if load.name.id_str() == abrupt_payload_param.name
+                                    && load.name.local_location().is_some()
+                        )
+            )
+        }),
+        "resume block should sync the carried abrupt payload into preserved state: {abrupt_payload_param_block:#?}"
+    );
+}
+
 fn unsound_runtime_builtin_name_binding_module(
     source: &str,
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
@@ -233,6 +295,13 @@ fn slot_by_name<'a>(slots: &'a [ClosureSlot], logical_name: &str) -> &'a Closure
         .iter()
         .find(|slot| slot.logical_name == logical_name)
         .unwrap_or_else(|| panic!("missing closure slot {logical_name}; got {slots:?}"))
+}
+
+fn preserved_slot_by_name<'a>(slots: &'a [PreservedSlot], logical_name: &str) -> &'a PreservedSlot {
+    slots
+        .iter()
+        .find(|slot| slot.logical_name == logical_name)
+        .unwrap_or_else(|| panic!("missing preserved slot {logical_name}; got {slots:?}"))
 }
 
 fn expr_text(expr: &impl crate::block_py::PrettyPrint) -> String {
@@ -509,26 +578,16 @@ fn resolved_function_has_cell_ref(function: &BlockPyFunction<ResolvedStorageModu
     blockpy_function_instr_any(function, |expr| matches!(expr, InstrResolved::CellRef(_)))
 }
 
-fn resolved_function_loads_preserved_state(
+fn resolved_function_uses_preserved_slots(
     function: &BlockPyFunction<ResolvedStorageModuleShape>,
 ) -> bool {
     blockpy_function_instr_any(function, |expr| {
-        matches!(
-            expr,
-            InstrResolved::GetItem(get_item)
-                if matches!(
-                    get_item.value.as_ref(),
-                    InstrResolved::GetAttr(get_attr)
-                        if matches!(
-                            get_attr.value.as_ref(),
-                            InstrResolved::Load(load) if load.name.id_str() == "_dp_self"
-                        )
-                )
-        )
+        matches!(expr, InstrResolved::Load(load) if load.name.preserved_location().is_some())
+            || matches!(expr, InstrResolved::Store(store) if store.name.preserved_location().is_some())
     })
 }
 
-fn resolved_function_spills_preserved_state(
+fn resolved_function_uses_preserved_values_container(
     function: &BlockPyFunction<ResolvedStorageModuleShape>,
 ) -> bool {
     blockpy_function_instr_any(function, |expr| {
@@ -2080,11 +2139,8 @@ def gen():
         "{resume:?}"
     );
     assert!(
-        resolved_function_loads_preserved_state(resume),
-        "{resume:?}"
-    );
-    assert!(
-        resolved_function_spills_preserved_state(resume),
+        resolved_function_uses_preserved_slots(resume)
+            && !resolved_function_uses_preserved_values_container(resume),
         "{resume:?}"
     );
 }
@@ -2110,11 +2166,8 @@ def delegator():
     );
     assert!(resolved_function_uses_captured_source(resume), "{resume:?}");
     assert!(
-        resolved_function_loads_preserved_state(resume),
-        "{resume:?}"
-    );
-    assert!(
-        resolved_function_spills_preserved_state(resume),
+        resolved_function_uses_preserved_slots(resume)
+            && !resolved_function_uses_preserved_values_container(resume),
         "{resume:?}"
     );
 }
@@ -2141,11 +2194,8 @@ def gen():
         "{resume:?}"
     );
     assert!(
-        resolved_function_loads_preserved_state(resume),
-        "{resume:?}"
-    );
-    assert!(
-        resolved_function_spills_preserved_state(resume),
+        resolved_function_uses_preserved_slots(resume)
+            && !resolved_function_uses_preserved_values_container(resume),
         "{resume:?}"
     );
 }
@@ -2229,11 +2279,8 @@ def gen():
     );
     assert!(!resolved_function_has_del(resume, "_dp_eval_", false));
     assert!(
-        resolved_function_loads_preserved_state(resume),
-        "{resume:?}"
-    );
-    assert!(
-        resolved_function_spills_preserved_state(resume),
+        resolved_function_uses_preserved_slots(resume)
+            && !resolved_function_uses_preserved_values_container(resume),
         "{resume:?}"
     );
 }
@@ -3133,17 +3180,20 @@ def outer(scale):
     assert_eq!(factor.storage_name, "factor");
     assert_eq!(factor.init, ClosureInit::InheritedCapture);
 
-    let a = slot_by_name(&layout.preserved_slots, "a");
+    let a = preserved_slot_by_name(&layout.preserved_slots, "a");
     assert_eq!(a.storage_name, "_dp_cell_a");
     assert_eq!(a.init, ClosureInit::Parameter);
+    assert_eq!(a.storage, PreservedSlotStorage::PyObjectOrNull);
 
-    let total = slot_by_name(&layout.preserved_slots, "total");
+    let total = preserved_slot_by_name(&layout.preserved_slots, "total");
     assert_eq!(total.storage_name, "_dp_cell_total");
     assert_eq!(total.init, ClosureInit::Deferred);
+    assert_eq!(total.storage, PreservedSlotStorage::PyObjectOrNull);
 
-    let pc = slot_by_name(&layout.preserved_slots, "_dp_pc");
+    let pc = preserved_slot_by_name(&layout.preserved_slots, "_dp_pc");
     assert_eq!(pc.storage_name, "_dp_cell__dp_pc");
     assert_eq!(pc.init, ClosureInit::RuntimePcUnstarted);
+    assert_eq!(pc.storage, PreservedSlotStorage::I64);
     assert!(layout.cellvars.is_empty(), "{layout:?}");
 }
 
@@ -3211,11 +3261,11 @@ def outer(scale):
     assert_eq!(factor.storage_name, "factor");
     assert_eq!(factor.init, ClosureInit::InheritedCapture);
 
-    let total = slot_by_name(&layout.preserved_slots, "total");
+    let total = preserved_slot_by_name(&layout.preserved_slots, "total");
     assert_eq!(total.storage_name, "_dp_cell_total");
     assert_eq!(total.init, ClosureInit::Deferred);
 
-    let pc = slot_by_name(&layout.preserved_slots, "_dp_pc");
+    let pc = preserved_slot_by_name(&layout.preserved_slots, "_dp_pc");
     assert_eq!(pc.storage_name, "_dp_cell__dp_pc");
     assert_eq!(pc.init, ClosureInit::RuntimePcUnstarted);
     let deleted_eval = slot_by_name(&layout.cellvars, "_dp_eval_7");
@@ -3313,9 +3363,15 @@ async def set_flag():
         !layout
             .freevars
             .iter()
-            .chain(layout.cellvars.iter())
-            .chain(layout.preserved_slots.iter())
-            .any(|slot| slot.logical_name == "flag"),
+            .any(|slot| slot.logical_name == "flag")
+            && !layout
+                .cellvars
+                .iter()
+                .any(|slot| slot.logical_name == "flag")
+            && !layout
+                .preserved_slots
+                .iter()
+                .any(|slot| slot.logical_name == "flag"),
         "global assignment target should not become coroutine state: {layout:#?}"
     );
     assert!(
@@ -3361,11 +3417,11 @@ def outer(scale):
     assert_eq!(factor.storage_name, "factor");
     assert_eq!(factor.init, ClosureInit::InheritedCapture);
 
-    let total = slot_by_name(&layout.preserved_slots, "total");
+    let total = preserved_slot_by_name(&layout.preserved_slots, "total");
     assert_eq!(total.storage_name, "_dp_cell_total");
     assert_eq!(total.init, ClosureInit::Deferred);
 
-    let pc = slot_by_name(&layout.preserved_slots, "_dp_pc");
+    let pc = preserved_slot_by_name(&layout.preserved_slots, "_dp_pc");
     assert_eq!(pc.storage_name, "_dp_cell__dp_pc");
     assert_eq!(pc.init, ClosureInit::RuntimePcUnstarted);
     assert!(layout.cellvars.is_empty(), "{layout:?}");
@@ -3862,19 +3918,9 @@ def make_counter(delta):
         lowering.name_binding_text(),
     );
     assert!(
-        blockpy_function_instr_any(resume, |expr| matches!(
-            expr,
-            InstrResolved::GetItem(get_item)
-                if matches!(
-                    get_item.value.as_ref(),
-                    InstrResolved::GetAttr(get_attr)
-                        if matches!(
-                            get_attr.value.as_ref(),
-                            InstrResolved::Load(load) if load.name.id_str() == "_dp_self"
-                        )
-                )
-        )),
-        "resume entry should reload preserved activation state from the wrapper:\n{}",
+        resolved_function_uses_preserved_slots(resume)
+            && !resolved_function_uses_preserved_values_container(resume),
+        "resume body should use first-class preserved slots rather than wrapper list traffic:\n{}",
         lowering.name_binding_text(),
     );
 }
@@ -3897,8 +3943,9 @@ def code_template_gen(_it):
 
     assert!(
         !resolved_function_uses_captured_source(resume)
-            && resolved_function_loads_preserved_state(resume),
-        "resume should reload _it from preserved activation state:\n{}",
+            && resolved_function_uses_preserved_slots(resume)
+            && !resolved_function_uses_preserved_values_container(resume),
+        "resume should access _it through preserved activation slots:\n{}",
         lowering.name_binding_text()
     );
 }
