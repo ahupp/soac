@@ -10,9 +10,9 @@ use soac_config::SoacEnvConfig;
 use soac_config::SpecializationMode;
 use soac_core::block_py::{
     BlockArg, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallableScopeKind, ChildVisitable, ConstantExpr, FunctionKind, HasSemanticInstrId, InstrId,
-    InstrLocationMap, Literal, LocalLocation, NameLike, RuntimeFunctionId, RuntimeName, Visit,
-    VisitMut, current_instr_locations,
+    CallArgPositional, CallableScopeKind, ChildVisitable, ConstantExpr, FunctionKind,
+    HasSemanticInstrId, InstrId, InstrLocationMap, Literal, LocalLocation, NameLike,
+    RuntimeFunctionId, RuntimeName, Visit, VisitMut, current_instr_locations,
 };
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_entry_function_id_for_init,
@@ -32,8 +32,9 @@ use soac_ir_typed::{
     TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
     TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactListItemAccessPlan,
     TypedExactListItemCounterSource, TypedExactListItemPlanSource, TypedGeneratorInstancePlan,
-    TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
-    TypedIndexedGlobalPlanSource, assign_missing_typed_function_instr_ids,
+    TypedGeneratorResumePlan, TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource,
+    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -895,6 +896,60 @@ fn annotate_typed_generator_instance_plans(
             .join(", ");
         return Err(format!(
             "typed generator-instance plans were not attached to call nodes: {missing}"
+        ));
+    }
+    Ok(annotator.count)
+}
+
+fn annotate_typed_generator_resume_plans(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    plans: &HashMap<InstrId, TypedGeneratorResumePlan>,
+) -> Result<usize, String> {
+    if plans.is_empty() {
+        return Ok(0);
+    }
+    let live_instr_ids = collect_typed_semantic_instr_ids(function);
+    let expected = plans
+        .keys()
+        .filter(|instr_id| live_instr_ids.contains(instr_id))
+        .count();
+
+    struct Annotator<'a> {
+        plans: &'a HashMap<InstrId, TypedGeneratorResumePlan>,
+        used: HashSet<InstrId>,
+        count: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && let Some(instr_id) = call.try_semantic_instr_id()
+                && let Some(plan) = self.plans.get(&instr_id)
+            {
+                call.extra.set_generator_resume_plan(*plan);
+                self.used.insert(instr_id);
+                self.count += 1;
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        plans,
+        used: HashSet::new(),
+        count: 0,
+    };
+    annotator.visit_fn_mut(function);
+    if annotator.used.len() != expected {
+        let missing = plans
+            .keys()
+            .filter(|instr_id| live_instr_ids.contains(instr_id))
+            .filter(|instr_id| !annotator.used.contains(instr_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "typed generator-resume plans were not attached to call nodes: {missing}"
         ));
     }
     Ok(annotator.count)
@@ -3792,6 +3847,27 @@ fn trusted_function_id_for_expr(
     }
 }
 
+fn trusted_field_function_id_for_expr(
+    expr: &InstrTyped,
+    state: &TrustedOwnerState,
+    module_constants: &[ConstantExpr],
+) -> Option<(InstrId, RuntimeFunctionId)> {
+    let InstrTyped::GetAttrTyped(get_attr) = expr else {
+        return None;
+    };
+    let field_name = typed_constant_string(get_attr.attr.as_ref(), module_constants)?;
+    let InstrTyped::Load(receiver) = get_attr.value.as_ref() else {
+        return None;
+    };
+    let receiver_location = receiver.name.local_location()?;
+    let origin = state.object_origins.get(&receiver_location).copied()?;
+    let function_id = state
+        .function_fields
+        .get(&(origin, field_name.to_string()))
+        .copied()?;
+    Some((origin, function_id))
+}
+
 fn trusted_generator_instance_owner(
     plan: &TypedGeneratorInstancePlan,
 ) -> Option<TypedAttrOwnerRef> {
@@ -4304,6 +4380,94 @@ fn visit_trusted_owner_term_instrs(
         BlockTerm::Return(value) => visitor.visit_instr(value),
         BlockTerm::Jump(_) => {}
     }
+}
+
+fn trusted_generator_resume_plans_for_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
+) -> HashMap<InstrId, TypedGeneratorResumePlan> {
+    struct Collector<'a> {
+        module_constants: &'a [ConstantExpr],
+        state: &'a TrustedOwnerState,
+        plans: HashMap<InstrId, TypedGeneratorResumePlan>,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && call.keywords.is_empty()
+                && trusted_runtime_name_for_expr(
+                    call.func.as_ref(),
+                    self.state,
+                    self.module_constants,
+                ) == Some(RuntimeName::ResumeGenerator)
+                && let Some(instr_id) = call.try_semantic_instr_id()
+                && let [
+                    CallArgPositional::Positional(resume_function),
+                    CallArgPositional::Positional(owner),
+                    ..,
+                ] = call.args.as_slice()
+                && let InstrTyped::Load(owner) = owner
+                && let Some(owner_location) = owner.name.local_location()
+                && let Some(generator_origin) =
+                    self.state.object_origins.get(&owner_location).copied()
+                && !self.state.escaped_origins.contains(&generator_origin)
+                && let Some((resume_origin, function_id)) = trusted_field_function_id_for_expr(
+                    resume_function,
+                    self.state,
+                    self.module_constants,
+                )
+                && resume_origin == generator_origin
+            {
+                self.plans.insert(
+                    instr_id,
+                    TypedGeneratorResumePlan {
+                        function_id,
+                        generator_origin,
+                    },
+                );
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let states = analyze_trusted_owner_states(
+        function,
+        module_constants,
+        trusted_constructor_calls,
+        trusted_constructor_init_owners,
+    );
+    let mut plans = HashMap::new();
+    for block in &function.blocks {
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            let Some(state) = states.body_before_instr.get(&TypedVirtualBodyInstr {
+                block: block.label,
+                instr_index,
+            }) else {
+                continue;
+            };
+            let mut collector = Collector {
+                module_constants,
+                state,
+                plans: HashMap::new(),
+            };
+            collector.visit_instr(instr);
+            plans.extend(collector.plans);
+        }
+        let Some(state) = states.block_before_term.get(&block.label) else {
+            continue;
+        };
+        let mut collector = Collector {
+            module_constants,
+            state,
+            plans: HashMap::new(),
+        };
+        visit_trusted_owner_term_instrs(&block.term, &mut collector);
+        plans.extend(collector.plans);
+    }
+    plans
 }
 
 fn trusted_runtime_protocol_calls_from_owner_states(
@@ -5373,6 +5537,15 @@ fn apply_typed_v3_module_rewrites(
                 lower_typed_function_call_emission_plans(function, &field_callable_emissions)?;
                 refresh_typed_function_value_facts(function);
             }
+            let generator_resume_plans = trusted_generator_resume_plans_for_function(
+                function,
+                &module.module_constants,
+                trusted_static_constructor_calls
+                    .get(&function.function_id)
+                    .unwrap_or(&HashMap::new()),
+                &trusted_constructor_init_owners,
+            );
+            annotate_typed_generator_resume_plans(function, &generator_resume_plans)?;
             let mut runtime_protocol_call_instr_ids = runtime_protocol_call_instr_ids(function);
             runtime_protocol_call_instr_ids.extend(trusted_runtime_protocol_calls.keys().copied());
             let mut inline_targets = typed_inline_targets_for_function(
@@ -5853,7 +6026,7 @@ mod tests {
     use super::*;
     use crate::jit::specialization_profile::DirectCallEmissionScope;
     use soac_core::block_py::{
-        BlockParam, InstrWithConstantNone, LocalFunctionId, NameLocation, ResolvedName,
+        BlockParam, InstrWithConstantNone, Load, LocalFunctionId, NameLocation, ResolvedName,
         RuntimeFunctionId, RuntimeModuleId,
     };
     use soac_ir_typed::lower_blockpy_module_to_typed;
@@ -6416,6 +6589,119 @@ def caller(limit):
                     },
                 )],
             )]),
+        );
+    }
+
+    #[test]
+    fn trusted_generator_resume_plans_follow_unescaped_generator_instances() {
+        fn typed_caller_with_resume_call(source: &str) -> (
+            BlockPyModule<TypedBlockPyModuleShape>,
+            BlockPyFunction<TypedBlockPyModuleShape>,
+            RuntimeFunctionId,
+        ) {
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .expect("source should lower")
+                .blockpy_module;
+            let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+            let target_function_id = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "values")
+                .expect("generator target should exist")
+                .function_id;
+            let generator_targets = strict_module_global_generator_targets_for_module(&lowered);
+            let typed = lower_blockpy_module_to_typed(lowered);
+            let mut caller = typed
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "caller")
+                .cloned()
+                .expect("typed caller should exist");
+            let plans = static_generator_instance_plans_for_function(
+                &caller,
+                &StaticDirectCallTargets {
+                    module_global_generators: HashMap::from([(module_id, generator_targets)]),
+                    ..StaticDirectCallTargets::default()
+                },
+            );
+            annotate_typed_generator_instance_plans(&mut caller, Some(&plans))
+                .expect("instance-plan annotation should succeed");
+            let call = caller
+                .blocks
+                .iter_mut()
+                .find_map(|block| match &mut block.term {
+                    BlockTerm::Return(InstrTyped::CallTyped(call)) => Some(call),
+                    _ => None,
+                })
+                .expect("caller should return the helper call");
+            call.func = Box::new(Load::new(ResolvedName::runtime_name("resume_generator")).into());
+            (typed, caller, target_function_id)
+        }
+
+        let (typed, mut caller, target_function_id) = typed_caller_with_resume_call(
+            r#"
+def values(limit):
+    yield limit
+
+def helper(fn, owner, value, exc):
+    return value
+
+def caller(limit):
+    gen = values(limit)
+    return helper(gen._resume_function, gen, None, None)
+"#,
+        );
+        let plans = trusted_generator_resume_plans_for_function(
+            &caller,
+            &typed.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let (source, plan) = plans
+            .iter()
+            .next()
+            .expect("unescaped generator resume should be planned");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plan.function_id, target_function_id);
+        annotate_typed_generator_resume_plans(&mut caller, &plans)
+            .expect("resume-plan annotation should succeed");
+        let annotated_plan = caller
+            .blocks
+            .iter()
+            .find_map(|block| match &block.term {
+                BlockTerm::Return(expr) if expr.try_semantic_instr_id() == Some(*source) => {
+                    expr.generator_resume_plan()
+                }
+                _ => None,
+            })
+            .expect("resume call should carry typed metadata");
+        assert_eq!(annotated_plan, *plan);
+
+        let (escaped_typed, escaped_caller, _) = typed_caller_with_resume_call(
+            r#"
+def values(limit):
+    yield limit
+
+def helper(fn, owner, value, exc):
+    return value
+
+def sink(value):
+    return None
+
+def caller(limit):
+    gen = values(limit)
+    sink(gen)
+    return helper(gen._resume_function, gen, None, None)
+"#,
+        );
+        assert!(
+            trusted_generator_resume_plans_for_function(
+                &escaped_caller,
+                &escaped_typed.module_constants,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .is_empty()
         );
     }
 

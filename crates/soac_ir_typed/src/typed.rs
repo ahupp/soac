@@ -1246,6 +1246,12 @@ pub struct TypedGeneratorInstancePlan {
     pub arg_plan: TypedDirectCallArgPlan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypedGeneratorResumePlan {
+    pub function_id: RuntimeFunctionId,
+    pub generator_origin: InstrId,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
@@ -1257,6 +1263,7 @@ pub struct TypedInstrExtra {
     pub exact_int_return: Option<TypedExactIntReturnPlan>,
     pub constructor_init: Option<TypedConstructorInitPlan>,
     pub generator_instance: Option<TypedGeneratorInstancePlan>,
+    pub generator_resume: Option<TypedGeneratorResumePlan>,
     pub guard_miss_deopt: bool,
 }
 
@@ -1427,6 +1434,22 @@ impl TypedInstrExtra {
         self.generator_instance.take().is_some()
     }
 
+    pub fn generator_resume_plan(&self) -> Option<TypedGeneratorResumePlan> {
+        self.generator_resume
+    }
+
+    pub fn set_generator_resume_plan(&mut self, plan: TypedGeneratorResumePlan) -> bool {
+        if self.generator_resume == Some(plan) {
+            return false;
+        }
+        self.generator_resume = Some(plan);
+        true
+    }
+
+    pub fn clear_generator_resume_plan(&mut self) -> bool {
+        self.generator_resume.take().is_some()
+    }
+
     pub fn guard_miss_deopt_enabled(&self) -> bool {
         self.guard_miss_deopt
     }
@@ -1512,6 +1535,11 @@ impl InstrTyped {
     pub fn generator_instance_plan(&self) -> Option<&TypedGeneratorInstancePlan> {
         self.typed_extra()
             .and_then(TypedInstrExtra::generator_instance_plan)
+    }
+
+    pub fn generator_resume_plan(&self) -> Option<TypedGeneratorResumePlan> {
+        self.typed_extra()
+            .and_then(TypedInstrExtra::generator_resume_plan)
     }
 
     pub fn guard_miss_deopt_enabled(&self) -> bool {
