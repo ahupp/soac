@@ -241,13 +241,18 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   [soac_py/src/soac/import_hook.py:39](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L39),
   restrict the import hook to resolved source paths under the listed
   file-tree roots. When unset, an installed import hook attempts to
-  transform every transformable Python source import.
+  transform every transformable Python source import. Compiler-owned
+  `soac` and `soac.*` modules stay transform-eligible regardless of this
+  allow-list so runtime helpers remain available to optimizer planning.
 
 - `SOAC_COMPILE_MODE=eager`
   In `fn eager_clif_compile_requested`, at
   [crates/soac_pyo3/src/jit_runtime.rs:96](/home/adam/project/soac-profile/crates/soac_pyo3/src/jit_runtime.rs#L96),
-  eagerly compile lazy CLIF/JIT entries as they are registered instead
-  of waiting for first execution.
+  eagerly compile direct CLIF/JIT entries for outermost transformed modules
+  before the lowered module body runs, including nested callable bodies that do
+  not yet have a live Python function object. Later function-instance
+  registration attaches those ready entries instead of waiting for first
+  execution.
 
 - `SOAC_EXEC_TRACE=<selector>`
   In `SoacEnvConfig::from_env`, at
@@ -332,6 +337,12 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   pending-call, signal-handling, thread-handoff, or async-exception latency
   matters for the workload.
 
+- `SOAC_JIT_BB_MAP=1`
+  Emit the detailed `$SOAC_WORK_DIR/jit-bb-map.jsonl` per-basic-block artifact
+  used by perf/VCode annotation. This is disabled by default because very large
+  generated functions can spend seconds serializing the map. Aggregate code-size
+  reporting stays on through `$SOAC_WORK_DIR/jit-code-summary.jsonl`.
+
 ## Counters And Specialization
 
 - `SOAC_WORK_DIR=/path/to/work-dir`
@@ -341,6 +352,8 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   - `verify.bin`: countered output recorded by the verify pass.
   - `events.jsonl`: default tracing JSONL when `SOAC_LOG` is not
     set.
+  - `jit-code-summary.jsonl`: compact aggregate generated-code summaries used
+    by ordinary benchmark reports.
   - `modules/`: root for cached pre-optimization BlockPy modules. Cached modules
     use stable per-module artifact paths such as
     `project/pkg/submod/mod.blockpy`, with source hash and build identity
@@ -436,12 +449,15 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 - `just benchmark-deep-profile`
   Run `just benchmark`, then add the heavier follow-on artifacts in the
   same result directory: counter/specialization text dumps, rendered
-  specialized CLIF/VCode/CFG, `perf` capture, and perf-annotated VCode.
+  specialized CLIF/VCode/CFG, `perf` capture, and perf-annotated VCode. The
+  follow-on perf run enables `SOAC_JIT_BB_MAP=1` so block-level annotation has
+  the full detailed map without charging ordinary benchmark runs for it.
 
 - `just benchmark-deep-profile-from-profile <result-dir>`
   Start from an existing result directory with `counters/profile.bin`,
   rerun only the verify pass to produce `verify.bin`, then add the same
-  deep-profile artifacts without rerunning the profile pass.
+  deep-profile artifacts without rerunning the profile pass. The added perf run
+  enables `SOAC_JIT_BB_MAP=1`.
 
 - `just pyperformance [stock|soac|soac-single] [output] [benchmarks] [extra pyperformance run args...]`
   Run the pyperformance suite against the vendored CPython executable. The
@@ -469,7 +485,8 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   default sample mode, and `--min-time=<seconds>` overrides the default
   calibration window for both passes. SOAC modes default `SOAC_MODULE_ENABLED`
   to the pyperformance benchmark source tree so the harness, pip, and pyperf
-  internals stay on stock CPython unless the caller overrides the allow-list.
+  internals stay on stock CPython unless the caller overrides the allow-list;
+  compiler-owned `soac.*` modules remain transform-eligible either way.
   Pyperformance workers also append the installed `tomli` package path so
   `tomli_loads` transforms the parser implementation rather than only the
   benchmark wrapper. They also
@@ -480,7 +497,11 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   recipe treats `SOAC_WORK_DIR` as a root and the worker wrapper writes each
   benchmark invocation's counters, logs, and module cache under a stable
   per-script-and-variant subdirectory so full-suite runs can profile many
-  `__main__` scripts without source-hash or type-observation collisions.
+  `__main__` scripts without source-hash or type-observation collisions. SOAC
+  worker directories also keep `pyperformance-worker-timing.jsonl`; after each
+  SOAC pass, the recipe prints a compact rollup of setup time before pyperf's
+  measured-value collection, measured-value collection wall time, and total
+  worker lifetime.
 
 - `just pyperformance-deep-profile-from-profile <result.json> <benchmark> [worker=<worker-dir>] [loops=<count>]`
   Replay one measured pyperformance worker directly from a prior SOAC
@@ -493,9 +514,9 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `<worker-dir>/worker_perf*`. The replay worker pauses through
   `SOAC_PYPERFORMANCE_MEASURE_READY_FILE` immediately before pyperf starts its
   measured values, so the attached profile excludes benchmark-module import and
-  any pyperf warmups. Use this when pyperformance says a benchmark is slow and
-  you need measured-worker attribution instead of profiling the pyperformance
-  harness.
+  any pyperf warmups. It also enables `SOAC_JIT_BB_MAP=1` for detailed JIT block
+  maps. Use this when pyperformance says a benchmark is slow and you need
+  measured-worker attribution instead of profiling the pyperformance harness.
 
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompile a counter-referenced set of cached BlockPy modules into

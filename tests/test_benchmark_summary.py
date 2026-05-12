@@ -163,3 +163,31 @@ def test_code_size_can_select_last_successful_no_refcount_apply_process(tmp_path
     assert code_size["selected_process_id"] == 70
     assert code_size["process_selection"] == "last_refcounts_disabled_apply"
     assert code_size["total_code_size_bytes"] == 220
+
+
+def test_compact_code_summary_uses_machine_block_count(tmp_path: Path) -> None:
+    summary = _load_summary_module()
+    code_summary = tmp_path / "jit-code-summary.jsonl"
+    code_summary.write_text(
+        json.dumps(
+            {
+                "process_id": 20,
+                "function_id": "1:6",
+                "function_qualname": "pystones",
+                "entry_kind": "direct_function_body",
+                "code_size": 321,
+                "machine_block_count": 17,
+            }
+        )
+        + "\n"
+    )
+
+    code_size = summary.parse_jit_code_size(
+        code_summary,
+        {
+            "apply_loops_per_s_runs": [1],
+        },
+    )
+
+    assert code_size["total_code_size_bytes"] == 321
+    assert code_size["total_machine_block_count"] == 17

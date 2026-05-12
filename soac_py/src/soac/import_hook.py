@@ -73,6 +73,10 @@ def _should_transform(path: str) -> bool:
 def _should_transform_module(fullname: str, path: str) -> bool:
     if fullname == "soac.bootstrap":
         return False
+    if fullname == "soac" or fullname.startswith("soac."):
+        if _runtime_bootstrap_in_progress():
+            return False
+        return True
     return _should_transform(path)
 
 

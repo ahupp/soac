@@ -584,6 +584,18 @@ def test_module_enabled_path_filter_only_transforms_matching_tree(monkeypatch, t
         sys.modules.pop("skipped_probe", None)
 
 
+def test_soac_modules_ignore_module_enabled_path_filter(monkeypatch, tmp_path):
+    enabled_dir = tmp_path / "enabled"
+    enabled_dir.mkdir()
+    disabled_path = tmp_path / "outside" / "runtime.py"
+
+    monkeypatch.setenv("SOAC_MODULE_ENABLED", f"path:{enabled_dir}")
+
+    assert import_hook._should_transform_module("soac", str(disabled_path))
+    assert import_hook._should_transform_module("soac.runtime", str(disabled_path))
+    assert not import_hook._should_transform_module("outside.runtime", str(disabled_path))
+
+
 def test_background_jit_does_not_recursively_compile_import_tree(tmp_path):
     log_path = tmp_path / "jit-events.jsonl"
     package_dir = tmp_path / "recursive_bg_pkg"

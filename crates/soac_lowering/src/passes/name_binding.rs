@@ -1088,11 +1088,17 @@ fn sync_block_param_preserved_slot_in_block(
     if !should_sync {
         return None;
     }
-    let storage_name = storage_layout?
+    let preserved_slot = storage_layout?
         .preserved_slots
         .iter()
         .find(|slot| slot.logical_name == param.name)
-        .map(|slot| slot.storage_name.clone())?;
+        .cloned()?;
+    let target_name = match preserved_slot.storage {
+        PreservedSlotStorage::PyCellObject => preserved_slot.logical_name,
+        PreservedSlotStorage::PyObjectOrNull | PreservedSlotStorage::I64 => {
+            preserved_slot.storage_name
+        }
+    };
 
     let node_index = compat_node_index();
     let range = compat_range();
@@ -1100,7 +1106,7 @@ fn sync_block_param_preserved_slot_in_block(
     let meta = crate::block_py::Meta::new(node_index.clone(), range);
     Some(op_stmt(
         Store::new(
-            ast::name::Name::new(storage_name),
+            ast::name::Name::new(target_name),
             Box::new(rewrite_local_name_load(param_load, meta.clone(), resolver)),
         )
         .with_meta(crate::block_py::Meta::new(node_index, range)),
@@ -1400,6 +1406,22 @@ fn collect_cell_bindings(
         add_binding(
             storage_name.as_str(),
             storage_name.as_str(),
+            CellBindingKind::Owner,
+        );
+    }
+
+    for slot in &layout.preserved_slots {
+        if slot.storage != PreservedSlotStorage::PyCellObject {
+            continue;
+        }
+        add_binding(
+            slot.logical_name.as_str(),
+            slot.storage_name.as_str(),
+            CellBindingKind::Owner,
+        );
+        add_binding(
+            slot.storage_name.as_str(),
+            slot.storage_name.as_str(),
             CellBindingKind::Owner,
         );
     }

@@ -14,6 +14,7 @@ pub(crate) const SOAC_JIT_COMPILE_WORKERS_ENV: &str = "SOAC_JIT_COMPILE_WORKERS"
 pub(crate) const SOAC_BACKGROUND_JIT_ENV: &str = "SOAC_BACKGROUND_JIT";
 pub(crate) const SOAC_PRECOMPILED_LIBRARY_ENV: &str = "SOAC_PRECOMPILED_LIBRARY";
 pub(crate) const SOAC_COMPILE_MODE_ENV: &str = "SOAC_COMPILE_MODE";
+pub(crate) const SOAC_JIT_BB_MAP_ENV: &str = "SOAC_JIT_BB_MAP";
 pub(crate) const SOAC_JIT_PERF_HELPER_FRAMES_ENV: &str = "SOAC_JIT_PERF_HELPER_FRAMES";
 pub(crate) const SOAC_LOG_ENV: &str = "SOAC_LOG";
 pub(crate) const SOAC_EXEC_TRACE_ENV: &str = "SOAC_EXEC_TRACE";
@@ -128,6 +129,7 @@ pub struct SoacEnvConfig {
     compile_mode: CompileMode,
     jit_compile_workers: Option<usize>,
     background_jit_enabled: bool,
+    jit_bb_map_enabled: bool,
     jit_perf_helper_frames_enabled: bool,
     precompiled_library_path: Option<PathBuf>,
     soac_exec_trace: Option<ExecTraceConfig>,
@@ -209,6 +211,7 @@ impl SoacEnvConfig {
             env_string(SOAC_JIT_COMPILE_WORKERS_ENV)?.as_deref(),
         )?;
         let background_jit_enabled = env_bool(SOAC_BACKGROUND_JIT_ENV, true)?;
+        let jit_bb_map_enabled = env_bool(SOAC_JIT_BB_MAP_ENV, false)?;
         let jit_perf_helper_frames_enabled = env_bool(SOAC_JIT_PERF_HELPER_FRAMES_ENV, false)?;
         let precompiled_library_path = env_path(SOAC_PRECOMPILED_LIBRARY_ENV)?;
         let soac_exec_trace = env_string(SOAC_EXEC_TRACE_ENV)?
@@ -230,6 +233,7 @@ impl SoacEnvConfig {
             compile_mode,
             jit_compile_workers,
             background_jit_enabled,
+            jit_bb_map_enabled,
             jit_perf_helper_frames_enabled,
             precompiled_library_path,
             soac_exec_trace,
@@ -328,6 +332,10 @@ impl SoacEnvConfig {
         self.background_jit_enabled
     }
 
+    pub fn jit_bb_map_enabled(&self) -> bool {
+        self.jit_bb_map_enabled
+    }
+
     pub fn jit_perf_helper_frames_enabled(&self) -> bool {
         self.jit_perf_helper_frames_enabled
     }
@@ -366,6 +374,7 @@ impl Default for SoacEnvConfig {
             compile_mode: CompileMode::Lazy,
             jit_compile_workers: None,
             background_jit_enabled: true,
+            jit_bb_map_enabled: false,
             jit_perf_helper_frames_enabled: false,
             precompiled_library_path: None,
             soac_exec_trace: None,
@@ -558,6 +567,7 @@ mod tests {
             EnvVarGuard::remove(SOAC_COMPILE_MODE_ENV),
             EnvVarGuard::remove(SOAC_JIT_COMPILE_WORKERS_ENV),
             EnvVarGuard::remove(SOAC_BACKGROUND_JIT_ENV),
+            EnvVarGuard::remove(SOAC_JIT_BB_MAP_ENV),
             EnvVarGuard::remove(SOAC_JIT_PERF_HELPER_FRAMES_ENV),
             EnvVarGuard::remove(SOAC_LOG_ENV),
             EnvVarGuard::remove(SOAC_EXEC_TRACE_ENV),
@@ -589,6 +599,7 @@ mod tests {
         assert!(config.background_jit_enabled());
         assert!(config.jit_refcount_emission_enabled());
         assert!(!config.jit_handle_pending_checks_enabled());
+        assert!(!config.jit_bb_map_enabled());
         assert!(!config.jit_perf_helper_frames_enabled());
     }
 
@@ -745,6 +756,24 @@ mod tests {
     }
 
     #[test]
+    fn env_config_parses_jit_bb_map_bool() {
+        let _lock = env_lock().lock().unwrap();
+        let _guards = clear_soac_config_env();
+
+        assert!(
+            !SoacEnvConfig::from_env().unwrap().jit_bb_map_enabled(),
+            "detailed JIT BB maps should be disabled by default"
+        );
+
+        let _bb_map = EnvVarGuard::set(SOAC_JIT_BB_MAP_ENV, "1");
+        assert!(SoacEnvConfig::from_env().unwrap().jit_bb_map_enabled());
+
+        drop(_bb_map);
+        let _bb_map = EnvVarGuard::set(SOAC_JIT_BB_MAP_ENV, "0");
+        assert!(!SoacEnvConfig::from_env().unwrap().jit_bb_map_enabled());
+    }
+
+    #[test]
     fn env_config_loads_precompiled_library_path() {
         let _lock = env_lock().lock().unwrap();
         let _guards = clear_soac_config_env();
@@ -771,6 +800,7 @@ mod tests {
             (SOAC_COMPILE_MODE_ENV, "always"),
             (SOAC_JIT_COMPILE_WORKERS_ENV, "0"),
             (SOAC_BACKGROUND_JIT_ENV, "sometimes"),
+            (SOAC_JIT_BB_MAP_ENV, "sometimes"),
             (SOAC_JIT_PERF_HELPER_FRAMES_ENV, "2"),
         ] {
             let _guards = clear_soac_config_env();

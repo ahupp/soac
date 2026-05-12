@@ -89,8 +89,7 @@ dp_jit_pyobject_to_i64
 dp_jit_make_cell
 dp_jit_raise_unbound_local_error
 dp_jit_raise_missing_required_argument
-dp_jit_load_preserved
-dp_jit_store_preserved
+dp_jit_preserved_values_ptr
 dp_jit_del_preserved
 dp_jit_del_preserved_quietly
 dp_jit_load_cell
@@ -214,6 +213,7 @@ _index
 IterRange
 tuple_from_iter
 list_from_iter
+set_from_iter
 constructor_call
 __deepcopy__
 templatelib_Template

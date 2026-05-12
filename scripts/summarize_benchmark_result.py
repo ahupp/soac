@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Summarize a SOAC benchmark result directory using benchmark.txt "
-            "throughput and counters/jit-bb-map.jsonl code size."
+            "throughput and counters/jit-code-summary.jsonl code size."
         )
     )
     parser.add_argument("result_dir", type=Path)
@@ -268,7 +268,9 @@ def summarize_jit_code_size_rows(
         name = qualname if entry_kind == "direct_function_body" else f"{qualname} [{entry_kind}]"
         by_name[name] = {
             "code_size_bytes": int(row["code_size"]),
-            "machine_block_count": len(row.get("bb_offsets") or []),
+            "machine_block_count": int(
+                row.get("machine_block_count", len(row.get("bb_offsets") or []))
+            ),
         }
         purpose_names = [str(name) for name in row.get("purpose_names") or []]
         purpose_values = [int(value) for value in row.get("purpose_bytes") or []]
@@ -653,14 +655,16 @@ def main() -> int:
     args = parse_args()
     result_dir = args.result_dir.resolve()
     benchmark = parse_benchmark_report(result_dir / "benchmark.txt")
+    jit_code_summary_path = result_dir / "counters" / "jit-code-summary.jsonl"
+    if not jit_code_summary_path.is_file():
+        # Older result directories predate the compact code summary artifact.
+        jit_code_summary_path = result_dir / "counters" / "jit-bb-map.jsonl"
     summary = {
         "result_dir": str(result_dir),
         "benchmark": benchmark,
-        "jit_code_size": parse_jit_code_size(
-            result_dir / "counters" / "jit-bb-map.jsonl", benchmark
-        ),
+        "jit_code_size": parse_jit_code_size(jit_code_summary_path, benchmark),
         "jit_code_size_refcounts_disabled": parse_refcounts_disabled_jit_code_size(
-            result_dir / "counters" / "jit-bb-map.jsonl", benchmark
+            jit_code_summary_path, benchmark
         ),
         "specialization_runtime": parse_specialization_stats(result_dir),
     }

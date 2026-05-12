@@ -406,6 +406,8 @@ so a later turn can resume without rediscovering context.
   when the user explicitly wants inspector/CLIF artifacts or perf capture, and
   use `just benchmark-deep-profile-from-profile <result-dir>` to extend an
   existing `counters/profile.bin` result without rerunning the profile pass.
+  Those deep-profile perf replays enable `SOAC_JIT_BB_MAP=1` so detailed
+  block maps exist only when block-level annotation needs them.
 `just benchmark` records the actual current `@` revision in the result header
 and does not accept a revision argument; switch revisions first with `jj edit`
 or, if you intentionally want a fresh child revision, `jj new`. Benchmark
@@ -440,18 +442,26 @@ another revision's cache.
   passes. SOAC modes default
   `SOAC_MODULE_ENABLED` to the pyperformance benchmark source tree so
   pyperformance's harness and venv setup stay on stock CPython unless a caller
-  explicitly overrides the allow-list. Pyperformance workers also append the
+  explicitly overrides the allow-list. Compiler-owned `soac.*` modules remain
+  transform-eligible regardless of that allow-list. Pyperformance workers also append the
   installed `tomli` package path so `tomli_loads` transforms the parser
   implementation rather than only the benchmark wrapper. They also default
   `SOAC_BACKGROUND_JIT=0`
   because pyperformance uses short worker subprocesses where background
   compiler threads can outlive interpreter shutdown, and default
   `SOAC_COMPILE_MODE=eager` because lazy first-call compilation can block
-  pyperformance's single worker loop. In SOAC modes, `SOAC_WORK_DIR` is a root;
+  pyperformance's single worker loop. Eager mode compiles outermost transformed
+  modules' direct-entry bodies before the lowered module body runs, including
+  nested callable bodies whose Python function objects are only created later.
+  In SOAC modes,
+  `SOAC_WORK_DIR` is a root;
   the worker wrapper writes each benchmark invocation's counters, logs, and
   module cache under a stable per-script-and-variant subdirectory so full-suite
   runs can profile many `__main__` scripts without source-hash or
-  type-observation collisions.
+  type-observation collisions. Each worker directory also records
+  `pyperformance-worker-timing.jsonl`; after every SOAC pyperformance pass, the
+  recipe prints a compact setup-versus-measured-value wall-time summary plus the
+  total worker lifetime.
 - `just pyperformance-deep-profile-from-profile <result.json> <benchmark> [worker=<worker-dir>] [loops=<count>]`
   Replays one measured pyperformance worker directly from a prior SOAC
   profile/apply run and records `perf` plus Speedscope artifacts for the worker
@@ -498,8 +508,9 @@ another revision's cache.
 - `SOAC_WORK_DIR` / `SOAC_OPT_MODE`
   Normal specialization runs use one work directory with conventional
 files: `profile.bin` for specialization input, `verify.bin` for the
-countered verification pass, and `events.jsonl` for default JSON
-tracing output. Cached pre-optimization BlockPy modules live under
+countered verification pass, `events.jsonl` for default JSON tracing output,
+and `jit-code-summary.jsonl` for compact generated-code summaries. Cached
+pre-optimization BlockPy modules live under
 `$SOAC_WORK_DIR/modules`. Set
 `SOAC_OPT_MODE=none`, `profile`, `verify`, or `apply`; recipes should pass the
 same `SOAC_WORK_DIR` and change only the mode between passes. `none` is the
@@ -523,6 +534,11 @@ explicit ordinary
   `verify`/`apply`. This is disabled by default; `profile` and
   `verify` only insert the underlying `block_entry` counters when this
   flag is enabled.
+- `SOAC_JIT_BB_MAP`
+  Optional detailed JIT basic-block map emission. Set to `1`, `true`, `yes`,
+  or `on` to write `$SOAC_WORK_DIR/jit-bb-map.jsonl` for perf/VCode annotation.
+  Ordinary runs keep only the compact `jit-code-summary.jsonl` aggregate so
+  large optimized functions do not pay to serialize per-block arrays.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
@@ -618,6 +634,11 @@ explicit ordinary
   default. Set to `1`, `true`, `yes`, or `on` when CPython pending calls,
   signal handling, thread handoff, or async-exception latency matters for the
   workload.
+- `SOAC_JIT_BB_MAP`
+  Detailed JIT per-basic-block map emission is disabled by default. Set to
+  `1`, `true`, `yes`, or `on` when a perf/VCode annotation workflow needs
+  `$SOAC_WORK_DIR/jit-bb-map.jsonl`; ordinary runs retain compact
+  `jit-code-summary.jsonl` code-size summaries instead.
 - `BEHAVIOR_CHANGE`
   Source comments with this exact tag mark intentional CPython-visible
   compatibility changes. Current examples: apply-mode raw indexed
@@ -628,9 +649,10 @@ explicit ordinary
   Optional comma-separated import-hook allow-list. Entries currently
   use `path:<file-or-directory>` and are resolved before matching. When
   set, `SoacLoader` only wraps source imports whose resolved source
-  path is inside one of the listed roots. Test recipes intentionally do
-  not set or change this variable; they inherit the caller environment
-  unchanged.
+  path is inside one of the listed roots, except compiler-owned `soac`
+  and `soac.*` modules, which always remain transform-eligible. Test
+  recipes intentionally do not set or change this variable; they inherit
+  the caller environment unchanged.
 
 ### CPython-specific notes
 

@@ -1450,6 +1450,7 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       echo "SOAC work dir: $SOAC_WORK_DIR"
       echo "SOAC opt mode: ${SOAC_OPT_MODE:-none}"
       echo "SOAC compile mode: ${SOAC_COMPILE_MODE:-eager}"
+      find "$SOAC_WORK_DIR" -name pyperformance-worker-timing.jsonl -delete
     fi
     (
       cd "$PYPERFORMANCE_RESULTS_DIR"
@@ -1459,6 +1460,12 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       echo "pyperformance result: $run_output"
     else
       echo "pyperformance completed without writing result: $run_output"
+    fi
+    if [[ "$MODE" == soac* ]]; then
+      "$CPYTHON_BIN" \
+        "$REPO_ROOT/scripts/summarize_pyperformance_worker_timing.py" \
+        "$SOAC_WORK_DIR" \
+        "${pass_label:-run}"
     fi
   }
 
@@ -1479,10 +1486,11 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     PROFILE_OUTPUT="$OUTPUT.profile.json"
   fi
 
-  rm -f "$SOAC_WORK_DIR/profile.bin" "$SOAC_WORK_DIR/verify.bin" "$SOAC_WORK_DIR/events.jsonl" "$SOAC_WORK_DIR/jit-bb-map.jsonl" "$SOAC_WORK_DIR/worker_manifest.jsonl"
+  rm -f "$SOAC_WORK_DIR/profile.bin" "$SOAC_WORK_DIR/verify.bin" "$SOAC_WORK_DIR/events.jsonl" "$SOAC_WORK_DIR/jit-code-summary.jsonl" "$SOAC_WORK_DIR/jit-bb-map.jsonl" "$SOAC_WORK_DIR/worker_manifest.jsonl"
   find "$SOAC_WORK_DIR" -mindepth 2 -name profile.bin -delete
   find "$SOAC_WORK_DIR" -mindepth 2 -name verify.bin -delete
   find "$SOAC_WORK_DIR" -mindepth 2 -name events.jsonl -delete
+  find "$SOAC_WORK_DIR" -mindepth 2 -name jit-code-summary.jsonl -delete
   find "$SOAC_WORK_DIR" -mindepth 2 -name jit-bb-map.jsonl -delete
 
   run_pyperformance_once "$PROFILE_OUTPUT" "profile" "profile" "${pyperformance_profile_args[@]}"
@@ -1612,6 +1620,7 @@ pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpytho
     SOAC_PYPERFORMANCE_MEASURE_READY_FILE="$READY_FILE" \
     SOAC_WORK_DIR="$WORKER_WORK_DIR" \
     SOAC_OPT_MODE=apply \
+    SOAC_JIT_BB_MAP=1 \
     SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}" \
     SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}" \
     SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}" \
@@ -1989,6 +1998,7 @@ _benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-cpython
   OUTPUT_PREFIX="$RESULT_DIR/$(basename "$RESULT_DIR")_perf"
   SOAC_WORK_DIR="$COUNTERS_DIR" \
   SOAC_OPT_MODE=apply \
+  SOAC_JIT_BB_MAP=1 \
     just perf-pystone-jit-warm "{{perf_loops}}" "$OUTPUT_PREFIX"
 
   PERF_DATA_SOURCE="$REPO_ROOT/work/tmp/$(basename "$OUTPUT_PREFIX").data"

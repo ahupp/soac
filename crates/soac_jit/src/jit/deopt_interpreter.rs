@@ -8,6 +8,7 @@ use crate::function_instantiation::{
 };
 use crate::module_constants::{ModuleConstantId, load_runtime_name_owned_by_id};
 use crate::module_type::SharedModuleState;
+use crate::preserved_state;
 use crate::session::CompileSession;
 use pyo3::ffi;
 use pyo3::types::PyAny;
@@ -1121,9 +1122,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         slot: u32,
         debug_name: &str,
     ) -> Result<ObjPtr, String> {
-        let owner = self.preserved_owner()?;
+        let state = self.preserved_state()?;
         let cell =
-            unsafe { super::specialized_helpers::dp_jit_load_preserved(owner, i64::from(slot)) };
+            unsafe { preserved_state::load_preserved_state_owned(state.cast(), i64::from(slot)) };
         if cell.is_null() {
             return Err(format!(
                 "deopt continuation expected non-null preserved cell slot {slot} for {debug_name}"
@@ -1756,17 +1757,17 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     }
 
     #[cold]
-    fn preserved_owner(&self) -> Result<ObjPtr, String> {
-        let owner = self.locals.get_by_name("_dp_self").ok_or_else(|| {
+    fn preserved_state(&self) -> Result<ObjPtr, String> {
+        let state = self.locals.get_by_name("_dp_state").ok_or_else(|| {
             format!(
-                "deopt continuation expected generator resume owner _dp_self for preserved state: {}",
+                "deopt continuation expected generator resume state _dp_state for preserved state: {}",
                 self.locals.describe()
             )
         })?;
-        let value = owner.value();
+        let value = state.value();
         if value.is_null() {
             return Err(
-                "deopt continuation found null generator resume owner _dp_self".to_string(),
+                "deopt continuation found null generator resume state _dp_state".to_string(),
             );
         }
         Ok(value)
@@ -1777,9 +1778,10 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         &self,
         location: PreservedLocation,
     ) -> Result<ObjPtr, String> {
-        let owner = self.preserved_owner()?;
+        let state = self.preserved_state()?;
         Ok(unsafe {
-            super::specialized_helpers::dp_jit_load_preserved(owner, i64::from(location.slot()))
+            preserved_state::load_preserved_state_owned(state.cast(), i64::from(location.slot()))
+                .cast()
         })
     }
 
@@ -1920,7 +1922,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         location: PreservedLocation,
         quietly: bool,
     ) -> Result<ObjPtr, String> {
-        let owner = self.preserved_owner()?;
+        let state = self.preserved_state()?;
         let name_len = ffi::Py_ssize_t::try_from(name.len()).map_err(|_| {
             format!("preserved-delete deopt name {name:?} is too large to materialize as PyUnicode")
         })?;
@@ -1931,7 +1933,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         let result = if quietly {
             unsafe {
                 super::specialized_helpers::dp_jit_del_preserved_quietly(
-                    owner,
+                    state,
                     i64::from(location.slot()),
                     name_obj.cast(),
                 )
@@ -1939,7 +1941,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         } else {
             unsafe {
                 super::specialized_helpers::dp_jit_del_preserved(
-                    owner,
+                    state,
                     i64::from(location.slot()),
                     name_obj.cast(),
                 )
@@ -2030,13 +2032,14 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         if value.is_null() {
             return Ok(ptr::null_mut());
         }
-        let owner = self.preserved_owner()?;
+        let state = self.preserved_state()?;
         let result = unsafe {
-            super::specialized_helpers::dp_jit_store_preserved(
-                owner,
+            preserved_state::store_preserved_state(
+                state.cast(),
                 i64::from(location.slot()),
-                value,
+                value.cast(),
             )
+            .cast()
         };
         unsafe {
             ffi::Py_DECREF(value.cast::<ffi::PyObject>());

@@ -26,6 +26,7 @@ use std::collections::{HashMap, VecDeque};
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ResumeAbiParam {
     SelfValue,
+    StateValue,
     SendValue,
     ResumeExc,
     TransportSent,
@@ -35,6 +36,7 @@ impl ResumeAbiParam {
     fn name(self) -> &'static str {
         match self {
             Self::SelfValue => "_dp_self",
+            Self::StateValue => "_dp_state",
             Self::SendValue => "_dp_send_value",
             Self::ResumeExc => "_dp_resume_exc",
             Self::TransportSent => "_dp_transport_sent",
@@ -42,14 +44,16 @@ impl ResumeAbiParam {
     }
 }
 
-const GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 3] = [
+const GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 4] = [
     ResumeAbiParam::SelfValue,
+    ResumeAbiParam::StateValue,
     ResumeAbiParam::SendValue,
     ResumeAbiParam::ResumeExc,
 ];
 
-const ASYNC_GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 4] = [
+const ASYNC_GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 5] = [
     ResumeAbiParam::SelfValue,
+    ResumeAbiParam::StateValue,
     ResumeAbiParam::SendValue,
     ResumeAbiParam::ResumeExc,
     ResumeAbiParam::TransportSent,

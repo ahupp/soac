@@ -518,17 +518,32 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   through local slots. After trusted generator-resume inlining, typed planning
   can replace a nonescaping generator wrapper with explicit caller locals for
   preserved activation slots, initializing those locals from the original
-  public-call arguments and runtime slot defaults. The first slice only lowers
-  generators whose preserved state has no preserved cell slots and whose wrapper
-  has no remaining observable uses after the resume body is inlined; synthetic
-  alias/setup temps introduced while inlining trusted `next`/`send` paths are
-  consumed with the wrapper.
-  Calls to builtin `list` with a proven nonescaping generator instance can also
-  carry an explicit typed builtin-implementation plan. That plan keeps the
-  observed callable as builtin `list`, but selects the visible
-  `soac.runtime.list_from_iter` helper as a fallback-free inline body so the
+  public-call arguments and runtime slot defaults. Public generator factories
+  also install the SOAC generator-factory vectorcall path consistently, so
+  non-inlined named generators use the same preserved activation storage model
+  rather than falling back to CPython's ordinary generator object layout. The
+  first slice only lowers generators whose preserved state has no preserved cell
+  slots and whose wrapper has no remaining observable uses after the resume body
+  is inlined; synthetic alias/setup temps introduced while inlining trusted
+  `next`/`send` paths are consumed with the wrapper.
+  The trusted `next(gen)` runtime-protocol inline uses that same erasability
+  proof up front. If later observable uses such as `gen.throw(...)` remain, the
+  protocol call stays generic instead of exposing wrapper-only fields before
+  generator-state lowering can prove the wrapper is erasable.
+  Calls to builtin `list`, `set`, or `tuple` with a proven nonescaping generator
+  instance can also carry an explicit typed builtin-implementation plan. That
+  plan keeps the observed callable as the original builtin, but selects the
+  visible `soac.runtime.list_from_iter`, `soac.runtime.set_from_iter`, or
+  `soac.runtime.tuple_from_iter` helper as a fallback-free inline body so the
   generator consumer loop can be exposed to later typed rewrites without
-  pretending that the builtin object itself is the helper target.
+  pretending that the builtin object itself is the helper target. The tuple
+  helper keeps its own visible `iter`/`next` loop around a list accumulator before
+  final tuple materialization, so tuple(genexpr) can reuse the same
+  generator-consumer lowering rather than falling back to CPython iteration.
+  The current slice only selects that body when the paired generator resume
+  target stays within the bounded generator-inline budget, so large resume state
+  machines keep the ordinary builtin path instead of flattening a
+  disproportionate amount of control flow into the caller.
   Constructor-entry targets currently require all user arguments to be explicit
   because their type-stored metadata does not yet refresh `__init__` defaults.
 - In apply/verify mode, JIT module planning consumes the cached pre-opt module

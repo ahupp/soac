@@ -706,7 +706,7 @@ pub fn plan_function_locals(
     };
     let live_ins = compute_function_local_live_ins(function);
     let must_bound_ins = compute_function_local_must_bound_ins(function);
-    let preserved_owner_location = preserved_owner_location(storage_layout);
+    let preserved_state_location = preserved_state_location(storage_layout);
     let entry_label = function.entry_block().label;
     let mut blocks = HashMap::with_capacity(function.blocks.len());
     for block in &function.blocks {
@@ -717,7 +717,7 @@ pub fn plan_function_locals(
             .get(&block.label)
             .cloned()
             .unwrap_or_default();
-        if let Some(location) = preserved_owner_location {
+        if let Some(location) = preserved_state_location {
             live_in_locations.insert(location);
             must_bound_locations.insert(location);
         }
@@ -824,7 +824,7 @@ pub fn plan_typed_function_locals(
     };
     let live_ins = compute_typed_function_local_live_ins(function);
     let must_bound_ins = compute_typed_function_local_must_bound_ins(function);
-    let preserved_owner_location = preserved_owner_location(storage_layout);
+    let preserved_state_location = preserved_state_location(storage_layout);
     let precise_entry_states =
         compute_typed_function_precise_immortal_local_entry_states(function, facts);
     let entry_label = function.entry_block().label;
@@ -837,7 +837,7 @@ pub fn plan_typed_function_locals(
             .get(&block.label)
             .cloned()
             .unwrap_or_default();
-        if let Some(location) = preserved_owner_location {
+        if let Some(location) = preserved_state_location {
             live_in_locations.insert(location);
             must_bound_locations.insert(location);
         }
@@ -1259,7 +1259,7 @@ fn local_ref_kind_for_block_entry(
     is_must_bound_on_entry: bool,
     facts: Option<PyObjFacts>,
 ) -> LocalRefKind {
-    if name == "_dp_self" {
+    if name == "_dp_self" || name == "_dp_state" {
         return LocalRefKind::Borrowed;
     }
     let is_function_param = is_entry_block
@@ -1294,7 +1294,7 @@ fn local_ref_kind_for_typed_block_entry(
     facts: Option<PyObjFacts>,
     precise_entry_state: Option<LocalRefState>,
 ) -> LocalRefKind {
-    if name == "_dp_self" {
+    if name == "_dp_self" || name == "_dp_state" {
         return LocalRefKind::Borrowed;
     }
     if precise_entry_state == Some(LocalRefState::Immortal) {
@@ -1327,7 +1327,7 @@ fn is_try_exception_alias_name(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")
 }
 
-fn preserved_owner_location(
+fn preserved_state_location(
     storage_layout: &soac_core::block_py::StorageLayout,
 ) -> Option<LocalLocation> {
     if storage_layout.preserved_slots.is_empty() {
@@ -1336,7 +1336,7 @@ fn preserved_owner_location(
     storage_layout
         .stack_slots()
         .iter()
-        .position(|name| name == "_dp_self")
+        .position(|name| name == "_dp_state")
         .map(|slot| LocalLocation(slot as u32))
 }
 
@@ -1407,8 +1407,8 @@ def gen(it):
             .expect("generator should have a LocalEnv plan");
 
         for block in function_plan.blocks.values() {
-            let owner = block.binding_for_name("_dp_self").expect(
-                "generator body owner should stay materialized across preserved-state blocks",
+            let owner = block.binding_for_name("_dp_state").expect(
+                "generator body state should stay materialized across preserved-state blocks",
             );
             assert_eq!(owner.storage, PlannedLocalStorage::BlockParam);
             assert_eq!(

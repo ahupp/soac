@@ -501,6 +501,7 @@ def read():
         "blockpy.blockpy",
         "exec_module.call_module_init",
         "exec_module.register_function_owner_types",
+        "exec_module.eager_jit_compile",
     ]:
         assert phases[phase]["elapsed_us"] >= 0
         assert isinstance(phases[phase]["elapsed_us"], int)
@@ -531,7 +532,7 @@ def read():
     assert jit_row["jit_machine_code_block_count"] > 0
 
 
-def test_eager_compile_leaves_original_named_generators_on_cpython_vectorcall(tmp_path):
+def test_eager_compile_registers_named_generators_with_soac_vectorcall(tmp_path):
     log_path = tmp_path / "generator-jit-events.jsonl"
     module_name = "eager_generator_compile_case"
     (tmp_path / f"{module_name}.py").write_text(
@@ -571,18 +572,17 @@ def run(repeats):
     _assert_subprocess_ok(result)
 
     rows = _read_jsonl(log_path)
+    code_summary_rows = _read_jsonl(tmp_path / "soac-work" / "jit-code-summary.jsonl")
     genexpr_codegen_rows = [
         row
-        for row in rows
-        if row.get("event") == "soac.jit_codegen"
-        and row.get("module_name", "").endswith(module_name)
+        for row in code_summary_rows
+        if row.get("entry_kind") == "direct_function_body"
         and row.get("function_qualname", "").endswith("<genexpr>")
     ]
     explicit_codegen_rows = [
         row
-        for row in rows
-        if row.get("event") == "soac.jit_codegen"
-        and row.get("module_name", "").endswith(module_name)
+        for row in code_summary_rows
+        if row.get("entry_kind") == "direct_function_body"
         and row.get("function_qualname", "").endswith("explicit_items")
     ]
     skip_rows = [
@@ -592,10 +592,101 @@ def run(repeats):
         and row.get("module_name", "").endswith(module_name)
     ]
 
-    assert any(row.get("function_qualname", "").endswith("explicit_items") for row in skip_rows)
     assert genexpr_codegen_rows
     assert len(genexpr_codegen_rows) <= 2, genexpr_codegen_rows
-    assert not explicit_codegen_rows
+    assert explicit_codegen_rows
+    assert not skip_rows
+
+
+def test_apply_eager_compile_prewarms_nested_genexpr_direct_entries(tmp_path):
+    module_name = "eager_nested_genexpr_precompile_case"
+    work_dir = tmp_path / "soac-work"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+def consume(limit):
+    return sum(item + 1 for item in range(limit))
+
+def run():
+    return consume(8)
+""",
+        encoding="utf-8",
+    )
+    profile_script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        "assert module.run() == 36",
+    )
+    base_env = _soac_subprocess_env(
+        tmp_path,
+        work_dir=work_dir,
+        extra_env={"SOAC_COMPILE_MODE": "eager"},
+    )
+    profile_result = _run_soac_subprocess(
+        profile_script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+    summary_path = work_dir / "jit-code-summary.jsonl"
+    if summary_path.exists():
+        summary_path.unlink()
+
+    apply_script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        "assert module.run() == 36",
+    )
+    apply_result = _run_soac_subprocess(
+        apply_script,
+        env={
+            **base_env,
+            "SOAC_OPT_MODE": "apply",
+        },
+    )
+    _assert_subprocess_ok(apply_result)
+
+    rows = _read_jsonl(summary_path)
+    genexpr_codegen_rows = [
+        row
+        for row in rows
+        if row.get("entry_kind") == "direct_function_body"
+        and row.get("function_qualname", "").endswith("<genexpr>")
+    ]
+    assert genexpr_codegen_rows
+    assert len(genexpr_codegen_rows) == 1, genexpr_codegen_rows
+
+
+def test_profile_eager_runtime_import_does_not_compile_runtime_entries(tmp_path):
+    log_path = tmp_path / "runtime-import-events.jsonl"
+    result = _run_soac_subprocess(
+        "\n".join(
+            [
+                "from soac.import_hook import install",
+                "install()",
+                "import soac.runtime as runtime",
+                'assert runtime.range.__module__ == "soac.runtime"',
+                "",
+            ]
+        ),
+        env=_soac_subprocess_env(
+            tmp_path,
+            work_dir=tmp_path / "soac-work",
+            extra_env={
+                "SOAC_COMPILE_MODE": "eager",
+                "SOAC_OPT_MODE": "profile",
+                "SOAC_LOG": f"soac_jit_codegen=info;json={log_path}",
+            },
+        ),
+    )
+    _assert_subprocess_ok(result)
+
+    rows = _read_jsonl(log_path)
+    runtime_codegen_rows = [
+        row
+        for row in rows
+        if row.get("event") == "soac.jit_codegen"
+        and row.get("module_name") == "soac.runtime"
+    ]
+    assert not runtime_codegen_rows
 
 
 def test_pre_optimization_blockpy_module_cache_is_reused(tmp_path):
@@ -1046,14 +1137,14 @@ def run():
     )
     _assert_subprocess_ok(profile_result)
     profile = _inspect_counter_dump_json(work_dir / "profile.bin")
-    record_type_entries = [
-        entry
+    record_type_entries = {
+        (entry["type_id"], entry["module_name"], entry["qualname"])
         for record in profile["records"]
         for entry in record["type_table"]
         if entry["module_name"] == module_name and entry["qualname"] == "Record"
-    ]
+    }
     assert len(record_type_entries) == 1, profile
-    record_type_id = record_type_entries[0]["type_id"]
+    record_type_id = next(iter(record_type_entries))[0]
     profiled_keys = {
         key["key"]
         for record in profile["records"]

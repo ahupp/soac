@@ -118,12 +118,43 @@ fn attach_ready_clif_direct_entry_raw(py: Python<'_>, func: &Bound<'_, PyAny>) -
     })
 }
 
+fn maybe_attach_ready_clif_direct_entry(
+    py: Python<'_>,
+    func: &Bound<'_, PyAny>,
+    module_runtime: &ModuleRuntimeContext,
+    function_id: RuntimeFunctionId,
+) -> PyResult<()> {
+    if module_runtime.shared_module_state_owner.module_name == "soac.runtime" {
+        return Ok(());
+    }
+    if !module_runtime
+        .compile_session
+        .env_config()
+        .map_err(PyRuntimeError::new_err)?
+        .eager_clif_compile_requested()
+    {
+        return Ok(());
+    }
+    if module_runtime
+        .shared_module_state_owner
+        .lookup_function(function_id)
+        .is_some_and(|function| function.execution_mode() != FunctionExecutionMode::Jit)
+    {
+        return Ok(());
+    }
+    let _ = attach_ready_clif_direct_entry_raw(py, func)?;
+    Ok(())
+}
+
 fn maybe_eager_compile_clif_entry(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
     module_runtime: &ModuleRuntimeContext,
     function_id: RuntimeFunctionId,
 ) -> PyResult<()> {
+    if module_runtime.shared_module_state_owner.module_name == "soac.runtime" {
+        return Ok(());
+    }
     if !module_runtime
         .compile_session
         .env_config()
@@ -484,15 +515,8 @@ fn make_lazy_clif_entry<'py>(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EntryCodeSource {
-    Original,
-    Generated,
-}
-
 struct InstantiatedEntry<'py> {
     entry: Bound<'py, PyAny>,
-    code_source: EntryCodeSource,
 }
 
 fn build_closure_shaped_entry_from_ordered_captures<'py>(
@@ -507,10 +531,8 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
 ) -> PyResult<InstantiatedEntry<'py>> {
     debug_assert!(!captured_names.is_empty());
     debug_assert_eq!(captured_names.len(), captured_values.len());
-    let mut code_source = EntryCodeSource::Generated;
     let code = if let Some(code) = original_code {
         if code_freevars_match_names(code, captured_names)? {
-            code_source = EntryCodeSource::Original;
             code.clone()
         } else {
             let (is_async, is_generator) = match function.lowered_kind() {
@@ -568,7 +590,6 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
     }
     Ok(InstantiatedEntry {
         entry: func.into_any(),
-        code_source,
     })
 }
 
@@ -592,14 +613,11 @@ fn build_closure_shaped_entry<'py>(
         }
         None => false,
     };
-    let code_source;
     let code = if original_code_matches_captures {
-        code_source = EntryCodeSource::Original;
         original_code
             .expect("original code should exist after matching captured names")
             .clone()
     } else {
-        code_source = EntryCodeSource::Generated;
         let (is_async, is_generator) = match function.lowered_kind() {
             FunctionKind::Function => (false, false),
             FunctionKind::Coroutine => (true, false),
@@ -650,7 +668,6 @@ fn build_closure_shaped_entry<'py>(
     }
     Ok(InstantiatedEntry {
         entry: func.into_any(),
-        code_source,
     })
 }
 
@@ -755,6 +772,8 @@ fn instantiate_bb_function_inner(
         has_original_runtime_code,
         records_specialization_counters,
     );
+    let keep_source_generator =
+        keep_source_generator_vectorcall(function.lowered_kind(), has_original_runtime_code);
     let instantiated_entry = instantiate_closure_backed_entry(
         py,
         dp,
@@ -790,7 +809,13 @@ fn instantiate_bb_function_inner(
     // helper bodies can run so their own call-site counters feed later
     // cross-module inline decisions, while larger bootstrap helpers stay on the
     // source path.
-    if keep_source_runtime_helper {
+    if keep_source_generator {
+        trace!(
+            module_name,
+            function_id = %function.function_id,
+            function_qualname = %function.names.qualname,
+            "keeping source generator vectorcall"
+        );
         let owned_runtime =
             unsafe { clone_module_runtime_context(module_runtime) }.map_err(|_| {
                 if unsafe { ffi::PyErr_Occurred() }.is_null() {
@@ -807,18 +832,25 @@ fn instantiate_bb_function_inner(
             )
         }
         .map_err(|()| PyErr::fetch(py))?;
-    } else if original_generator_entry_can_use_cpython_vectorcall(
-        function,
-        instantiated_entry.code_source,
-    ) {
-        trace!(
-            target: "soac_function_create",
-            event = "soac.function_create.skip_jit_vectorcall",
-            module_name,
-            function_id = %function.function_id,
-            function_qualname = function.names.qualname.as_str(),
-            "leaving original generator function on CPython vectorcall"
-        );
+        maybe_attach_ready_clif_direct_entry(py, &entry, module_runtime, function.function_id)?;
+    } else if keep_source_runtime_helper {
+        let owned_runtime =
+            unsafe { clone_module_runtime_context(module_runtime) }.map_err(|_| {
+                if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                    PyRuntimeError::new_err("failed to clone module runtime context")
+                } else {
+                    PyErr::fetch(py)
+                }
+            })?;
+        unsafe {
+            crate::register_clif_direct_metadata(
+                entry.as_ptr(),
+                function.function_id,
+                owned_runtime,
+            )
+        }
+        .map_err(|()| PyErr::fetch(py))?;
+        maybe_attach_ready_clif_direct_entry(py, &entry, module_runtime, function.function_id)?;
     } else {
         register_jit_vectorcall(py, &entry, function.function_id, module_runtime)?;
     }
@@ -840,13 +872,11 @@ fn keep_source_runtime_helper_vectorcall(
     block_count > MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS
 }
 
-fn original_generator_entry_can_use_cpython_vectorcall(
-    function: &BlockPyFunction<BlockPyModuleShape>,
-    code_source: EntryCodeSource,
+fn keep_source_generator_vectorcall(
+    function_kind: &FunctionKind,
+    has_original_runtime_code: bool,
 ) -> bool {
-    code_source == EntryCodeSource::Original
-        && matches!(function.lowered_kind(), FunctionKind::Generator)
-        && function.names.display_name != "<genexpr>"
+    has_original_runtime_code && *function_kind == FunctionKind::Generator
 }
 
 fn instantiate_closure_backed_entry<'py>(
@@ -881,14 +911,7 @@ fn instantiate_closure_backed_entry<'py>(
                     module_globals,
                     original_code_without_freevars,
                 )?;
-                return Ok(InstantiatedEntry {
-                    entry,
-                    code_source: if original_code_without_freevars.is_some() {
-                        EntryCodeSource::Original
-                    } else {
-                        EntryCodeSource::Generated
-                    },
-                });
+                return Ok(InstantiatedEntry { entry });
             } else {
                 return build_closure_shaped_entry_from_ordered_captures(
                     py,
@@ -921,14 +944,7 @@ fn instantiate_closure_backed_entry<'py>(
             module_globals,
             original_code_without_freevars,
         )?;
-        return Ok(InstantiatedEntry {
-            entry,
-            code_source: if original_code_without_freevars.is_some() {
-                EntryCodeSource::Original
-            } else {
-                EntryCodeSource::Generated
-            },
-        });
+        return Ok(InstantiatedEntry { entry });
     } else {
         return build_closure_shaped_entry(
             py,
@@ -1216,8 +1232,10 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS, keep_source_runtime_helper_vectorcall,
+        MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS, keep_source_generator_vectorcall,
+        keep_source_runtime_helper_vectorcall,
     };
+    use soac_core::block_py::FunctionKind;
 
     #[test]
     fn source_runtime_helpers_keep_cpython_vectorcall_outside_counter_modes() {
@@ -1262,6 +1280,26 @@ mod tests {
             1,
             false,
             false
+        ));
+    }
+
+    #[test]
+    fn source_generators_keep_cpython_vectorcall() {
+        assert!(keep_source_generator_vectorcall(
+            &FunctionKind::Generator,
+            true
+        ));
+    }
+
+    #[test]
+    fn generated_or_non_generator_functions_still_use_transformed_vectorcall() {
+        assert!(!keep_source_generator_vectorcall(
+            &FunctionKind::Generator,
+            false
+        ));
+        assert!(!keep_source_generator_vectorcall(
+            &FunctionKind::Function,
+            true
         ));
     }
 }

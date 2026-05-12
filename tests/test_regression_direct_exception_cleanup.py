@@ -128,6 +128,45 @@ def test_apply_mode_constructor_entry_failure_preserves_exception(
     assert result == ["Marker", "boom:7", True]
 
 
+def test_apply_mode_runtime_unpack_reuses_batched_direct_entry(
+    tmp_path: Path,
+) -> None:
+    result, rows = _run_apply_module(
+        tmp_path,
+        "runtime_unpack_batched_direct_entry",
+        """
+        def run():
+            iterator = iter((1, 2))
+            result = []
+            spec = (True, True)
+            for _, flag in enumerate(spec):
+                if flag:
+                    try:
+                        result.append(next(iterator))
+                    except StopIteration:
+                        raise ValueError
+                else:
+                    break
+            try:
+                next(iterator)
+            except StopIteration:
+                return result
+            raise ValueError
+        """,
+    )
+
+    unpack_direct_edge_rows = [
+        row
+        for row in rows
+        if row.get("target") == "soac_jit_direct_edges"
+        and row.get("module") == "soac.runtime"
+        and row.get("qualname") == "unpack"
+        and row.get("clif_direct_edges", 0) > 0
+    ]
+    assert unpack_direct_edge_rows, rows
+    assert result == [1, 2]
+
+
 def test_apply_mode_constructor_entry_custom_new_stays_generic(
     tmp_path: Path,
 ) -> None:

@@ -262,77 +262,86 @@ fn analyze_typed_virtual_field_states(
     let mut out_states = vec![None::<TypedVirtualLoweringState>; function.blocks.len()];
     let labels = typed_block_indices_by_label(function);
     let entry_label = function.blocks.first().map(|block| block.label);
-    loop {
-        let mut changed = false;
-        for (block_index, block) in function.blocks.iter().enumerate() {
-            let in_state = typed_field_scalar_in_state_for_block(
-                function,
-                block,
-                entry_label,
-                &predecessors,
-                &labels,
-                &out_states,
-            );
-            if in_states[block_index] != in_state {
-                in_states[block_index] = in_state.clone();
-                changed = true;
-            }
-            let (body_before_instr_state, before_term_state, out_state) = in_state
-                .map(|mut out_state| {
-                    let mut block_clone = block.clone();
-                    let mut ignored_stats = TypedFieldScalarizationStats::default();
-                    let mut snapshot_state = out_state.clone();
-                    let body_before_instr_state = typed_field_scalar_body_snapshots(
-                        block,
-                        &mut snapshot_state,
-                        module_constants,
-                        constructor_field_bindings,
-                        generic_field_sources,
-                    );
-                    transfer_typed_field_scalar_body(
-                        &mut block_clone.body,
-                        &mut out_state,
-                        module_constants,
-                        constructor_field_bindings,
-                        generic_field_sources,
-                        &mut ignored_stats,
-                        false,
-                    );
-                    let before_term_state = out_state.clone();
-                    transfer_typed_field_scalar_term(
-                        &mut block_clone.term,
-                        &mut out_state,
-                        module_constants,
-                        &mut ignored_stats,
-                        false,
-                    );
-                    (body_before_instr_state, before_term_state, out_state)
-                })
-                .map_or(
-                    (None, None, None),
-                    |(body_before_instr_state, before_term_state, out_state)| {
-                        (
-                            Some(body_before_instr_state),
-                            Some(before_term_state),
-                            Some(out_state),
-                        )
-                    },
+    let successor_indices = function
+        .blocks
+        .iter()
+        .map(|block| {
+            typed_scalar_term_successors(&block.term)
+                .into_iter()
+                .filter_map(|label| labels.get(&label).copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut pending = std::collections::VecDeque::new();
+    let mut queued = vec![false; function.blocks.len()];
+    if !function.blocks.is_empty() {
+        pending.push_back(0);
+        queued[0] = true;
+    }
+    while let Some(block_index) = pending.pop_front() {
+        queued[block_index] = false;
+        let block = &function.blocks[block_index];
+        let in_state = typed_field_scalar_in_state_for_block(
+            function,
+            block,
+            entry_label,
+            &predecessors,
+            &labels,
+            &out_states,
+        );
+        in_states[block_index] = in_state.clone();
+        let (body_before_instr_state, before_term_state, out_state) = in_state
+            .map(|mut out_state| {
+                let mut block_clone = block.clone();
+                let mut ignored_stats = TypedFieldScalarizationStats::default();
+                let mut snapshot_state = out_state.clone();
+                let body_before_instr_state = typed_field_scalar_body_snapshots(
+                    block,
+                    &mut snapshot_state,
+                    module_constants,
+                    constructor_field_bindings,
+                    generic_field_sources,
                 );
-            if body_before_instr_states[block_index] != body_before_instr_state {
-                body_before_instr_states[block_index] = body_before_instr_state;
-                changed = true;
-            }
-            if before_term_states[block_index] != before_term_state {
-                before_term_states[block_index] = before_term_state;
-                changed = true;
-            }
-            if out_states[block_index] != out_state {
-                out_states[block_index] = out_state;
-                changed = true;
-            }
+                transfer_typed_field_scalar_body(
+                    &mut block_clone.body,
+                    &mut out_state,
+                    module_constants,
+                    constructor_field_bindings,
+                    generic_field_sources,
+                    &mut ignored_stats,
+                    false,
+                );
+                let before_term_state = out_state.clone();
+                transfer_typed_field_scalar_term(
+                    &mut block_clone.term,
+                    &mut out_state,
+                    module_constants,
+                    &mut ignored_stats,
+                    false,
+                );
+                (body_before_instr_state, before_term_state, out_state)
+            })
+            .map_or(
+                (None, None, None),
+                |(body_before_instr_state, before_term_state, out_state)| {
+                    (
+                        Some(body_before_instr_state),
+                        Some(before_term_state),
+                        Some(out_state),
+                    )
+                },
+            );
+        body_before_instr_states[block_index] = body_before_instr_state;
+        before_term_states[block_index] = before_term_state;
+        if out_states[block_index] == out_state {
+            continue;
         }
-        if !changed {
-            break;
+        out_states[block_index] = out_state;
+        for successor_index in &successor_indices[block_index] {
+            if !queued[*successor_index] {
+                pending.push_back(*successor_index);
+                queued[*successor_index] = true;
+            }
         }
     }
     let block_in = function

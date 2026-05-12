@@ -275,6 +275,17 @@ pub(super) static DP_JIT_PY_VECTORCALL_IMPORT: ImportSpec = ImportSpec::new(
     ],
     &[SigType::Pointer],
 );
+pub(super) static DP_JIT_MAKE_GENERATOR_INSTANCE_FROM_VECTORCALL_IMPORT: ImportSpec =
+    ImportSpec::new(
+        "dp_jit_make_generator_instance_from_vectorcall",
+        &[
+            SigType::Pointer,
+            SigType::Pointer,
+            SigType::Pointer,
+            SigType::Pointer,
+        ],
+        &[SigType::Pointer],
+    );
 pub(super) static DP_JIT_ENTER_RECURSIVE_CALL_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_enter_recursive_call",
     &[SigType::Pointer],
@@ -319,14 +330,9 @@ pub(super) static DP_JIT_PYOBJECT_SETITEM_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
-pub(super) static DP_JIT_LOAD_PRESERVED_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_load_preserved",
-    &[SigType::Pointer, SigType::I64],
+pub(super) static DP_JIT_PRESERVED_VALUES_PTR_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_preserved_values_ptr",
     &[SigType::Pointer],
-);
-pub(super) static DP_JIT_STORE_PRESERVED_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_store_preserved",
-    &[SigType::Pointer, SigType::I64, SigType::Pointer],
     &[SigType::Pointer],
 );
 pub(super) static DP_JIT_DEL_PRESERVED_IMPORT: ImportSpec = ImportSpec::new(
@@ -529,6 +535,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
     &DP_JIT_PY_CALL_OBJECT_IMPORT,
     &DP_JIT_PY_VECTORCALL_IMPORT,
+    &DP_JIT_MAKE_GENERATOR_INSTANCE_FROM_VECTORCALL_IMPORT,
     &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
     &PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
     &PY_HANDLE_PENDING_IMPORT,
@@ -539,8 +546,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PYOBJECT_SETATTR_IMPORT,
     &DP_JIT_PYOBJECT_GETITEM_IMPORT,
     &DP_JIT_PYOBJECT_SETITEM_IMPORT,
-    &DP_JIT_LOAD_PRESERVED_IMPORT,
-    &DP_JIT_STORE_PRESERVED_IMPORT,
+    &DP_JIT_PRESERVED_VALUES_PTR_IMPORT,
     &DP_JIT_DEL_PRESERVED_IMPORT,
     &DP_JIT_DEL_PRESERVED_QUIETLY_IMPORT,
     &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,

@@ -36,6 +36,7 @@ use soac_config::SoacEnvConfig;
 use soac_core::block_py::RuntimeFunctionId;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 #[cfg(not(test))]
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
@@ -1016,6 +1017,67 @@ fn stable_cranelift_function_hash_impl(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn append_jit_artifact_record(
+    dir: &Path,
+    path: &Path,
+    record: &serde_json::Value,
+    artifact_kind: &str,
+) {
+    let result = (|| -> Result<(), String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+        use std::io::Write;
+        serde_json::to_writer(&mut file, record)
+            .map_err(|err| format!("failed to serialize {}: {err}", path.display()))?;
+        file.write_all(b"\n")
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        eprintln!("[soac {artifact_kind}] {err}");
+    }
+}
+
+pub(super) fn record_jit_code_summary(
+    env_config: &SoacEnvConfig,
+    symbol: &str,
+    code_id: u64,
+    artifact: &DefinedFunctionArtifact,
+    function_id: RuntimeFunctionId,
+    function_qualname: &str,
+    entry_kind: &str,
+) {
+    let Some(dir) = env_config.soac_work_dir() else {
+        return;
+    };
+    let path = dir.join("jit-code-summary.jsonl");
+    let record = serde_json::json!({
+        "process_id": std::process::id(),
+        "code_id": code_id,
+        "symbol": symbol,
+        "code_size": artifact.code_size,
+        "machine_block_count": artifact.code_bb_offsets.len(),
+        "function_id": format!("{function_id}"),
+        "function_qualname": function_qualname,
+        "entry_kind": entry_kind,
+        "purpose_names": &artifact.code_purpose_names,
+        "purpose_bytes": &artifact.code_purpose_bytes,
+        "refcount_family_names": &artifact.code_refcount_family_names,
+        "refcount_family_bytes": &artifact.code_refcount_family_bytes,
+        "unattributed_bytes": artifact.code_unattributed_bytes,
+        "block_role_names": &artifact.code_block_role_names,
+        "block_role_attributed_bytes": &artifact.code_block_role_attributed_bytes,
+        "block_role_unattributed_bytes": &artifact.code_block_role_unattributed_bytes,
+        "block_role_purpose_bytes": &artifact.code_block_role_purpose_bytes,
+    });
+    append_jit_artifact_record(&dir, &path, &record, "jit code summary");
+}
+
 pub(super) fn record_jit_bb_map(
     env_config: &SoacEnvConfig,
     symbol: &str,
@@ -1025,6 +1087,9 @@ pub(super) fn record_jit_bb_map(
     function_qualname: &str,
     entry_kind: &str,
 ) {
+    if !env_config.jit_bb_map_enabled() {
+        return;
+    }
     let Some(dir) = env_config.soac_work_dir() else {
         return;
     };
@@ -1052,24 +1117,7 @@ pub(super) fn record_jit_bb_map(
         "bb_purpose_bytes": &artifact.code_bb_purpose_bytes,
         "bb_unattributed_bytes": &artifact.code_bb_unattributed_bytes,
     });
-    let result = (|| -> Result<(), String> {
-        std::fs::create_dir_all(&dir)
-            .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-        use std::io::Write;
-        serde_json::to_writer(&mut file, &record)
-            .map_err(|err| format!("failed to serialize {}: {err}", path.display()))?;
-        file.write_all(b"\n")
-            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        eprintln!("[soac jit bb map] {err}");
-    }
+    append_jit_artifact_record(&dir, &path, &record, "jit bb map");
 }
 
 pub(super) fn register_jit_signal_diagnostics(

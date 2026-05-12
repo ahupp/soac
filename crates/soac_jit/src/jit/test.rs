@@ -19028,6 +19028,17 @@ def f(x, y):
                 &typed_v3_env_config(),
             )
             .expect("typed-v3 runtime should lower caller with external callee bodies visible");
+            let cached_module_plan = optimize_blockpy_for_shared_state(
+                caller_shared_state.as_ref(),
+                Some(&compile_session),
+                Some(&profile),
+                &typed_v3_env_config(),
+            )
+            .expect("typed-v3 runtime should reuse cached shared-state plans");
+            assert!(
+                std::sync::Arc::ptr_eq(&module_plan, &cached_module_plan),
+                "verify/apply shared-state planning should reuse the cached typed module plan"
+            );
             let planned_caller = module_plan
                 .module
                 .callable_defs

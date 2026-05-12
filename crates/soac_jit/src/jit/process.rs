@@ -1,7 +1,7 @@
 use super::backend::{
     CompiledFunctionArtifact, compile_prepared_function_bytes,
     compile_prepared_function_bytes_with_purpose_aliases, define_compiled_function_bytes,
-    new_jit_module, record_jit_bb_map, register_jit_signal_diagnostics,
+    new_jit_module, record_jit_bb_map, record_jit_code_summary, register_jit_signal_diagnostics,
 };
 use super::clif_function_display_aliases;
 use super::codegen_env::JitCodegenEnv;
@@ -777,6 +777,8 @@ fn emit_jit_batch_codegen_log(
     functions_to_define_count: usize,
     batch_collect_elapsed: Duration,
     reservation_elapsed: Duration,
+    plan_elapsed: Duration,
+    constant_refresh_elapsed: Duration,
     codegen_elapsed: Duration,
     commit_elapsed: Duration,
     total_elapsed: Duration,
@@ -790,6 +792,19 @@ fn emit_jit_batch_codegen_log(
             )
         })
         .unwrap_or(("", ""));
+    let total_us = duration_micros(total_elapsed);
+    let collect_us = duration_micros(batch_collect_elapsed);
+    let reservation_us = duration_micros(reservation_elapsed);
+    let plan_us = duration_micros(plan_elapsed);
+    let constant_refresh_us = duration_micros(constant_refresh_elapsed);
+    let codegen_us = duration_micros(codegen_elapsed);
+    let commit_us = duration_micros(commit_elapsed);
+    let attributed_us = collect_us
+        .saturating_add(reservation_us)
+        .saturating_add(plan_us)
+        .saturating_add(constant_refresh_us)
+        .saturating_add(codegen_us)
+        .saturating_add(commit_us);
     info!(
         target: "soac_jit_codegen",
         event = "soac.jit_batch_codegen",
@@ -807,11 +822,14 @@ fn emit_jit_batch_codegen_log(
         actual_worker_count = u64::try_from(worker_metrics.actual_worker_count).unwrap_or(u64::MAX),
         worker_function_count_min = u64::try_from(worker_metrics.worker_function_count_min).unwrap_or(u64::MAX),
         worker_function_count_max = u64::try_from(worker_metrics.worker_function_count_max).unwrap_or(u64::MAX),
-        jit_batch_collect_us = duration_micros(batch_collect_elapsed),
-        jit_batch_reservation_us = duration_micros(reservation_elapsed),
-        jit_batch_codegen_us = duration_micros(codegen_elapsed),
-        jit_batch_commit_us = duration_micros(commit_elapsed),
-        jit_batch_total_us = duration_micros(total_elapsed),
+        jit_batch_collect_us = collect_us,
+        jit_batch_reservation_us = reservation_us,
+        jit_batch_plan_us = plan_us,
+        jit_batch_constant_refresh_us = constant_refresh_us,
+        jit_batch_codegen_us = codegen_us,
+        jit_batch_commit_us = commit_us,
+        jit_batch_total_us = total_us,
+        jit_batch_unattributed_us = total_us.saturating_sub(attributed_us),
         jit_batch_worker_total_sum_us = duration_micros(worker_metrics.worker_total_sum),
         jit_batch_worker_total_max_us = duration_micros(worker_metrics.worker_total_max),
         jit_batch_worker_setup_sum_us = duration_micros(worker_metrics.worker_setup_sum),
@@ -1891,6 +1909,13 @@ impl ProcessJitState {
         )>,
         String,
     > {
+        let total_start = Instant::now();
+        let function_count = compiled_functions.len();
+        let default_adapter_count = compiled_functions
+            .iter()
+            .filter(|function| function.default_adapter_compiled.is_some())
+            .count();
+        let define_start = Instant::now();
         for defined in &compiled_functions {
             define_compiled_function_bytes(
                 jit_module,
@@ -1925,10 +1950,19 @@ impl ProcessJitState {
                 })?;
             }
         }
+        let define_elapsed = define_start.elapsed();
+        let finalize_start = Instant::now();
         jit_module
             .finalize_definitions()
             .map_err(|err| format!("failed to finalize specialized jit run_bb function: {err}"))?;
+        let finalize_elapsed = finalize_start.elapsed();
 
+        let publish_start = Instant::now();
+        let mut ready_elapsed = Duration::ZERO;
+        let mut jitdump_elapsed = Duration::ZERO;
+        let mut code_summary_elapsed = Duration::ZERO;
+        let mut bb_map_elapsed = Duration::ZERO;
+        let mut signal_diag_elapsed = Duration::ZERO;
         let mut committed = Vec::with_capacity(compiled_functions.len());
         for defined in compiled_functions {
             let code_ptr = jit_module.get_finalized_function(defined.main_id);
@@ -1936,6 +1970,7 @@ impl ProcessJitState {
                 .default_adapter_id
                 .map(|default_adapter_id| jit_module.get_finalized_function(default_adapter_id))
                 .unwrap_or(code_ptr);
+            let ready_start = Instant::now();
             let compiled_handle = self.mark_direct_function_ready(
                 session,
                 defined.function_id,
@@ -1944,6 +1979,8 @@ impl ProcessJitState {
                 defined.param_count,
                 Arc::clone(&defined.deopt_table),
             )?;
+            ready_elapsed += ready_start.elapsed();
+            let jitdump_start = Instant::now();
             let code_id = jitdump::record_code_load(
                 &defined.main_symbol,
                 code_ptr.cast::<u8>(),
@@ -1951,6 +1988,19 @@ impl ProcessJitState {
                 jit_module.codegen_isa(),
                 defined.compiled.artifact.systemv_unwind_info.as_ref(),
             )?;
+            jitdump_elapsed += jitdump_start.elapsed();
+            let code_summary_start = Instant::now();
+            record_jit_code_summary(
+                session.env_config()?,
+                &defined.main_symbol,
+                code_id,
+                &defined.compiled.artifact,
+                defined.function_id,
+                &defined.function_qualname,
+                "direct_function_body",
+            );
+            code_summary_elapsed += code_summary_start.elapsed();
+            let bb_map_start = Instant::now();
             record_jit_bb_map(
                 session.env_config()?,
                 &defined.main_symbol,
@@ -1960,6 +2010,8 @@ impl ProcessJitState {
                 &defined.function_qualname,
                 "direct_function_body",
             );
+            bb_map_elapsed += bb_map_start.elapsed();
+            let signal_diag_start = Instant::now();
             register_jit_signal_diagnostics(
                 &defined.main_symbol,
                 code_ptr.cast::<u8>(),
@@ -1968,6 +2020,7 @@ impl ProcessJitState {
                 &defined.function_qualname,
                 "direct_function_body",
             );
+            signal_diag_elapsed += signal_diag_start.elapsed();
             if let (
                 Some(default_adapter_id),
                 Some(default_adapter_symbol),
@@ -1978,6 +2031,7 @@ impl ProcessJitState {
                 defined.default_adapter_compiled.as_ref(),
             ) {
                 let default_code_ptr = jit_module.get_finalized_function(default_adapter_id);
+                let jitdump_start = Instant::now();
                 let code_id = jitdump::record_code_load(
                     default_adapter_symbol,
                     default_code_ptr.cast::<u8>(),
@@ -1988,6 +2042,19 @@ impl ProcessJitState {
                         .systemv_unwind_info
                         .as_ref(),
                 )?;
+                jitdump_elapsed += jitdump_start.elapsed();
+                let code_summary_start = Instant::now();
+                record_jit_code_summary(
+                    session.env_config()?,
+                    default_adapter_symbol,
+                    code_id,
+                    &default_adapter_compiled.artifact,
+                    defined.function_id,
+                    &defined.function_qualname,
+                    "default_direct_adapter",
+                );
+                code_summary_elapsed += code_summary_start.elapsed();
+                let bb_map_start = Instant::now();
                 record_jit_bb_map(
                     session.env_config()?,
                     default_adapter_symbol,
@@ -1997,6 +2064,8 @@ impl ProcessJitState {
                     &defined.function_qualname,
                     "default_direct_adapter",
                 );
+                bb_map_elapsed += bb_map_start.elapsed();
+                let signal_diag_start = Instant::now();
                 register_jit_signal_diagnostics(
                     default_adapter_symbol,
                     default_code_ptr.cast::<u8>(),
@@ -2005,9 +2074,28 @@ impl ProcessJitState {
                     &defined.function_qualname,
                     "default_direct_adapter",
                 );
+                signal_diag_elapsed += signal_diag_start.elapsed();
             }
             committed.push((defined.function_id, compiled_handle, defined.stats));
         }
+        let publish_elapsed = publish_start.elapsed();
+        tracing::info!(
+            target: "soac_jit_codegen",
+            event = "soac.jit_commit_detail",
+            function_count = u64::try_from(function_count).unwrap_or(u64::MAX),
+            default_adapter_count =
+                u64::try_from(default_adapter_count).unwrap_or(u64::MAX),
+            jit_commit_define_us = duration_micros(define_elapsed),
+            jit_commit_finalize_us = duration_micros(finalize_elapsed),
+            jit_commit_publish_us = duration_micros(publish_elapsed),
+            jit_commit_ready_us = duration_micros(ready_elapsed),
+            jit_commit_jitdump_us = duration_micros(jitdump_elapsed),
+            jit_commit_code_summary_us = duration_micros(code_summary_elapsed),
+            jit_commit_bb_map_us = duration_micros(bb_map_elapsed),
+            jit_commit_signal_diag_us = duration_micros(signal_diag_elapsed),
+            jit_commit_total_us = duration_micros(total_start.elapsed()),
+            "jit_commit_detail",
+        );
         Ok(committed)
     }
 }
@@ -2624,6 +2712,9 @@ impl ProcessJitEngine {
         shared_state: Arc<crate::module_type::SharedModuleState>,
     ) -> Result<(), String> {
         let env_config = session.env_config()?;
+        if env_config.eager_clif_compile_requested() {
+            return Ok(());
+        }
         if !env_config.background_jit_enabled() {
             return Ok(());
         }
@@ -2639,7 +2730,7 @@ impl ProcessJitEngine {
             .name(thread_name)
             .spawn(move || {
                 if let Err(err) = unsafe {
-                    ProcessJitEngine::compile_shared_module_in_background(session, shared_state)
+                    ProcessJitEngine::compile_shared_module_direct_entries(session, shared_state)
                 } {
                     warn!(
                         target: "soac_jit_codegen",
@@ -2653,7 +2744,21 @@ impl ProcessJitEngine {
             .map_err(|err| format!("failed to spawn process JIT background compile worker: {err}"))
     }
 
-    unsafe fn compile_shared_module_in_background(
+    pub(crate) unsafe fn eager_compile_shared_module(
+        &self,
+        session: Arc<crate::session::CompileSession>,
+        shared_state: Arc<crate::module_type::SharedModuleState>,
+    ) -> Result<(), String> {
+        if !session.env_config()?.eager_clif_compile_requested() {
+            return Ok(());
+        }
+        if shared_state.lowered_module.callable_defs.is_empty() {
+            return Ok(());
+        }
+        unsafe { Self::compile_shared_module_direct_entries(session, shared_state) }
+    }
+
+    unsafe fn compile_shared_module_direct_entries(
         session: Arc<crate::session::CompileSession>,
         shared_state: Arc<crate::module_type::SharedModuleState>,
     ) -> Result<(), String> {
@@ -2810,13 +2915,18 @@ impl ProcessJitEngine {
                     reservation_elapsed,
                     Duration::ZERO,
                     Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
                     total_start.elapsed(),
                     JitBatchWorkerMetrics::default(),
                 );
                 return Err(err);
             }
         };
-        if let Err(err) = plan.precompute_module_plans(&inputs) {
+        let plan_start = Instant::now();
+        let plan_result = plan.precompute_module_plans(&inputs);
+        let plan_elapsed = plan_start.elapsed();
+        if let Err(err) = plan_result {
             emit_jit_batch_codegen_log(
                 function,
                 direct_call_resolver,
@@ -2827,6 +2937,8 @@ impl ProcessJitEngine {
                 plan.function_indices_to_define.len(),
                 Duration::ZERO,
                 reservation_elapsed,
+                plan_elapsed,
+                Duration::ZERO,
                 Duration::ZERO,
                 Duration::ZERO,
                 total_start.elapsed(),
@@ -2850,7 +2962,9 @@ impl ProcessJitEngine {
                         plan.function_indices_to_define.len(),
                         Duration::ZERO,
                         reservation_elapsed,
+                        plan_elapsed,
                         refresh_start.elapsed(),
+                        Duration::ZERO,
                         Duration::ZERO,
                         total_start.elapsed(),
                         JitBatchWorkerMetrics::default(),
@@ -2887,7 +3001,9 @@ impl ProcessJitEngine {
                 plan.function_indices_to_define.len(),
                 Duration::ZERO,
                 reservation_elapsed,
+                plan_elapsed,
                 refresh_start.elapsed(),
+                Duration::ZERO,
                 Duration::ZERO,
                 total_start.elapsed(),
                 JitBatchWorkerMetrics::default(),
@@ -2895,6 +3011,7 @@ impl ProcessJitEngine {
             self.fail_reserved_direct_function_batch(&plan, &err);
             return Err(err);
         }
+        let constant_refresh_elapsed = refresh_start.elapsed();
         let batch_function_count = plan.batch_functions.len();
         let functions_to_define_count = plan.function_indices_to_define.len();
         let dependencies = match Self::streaming_batch_direct_dependencies(&plan) {
@@ -2910,6 +3027,8 @@ impl ProcessJitEngine {
                     functions_to_define_count,
                     Duration::ZERO,
                     reservation_elapsed,
+                    plan_elapsed,
+                    constant_refresh_elapsed,
                     Duration::ZERO,
                     Duration::ZERO,
                     total_start.elapsed(),
@@ -2943,6 +3062,8 @@ impl ProcessJitEngine {
                     functions_to_define_count,
                     Duration::ZERO,
                     reservation_elapsed,
+                    plan_elapsed,
+                    constant_refresh_elapsed,
                     Duration::ZERO,
                     Duration::ZERO,
                     total_start.elapsed(),
@@ -2983,6 +3104,8 @@ impl ProcessJitEngine {
                     output.committed_function_count,
                     Duration::ZERO,
                     reservation_elapsed,
+                    plan_elapsed,
+                    constant_refresh_elapsed,
                     codegen_elapsed,
                     output.commit_elapsed,
                     total_start.elapsed(),
@@ -3002,6 +3125,8 @@ impl ProcessJitEngine {
                     functions_to_define_count,
                     Duration::ZERO,
                     reservation_elapsed,
+                    plan_elapsed,
+                    constant_refresh_elapsed,
                     codegen_elapsed,
                     Duration::ZERO,
                     total_start.elapsed(),
@@ -3108,6 +3233,8 @@ impl ProcessJitEngine {
                         Duration::ZERO,
                         Duration::ZERO,
                         Duration::ZERO,
+                        Duration::ZERO,
+                        Duration::ZERO,
                         total_start.elapsed(),
                         JitBatchWorkerMetrics::default(),
                     );
@@ -3191,13 +3318,18 @@ impl ProcessJitEngine {
                     reservation_elapsed,
                     Duration::ZERO,
                     Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
                     total_start.elapsed(),
                     JitBatchWorkerMetrics::default(),
                 );
                 return Err(err);
             }
         };
-        if let Err(err) = plan.precompute_module_plans(&inputs) {
+        let plan_start = Instant::now();
+        let plan_result = plan.precompute_module_plans(&inputs);
+        let plan_elapsed = plan_start.elapsed();
+        if let Err(err) = plan_result {
             emit_jit_batch_codegen_log(
                 function,
                 direct_call_resolver,
@@ -3208,6 +3340,8 @@ impl ProcessJitEngine {
                 plan.function_indices_to_define.len(),
                 batch_collect_elapsed,
                 reservation_elapsed,
+                plan_elapsed,
+                Duration::ZERO,
                 Duration::ZERO,
                 Duration::ZERO,
                 total_start.elapsed(),
@@ -3231,7 +3365,9 @@ impl ProcessJitEngine {
                         plan.function_indices_to_define.len(),
                         batch_collect_elapsed,
                         reservation_elapsed,
+                        plan_elapsed,
                         refresh_start.elapsed(),
+                        Duration::ZERO,
                         Duration::ZERO,
                         total_start.elapsed(),
                         JitBatchWorkerMetrics::default(),
@@ -3268,7 +3404,9 @@ impl ProcessJitEngine {
                 plan.function_indices_to_define.len(),
                 batch_collect_elapsed,
                 reservation_elapsed,
+                plan_elapsed,
                 refresh_start.elapsed(),
+                Duration::ZERO,
                 Duration::ZERO,
                 total_start.elapsed(),
                 JitBatchWorkerMetrics::default(),
@@ -3276,6 +3414,7 @@ impl ProcessJitEngine {
             self.fail_reserved_direct_function_batch(&plan, &err);
             return Err(err);
         }
+        let constant_refresh_elapsed = refresh_start.elapsed();
         let batch_function_count = plan.batch_functions.len();
         let functions_to_define_count = plan.function_indices_to_define.len();
         let codegen_start = Instant::now();
@@ -3297,6 +3436,8 @@ impl ProcessJitEngine {
                         functions_to_define_count,
                         batch_collect_elapsed,
                         reservation_elapsed,
+                        plan_elapsed,
+                        constant_refresh_elapsed,
                         codegen_elapsed,
                         Duration::ZERO,
                         total_start.elapsed(),
@@ -3348,6 +3489,8 @@ impl ProcessJitEngine {
                     functions_to_define_count,
                     batch_collect_elapsed,
                     reservation_elapsed,
+                    plan_elapsed,
+                    constant_refresh_elapsed,
                     codegen_elapsed,
                     commit_elapsed,
                     total_start.elapsed(),
@@ -3366,6 +3509,8 @@ impl ProcessJitEngine {
                     functions_to_define_count,
                     batch_collect_elapsed,
                     reservation_elapsed,
+                    plan_elapsed,
+                    constant_refresh_elapsed,
                     codegen_elapsed,
                     commit_elapsed,
                     total_start.elapsed(),

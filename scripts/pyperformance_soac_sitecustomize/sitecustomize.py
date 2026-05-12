@@ -16,7 +16,9 @@ import json
 import os
 import signal
 import sys
+import atexit
 import importlib.util
+import time
 from hashlib import sha256
 from pathlib import Path
 
@@ -50,6 +52,8 @@ _PYPERF_FLAGS = {
 }
 
 _DEFAULT_JIT_PACKAGES = ("tomli",)
+_WORKER_START_ENV = "SOAC_PYPERFORMANCE_WORKER_START_NS"
+_WORKER_TIMING_FILENAME = "pyperformance-worker-timing.jsonl"
 
 
 def _enabled(name: str) -> bool:
@@ -184,19 +188,43 @@ def _benchmark_manifest_record(work_dir: str) -> dict[str, object]:
     }
 
 
-def _append_benchmark_manifest(work_root: str, work_dir: str) -> None:
-    manifest_path = Path(work_root) / "worker_manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+def _append_jsonl(path: Path, record: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(
-        _benchmark_manifest_record(work_dir),
+        record,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8") + b"\n"
-    fd = os.open(manifest_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
     try:
         os.write(fd, payload)
     finally:
         os.close(fd)
+
+
+def _append_benchmark_manifest(work_root: str, work_dir: str) -> None:
+    _append_jsonl(
+        Path(work_root) / "worker_manifest.jsonl",
+        _benchmark_manifest_record(work_dir),
+    )
+
+
+def _worker_timing_enabled() -> bool:
+    return _enabled("SOAC_PYPERFORMANCE_ENABLE") and _is_benchmark_worker()
+
+
+def _ensure_worker_timing_start() -> None:
+    if _worker_timing_enabled():
+        os.environ.setdefault(_WORKER_START_ENV, str(time.perf_counter_ns()))
+
+
+def _worker_timing_path() -> Path | None:
+    if not _worker_timing_enabled():
+        return None
+    work_dir = os.environ.get("SOAC_WORK_DIR")
+    if not work_dir:
+        return None
+    return Path(work_dir) / _WORKER_TIMING_FILENAME
 
 
 def _pause_before_measured_values(ready_file: str) -> None:
@@ -208,7 +236,8 @@ def _pause_before_measured_values(ready_file: str) -> None:
 
 def _install_measured_value_pause_hook(worker_task_cls=None) -> None:
     ready_file = os.environ.get("SOAC_PYPERFORMANCE_MEASURE_READY_FILE")
-    if not ready_file:
+    timing_path = _worker_timing_path()
+    if not ready_file and timing_path is None:
         return
 
     if worker_task_cls is None:
@@ -218,6 +247,10 @@ def _install_measured_value_pause_hook(worker_task_cls=None) -> None:
 
     original_compute_values = worker_task_cls._compute_values
     paused = False
+    first_measured_start_ns: int | None = None
+    last_measured_end_ns: int | None = None
+    measured_batches = 0
+    measured_wall_ns = 0
 
     def compute_values_with_pause(
         self,
@@ -228,21 +261,77 @@ def _install_measured_value_pause_hook(worker_task_cls=None) -> None:
         start=0,
     ):
         nonlocal paused
-        if not paused and not is_warmup and not calibrate_loops:
+        nonlocal first_measured_start_ns
+        nonlocal last_measured_end_ns
+        nonlocal measured_batches
+        nonlocal measured_wall_ns
+
+        measured = not is_warmup and not calibrate_loops
+        if not paused and measured and ready_file:
             paused = True
             _pause_before_measured_values(ready_file)
-        return original_compute_values(
-            self,
-            values,
-            nvalue,
-            is_warmup=is_warmup,
-            calibrate_loops=calibrate_loops,
-            start=start,
+        started_ns = time.perf_counter_ns() if measured else None
+        if measured and first_measured_start_ns is None:
+            first_measured_start_ns = started_ns
+        try:
+            return original_compute_values(
+                self,
+                values,
+                nvalue,
+                is_warmup=is_warmup,
+                calibrate_loops=calibrate_loops,
+                start=start,
+            )
+        finally:
+            if measured and started_ns is not None:
+                ended_ns = time.perf_counter_ns()
+                last_measured_end_ns = ended_ns
+                measured_batches += 1
+                measured_wall_ns += ended_ns - started_ns
+
+    def flush_worker_timing() -> None:
+        if (
+            timing_path is None
+            or first_measured_start_ns is None
+            or last_measured_end_ns is None
+            or measured_batches == 0
+        ):
+            return
+
+        try:
+            worker_start_ns = int(
+                os.environ.get(_WORKER_START_ENV, str(first_measured_start_ns))
+            )
+        except ValueError:
+            worker_start_ns = first_measured_start_ns
+
+        work_dir = os.environ.get("SOAC_WORK_DIR", "")
+        record = _benchmark_manifest_record(work_dir)
+        record.update(
+            {
+                "record_type": "pyperformance_worker_timing_v1",
+                "pid": os.getpid(),
+                "setup_wall_ns": max(0, first_measured_start_ns - worker_start_ns),
+                "measured_batches": measured_batches,
+                "measured_wall_ns": measured_wall_ns,
+                "measured_span_wall_ns": max(
+                    0,
+                    last_measured_end_ns - first_measured_start_ns,
+                ),
+                "worker_total_wall_ns": max(
+                    0,
+                    time.perf_counter_ns() - worker_start_ns,
+                ),
+            }
         )
+        _append_jsonl(timing_path, record)
 
     worker_task_cls._compute_values = compute_values_with_pause
+    if timing_path is not None:
+        atexit.register(flush_worker_timing)
 
 
+_ensure_worker_timing_start()
 _install_measured_value_pause_hook()
 
 

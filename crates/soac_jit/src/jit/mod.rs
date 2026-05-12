@@ -14,8 +14,8 @@ use soac_core::block_py::{
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable,
     CounterDef, CounterId, Del, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId,
     InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ParamKind,
-    PreservedLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit,
-    current_instr_locations,
+    PreservedLocation, PreservedSlotStorage, ResolvedName, RuntimeFunctionId, RuntimeName,
+    StorageLayout, Store, Visit, current_instr_locations,
 };
 use soac_instrument::RUNTIME_DECREF_LOCATION_COUNTER_KIND;
 use soac_ir_blockpy::{
@@ -248,6 +248,7 @@ use symbols::{
     SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, push_direct_function_module_identity,
     register_runtime_type_for_key,
 };
+pub(crate) use typed_pipeline::JitModulePlan;
 #[cfg(test)]
 use typed_pipeline::{
     apply_profile_typed_block_metadata_to_typed_function,
@@ -278,17 +279,17 @@ use imports::{
     DP_JIT_DEL_PRESERVED_IMPORT, DP_JIT_DEL_PRESERVED_QUIETLY_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT,
     DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT, DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
     DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT,
-    DP_JIT_LOAD_CELL_IMPORT, DP_JIT_LOAD_PRESERVED_IMPORT, DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
-    DP_JIT_MAKE_CELL_IMPORT, DP_JIT_POP_HANDLED_EXCEPTION_IMPORT,
-    DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT, DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
-    DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT, DP_JIT_PY_CALL_OBJECT_IMPORT,
-    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_CALL_WITH_KW_IMPORT,
-    DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT, DP_JIT_PYOBJECT_GETITEM_IMPORT,
-    DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT, DP_JIT_PYOBJECT_TO_I64_IMPORT,
-    DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT, DP_JIT_RAISE_FROM_EXC_IMPORT,
-    DP_JIT_RAISE_I64_OVERFLOW_IMPORT, DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
-    DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT, DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
-    DP_JIT_STORE_CELL_IMPORT, DP_JIT_STORE_PRESERVED_IMPORT, ImportSpec, ModuleFuncImports,
+    DP_JIT_LOAD_CELL_IMPORT, DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
+    DP_JIT_MAKE_GENERATOR_INSTANCE_FROM_VECTORCALL_IMPORT, DP_JIT_POP_HANDLED_EXCEPTION_IMPORT,
+    DP_JIT_PRESERVED_VALUES_PTR_IMPORT, DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT,
+    DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT, DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
+    DP_JIT_PY_CALL_OBJECT_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
+    DP_JIT_PY_CALL_WITH_KW_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT,
+    DP_JIT_PYOBJECT_GETITEM_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT,
+    DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
+    DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
+    DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT, DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
+    DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
     PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT,
     PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT,
     PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
@@ -519,13 +520,13 @@ fn local_name_for_location<'a>(
         .unwrap_or_else(|| panic!("missing stack slot for local location {}", location.slot()))
 }
 
-fn emit_preserved_owner_with_local_env(
+fn emit_preserved_state_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     local_env
-        .load_name(fb, "_dp_self", ctx, true)
+        .load_name(fb, "_dp_state", ctx, true)
         .unwrap_or_else(|| {
             let qualname = ctx
                 .module
@@ -535,17 +536,51 @@ fn emit_preserved_owner_with_local_env(
                 .map(|function| function.names.qualname.as_str())
                 .unwrap_or("<unknown>");
             panic!(
-                "preserved slots require the generator resume owner local _dp_self [function={qualname} id={}]",
+                "preserved slots require the generator resume state local _dp_state [function={qualname} id={}]",
                 ctx.function_id
             )
         })
+}
+
+fn preserved_slot_storage_for_location(
+    ctx: &JitEmitCtx<'_>,
+    location: PreservedLocation,
+) -> PreservedSlotStorage {
+    ctx.storage_layout
+        .as_ref()
+        .and_then(|layout| layout.preserved_slot(location.slot()))
+        .map(|slot| slot.storage)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing preserved slot {} in storage layout for function {}",
+                location.slot(),
+                ctx.function_id
+            )
+        })
+}
+
+fn preserved_values_base_value(ctx: &JitEmitCtx<'_>) -> ir::Value {
+    ctx.consts.preserved_values_base_value.unwrap_or_else(|| {
+        panic!(
+            "missing preserved values base for function {}",
+            ctx.function_id
+        )
+    })
+}
+
+fn preserved_values_slot_offset(slot: u32) -> Result<i32, String> {
+    let slot_offset = i64::from(slot)
+        * i64::try_from(std::mem::size_of::<u64>())
+            .map_err(|_| "preserved slot word size does not fit i64".to_string())?;
+    i32::try_from(slot_offset)
+        .map_err(|_| format!("preserved slot offset {slot_offset} does not fit i32"))
 }
 
 fn emit_codegen_non_local_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
     _load_instr_id: Option<InstrId>,
-    local_env: &LocalEnv,
+    _local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     _borrowed: bool,
 ) -> Option<ir::Value> {
@@ -612,22 +647,43 @@ fn emit_codegen_non_local_name_load(
             Some(fb.block_params(value_ok_block)[0])
         }
         NameLocation::Preserved(location) => {
-            let owner = emit_preserved_owner_with_local_env(fb, local_env, ctx);
-            let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
-            let value_inst = fb.ins().call(ctx.load_preserved_ref, &[owner, slot]);
-            let value = fb.inst_results(value_inst)[0];
-            let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-            let value_ok_block = fb.create_block();
-            fb.append_block_param(value_ok_block, ptr_ty);
-            fb.ins().brif(
-                value_is_null,
-                ctx.consts.step_null_block,
-                &step_null_block_args(ctx),
-                value_ok_block,
-                &[ir::BlockArg::Value(value)],
-            );
-            fb.switch_to_block(value_ok_block);
-            Some(fb.block_params(value_ok_block)[0])
+            let values = preserved_values_base_value(ctx);
+            let slot_offset = preserved_values_slot_offset(location.slot()).unwrap_or_else(|err| {
+                panic!(
+                    "invalid preserved load offset for function {} slot {}: {err}",
+                    ctx.function_id,
+                    location.slot()
+                )
+            });
+            match preserved_slot_storage_for_location(ctx, location) {
+                PreservedSlotStorage::PyObjectOrNull | PreservedSlotStorage::PyCellObject => {
+                    let value = fb
+                        .ins()
+                        .load(ptr_ty, ir::MemFlags::trusted(), values, slot_offset);
+                    Some(emit_checked_local_value_or_unbound(
+                        fb,
+                        name.id.as_str(),
+                        value,
+                        LocalRefKind::Borrowed,
+                        ctx,
+                        false,
+                    ))
+                }
+                PreservedSlotStorage::I64 => {
+                    let value = fb.ins().load(
+                        ctx.consts.i64_ty,
+                        ir::MemFlags::trusted(),
+                        values,
+                        slot_offset,
+                    );
+                    let value_inst = fb.ins().call(ctx.py_long_from_i64_ref, &[value]);
+                    Some(emit_checked_owned_pyobject_result(
+                        fb,
+                        fb.inst_results(value_inst)[0],
+                        ctx,
+                    ))
+                }
+            }
         }
         NameLocation::Local(_) | NameLocation::Cell(_) => None,
     }
@@ -1546,6 +1602,7 @@ struct JitEmitConsts {
     scalar_counter_base_value: Option<ir::Value>,
     top_value_counter_base_value: Option<ir::Value>,
     thread_state_value: ir::Value,
+    preserved_values_base_value: Option<ir::Value>,
     none_constant_id: ModuleConstantId,
     true_constant_id: ModuleConstantId,
     false_constant_id: ModuleConstantId,
@@ -1596,10 +1653,9 @@ struct JitEmitCtx<'mc> {
     pyobject_setattr_ref: ir::FuncRef,
     pyobject_getitem_ref: ir::FuncRef,
     pyobject_setitem_ref: ir::FuncRef,
-    load_preserved_ref: ir::FuncRef,
-    store_preserved_ref: ir::FuncRef,
     del_preserved_ref: ir::FuncRef,
     del_preserved_quietly_ref: ir::FuncRef,
+    pyobject_to_i64_ref: ir::FuncRef,
     py_long_from_i64_ref: ir::FuncRef,
     raise_unbound_local_error_ref: ir::FuncRef,
     make_function_with_closure_ref: ir::FuncRef,
@@ -4439,7 +4495,6 @@ fn emit_preserved_store_result_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<EmitResult> {
     let location = op.name.preserved_location()?;
-    let owner = emit_preserved_owner_with_local_env(fb, local_env, emit_ctx);
     let value = emit_codegen_expr_with_local_env(
         fb,
         &op.value,
@@ -4449,18 +4504,8 @@ fn emit_preserved_store_result_with_local_env(
         codegen_env,
         func_imports,
     );
-    let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
-    let call_inst = fb
-        .ins()
-        .call(emit_ctx.store_preserved_ref, &[owner, slot, value]);
-    emit_ctx.emit_decref_for_family(fb, value, None, RefcountFamily::OwnedTemporary);
-    let result = emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], emit_ctx);
-    Some(emit_owned_pyobject_result_for_demand(
-        fb,
-        result,
-        PyObjFacts::none_singleton(),
-        emit_ctx,
-        demand,
+    Some(emit_preserved_store_value_result(
+        fb, location, value, true, emit_ctx, demand,
     ))
 }
 
@@ -4476,7 +4521,23 @@ fn emit_typed_preserved_store_result_with_local_env(
     let Some(location) = op.name.preserved_location() else {
         return Ok(None);
     };
-    let owner = emit_preserved_owner_with_local_env(fb, local_env, emit_ctx);
+    if preserved_slot_storage_for_location(emit_ctx, location) == PreservedSlotStorage::I64
+        && typed_expr_i64_demand_facts(op.value.as_ref(), local_env, emit_ctx).is_some()
+    {
+        let value_result = emit_typed_codegen_stmt_result_with_local_env(
+            fb,
+            &op.value,
+            local_env,
+            emit_ctx,
+            ResultDemand::I64_VALUE,
+            codegen_env,
+            func_imports,
+        )?;
+        let (raw_value, _) = value_result.expect_i64("typed preserved scalar store value");
+        return Ok(Some(emit_preserved_store_i64_result(
+            fb, location, raw_value, emit_ctx, demand,
+        )));
+    }
     let value = emit_typed_codegen_expr_value_with_local_env(
         fb,
         &op.value,
@@ -4487,21 +4548,118 @@ fn emit_typed_preserved_store_result_with_local_env(
         func_imports,
     )?;
     let (value, ownership, _) = value.expect_pyobject("typed preserved store value");
-    let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
-    let call_inst = fb
-        .ins()
-        .call(emit_ctx.store_preserved_ref, &[owner, slot, value]);
-    if ownership.is_owned() {
-        emit_ctx.emit_decref_for_family(fb, value, None, RefcountFamily::OwnedTemporary);
-    }
-    let result = emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], emit_ctx);
-    Ok(Some(emit_owned_pyobject_result_for_demand(
+    Ok(Some(emit_preserved_store_value_result(
         fb,
-        result,
-        PyObjFacts::none_singleton(),
+        location,
+        value,
+        ownership.is_owned(),
         emit_ctx,
         demand,
     )))
+}
+
+fn emit_preserved_store_value_result(
+    fb: &mut FunctionBuilder<'_>,
+    location: PreservedLocation,
+    value: ir::Value,
+    value_is_owned: bool,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    let values = preserved_values_base_value(emit_ctx);
+    let slot_offset = preserved_values_slot_offset(location.slot()).unwrap_or_else(|err| {
+        panic!(
+            "invalid preserved store offset for function {} slot {}: {err}",
+            emit_ctx.function_id,
+            location.slot()
+        )
+    });
+    match preserved_slot_storage_for_location(emit_ctx, location) {
+        PreservedSlotStorage::PyObjectOrNull | PreservedSlotStorage::PyCellObject => {
+            emit_ctx.emit_incref_for_family(
+                fb,
+                value,
+                Some(PyObjFacts::unknown().with_non_null_ref()),
+                RefcountFamily::ContainerStoreClone,
+            );
+            let old_value = fb.ins().load(
+                emit_ctx.consts.ptr_ty,
+                ir::MemFlags::trusted(),
+                values,
+                slot_offset,
+            );
+            fb.ins()
+                .store(ir::MemFlags::trusted(), value, values, slot_offset);
+            let null_ptr = fb.ins().iconst(emit_ctx.consts.ptr_ty, 0);
+            let old_is_null = fb
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, old_value, null_ptr);
+            let release_old_block = fb.create_block();
+            let done_block = fb.create_block();
+            fb.append_block_param(release_old_block, emit_ctx.consts.ptr_ty);
+            fb.ins().brif(
+                old_is_null,
+                done_block,
+                &[],
+                release_old_block,
+                &[ir::BlockArg::Value(old_value)],
+            );
+
+            fb.switch_to_block(release_old_block);
+            let old_value = fb.block_params(release_old_block)[0];
+            emit_ctx.emit_decref_for_family(
+                fb,
+                old_value,
+                Some(PyObjFacts::unknown().with_non_null_ref()),
+                RefcountFamily::ContainerOverwriteRelease,
+            );
+            fb.ins().jump(done_block, &[]);
+
+            fb.switch_to_block(done_block);
+            if value_is_owned {
+                emit_ctx.emit_decref_for_family(fb, value, None, RefcountFamily::OwnedTemporary);
+            }
+        }
+        PreservedSlotStorage::I64 => {
+            let value_inst = fb.ins().call(emit_ctx.pyobject_to_i64_ref, &[value]);
+            let raw_value = fb.inst_results(value_inst)[0];
+            let owned_inputs_storage = [value];
+            let owned_inputs = if value_is_owned {
+                &owned_inputs_storage[..]
+            } else {
+                &[][..]
+            };
+            let raw_value = emit_scalar_result_after_current_exception_check_with_cleanup(
+                fb,
+                raw_value,
+                emit_ctx.consts.i64_ty,
+                owned_inputs,
+                emit_ctx,
+            );
+            return emit_preserved_store_i64_result(fb, location, raw_value, emit_ctx, demand);
+        }
+    }
+    emit_none_for_demand(fb, emit_ctx, demand)
+}
+
+fn emit_preserved_store_i64_result(
+    fb: &mut FunctionBuilder<'_>,
+    location: PreservedLocation,
+    raw_value: ir::Value,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    let values = preserved_values_base_value(emit_ctx);
+    let slot_offset = preserved_values_slot_offset(location.slot()).unwrap_or_else(|err| {
+        panic!(
+            "invalid preserved scalar store offset for function {} slot {}: {err}",
+            emit_ctx.function_id,
+            location.slot()
+        )
+    });
+    fb.ins()
+        .store(ir::MemFlags::trusted(), raw_value, values, slot_offset);
+    emit_none_for_demand(fb, emit_ctx, demand)
 }
 
 fn typed_local_store_prefers_scalar_repr(
@@ -4812,33 +4970,115 @@ fn emit_preserved_delete_result(
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
-    let owner = emit_preserved_owner_with_local_env(fb, local_env, emit_ctx);
-    let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
-    let name_obj = emit_owned_module_constant(
-        fb,
-        emit_ctx.module_constants.require_unicode_constant_id(name),
-        emit_ctx,
-    );
-    let func_ref = if quietly {
-        emit_ctx.del_preserved_quietly_ref
-    } else {
-        emit_ctx.del_preserved_ref
-    };
-    let call_inst = fb.ins().call(func_ref, &[owner, slot, name_obj]);
-    emit_ctx.emit_decref_for_family(
-        fb,
-        name_obj,
-        Some(PyObjFacts::exact_type(PyExactType::Str)),
-        RefcountFamily::OwnedTemporary,
-    );
-    let result = emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], emit_ctx);
-    emit_owned_pyobject_result_for_demand(
-        fb,
-        result,
-        PyObjFacts::none_singleton(),
-        emit_ctx,
-        demand,
-    )
+    match preserved_slot_storage_for_location(emit_ctx, location) {
+        PreservedSlotStorage::PyObjectOrNull | PreservedSlotStorage::PyCellObject => {
+            let values = preserved_values_base_value(emit_ctx);
+            let slot_offset = preserved_values_slot_offset(location.slot()).unwrap_or_else(|err| {
+                panic!(
+                    "invalid preserved delete offset for function {} slot {}: {err}",
+                    emit_ctx.function_id,
+                    location.slot()
+                )
+            });
+            let null_ptr = fb.ins().iconst(emit_ctx.consts.ptr_ty, 0);
+            let old_value = fb.ins().load(
+                emit_ctx.consts.ptr_ty,
+                ir::MemFlags::trusted(),
+                values,
+                slot_offset,
+            );
+            let old_is_null = fb
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, old_value, null_ptr);
+            let release_block = fb.create_block();
+            let done_block = fb.create_block();
+            fb.append_block_param(release_block, emit_ctx.consts.ptr_ty);
+            if quietly {
+                fb.ins().brif(
+                    old_is_null,
+                    done_block,
+                    &[],
+                    release_block,
+                    &[ir::BlockArg::Value(old_value)],
+                );
+            } else {
+                let unbound_block = fb.create_block();
+                fb.ins().brif(
+                    old_is_null,
+                    unbound_block,
+                    &[],
+                    release_block,
+                    &[ir::BlockArg::Value(old_value)],
+                );
+
+                fb.switch_to_block(unbound_block);
+                let name_obj = emit_owned_module_constant(
+                    fb,
+                    emit_ctx.module_constants.require_unicode_constant_id(name),
+                    emit_ctx,
+                );
+                tracing::info!(
+                    target: "soac_unbound_local_codegen",
+                    function_id = ?emit_ctx.function_id,
+                    name,
+                    location = ?location,
+                    "emit_preserved_delete_unbound_path",
+                );
+                fb.ins()
+                    .call(emit_ctx.raise_unbound_local_error_ref, &[name_obj]);
+                emit_release_owned_inputs(fb, emit_ctx, &[name_obj]);
+                fb.ins().jump(
+                    emit_ctx.consts.step_null_block,
+                    &step_null_block_args(emit_ctx),
+                );
+            }
+
+            fb.switch_to_block(release_block);
+            let old_value = fb.block_params(release_block)[0];
+            fb.ins()
+                .store(ir::MemFlags::trusted(), null_ptr, values, slot_offset);
+            emit_ctx.emit_decref_for_family(
+                fb,
+                old_value,
+                Some(PyObjFacts::unknown().with_non_null_ref()),
+                RefcountFamily::ExplicitDelete,
+            );
+            fb.ins().jump(done_block, &[]);
+
+            fb.switch_to_block(done_block);
+            emit_none_for_demand(fb, emit_ctx, demand)
+        }
+        PreservedSlotStorage::I64 => {
+            let state = emit_preserved_state_with_local_env(fb, local_env, emit_ctx);
+            let slot = fb.ins().iconst(ir::types::I64, i64::from(location.slot()));
+            let name_obj = emit_owned_module_constant(
+                fb,
+                emit_ctx.module_constants.require_unicode_constant_id(name),
+                emit_ctx,
+            );
+            let func_ref = if quietly {
+                emit_ctx.del_preserved_quietly_ref
+            } else {
+                emit_ctx.del_preserved_ref
+            };
+            let call_inst = fb.ins().call(func_ref, &[state, slot, name_obj]);
+            emit_ctx.emit_decref_for_family(
+                fb,
+                name_obj,
+                Some(PyObjFacts::exact_type(PyExactType::Str)),
+                RefcountFamily::OwnedTemporary,
+            );
+            let result =
+                emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], emit_ctx);
+            emit_owned_pyobject_result_for_demand(
+                fb,
+                result,
+                PyObjFacts::none_singleton(),
+                emit_ctx,
+                demand,
+            )
+        }
+    }
 }
 
 fn emit_local_delete_with_local_env(
@@ -6016,6 +6256,14 @@ fn emit_checked_local_value_or_unbound(
         ctx.module_constants.require_unicode_constant_id(name),
         ctx,
     );
+    tracing::info!(
+        target: "soac_unbound_local_codegen",
+        function_id = ?ctx.function_id,
+        name,
+        borrowed,
+        ref_kind = ?ref_kind,
+        "emit_local_load_unbound_path",
+    );
     fb.ins()
         .call(ctx.raise_unbound_local_error_ref, &[name_obj]);
     emit_release_owned_inputs(fb, ctx, &[name_obj]);
@@ -6548,10 +6796,36 @@ fn emit_raw_cell_object_for_location_with_local_env(
             );
         }
         CellLocation::Preserved(slot) => {
-            let owner = emit_preserved_owner_with_local_env(fb, local_env, ctx);
-            let slot = fb.ins().iconst(ir::types::I64, i64::from(slot));
-            let call_inst = fb.ins().call(ctx.load_preserved_ref, &[owner, slot]);
-            emit_checked_owned_pyobject_result(fb, fb.inst_results(call_inst)[0], ctx)
+            let location = PreservedLocation(slot);
+            let values = preserved_values_base_value(ctx);
+            let slot_offset = preserved_values_slot_offset(slot).unwrap_or_else(|err| {
+                panic!(
+                    "invalid preserved cell load offset for function {} slot {}: {err}",
+                    ctx.function_id, slot
+                )
+            });
+            let value = fb.ins().load(
+                ctx.consts.ptr_ty,
+                ir::MemFlags::trusted(),
+                values,
+                slot_offset,
+            );
+            match preserved_slot_storage_for_location(ctx, location) {
+                PreservedSlotStorage::PyCellObject | PreservedSlotStorage::PyObjectOrNull => {
+                    emit_checked_local_value_or_unbound(
+                        fb,
+                        debug_name,
+                        value,
+                        LocalRefKind::Borrowed,
+                        ctx,
+                        false,
+                    )
+                }
+                PreservedSlotStorage::I64 => panic!(
+                    "preserved raw cell slot {} in function {} used scalar storage",
+                    slot, ctx.function_id
+                ),
+            }
         }
         CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
             emit_raw_closure_cell_object_for_slot(fb, slot, ctx)
@@ -6909,6 +7183,61 @@ fn emit_positional_vectorcall_result_with_arg_values(
         ctx,
         demand,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_generator_instance_result_with_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    arg_values: Vec<ir::Value>,
+    arg_borrowed: Vec<bool>,
+    ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    debug_assert_eq!(arg_values.len(), arg_borrowed.len());
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let args_ptr = if arg_values.is_empty() {
+        null_ptr
+    } else {
+        let args_slot = fb.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            (arg_values.len() * std::mem::size_of::<u64>()) as u32,
+            0,
+        ));
+        for (index, value) in arg_values.iter().copied().enumerate() {
+            fb.ins().stack_store(
+                value,
+                args_slot,
+                (index * std::mem::size_of::<u64>()) as i32,
+            );
+        }
+        fb.ins().stack_addr(ptr_ty, args_slot, 0)
+    };
+    let nargsf = fb.ins().iconst(ptr_ty, arg_values.len() as i64);
+    let make_generator_instance_ref = func_imports.get(
+        codegen_env,
+        &mut fb.func,
+        &DP_JIT_MAKE_GENERATOR_INSTANCE_FROM_VECTORCALL_IMPORT,
+    )?;
+    let call_inst = fb.ins().call(
+        make_generator_instance_ref,
+        &[callable, args_ptr, nargsf, null_ptr],
+    );
+    let call_value = fb.inst_results(call_inst)[0];
+    Ok(emit_checked_positional_call_result_for_demand(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        call_value,
+        ctx,
+        demand,
+    ))
 }
 
 fn emit_positional_call_three_with_local_env(
@@ -11399,6 +11728,51 @@ fn emit_typed_positional_call_result_with_arg_refs(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_generator_instance_call_result_with_arg_refs(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrTyped],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let (arg_values, arg_borrowed) =
+        emit_typed_positional_arg_values(fb, args, local_env, emit_ctx, codegen_env, func_imports)?;
+    let call_demand = if demand == ResultDemand::I32Bool01 {
+        ResultDemand::PYOBJECT_OWNED
+    } else {
+        demand
+    };
+    let result = emit_generator_instance_result_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        emit_ctx,
+        call_demand,
+        codegen_env,
+        func_imports,
+    )?;
+    if demand == ResultDemand::I32Bool01 {
+        let (value, ownership, facts) =
+            result.expect_pyobject("typed generator instance call bool result");
+        let is_true_ref = func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+        return Ok(emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::pyobject_with_ownership(value, ownership, facts),
+            emit_ctx,
+            demand,
+            Some(is_true_ref),
+        ));
+    }
+    Ok(result)
+}
+
 fn current_constructor_entry_init_function<'a>(
     emit_ctx: &'a JitEmitCtx<'_>,
 ) -> Option<&'a BlockPyFunction<TypedBlockPyModuleShape>> {
@@ -14951,6 +15325,16 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         .try_semantic_instr_id()
         .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
         .copied();
+    if let Some(plan) = call.extra.generator_instance_plan() {
+        tracing::info!(
+            target: "soac_generator_instance_codegen",
+            function = ?emit_ctx.function_id,
+            instr_id = ?call.try_semantic_instr_id(),
+            generator = ?plan.function_id,
+            lane = "call_typed_simple_positional",
+            "typed_generator_instance_codegen_lane",
+        );
+    }
 
     let mut sampled_protocol_target = false;
     if call_access_allows_protocol_target_sample(Some(&call.access))
@@ -14991,17 +15375,31 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
     }
 
-    let result = emit_typed_positional_call_result_with_arg_refs(
-        fb,
-        callable,
-        callable_is_borrowed,
-        arg_refs.as_slice(),
-        local_env,
-        emit_ctx,
-        demand,
-        codegen_env,
-        func_imports,
-    )?;
+    let result = if call.extra.generator_instance_plan().is_some() {
+        emit_typed_generator_instance_call_result_with_arg_refs(
+            fb,
+            callable,
+            callable_is_borrowed,
+            arg_refs.as_slice(),
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?
+    } else {
+        emit_typed_positional_call_result_with_arg_refs(
+            fb,
+            callable,
+            callable_is_borrowed,
+            arg_refs.as_slice(),
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?
+    };
     Ok(Some(result))
 }
 
@@ -15328,11 +15726,43 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    if let Some(plan) = call.extra.generator_instance_plan() {
+        tracing::info!(
+            target: "soac_generator_instance_codegen",
+            function = ?emit_ctx.function_id,
+            instr_id = ?call.try_semantic_instr_id(),
+            generator = ?plan.function_id,
+            lane = "guarded_callable",
+            "typed_generator_instance_codegen_lane",
+        );
+    }
     let arg_refs = typed_simple_positional_arg_refs(
         call.args.as_slice(),
         call.keywords.as_slice(),
         "typed guarded callable call",
     )?;
+    if call.extra.generator_instance_plan().is_some() {
+        let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+            "typed guarded generator callable",
+        )?;
+        return emit_typed_generator_instance_call_result_with_arg_refs(
+            fb,
+            callable,
+            callable_is_borrowed,
+            arg_refs.as_slice(),
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        );
+    }
     let direct_specializations =
         direct_function_specializations_from_typed_guards(call.function_guards.as_slice());
     if direct_specializations.is_empty() {
@@ -15614,6 +16044,16 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    if let Some(plan) = call.extra.generator_instance_plan() {
+        tracing::info!(
+            target: "soac_generator_instance_codegen",
+            function = ?emit_ctx.function_id,
+            instr_id = ?call.try_semantic_instr_id(),
+            generator = ?plan.function_id,
+            lane = "direct_callable",
+            "typed_generator_instance_codegen_lane",
+        );
+    }
     let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         call.func.as_ref(),
@@ -15629,6 +16069,20 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
             return Err("typed direct callable call does not support starred args".to_string());
         };
         arg_refs.push(arg);
+    }
+    if call.extra.generator_instance_plan().is_some() {
+        let result = emit_typed_generator_instance_call_result_with_arg_refs(
+            fb,
+            callable,
+            callable_is_borrowed,
+            arg_refs.as_slice(),
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?;
+        return Ok(result);
     }
     let TypedDirectCallableCallGuard::Function(guard) = &call.guard;
     let target_function =
@@ -21247,10 +21701,11 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_GETITEM_IMPORT);
         let pyobject_setitem_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PYOBJECT_SETITEM_IMPORT);
-        let load_preserved_ref =
-            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_LOAD_PRESERVED_IMPORT);
-        let store_preserved_ref =
-            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_STORE_PRESERVED_IMPORT);
+        let preserved_values_ptr_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_PRESERVED_VALUES_PTR_IMPORT,
+        );
         let del_preserved_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEL_PRESERVED_IMPORT);
         let del_preserved_quietly_ref = func_imports.get_or_panic(
@@ -21476,6 +21931,57 @@ fn build_cranelift_run_bb_specialized_function(
                 entry_param_values.insert(param.binding.name.as_str(), null_ptr);
             }
         }
+        let preserved_values_base_value =
+            if function
+                .storage_layout()
+                .as_ref()
+                .is_some_and(|layout| !layout.preserved_slots.is_empty())
+            {
+                let preserved_state = entry_param_values.get("_dp_state").copied().ok_or_else(
+                    || {
+                        format!(
+                            "preserved-state function {} ({}) is missing direct entry _dp_state",
+                            function.function_id, function.names.qualname
+                        )
+                    },
+                )?;
+                let values_inst = fb.ins().call(preserved_values_ptr_ref, &[preserved_state]);
+                let values = fb.inst_results(values_inst)[0];
+                let values_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, values, null_ptr);
+                let values_ok_block = fb.create_block();
+                fb.append_block_param(values_ok_block, ptr_ty);
+                fb.ins().brif(
+                    values_is_null,
+                    entry_failure_block,
+                    &block_arg_values(&entry_failure_args),
+                    values_ok_block,
+                    &[ir::BlockArg::Value(values)],
+                );
+                fb.switch_to_block(values_ok_block);
+                Some(fb.block_params(values_ok_block)[0])
+            } else {
+                None
+            };
+        if let Some(layout) = function.storage_layout().as_ref()
+            && !layout.preserved_slots.is_empty()
+        {
+            tracing::info!(
+                target: "soac_generator_preserved_layout",
+                function_id = ?function.function_id,
+                qualname = function.names.qualname.as_str(),
+                preserved_slots = ?layout
+                    .preserved_slots
+                    .iter()
+                    .map(|slot| (
+                        slot.logical_name.as_str(),
+                        slot.storage_name.as_str(),
+                        slot.storage,
+                        slot.init.clone(),
+                    ))
+                    .collect::<Vec<_>>(),
+                "jit_resume_body_preserved_layout",
+            );
+        }
         let entry_jump_args = runtime_block_params[0]
             .iter()
             .map(|param| {
@@ -21592,6 +22098,7 @@ fn build_cranelift_run_bb_specialized_function(
                     scalar_counter_base_value,
                     top_value_counter_base_value,
                     thread_state_value,
+                    preserved_values_base_value,
                     none_constant_id,
                     true_constant_id,
                     false_constant_id,
@@ -21616,10 +22123,9 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_setattr_ref,
                 pyobject_getitem_ref,
                 pyobject_setitem_ref,
-                load_preserved_ref,
-                store_preserved_ref,
                 del_preserved_ref,
                 del_preserved_quietly_ref,
+                pyobject_to_i64_ref,
                 py_long_from_i64_ref,
                 raise_unbound_local_error_ref,
                 make_function_with_closure_ref,

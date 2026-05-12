@@ -90,6 +90,12 @@ def reuse_iterator(stop):
     iterator = iter(range(stop))
     return list(iterator), list(iterator)
 
+def collect_reversed_stop(stop):
+    return list(reversed(range(stop)))
+
+def collect_reversed_step(start, stop, step):
+    return list(reversed(range(start, stop, step)))
+
 def iterator_type_name(stop):
     return type(iter(range(stop))).__name__
 
@@ -130,6 +136,9 @@ def no_index():
         assert module.collect_step(5, 1, -2) == [5, 3]
         assert module.reuse_range(3) == ([0, 1, 2], [0, 1, 2])
         assert module.reuse_iterator(3) == ([0, 1, 2], [])
+        assert module.collect_reversed_stop(4) == [3, 2, 1, 0]
+        assert module.collect_reversed_step(1, 8, 2) == [7, 5, 3, 1]
+        assert module.collect_reversed_step(8, 1, -3) == [2, 5, 8]
         assert module.iterator_type_name(3) == "IterRange"
         assert module.range_type_name(3) == ("soac.runtime", "range")
         assert module.collect_indexable() == [1, 3]

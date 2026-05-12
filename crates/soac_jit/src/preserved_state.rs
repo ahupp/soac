@@ -247,6 +247,13 @@ pub unsafe fn load_preserved_state_owned(
     }
 }
 
+pub unsafe fn preserved_values_ptr(capsule: *mut ffi::PyObject) -> *mut u64 {
+    let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
+        return ptr::null_mut();
+    };
+    state.values.as_mut_ptr()
+}
+
 pub unsafe fn store_preserved_state(
     capsule: *mut ffi::PyObject,
     slot: i64,
@@ -367,6 +374,20 @@ mod tests {
                 object_before_state + 1,
                 "object slots should own their initial value"
             );
+            let values_ptr = preserved_values_ptr(state);
+            assert!(
+                !values_ptr.is_null(),
+                "preserved state should expose raw slot storage"
+            );
+            assert_eq!(
+                *values_ptr, object as usize as u64,
+                "object slots should store the owned object pointer directly"
+            );
+            assert_eq!(
+                *values_ptr.add(1),
+                7_u64,
+                "i64 slots should store their machine integer payload directly"
+            );
 
             let loaded_object = load_preserved_state_owned(state, 0);
             assert_eq!(
@@ -403,6 +424,15 @@ mod tests {
             let store_i64_result = store_preserved_state(state, 1, replacement_i64);
             assert!(!store_i64_result.is_null(), "i64 store should succeed");
             ffi::Py_DECREF(store_i64_result);
+            assert_eq!(
+                *values_ptr, replacement as usize as u64,
+                "object stores should update raw preserved slot storage in place"
+            );
+            assert_eq!(
+                *values_ptr.add(1),
+                11_u64,
+                "i64 stores should update raw preserved slot storage in place"
+            );
             let reloaded_i64 = load_preserved_state_owned(state, 1);
             assert_eq!(
                 py_long_as_i64(reloaded_i64),

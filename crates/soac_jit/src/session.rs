@@ -1,4 +1,4 @@
-use crate::jit::{PlannedOptimizationInputs, ProcessJitEngine};
+use crate::jit::{JitModulePlan, PlannedOptimizationInputs, ProcessJitEngine};
 use crate::module_type::SharedModuleState;
 use soac_config::{SoacEnvConfig, SpecializationMode};
 use soac_core::block_py::{BlockPyFunction, ModuleNameGen, RuntimeFunctionId};
@@ -32,22 +32,25 @@ pub struct CompileSession {
     shared_module_states: Mutex<SharedModuleStateRegistry>,
     planned_optimization_inputs:
         Mutex<HashMap<PlannedOptimizationInputsCacheKey, Arc<PlannedOptimizationInputsResult>>>,
+    shared_typed_module_plans:
+        Mutex<HashMap<SharedTypedModulePlanCacheKey, Arc<SharedTypedModulePlanResult>>>,
     process_jit: OnceLock<Result<ProcessJitEngine, String>>,
     env_config: OnceLock<Result<SoacEnvConfig, String>>,
 }
 
 type PlannedOptimizationInputsResult = Result<PlannedOptimizationInputs, String>;
+type SharedTypedModulePlanResult = Result<Arc<JitModulePlan>, String>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PlannedOptimizationInputsCacheKey {
     module_storage_instance_key: usize,
     shared_module_registry_epoch: u64,
     counter_dump_path: PathBuf,
-    specialization_mode: PlannedOptimizationInputsMode,
+    specialization_mode: CachedSpecializationMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum PlannedOptimizationInputsMode {
+enum CachedSpecializationMode {
     Verify,
     Apply,
 }
@@ -59,17 +62,57 @@ impl PlannedOptimizationInputsCacheKey {
         counter_dump_path: PathBuf,
         specialization_mode: SpecializationMode,
     ) -> Option<Self> {
-        let specialization_mode = match specialization_mode {
-            SpecializationMode::Verify => PlannedOptimizationInputsMode::Verify,
-            SpecializationMode::Apply => PlannedOptimizationInputsMode::Apply,
-            SpecializationMode::Profile => return None,
-        };
+        let specialization_mode = CachedSpecializationMode::new(specialization_mode)?;
         Some(Self {
             module_storage_instance_key,
             shared_module_registry_epoch,
             counter_dump_path,
             specialization_mode,
         })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SharedTypedModulePlanCacheKey {
+    module_storage_instance_key: usize,
+    shared_module_registry_epoch: u64,
+    counter_dump_path: PathBuf,
+    specialization_mode: CachedSpecializationMode,
+    behavior_change_indexed_stores: bool,
+    profiled_cold_blocks: bool,
+    guard_miss_deopt: bool,
+}
+
+impl SharedTypedModulePlanCacheKey {
+    pub(crate) fn new(
+        module_storage_instance_key: usize,
+        shared_module_registry_epoch: u64,
+        counter_dump_path: PathBuf,
+        specialization_mode: SpecializationMode,
+        behavior_change_indexed_stores: bool,
+        profiled_cold_blocks: bool,
+        guard_miss_deopt: bool,
+    ) -> Option<Self> {
+        let specialization_mode = CachedSpecializationMode::new(specialization_mode)?;
+        Some(Self {
+            module_storage_instance_key,
+            shared_module_registry_epoch,
+            counter_dump_path,
+            specialization_mode,
+            behavior_change_indexed_stores,
+            profiled_cold_blocks,
+            guard_miss_deopt,
+        })
+    }
+}
+
+impl CachedSpecializationMode {
+    fn new(specialization_mode: SpecializationMode) -> Option<Self> {
+        match specialization_mode {
+            SpecializationMode::Verify => Some(Self::Verify),
+            SpecializationMode::Apply => Some(Self::Apply),
+            SpecializationMode::Profile => None,
+        }
     }
 }
 
@@ -124,6 +167,7 @@ impl CompileSession {
             shared_module_registry_epoch: AtomicU64::new(0),
             shared_module_states: Mutex::new(SharedModuleStateRegistry::default()),
             planned_optimization_inputs: Mutex::new(HashMap::new()),
+            shared_typed_module_plans: Mutex::new(HashMap::new()),
             process_jit: OnceLock::new(),
             env_config: OnceLock::new(),
         }
@@ -209,6 +253,36 @@ impl CompileSession {
         clone_planned_optimization_inputs_result(cached.as_ref())
     }
 
+    pub(crate) fn cached_shared_typed_module_plan(
+        &self,
+        key: SharedTypedModulePlanCacheKey,
+        build: impl FnOnce() -> SharedTypedModulePlanResult,
+    ) -> SharedTypedModulePlanResult {
+        if let Some(cached) = self
+            .shared_typed_module_plans
+            .lock()
+            .map_err(|_| {
+                "compile session shared typed module plan cache lock poisoned".to_string()
+            })?
+            .get(&key)
+            .cloned()
+        {
+            return clone_shared_typed_module_plan_result(cached.as_ref());
+        }
+
+        let built = Arc::new(build());
+        let cached = {
+            let mut cache = self.shared_typed_module_plans.lock().map_err(|_| {
+                "compile session shared typed module plan cache lock poisoned".to_string()
+            })?;
+            cache
+                .entry(key)
+                .or_insert_with(|| Arc::clone(&built))
+                .clone()
+        };
+        clone_shared_typed_module_plan_result(cached.as_ref())
+    }
+
     pub fn retain_shared_module_state_for_inspection(
         &self,
         shared_state: Arc<SharedModuleState>,
@@ -281,6 +355,15 @@ fn clone_planned_optimization_inputs_result(
 ) -> PlannedOptimizationInputsResult {
     match result {
         Ok(inputs) => Ok(inputs.clone()),
+        Err(err) => Err(err.clone()),
+    }
+}
+
+fn clone_shared_typed_module_plan_result(
+    result: &SharedTypedModulePlanResult,
+) -> SharedTypedModulePlanResult {
+    match result {
+        Ok(plan) => Ok(Arc::clone(plan)),
         Err(err) => Err(err.clone()),
     }
 }

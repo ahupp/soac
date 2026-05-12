@@ -1253,10 +1253,11 @@ pub struct TypedBuiltinImplementationPlan {
     pub arg_plan: TypedDirectCallArgPlan,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedGeneratorResumePlan {
     pub function_id: RuntimeFunctionId,
-    pub generator_origin: InstrId,
+    pub generator_origin: Option<InstrId>,
+    pub candidate_origins: Vec<InstrId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1462,11 +1463,11 @@ impl TypedInstrExtra {
     }
 
     pub fn generator_resume_plan(&self) -> Option<TypedGeneratorResumePlan> {
-        self.generator_resume
+        self.generator_resume.clone()
     }
 
     pub fn set_generator_resume_plan(&mut self, plan: TypedGeneratorResumePlan) -> bool {
-        if self.generator_resume == Some(plan) {
+        if self.generator_resume.as_ref() == Some(&plan) {
             return false;
         }
         self.generator_resume = Some(plan);

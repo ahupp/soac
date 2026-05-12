@@ -888,6 +888,45 @@ pub unsafe fn start_background_jit_compile_for_module(
         })
 }
 
+pub unsafe fn eager_compile_jit_for_module(module: *mut ffi::PyObject) -> Result<(), ()> {
+    let py = Python::assume_attached();
+    if module.is_null() {
+        return set_runtime_error("missing transformed module for eager JIT compile");
+    }
+    let module = unsafe { Bound::from_borrowed_ptr(py, module) };
+    let shared_state = crate::module_type::SoacExtModule::clone_shared_state(module.as_any())
+        .map_err(|err| {
+            err.restore(py);
+        })?;
+    let compile_session = CompileSession::process();
+    let process_jit = compile_session.process_jit().map_err(|err| {
+        if let Ok(c_msg) = CString::new(err) {
+            unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr()) };
+        } else {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"failed to initialize process JIT for eager compile\0".as_ptr()
+                        as *const c_char,
+                )
+            };
+        }
+    })?;
+    unsafe { process_jit.eager_compile_shared_module(Arc::clone(&compile_session), shared_state) }
+        .map_err(|err| {
+            if let Ok(c_msg) = CString::new(err) {
+                unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr()) };
+            } else {
+                unsafe {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        b"failed to eagerly compile transformed module\0".as_ptr() as *const c_char,
+                    )
+                };
+            }
+        })
+}
+
 unsafe fn make_clif_function_data(
     callable: *mut ffi::PyObject,
     function_id: RuntimeFunctionId,
@@ -1630,17 +1669,18 @@ fn lookup_or_compile_direct_function_handle(
 pub unsafe fn resume_generator(
     resume_function: *mut ffi::PyObject,
     owner: *mut ffi::PyObject,
+    preserved_state: *mut ffi::PyObject,
     send_value: *mut ffi::PyObject,
     resume_exc: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
     let Ok(data) = (unsafe { py_function_jit_extra(resume_function) }) else {
         return ptr::null_mut();
     };
-    if data.function_template.function().body_params().len() != 3 {
+    if data.function_template.function().body_params().len() != 4 {
         unsafe {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                c"generator resume function expected a 3-argument resume body".as_ptr(),
+                c"generator resume function expected a 4-argument resume body".as_ptr(),
             );
         }
         return ptr::null_mut();
@@ -1655,12 +1695,14 @@ pub unsafe fn resume_generator(
         *mut ffi::PyObject,
         *mut ffi::PyObject,
         *mut ffi::PyObject,
+        *mut ffi::PyObject,
     ) -> *mut ffi::PyObject = unsafe { mem::transmute(data.function_env.direct_code_ptr()) };
     unsafe {
         entry(
             data.function_env.as_mut_ptr(),
             ffi::PyThreadState_Get().cast(),
             owner,
+            preserved_state,
             send_value,
             resume_exc,
         )
@@ -1670,6 +1712,7 @@ pub unsafe fn resume_generator(
 pub unsafe fn resume_async_generator(
     resume_function: *mut ffi::PyObject,
     owner: *mut ffi::PyObject,
+    preserved_state: *mut ffi::PyObject,
     send_value: *mut ffi::PyObject,
     resume_exc: *mut ffi::PyObject,
     transport_sent: *mut ffi::PyObject,
@@ -1677,11 +1720,11 @@ pub unsafe fn resume_async_generator(
     let Ok(data) = (unsafe { py_function_jit_extra(resume_function) }) else {
         return ptr::null_mut();
     };
-    if data.function_template.function().body_params().len() != 4 {
+    if data.function_template.function().body_params().len() != 5 {
         unsafe {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                c"async-generator resume function expected a 4-argument resume body".as_ptr(),
+                c"async-generator resume function expected a 5-argument resume body".as_ptr(),
             );
         }
         return ptr::null_mut();
@@ -1697,12 +1740,14 @@ pub unsafe fn resume_async_generator(
         *mut ffi::PyObject,
         *mut ffi::PyObject,
         *mut ffi::PyObject,
+        *mut ffi::PyObject,
     ) -> *mut ffi::PyObject = unsafe { mem::transmute(data.function_env.direct_code_ptr()) };
     unsafe {
         entry(
             data.function_env.as_mut_ptr(),
             ffi::PyThreadState_Get().cast(),
             owner,
+            preserved_state,
             send_value,
             resume_exc,
             transport_sent,
@@ -2471,6 +2516,22 @@ unsafe fn make_generator_instance_from_vectorcall(
     let Some(layout) = function.public_storage_layout() else {
         return set_runtime_error("generator-like function is missing preserved-state layout");
     };
+    tracing::info!(
+        target: "soac_generator_preserved_layout",
+        function_id = ?function.function_id,
+        qualname = function.names.qualname.as_str(),
+        preserved_slots = ?layout
+            .preserved_slots
+            .iter()
+            .map(|slot| (
+                slot.logical_name.as_str(),
+                slot.storage_name.as_str(),
+                slot.storage,
+                slot.init.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        "generator_factory_public_preserved_layout",
+    );
     let Some(yieldfrom_slot) = layout
         .preserved_slots
         .iter()
@@ -2534,12 +2595,30 @@ unsafe fn make_generator_instance_from_vectorcall(
                     return set_runtime_error("preserved parameter slot has no public parameter");
                 };
                 let value = bound_args[param_index];
-                if value.is_null() {
-                    ffi::Py_DECREF(initial_values);
-                    ffi::Py_DECREF(slot_kinds);
-                    cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
-                    return set_runtime_error("preserved parameter slot was not bound");
-                }
+                let value = if value.is_null() {
+                    let Some(default_slot) = data
+                        .function_template
+                        .binding_plan()
+                        .params
+                        .get(param_index)
+                        .and_then(|param| param.default_slot)
+                    else {
+                        ffi::Py_DECREF(initial_values);
+                        ffi::Py_DECREF(slot_kinds);
+                        cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                        return set_runtime_error("preserved parameter slot was not bound");
+                    };
+                    let default_value = data.function_env.runtime_object(default_slot);
+                    if default_value.is_null() {
+                        ffi::Py_DECREF(initial_values);
+                        ffi::Py_DECREF(slot_kinds);
+                        cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                        return set_runtime_error("preserved parameter slot default was not bound");
+                    }
+                    default_value
+                } else {
+                    value
+                };
                 match slot.storage {
                     PreservedSlotStorage::PyCellObject => {
                         let cell = PyCell_New(value);

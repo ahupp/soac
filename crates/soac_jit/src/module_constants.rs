@@ -581,7 +581,9 @@ impl ModuleConstantCollector {
                         .intern_unicode_bytes(runtime_name.name().as_bytes());
                 }
             }
-            InstrBlockPy::Load(op) if op.name.local_location().is_some() => {
+            InstrBlockPy::Load(op)
+                if op.name.local_location().is_some() || op.name.preserved_location().is_some() =>
+            {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
                 if op.name.id_str().starts_with("_dp_try_abrupt_kind_") {
@@ -712,7 +714,9 @@ impl ModuleConstantCollector {
                         .intern_unicode_bytes(runtime_name.name().as_bytes());
                 }
             }
-            InstrTyped::Load(op) if op.name.local_location().is_some() => {
+            InstrTyped::Load(op)
+                if op.name.local_location().is_some() || op.name.preserved_location().is_some() =>
+            {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
                 if op.name.id_str().starts_with("_dp_try_abrupt_kind_") {

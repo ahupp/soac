@@ -2,7 +2,7 @@ use crate::block_py::PrettyPrint;
 use crate::block_py::{
     instr_any, BlockArg, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, Call,
     CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable,
-    FunctionExecutionMode, FunctionKind, InstrResolved, NameLike, NameLocation,
+    FunctionExecutionMode, FunctionKind, InstrResolved, NameLike, NameLocation, PreservedLocation,
     ResolvedStorageBlock, ScopeExprNode,
 };
 use crate::block_py::{
@@ -4011,6 +4011,58 @@ def outer():
     assert!(
         resolved_function_uses_preserved_cell(gen),
         "generator body should access its owned lexical cell through preserved state:\n{}",
+        lowering.name_binding_text(),
+    );
+}
+
+#[test]
+fn generator_preserved_cell_block_param_sync_writes_through_the_cell() {
+    let source = r#"
+def gen(items):
+    for item in items:
+        def inner():
+            return item
+        yield inner
+"#;
+
+    let lowering = TrackedLowering::new(source);
+    let bb_module = lowering.bb_module();
+    let gen = bb_module
+        .callable_defs
+        .iter()
+        .find(|func| func.names.bind_name == "gen")
+        .expect("missing lowered generator function");
+    let item_slot = gen
+        .public_storage_layout()
+        .expect("generator should have preserved state")
+        .preserved_slots
+        .iter()
+        .enumerate()
+        .find_map(|(slot, preserved)| {
+            (preserved.logical_name == "item"
+                && preserved.storage == PreservedSlotStorage::PyCellObject)
+                .then_some(PreservedLocation(
+                    u32::try_from(slot).expect("preserved slot should fit in u32"),
+                ))
+        })
+        .expect("captured loop variable should use preserved cell storage");
+
+    assert!(
+        blockpy_function_instr_any(gen, |expr| matches!(
+            expr,
+            InstrResolved::Store(store)
+                if store.name.cell_location() == Some(CellLocation::Preserved(item_slot.0))
+        )),
+        "block-param sync for a preserved lexical cell should write through the preserved cell:\n{}",
+        lowering.name_binding_text(),
+    );
+    assert!(
+        !blockpy_function_instr_any(gen, |expr| matches!(
+            expr,
+            InstrResolved::Store(store)
+                if store.name.preserved_location() == Some(item_slot)
+        )),
+        "block-param sync must not overwrite the preserved raw cell object itself:\n{}",
         lowering.name_binding_text(),
     );
 }

@@ -357,6 +357,12 @@ impl SharedModuleState {
         {
             return Ok(Some((handle, false)));
         }
+        if let Some(handle) = compile_session
+            .process_jit()?
+            .lookup_ready_direct_function(&function)?
+        {
+            return Ok(Some((handle, false)));
+        }
         let blocks = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
         let module_constant_ptrs = self.module_constant_ptrs();
         let compile_start = std::time::Instant::now();

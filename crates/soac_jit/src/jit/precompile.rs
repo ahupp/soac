@@ -20,7 +20,8 @@ use super::precompiled_object::{
 use super::runtime_support::compile_runtime_support_clif_for_object;
 use super::symbols::direct_function_backend_name;
 use super::typed_pipeline::{
-    apply_profile_call_emission_plans_to_typed_function, optimize_blockpy,
+    apply_profile_call_emission_plans_to_typed_function, collect_codegen_constants_for_module_name,
+    optimize_blockpy,
 };
 use super::{
     BuildSpecializedFunctionOptions, SpecializationProfile,
@@ -28,7 +29,7 @@ use super::{
 };
 use crate::config::{CraneliftTargetConfig, pre_optimization_module_cache_identity};
 use crate::counter::TopValueCounter;
-use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
+use crate::module_constants::ModuleConstantId;
 use crate::module_type::build_counter_storage_layout;
 use cranelift_jit::JITModule;
 use soac_core::block_py::{
@@ -251,7 +252,30 @@ pub(super) fn precompile_codegen_module_to_object_bytes(
     let mut function_definitions =
         compile_runtime_support_clif_for_object(&mut jit_module, env_config, object_isa.as_ref())?;
 
-    let module_constants = ModuleCodegenConstants::collect_from_module(module);
+    let default_cache_identity;
+    let cache_identity = match cache_identity {
+        Some(cache_identity) => cache_identity,
+        None => {
+            default_cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                module_name == "soac.runtime",
+            );
+            default_cache_identity.as_str()
+        }
+    };
+    let specialization_profile = SpecializationProfile::from_precompile(
+        env_config,
+        module_name,
+        source_hash,
+        cache_identity,
+        module,
+        module_index,
+        counter_dump_path,
+    )?;
+    let jit_module_plan = optimize_blockpy(module, Some(&specialization_profile), env_config)?;
+    let planned_module = jit_module_plan.module.as_ref();
+
+    let module_constants = collect_codegen_constants_for_module_name(module_name, planned_module);
     let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
     let module_constant_symbol_prefix =
         module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
@@ -361,28 +385,6 @@ pub(super) fn precompile_codegen_module_to_object_bytes(
         });
     }
 
-    let default_cache_identity;
-    let cache_identity = match cache_identity {
-        Some(cache_identity) => cache_identity,
-        None => {
-            default_cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                module_name == "soac.runtime",
-            );
-            default_cache_identity.as_str()
-        }
-    };
-    let specialization_profile = SpecializationProfile::from_precompile(
-        env_config,
-        module_name,
-        source_hash,
-        cache_identity,
-        module,
-        module_index,
-        counter_dump_path,
-    )?;
-    let jit_module_plan = optimize_blockpy(module, Some(&specialization_profile), env_config)?;
-    let planned_module = jit_module_plan.module.as_ref();
     let external_direct_call_target_functions = precompile_external_direct_call_target_functions(
         planned_module,
         &specialization_profile,

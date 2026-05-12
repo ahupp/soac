@@ -79,7 +79,14 @@ def _unsupported_frame_builtin(*args, **kwargs):
 
 
 def tuple_from_iter(value):
-    return _builtins.tuple(value)
+    result = []
+    iterator = iter(value)
+    while True:
+        try:
+            item = next(iterator)
+            result.append(item)
+        except StopIteration:
+            return _builtins.tuple(result)
 
 
 def list_from_iter(value):
@@ -89,6 +96,17 @@ def list_from_iter(value):
         try:
             item = next(iterator)
             result.append(item)
+        except StopIteration:
+            return result
+
+
+def set_from_iter(value):
+    result = set()
+    iterator = iter(value)
+    while True:
+        try:
+            item = next(iterator)
+            result.add(item)
         except StopIteration:
             return result
 
@@ -314,12 +332,14 @@ def unpack(iterable, spec):
     result = []
     star_index = None
 
-    for idx, flag in enumerate(spec):
+    idx = 0
+    for flag in spec:
         if flag:
             try:
                 result.append(next(iterator))
             except StopIteration as exc:
                 raise ValueError from exc
+            idx += 1
         else:
             if star_index is not None:
                 raise ValueError("only one starred target is supported")
@@ -790,6 +810,24 @@ class range:
     def __iter__(self):
         return IterRange(self.start, self.stop, self.step)
 
+    def __reversed__(self):
+        start = self.start
+        stop = self.stop
+        step = self.step
+        if step > 0:
+            if start >= stop:
+                return IterRange(0, 0, 1)
+            count = (stop - start + step - 1) // step
+            last = start + (count - 1) * step
+            return IterRange(last, start - 1, -step)
+
+        if start <= stop:
+            return IterRange(0, 0, 1)
+        reverse_step = -step
+        count = (start - stop + reverse_step - 1) // reverse_step
+        last = start + (count - 1) * step
+        return IterRange(last, start + 1, reverse_step)
+
 
 class IterRange:
 
@@ -860,7 +898,13 @@ class ClosureGenerator:
         if _is_generator_closed(self):
             raise StopIteration
         try:
-            return resume_generator(self._resume_function, self, value, NO_DEFAULT)
+            return resume_generator(
+                self._resume_function,
+                self,
+                self._preserved_values,
+                value,
+                NO_DEFAULT,
+            )
         except BaseException as exc:
             _reraise_control_flow(exc)
 
@@ -881,7 +925,13 @@ class ClosureGenerator:
             throw_context=_current_throw_context(self),
         )
         try:
-            return resume_generator(self._resume_function, self, NO_DEFAULT, exc)
+            return resume_generator(
+                self._resume_function,
+                self,
+                self._preserved_values,
+                NO_DEFAULT,
+                exc,
+            )
         except BaseException as exc:
             _reraise_control_flow(exc)
 
@@ -1052,6 +1102,7 @@ class AsyncGenSend:
             result = resume_async_generator(
                 self._generator._resume_function,
                 self._generator,
+                self._generator._preserved_values,
                 step_send_value,
                 self._resume_exception,
                 transport_sent,

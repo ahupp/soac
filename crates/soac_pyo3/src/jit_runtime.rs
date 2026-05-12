@@ -615,6 +615,17 @@ fn exec_module_inner(
                 },
             )
         })?;
+        if exec_depth.is_outermost() && !is_soac_runtime {
+            time_phase(exec_timings, "eager_jit_compile", || {
+                unsafe { soac_jit::eager_compile_jit_for_module(module.as_ptr()) }.map_err(|_| {
+                    if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                        PyRuntimeError::new_err("failed to eagerly compile transformed module")
+                    } else {
+                        PyErr::fetch(py)
+                    }
+                })
+            })?;
+        }
         let module_init = time_phase(exec_timings, "instantiate_module_init", || {
             soac_jit::instantiate_bb_function(
                 py,
@@ -721,6 +732,7 @@ fn resume_generator(
     py: Python<'_>,
     handle: &Bound<'_, PyAny>,
     owner: &Bound<'_, PyAny>,
+    preserved_state: &Bound<'_, PyAny>,
     send_value: &Bound<'_, PyAny>,
     resume_exc: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
@@ -728,6 +740,7 @@ fn resume_generator(
         soac_jit::resume_generator(
             handle.as_ptr(),
             owner.as_ptr(),
+            preserved_state.as_ptr(),
             send_value.as_ptr(),
             resume_exc.as_ptr(),
         )
@@ -740,6 +753,7 @@ fn resume_async_generator(
     py: Python<'_>,
     handle: &Bound<'_, PyAny>,
     owner: &Bound<'_, PyAny>,
+    preserved_state: &Bound<'_, PyAny>,
     send_value: &Bound<'_, PyAny>,
     resume_exc: &Bound<'_, PyAny>,
     transport_sent: &Bound<'_, PyAny>,
@@ -748,6 +762,7 @@ fn resume_async_generator(
         soac_jit::resume_async_generator(
             handle.as_ptr(),
             owner.as_ptr(),
+            preserved_state.as_ptr(),
             send_value.as_ptr(),
             resume_exc.as_ptr(),
             transport_sent.as_ptr(),

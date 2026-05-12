@@ -20,15 +20,21 @@ pub use soac_opt::passes::{
 };
 use soac_opt::passes::{
     FunctionLocalEnvResumePlan, FunctionRefcountPlan, LocalEnvModulePlan, LocalEnvResumeEntry,
-    LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalRefState,
-    RefcountActionKind, RefcountLocal, RefcountPlan, RefcountReleaseReason, RefcountSite,
-    compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
-    plan_typed_local_env_module, plan_typed_local_env_resume_module, plan_typed_ownership_effects,
+    LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
+    LocalEnvResumeValueSource, LocalRefState, RefcountActionKind, RefcountLocal, RefcountPlan,
+    RefcountReleaseReason, RefcountSite, compute_typed_function_local_live_ins,
+    compute_typed_function_local_must_bound_ins, plan_typed_local_env_module,
+    plan_typed_local_env_resume_module, plan_typed_ownership_effects,
     validate_typed_local_env_module_plan, validate_typed_local_env_resume_module_plan,
     validate_typed_ownership_effects,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
+use std::time::{Duration, Instant};
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
 
 #[derive(Clone, Debug)]
 pub struct PreparedJitTypedModulePlan {
@@ -941,21 +947,12 @@ fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape
     Ok(())
 }
 
-pub fn plan_jit_typed_module_locals_from_passes(
+fn build_jit_typed_module_locals_from_validated_passes(
     module: &BlockPyModule<TypedBlockPyModuleShape>,
-    facts: &FactStore,
     local_env_plan: &LocalEnvModulePlan,
     local_env_resume_plan: &LocalEnvResumeModulePlan,
     refcount_plan: &RefcountPlan,
 ) -> Result<PlannedJitModuleLocals, String> {
-    validate_typed_local_env_module_plan(module, facts, local_env_plan)?;
-    validate_typed_local_env_resume_module_plan(
-        module,
-        local_env_plan,
-        facts,
-        local_env_resume_plan,
-    )?;
-    validate_typed_ownership_effects(module, facts, refcount_plan)?;
     let mut functions = HashMap::with_capacity(module.callable_defs.len());
     for function in &module.callable_defs {
         let local_plan = local_env_plan
@@ -999,14 +996,10 @@ pub fn plan_jit_typed_module_locals_from_passes(
     Ok(PlannedJitModuleLocals { functions })
 }
 
-pub fn plan_jit_typed_deopt_resume_module_from_passes(
+fn build_jit_typed_deopt_resume_module_from_validated_passes(
     module: &BlockPyModule<TypedBlockPyModuleShape>,
-    facts: &FactStore,
-    local_env_plan: &LocalEnvModulePlan,
     resume_plan: &LocalEnvResumeModulePlan,
 ) -> Result<PlannedJitDeoptResumeModule, String> {
-    validate_typed_local_env_module_plan(module, facts, local_env_plan)?;
-    validate_typed_local_env_resume_module_plan(module, local_env_plan, facts, resume_plan)?;
     let mut functions = HashMap::with_capacity(module.callable_defs.len());
     for function in &module.callable_defs {
         let resume_plan = resume_plan
@@ -1045,23 +1038,59 @@ pub fn plan_jit_typed_module(
     module: BlockPyModule<TypedBlockPyModuleShape>,
     value_facts: FactStore,
 ) -> Result<PreparedJitTypedModulePlan, String> {
+    let total_start = Instant::now();
+    let local_env_start = Instant::now();
     let local_env_plan = plan_typed_local_env_module(&module, &value_facts);
+    let local_env_elapsed = local_env_start.elapsed();
+    let local_env_resume_start = Instant::now();
     let local_env_resume_plan =
         plan_typed_local_env_resume_module(&module, &local_env_plan, &value_facts);
+    let local_env_resume_elapsed = local_env_resume_start.elapsed();
+    let refcount_start = Instant::now();
     let refcount_plan = plan_typed_ownership_effects(&module, &value_facts);
-    let locals = plan_jit_typed_module_locals_from_passes(
+    let refcount_elapsed = refcount_start.elapsed();
+    let validate_local_env_start = Instant::now();
+    validate_typed_local_env_module_plan(&module, &value_facts, &local_env_plan)?;
+    let validate_local_env_elapsed = validate_local_env_start.elapsed();
+    let validate_local_env_resume_start = Instant::now();
+    validate_typed_local_env_resume_module_plan(
         &module,
+        &local_env_plan,
         &value_facts,
+        &local_env_resume_plan,
+    )?;
+    let validate_local_env_resume_elapsed = validate_local_env_resume_start.elapsed();
+    let validate_refcount_start = Instant::now();
+    validate_typed_ownership_effects(&module, &value_facts, &refcount_plan)?;
+    let validate_refcount_elapsed = validate_refcount_start.elapsed();
+    let locals_start = Instant::now();
+    let locals = build_jit_typed_module_locals_from_validated_passes(
+        &module,
         &local_env_plan,
         &local_env_resume_plan,
         &refcount_plan,
     )?;
-    let deopt_resume = plan_jit_typed_deopt_resume_module_from_passes(
-        &module,
-        &value_facts,
-        &local_env_plan,
-        &local_env_resume_plan,
-    )?;
+    let locals_elapsed = locals_start.elapsed();
+    let deopt_resume_start = Instant::now();
+    let deopt_resume =
+        build_jit_typed_deopt_resume_module_from_validated_passes(&module, &local_env_resume_plan)?;
+    let deopt_resume_elapsed = deopt_resume_start.elapsed();
+    tracing::info!(
+        target: "soac_jit_codegen",
+        event = "soac.jit_typed_plan_detail",
+        runtime_module_id = module.module_name_gen.runtime_module_id().as_u32(),
+        function_count = u64::try_from(module.callable_defs.len()).unwrap_or(u64::MAX),
+        local_env_us = duration_micros(local_env_elapsed),
+        local_env_resume_us = duration_micros(local_env_resume_elapsed),
+        refcount_us = duration_micros(refcount_elapsed),
+        validate_local_env_us = duration_micros(validate_local_env_elapsed),
+        validate_local_env_resume_us = duration_micros(validate_local_env_resume_elapsed),
+        validate_refcount_us = duration_micros(validate_refcount_elapsed),
+        locals_us = duration_micros(locals_elapsed),
+        deopt_resume_us = duration_micros(deopt_resume_elapsed),
+        total_us = duration_micros(total_start.elapsed()),
+        "jit_typed_plan_detail",
+    );
     Ok(PreparedJitTypedModulePlan {
         module,
         value_facts,
@@ -1398,6 +1427,20 @@ pub fn planned_jit_params_for_typed_function(
     cleanup_root_names: &HashSet<String>,
 ) -> Result<Vec<Vec<RuntimeBlockParamPlan>>, String> {
     let live_ins = compute_typed_function_local_live_ins(function);
+    planned_jit_params_for_typed_function_with_live_ins(
+        function,
+        local_plan,
+        cleanup_root_names,
+        &live_ins,
+    )
+}
+
+fn planned_jit_params_for_typed_function_with_live_ins(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    local_plan: &FunctionLocalPlan,
+    cleanup_root_names: &HashSet<String>,
+    live_ins: &HashMap<BlockLabel, HashSet<LocalLocation>>,
+) -> Result<Vec<Vec<RuntimeBlockParamPlan>>, String> {
     function
         .blocks
         .iter()
@@ -2392,53 +2435,84 @@ fn planned_runtime_block_param_reprs_for_typed_function(
         }
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (source_index, block) in function.blocks.iter().enumerate() {
-            if !runtime_block_param_reprs_known(
-                &runtime_block_params[source_index],
-                &entry_reprs[source_index],
-            ) {
-                continue;
-            }
-            if let Some(exc_edge) = block.exc_edge.as_ref() {
-                let target_index =
-                    typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
-                changed |= force_exception_forwarded_source_reprs_to_pyobject(
-                    &mut entry_reprs[source_index],
-                    function,
-                    block,
-                    &runtime_block_params[target_index],
-                    &local_locations_by_name,
-                    &block_indices_by_label,
-                    &stack_slot_names,
-                );
-            }
-            let exit_reprs = transfer_runtime_local_reprs_for_typed_block(
+    let mut queued = vec![false; function.blocks.len()];
+    let mut worklist = VecDeque::new();
+    if !function.blocks.is_empty() {
+        queued[0] = true;
+        worklist.push_back(0);
+    }
+    while let Some(source_index) = worklist.pop_front() {
+        queued[source_index] = false;
+        let block = &function.blocks[source_index];
+        if !runtime_block_param_reprs_known(
+            &runtime_block_params[source_index],
+            &entry_reprs[source_index],
+        ) {
+            continue;
+        }
+        if let Some(exc_edge) = block.exc_edge.as_ref() {
+            let target_index =
+                typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
+            force_exception_forwarded_source_reprs_to_pyobject(
+                &mut entry_reprs[source_index],
+                function,
                 block,
-                &entry_reprs[source_index],
-                module_constants,
-                truthiness_only_local_locations,
-                exact_int_scalar_deopt_instr_ids,
+                &runtime_block_params[target_index],
+                &local_locations_by_name,
+                &block_indices_by_label,
+                &stack_slot_names,
             );
-            if let Some(exc_edge) = block.exc_edge.as_ref() {
+        }
+        let exit_reprs = transfer_runtime_local_reprs_for_typed_block(
+            block,
+            &entry_reprs[source_index],
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        );
+        let mut queue_target = |target_index: usize, changed: bool| {
+            if changed && !queued[target_index] {
+                queued[target_index] = true;
+                worklist.push_back(target_index);
+            }
+        };
+        if let Some(exc_edge) = block.exc_edge.as_ref() {
+            let target_index =
+                typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
+            let changed = merge_runtime_block_param_pyobject_edge_reprs(
+                &mut entry_reprs[target_index],
+                &runtime_block_params[target_index],
+            );
+            queue_target(target_index, changed);
+        }
+        match &block.term {
+            BlockTerm::Jump(edge) => {
                 let target_index =
-                    typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
-                changed |= merge_runtime_block_param_pyobject_edge_reprs(
+                    typed_block_index_for_label(function, &block_indices_by_label, edge.target);
+                let changed = merge_runtime_block_param_edge_reprs(
                     &mut entry_reprs[target_index],
                     &runtime_block_params[target_index],
+                    &function.blocks[target_index].param_name_vec(),
+                    &edge.args,
+                    block,
+                    &runtime_block_params[source_index],
+                    &exit_reprs,
+                    &local_locations_by_name,
+                    module_constants,
+                    truthiness_only_local_locations,
+                    exact_int_scalar_deopt_instr_ids,
                 );
+                queue_target(target_index, changed);
             }
-            match &block.term {
-                BlockTerm::Jump(edge) => {
+            BlockTerm::IfTerm(if_term) => {
+                for target in [if_term.then_label, if_term.else_label] {
                     let target_index =
-                        typed_block_index_for_label(function, &block_indices_by_label, edge.target);
-                    changed |= merge_runtime_block_param_edge_reprs(
+                        typed_block_index_for_label(function, &block_indices_by_label, target);
+                    let changed = merge_runtime_block_param_edge_reprs(
                         &mut entry_reprs[target_index],
                         &runtime_block_params[target_index],
                         &function.blocks[target_index].param_name_vec(),
-                        &edge.args,
+                        &[],
                         block,
                         &runtime_block_params[source_index],
                         &exit_reprs,
@@ -2447,52 +2521,35 @@ fn planned_runtime_block_param_reprs_for_typed_function(
                         truthiness_only_local_locations,
                         exact_int_scalar_deopt_instr_ids,
                     );
+                    queue_target(target_index, changed);
                 }
-                BlockTerm::IfTerm(if_term) => {
-                    for target in [if_term.then_label, if_term.else_label] {
-                        let target_index =
-                            typed_block_index_for_label(function, &block_indices_by_label, target);
-                        changed |= merge_runtime_block_param_edge_reprs(
-                            &mut entry_reprs[target_index],
-                            &runtime_block_params[target_index],
-                            &function.blocks[target_index].param_name_vec(),
-                            &[],
-                            block,
-                            &runtime_block_params[source_index],
-                            &exit_reprs,
-                            &local_locations_by_name,
-                            module_constants,
-                            truthiness_only_local_locations,
-                            exact_int_scalar_deopt_instr_ids,
-                        );
-                    }
-                }
-                BlockTerm::BranchTable(branch) => {
-                    for target in branch
-                        .targets
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(branch.default_label))
-                    {
-                        let target_index =
-                            typed_block_index_for_label(function, &block_indices_by_label, target);
-                        changed |= merge_runtime_block_param_edge_reprs(
-                            &mut entry_reprs[target_index],
-                            &runtime_block_params[target_index],
-                            &function.blocks[target_index].param_name_vec(),
-                            &[],
-                            block,
-                            &runtime_block_params[source_index],
-                            &exit_reprs,
-                            &local_locations_by_name,
-                            module_constants,
-                            truthiness_only_local_locations,
-                            exact_int_scalar_deopt_instr_ids,
-                        );
-                    }
-                }
-                BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
             }
+            BlockTerm::BranchTable(branch) => {
+                for target in branch
+                    .targets
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(branch.default_label))
+                {
+                    let target_index =
+                        typed_block_index_for_label(function, &block_indices_by_label, target);
+                    let changed = merge_runtime_block_param_edge_reprs(
+                        &mut entry_reprs[target_index],
+                        &runtime_block_params[target_index],
+                        &function.blocks[target_index].param_name_vec(),
+                        &[],
+                        block,
+                        &runtime_block_params[source_index],
+                        &exit_reprs,
+                        &local_locations_by_name,
+                        module_constants,
+                        truthiness_only_local_locations,
+                        exact_int_scalar_deopt_instr_ids,
+                    );
+                    queue_target(target_index, changed);
+                }
+            }
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
         }
     }
 
@@ -2536,9 +2593,25 @@ fn apply_runtime_block_param_reprs(
 pub fn planned_stack_slot_entry_seeds_for_typed_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     local_plan: &FunctionLocalPlan,
+    local_env_resume_plan: &FunctionLocalEnvResumePlan,
 ) -> Vec<Vec<PlannedStackSlotEntrySeed>> {
     let live_ins = compute_typed_function_local_live_ins(function);
+    planned_stack_slot_entry_seeds_for_typed_function_with_live_ins(
+        function,
+        local_plan,
+        local_env_resume_plan,
+        &live_ins,
+    )
+}
+
+fn planned_stack_slot_entry_seeds_for_typed_function_with_live_ins(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    local_plan: &FunctionLocalPlan,
+    local_env_resume_plan: &FunctionLocalEnvResumePlan,
+    live_ins: &HashMap<BlockLabel, HashSet<LocalLocation>>,
+) -> Vec<Vec<PlannedStackSlotEntrySeed>> {
     let must_bound_ins = compute_typed_function_local_must_bound_ins(function);
+    let instr_locations = current_instr_locations(function);
     function
         .blocks
         .iter()
@@ -2548,6 +2621,14 @@ pub fn planned_stack_slot_entry_seeds_for_typed_function(
                 .get(&block.label)
                 .cloned()
                 .unwrap_or_default();
+            let deopt_stack_slot_locations = local_env_resume_plan
+                .entries_for_block(block.label, &instr_locations)
+                .flat_map(|entry| entry.locals.iter())
+                .filter_map(|binding| match binding.source {
+                    LocalEnvResumeValueSource::StackSlot(location) => Some(location),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
             local_plan
                 .block(block.label)
                 .map(|block_plan| {
@@ -2561,6 +2642,7 @@ pub fn planned_stack_slot_entry_seeds_for_typed_function(
                             }
                             if !live_in_locations.contains(&binding.location)
                                 && !must_bound_locations.contains(&binding.location)
+                                && !deopt_stack_slot_locations.contains(&binding.location)
                             {
                                 return None;
                             }
@@ -2613,15 +2695,6 @@ fn cleanup_root_slot_state_for_local_ref_state(state: LocalRefState) -> CleanupR
     }
 }
 
-fn empty_cleanup_root_slot_state_map(
-    tracked_slot_names: &HashSet<String>,
-) -> HashMap<String, CleanupRootSlotState> {
-    tracked_slot_names
-        .iter()
-        .map(|name| (name.clone(), CleanupRootSlotState::NoOwnedReference))
-        .collect()
-}
-
 fn merge_cleanup_root_slot_state_maps(
     target: &mut HashMap<String, CleanupRootSlotState>,
     incoming: &HashMap<String, CleanupRootSlotState>,
@@ -2643,6 +2716,33 @@ fn merge_cleanup_root_slot_state_maps(
     changed
 }
 
+fn cleanup_root_slot_state_vec_to_map(
+    slot_names: &[String],
+    states: &[CleanupRootSlotState],
+) -> HashMap<String, CleanupRootSlotState> {
+    slot_names
+        .iter()
+        .cloned()
+        .zip(states.iter().copied())
+        .collect()
+}
+
+fn merge_cleanup_root_slot_state_vecs(
+    target: &mut [CleanupRootSlotState],
+    incoming: &[CleanupRootSlotState],
+) -> bool {
+    let mut changed = false;
+    for (target_state, incoming_state) in target.iter_mut().zip(incoming.iter().copied()) {
+        if *target_state == CleanupRootSlotState::NoOwnedReference
+            && incoming_state == CleanupRootSlotState::MaybeOwnedReference
+        {
+            *target_state = CleanupRootSlotState::MaybeOwnedReference;
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn cleanup_root_slot_state_after_dispatch_write(source: &BlockArg) -> CleanupRootSlotState {
     match source {
         BlockArg::None | BlockArg::AbruptKind(_) => CleanupRootSlotState::NoOwnedReference,
@@ -2650,18 +2750,16 @@ fn cleanup_root_slot_state_after_dispatch_write(source: &BlockArg) -> CleanupRoo
     }
 }
 
-fn apply_exception_dispatch_writes_to_cleanup_root_slot_state(
-    mut state: HashMap<String, CleanupRootSlotState>,
+fn apply_exception_dispatch_writes_to_dense_cleanup_root_slot_state(
+    mut state: Vec<CleanupRootSlotState>,
     dispatch: &BlockExcDispatchPlan,
-    tracked_slot_names: &HashSet<String>,
-) -> HashMap<String, CleanupRootSlotState> {
+    slot_indices_by_name: &HashMap<String, usize>,
+) -> Vec<CleanupRootSlotState> {
     for (target_name, source) in &dispatch.slot_writes {
-        if tracked_slot_names.contains(target_name) {
-            state.insert(
-                target_name.clone(),
-                cleanup_root_slot_state_after_dispatch_write(source),
-            );
-        }
+        let Some(slot_index) = slot_indices_by_name.get(target_name).copied() else {
+            continue;
+        };
+        state[slot_index] = cleanup_root_slot_state_after_dispatch_write(source);
     }
     state
 }
@@ -2809,6 +2907,97 @@ fn transfer_cleanup_root_slot_state_for_block(
                             .or_insert(previous_state);
                     }
                     state.insert(local.name.clone(), CleanupRootSlotState::NoOwnedReference);
+                }
+                _ => {}
+            }
+        }
+        transfer_runtime_local_repr_for_instr(
+            instr,
+            &mut runtime_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        );
+    }
+    state
+}
+
+fn transfer_dense_cleanup_root_slot_state_for_block(
+    function_id: RuntimeFunctionId,
+    block: &TypedBlock,
+    refcount_plan: &FunctionRefcountPlan,
+    slot_indices_by_name: &HashMap<String, usize>,
+    entry_state: &[CleanupRootSlotState],
+    entry_runtime_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+) -> Vec<CleanupRootSlotState> {
+    let mut state = entry_state.to_vec();
+    let mut runtime_reprs = entry_runtime_reprs.clone();
+    let Some(block_plan) = refcount_plan.block(block.label) else {
+        return state;
+    };
+    let mut actions_by_instr = HashMap::<InstrKey, Vec<&RefcountActionKind>>::new();
+    for action in &block_plan.actions {
+        let RefcountSite::Instr(instr_key) = &action.site else {
+            continue;
+        };
+        actions_by_instr
+            .entry(*instr_key)
+            .or_default()
+            .push(&action.kind);
+    }
+
+    for instr in &block.body {
+        let store_repr = typed_store_runtime_local_repr(
+            instr,
+            &runtime_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        );
+        let Some(instr_id) = instr.try_semantic_instr_id() else {
+            transfer_runtime_local_repr_for_instr(
+                instr,
+                &mut runtime_reprs,
+                module_constants,
+                truthiness_only_local_locations,
+                exact_int_scalar_deopt_instr_ids,
+            );
+            continue;
+        };
+        let instr_key = InstrKey::new(function_id, instr_id);
+        let Some(actions) = actions_by_instr.get(&instr_key) else {
+            transfer_runtime_local_repr_for_instr(
+                instr,
+                &mut runtime_reprs,
+                module_constants,
+                truthiness_only_local_locations,
+                exact_int_scalar_deopt_instr_ids,
+            );
+            continue;
+        };
+        for action in actions {
+            match action {
+                RefcountActionKind::RebindLocal {
+                    local, new_state, ..
+                } if slot_indices_by_name.contains_key(&local.name) => {
+                    let slot_index = slot_indices_by_name[&local.name];
+                    let new_slot_state = match store_repr {
+                        Some((
+                            location,
+                            RuntimeBlockParamRepr::ExactI64 | RuntimeBlockParamRepr::I32Bool01,
+                        )) if location == local.location => CleanupRootSlotState::NoOwnedReference,
+                        _ => cleanup_root_slot_state_for_local_ref_state(*new_state),
+                    };
+                    state[slot_index] = new_slot_state;
+                }
+                RefcountActionKind::DeleteLocal { local, .. }
+                    if slot_indices_by_name.contains_key(&local.name) =>
+                {
+                    let slot_index = slot_indices_by_name[&local.name];
+                    state[slot_index] = CleanupRootSlotState::NoOwnedReference;
                 }
                 _ => {}
             }
@@ -3022,74 +3211,95 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
     truthiness_only_local_locations: &HashSet<LocalLocation>,
     exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> PlannedCleanupRootSlotStates {
+    let total_start = Instant::now();
     let block_count = function.blocks.len();
     let block_indices_by_label = typed_block_indices_by_label(function);
-    let mut entry_states = vec![empty_cleanup_root_slot_state_map(tracked_slot_names); block_count];
+    let slot_names = tracked_slot_names.iter().cloned().collect::<Vec<_>>();
+    let slot_indices_by_name = slot_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut entry_states =
+        vec![vec![CleanupRootSlotState::NoOwnedReference; slot_names.len()]; block_count];
     let mut entry_reached = vec![false; block_count];
     if let Some(entry_state) = entry_states.first_mut() {
         entry_reached[0] = true;
-        for name in tracked_slot_names {
+        for name in &slot_names {
             if is_try_abrupt_kind_slot(name) {
-                entry_state.insert(name.clone(), CleanupRootSlotState::MaybeOwnedReference);
+                let slot_index = slot_indices_by_name[name];
+                entry_state[slot_index] = CleanupRootSlotState::MaybeOwnedReference;
             }
         }
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (source_index, block) in function.blocks.iter().enumerate() {
-            if !entry_reached[source_index] {
-                continue;
-            }
-            let exit_state = transfer_cleanup_root_slot_state_for_block(
-                function.function_id,
-                block,
-                refcount_plan,
-                tracked_slot_names,
-                &entry_states[source_index],
-                &runtime_entry_reprs[source_index],
-                module_constants,
-                truthiness_only_local_locations,
-                exact_int_scalar_deopt_instr_ids,
-                None,
-            );
-            for (target_index, maybe_dispatch) in cleanup_root_slot_successors_for_block(
+    let successors_by_block = (0..block_count)
+        .map(|source_index| {
+            cleanup_root_slot_successors_for_block(
                 function,
                 &block_indices_by_label,
                 source_index,
                 exc_dispatches,
-            ) {
-                let incoming = if let Some(dispatch) = maybe_dispatch {
-                    apply_exception_dispatch_writes_to_cleanup_root_slot_state(
-                        exit_state.clone(),
-                        dispatch,
-                        tracked_slot_names,
-                    )
-                } else {
-                    exit_state.clone()
-                };
-                if !entry_reached[target_index] {
-                    entry_states[target_index] = incoming;
-                    entry_reached[target_index] = true;
-                    changed = true;
-                } else {
-                    changed |= merge_cleanup_root_slot_state_maps(
-                        &mut entry_states[target_index],
-                        &incoming,
-                    );
-                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut queued = vec![false; block_count];
+    let mut worklist = VecDeque::new();
+    if block_count > 0 {
+        queued[0] = true;
+        worklist.push_back(0);
+    }
+    let propagate_start = Instant::now();
+    while let Some(source_index) = worklist.pop_front() {
+        queued[source_index] = false;
+        if !entry_reached[source_index] {
+            continue;
+        }
+        let block = &function.blocks[source_index];
+        let exit_state = transfer_dense_cleanup_root_slot_state_for_block(
+            function.function_id,
+            block,
+            refcount_plan,
+            &slot_indices_by_name,
+            &entry_states[source_index],
+            &runtime_entry_reprs[source_index],
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        );
+        for (target_index, maybe_dispatch) in &successors_by_block[source_index] {
+            let incoming = if let Some(dispatch) = maybe_dispatch {
+                apply_exception_dispatch_writes_to_dense_cleanup_root_slot_state(
+                    exit_state.clone(),
+                    dispatch,
+                    &slot_indices_by_name,
+                )
+            } else {
+                exit_state.clone()
+            };
+            let state_changed = if !entry_reached[*target_index] {
+                entry_states[*target_index] = incoming;
+                entry_reached[*target_index] = true;
+                true
+            } else {
+                merge_cleanup_root_slot_state_vecs(&mut entry_states[*target_index], &incoming)
+            };
+            if state_changed && !queued[*target_index] {
+                queued[*target_index] = true;
+                worklist.push_back(*target_index);
             }
         }
     }
+    let propagate_elapsed = propagate_start.elapsed();
 
+    let materialize_start = Instant::now();
     let mut block_entry_states = HashMap::new();
     let mut block_exit_states = HashMap::new();
     let mut instr_previous_states = HashMap::new();
     let mut block_exit_facts = HashMap::new();
     let mut instr_previous_facts = HashMap::new();
     for (index, block) in function.blocks.iter().enumerate() {
-        let entry_state = entry_states[index].clone();
+        let entry_state = cleanup_root_slot_state_vec_to_map(&slot_names, &entry_states[index]);
         let exit_state = transfer_cleanup_root_slot_state_for_block(
             function.function_id,
             block,
@@ -3120,14 +3330,28 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
         block_exit_states.insert(block.label, exit_state);
         block_exit_facts.insert(block.label, exit_facts);
     }
+    let materialize_elapsed = materialize_start.elapsed();
 
-    PlannedCleanupRootSlotStates {
+    let plan = PlannedCleanupRootSlotStates {
         block_entry_states,
         block_exit_states,
         instr_previous_states,
         block_exit_facts,
         instr_previous_facts,
-    }
+    };
+    tracing::info!(
+        target: "soac_jit_codegen",
+        event = "soac.cleanup_root_slot_states_detail",
+        function_id = ?function.function_id,
+        function_qualname = %function.names.qualname,
+        block_count = u64::try_from(function.blocks.len()).unwrap_or(u64::MAX),
+        tracked_slot_count = u64::try_from(tracked_slot_names.len()).unwrap_or(u64::MAX),
+        propagate_us = duration_micros(propagate_elapsed),
+        materialize_us = duration_micros(materialize_elapsed),
+        total_us = duration_micros(total_start.elapsed()),
+        "cleanup_root_slot_states_detail",
+    );
+    plan
 }
 
 pub fn planned_local_env_entry_materializations_for_function(
@@ -3390,13 +3614,24 @@ pub fn plan_jit_typed_function_locals_from_plans(
     local_env_resume_plan: &FunctionLocalEnvResumePlan,
     module_constants: &[ConstantExpr],
 ) -> Result<PlannedJitFunctionLocals, String> {
+    let total_start = Instant::now();
+    let setup_start = Instant::now();
     let block_indices_by_label = typed_block_indices_by_label(function);
     let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(&refcount_plan);
     let truthiness_only_local_locations = typed_truthiness_only_internal_local_locations(function);
     let exact_int_scalar_deopt_instr_ids =
         exact_int_scalar_deopt_instr_ids_for_typed_function(function, local_env_resume_plan);
-    let mut runtime_block_params =
-        planned_jit_params_for_typed_function(function, &local_plan, &cleanup_root_names)?;
+    let setup_elapsed = setup_start.elapsed();
+    let live_ins_start = Instant::now();
+    let live_ins = compute_typed_function_local_live_ins(function);
+    let live_ins_elapsed = live_ins_start.elapsed();
+    let params_start = Instant::now();
+    let mut runtime_block_params = planned_jit_params_for_typed_function_with_live_ins(
+        function,
+        &local_plan,
+        &cleanup_root_names,
+        &live_ins,
+    )?;
     let runtime_local_reprs = planned_runtime_block_param_reprs_for_typed_function(
         function,
         &runtime_block_params,
@@ -3404,6 +3639,8 @@ pub fn plan_jit_typed_function_locals_from_plans(
         &truthiness_only_local_locations,
         &exact_int_scalar_deopt_instr_ids,
     );
+    let params_elapsed = params_start.elapsed();
+    let transport_start = Instant::now();
     apply_runtime_block_param_reprs(
         &mut runtime_block_params,
         runtime_local_reprs.block_param_reprs,
@@ -3419,13 +3656,21 @@ pub fn plan_jit_typed_function_locals_from_plans(
         planned_implicit_target_transports_for_typed_function(function, &runtime_block_params);
     let jump_edge_transports =
         planned_jump_edge_transports_for_typed_function(function, &runtime_block_params);
-    let stack_slot_entry_seeds =
-        planned_stack_slot_entry_seeds_for_typed_function(function, &local_plan);
+    let transport_elapsed = transport_start.elapsed();
+    let entries_start = Instant::now();
+    let stack_slot_entry_seeds = planned_stack_slot_entry_seeds_for_typed_function_with_live_ins(
+        function,
+        &local_plan,
+        local_env_resume_plan,
+        &live_ins,
+    );
     let entry_materializations = planned_local_env_entry_materializations_for_function(
         &runtime_block_params,
         &stack_slot_entry_seeds,
         &cleanup_root_names,
     )?;
+    let entries_elapsed = entries_start.elapsed();
+    let exc_dispatch_start = Instant::now();
     let exc_dispatches = function
         .blocks
         .iter()
@@ -3448,6 +3693,8 @@ pub fn plan_jit_typed_function_locals_from_plans(
             )
         })
         .collect::<Vec<_>>();
+    let exc_dispatch_elapsed = exc_dispatch_start.elapsed();
+    let cleanup_start = Instant::now();
     let tracked_stack_slot_names = required_stack_slot_names_for_function_parts(
         function,
         &runtime_block_params,
@@ -3469,6 +3716,7 @@ pub fn plan_jit_typed_function_locals_from_plans(
         &truthiness_only_local_locations,
         &exact_int_scalar_deopt_instr_ids,
     );
+    let cleanup_elapsed = cleanup_start.elapsed();
 
     let plan = PlannedJitFunctionLocals {
         local_plan,
@@ -3483,7 +3731,26 @@ pub fn plan_jit_typed_function_locals_from_plans(
         entry_materializations,
         exc_dispatches,
     };
+    let validate_start = Instant::now();
     plan.validate_for_typed_function(function)?;
+    let validate_elapsed = validate_start.elapsed();
+    tracing::info!(
+        target: "soac_jit_codegen",
+        event = "soac.jit_typed_function_locals_detail",
+        function_id = %function.function_id,
+        function_qualname = function.names.qualname.as_str(),
+        block_count = u64::try_from(function.blocks.len()).unwrap_or(u64::MAX),
+        setup_us = duration_micros(setup_elapsed),
+        live_ins_us = duration_micros(live_ins_elapsed),
+        params_us = duration_micros(params_elapsed),
+        transport_us = duration_micros(transport_elapsed),
+        entries_us = duration_micros(entries_elapsed),
+        exc_dispatch_us = duration_micros(exc_dispatch_elapsed),
+        cleanup_us = duration_micros(cleanup_elapsed),
+        validate_us = duration_micros(validate_elapsed),
+        total_us = duration_micros(total_start.elapsed()),
+        "jit_typed_function_locals_detail",
+    );
     Ok(plan)
 }
 
@@ -3510,9 +3777,10 @@ mod tests {
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use soac_opt::passes::{BlockLocalPlan, FunctionLocalPlan};
     use soac_opt::passes::{
-        FunctionRefcountPlan, LocalEnvResumeBindingState, LocalEnvResumePoint,
-        LocalEnvResumeValueSource, LocalRefState, RefcountActionKind, RefcountReleaseReason,
-        infer_module_value_facts,
+        FunctionLocalEnvResumePlan, FunctionRefcountPlan, LocalEnvResumeBinding,
+        LocalEnvResumeBindingState, LocalEnvResumeEntry, LocalEnvResumePoint,
+        LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, RefcountActionKind,
+        RefcountReleaseReason, infer_module_value_facts,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -3848,7 +4116,11 @@ def f(flag):
         let runtime_params =
             planned_jit_params_for_typed_function(function, plan, &cleanup_root_names)
                 .expect("runtime params should bind");
-        let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan);
+        let resume_plan = prepared
+            .local_env_resume_plan
+            .function(function.function_id)
+            .expect("missing typed resume plan");
+        let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan, resume_plan);
         let block_indices_by_label = typed_block_indices_by_label(function);
         let else_index =
             typed_block_index_for_label(function, &block_indices_by_label, if_term.else_label);
@@ -4259,7 +4531,11 @@ def f(flag):
             .expect("missing typed local plan");
         let runtime_params = planned_jit_params_for_typed_function(function, plan, &HashSet::new())
             .expect("runtime params should bind");
-        let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan);
+        let resume_plan = prepared
+            .local_env_resume_plan
+            .function(function.function_id)
+            .expect("missing typed resume plan");
+        let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan, resume_plan);
         let entry_label = function.entry_block().label;
         let entry_plan = plan.block(entry_label).expect("missing entry local plan");
         let entry_x = binding_for_name(entry_plan, "x");
@@ -4679,6 +4955,62 @@ def f():
             .deopt_point(before_term_point)
             .expect("module-level point lookup should find planned deopt point");
         assert_eq!(via_module_deopt, planned_deopt);
+    }
+
+    #[test]
+    fn deopt_only_stack_slot_resume_bindings_seed_frame_slots() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def f():
+    x = 1
+    return x
+"#,
+            "f",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let local_plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
+        let entry_label = function.entry_block().label;
+        let entry_index = typed_block_index_for_label(
+            function,
+            &typed_block_indices_by_label(function),
+            entry_label,
+        );
+        let binding = local_plan
+            .block(entry_label)
+            .and_then(|block| block.binding_for_name("x"))
+            .cloned()
+            .expect("entry block should plan local x");
+        assert_eq!(binding.storage, PlannedLocalStorage::StackSlot);
+
+        let resume_plan = FunctionLocalEnvResumePlan {
+            entries: vec![LocalEnvResumeEntry {
+                point: LocalEnvResumePoint::BeforeTerm {
+                    function_id: function.function_id,
+                    block: entry_label,
+                },
+                precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                locals: vec![LocalEnvResumeBinding {
+                    name: binding.name.clone(),
+                    location: binding.location,
+                    binding: LocalEnvResumeBindingState::Bound,
+                    source: LocalEnvResumeValueSource::StackSlot(binding.location),
+                    ownership: binding.param_facts.ownership,
+                    value: binding.param_facts.value,
+                }],
+            }],
+        };
+
+        let seeds =
+            planned_stack_slot_entry_seeds_for_typed_function(function, local_plan, &resume_plan);
+        assert!(
+            seeds[entry_index]
+                .iter()
+                .any(|seed| seed.binding.name == "x"),
+            "deopt-only stack-slot bindings must seed frame slots before codegen: {seeds:#?}"
+        );
     }
 
     #[test]
