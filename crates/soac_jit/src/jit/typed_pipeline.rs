@@ -10,8 +10,8 @@ use soac_config::SoacEnvConfig;
 use soac_config::SpecializationMode;
 use soac_core::block_py::{
     BlockArg, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgPositional, CallableScopeKind, ChildVisitable, ConstantExpr, FunctionKind,
-    HasSemanticInstrId, InstrId, InstrLocationMap, Literal, LocalLocation, NameLike,
+    CallArgKeyword, CallArgPositional, CallableScopeKind, ChildVisitable, ConstantExpr,
+    FunctionKind, HasSemanticInstrId, InstrId, InstrLocationMap, Literal, LocalLocation, NameLike,
     RuntimeFunctionId, RuntimeName, Visit, VisitMut, current_instr_locations,
 };
 use soac_ir_blockpy::{
@@ -27,13 +27,13 @@ use soac_ir_typed::plan_v3::{
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, ProvenanceFact, TypedAttrAccessPlan, TypedAttrOwnerRef,
-    TypedBlockPyModuleShape, TypedCallEmissionPlan, TypedCallEmissionPlans,
-    TypedConstructorInitPlan, TypedConstructorInitPlanSource, TypedDirectCallArgPlan,
-    TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
-    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactListItemAccessPlan,
-    TypedExactListItemCounterSource, TypedExactListItemPlanSource, TypedGeneratorInstancePlan,
-    TypedGeneratorResumePlan, TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource,
-    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedBlockPyModuleShape, TypedBuiltinImplementationPlan, TypedCall, TypedCallEmissionPlan,
+    TypedCallEmissionPlans, TypedConstructorInitPlan, TypedConstructorInitPlanSource,
+    TypedDirectCallArgPlan, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
+    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
+    TypedExactListItemAccessPlan, TypedExactListItemCounterSource, TypedExactListItemPlanSource,
+    TypedGeneratorInstancePlan, TypedGeneratorResumePlan, TypedIndexedFieldCounterSource,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -91,6 +91,8 @@ struct StaticDirectCallTarget {
 }
 
 type StaticRuntimeDirectCallTargets = HashMap<RuntimeName, StaticDirectCallTarget>;
+type StaticRuntimeBuiltinImplementationTargets =
+    HashMap<RuntimeName, BlockPyFunction<BlockPyModuleShape>>;
 type StaticModuleGlobalDirectCallTargets = HashMap<u32, HashMap<String, StaticDirectCallTarget>>;
 type StaticModuleGlobalGeneratorTargets =
     HashMap<u32, HashMap<String, BlockPyFunction<BlockPyModuleShape>>>;
@@ -100,6 +102,7 @@ type StaticStrictMethodTargets =
 #[derive(Clone, Default)]
 struct StaticDirectCallTargets {
     runtime_names: StaticRuntimeDirectCallTargets,
+    runtime_builtin_implementations: StaticRuntimeBuiltinImplementationTargets,
     module_globals: StaticModuleGlobalDirectCallTargets,
     module_global_generators: StaticModuleGlobalGeneratorTargets,
     strict_methods: StaticStrictMethodTargets,
@@ -551,8 +554,13 @@ fn static_direct_call_targets(
             runtime_names.insert(runtime_name, target.clone());
         }
     }
+    let mut runtime_builtin_implementations = HashMap::new();
+    if let Some(target) = runtime_globals.and_then(|globals| globals.get("list_from_iter")) {
+        runtime_builtin_implementations.insert(RuntimeName::List, target.function.clone());
+    }
     Ok(StaticDirectCallTargets {
         runtime_names,
+        runtime_builtin_implementations,
         module_globals,
         module_global_generators,
         strict_methods,
@@ -1024,6 +1032,204 @@ fn annotate_typed_generator_instance_plans(
             .join(", ");
         return Err(format!(
             "typed generator-instance plans were not attached to call nodes: {missing}"
+        ));
+    }
+    Ok(annotator.count)
+}
+
+fn typed_generator_instance_plans_by_origin(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<InstrId, TypedGeneratorInstancePlan> {
+    struct Collector {
+        plans: HashMap<InstrId, TypedGeneratorInstancePlan>,
+    }
+
+    impl Visit<InstrTyped> for Collector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let Some(plan) = expr.generator_instance_plan()
+                && let Some(instr_id) = expr.try_semantic_instr_id()
+            {
+                self.plans.insert(instr_id, plan.clone());
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        plans: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.plans
+}
+
+fn trusted_generator_instance_plan_for_expr<'a>(
+    expr: &'a InstrTyped,
+    state: &TrustedOwnerState,
+    plans_by_origin: &'a HashMap<InstrId, TypedGeneratorInstancePlan>,
+) -> Option<&'a TypedGeneratorInstancePlan> {
+    if let Some(plan) = expr.generator_instance_plan() {
+        return (plan.kind == FunctionKind::Generator).then_some(plan);
+    }
+    let InstrTyped::Load(load) = expr else {
+        return None;
+    };
+    let location = load.name.local_location()?;
+    let origin = state.object_origins.get(&location)?;
+    if state.escaped_origins.contains(origin) {
+        return None;
+    }
+    let plan = plans_by_origin.get(origin)?;
+    (plan.kind == FunctionKind::Generator).then_some(plan)
+}
+
+fn trusted_list_builtin_implementation_plans_for_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
+    static_targets: &StaticDirectCallTargets,
+) -> HashMap<InstrId, TypedBuiltinImplementationPlan> {
+    let Some(target) = static_targets
+        .runtime_builtin_implementations
+        .get(&RuntimeName::List)
+    else {
+        return HashMap::new();
+    };
+    let plans_by_origin = typed_generator_instance_plans_by_origin(function);
+
+    struct Collector<'a> {
+        module_constants: &'a [ConstantExpr],
+        state: &'a TrustedOwnerState,
+        target: &'a BlockPyFunction<BlockPyModuleShape>,
+        plans_by_origin: &'a HashMap<InstrId, TypedGeneratorInstancePlan>,
+        plans: HashMap<InstrId, TypedBuiltinImplementationPlan>,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && matches!(call.access, soac_ir_typed::TypedCallAccessPlan::Generic)
+                && call.keywords.is_empty()
+                && trusted_runtime_name_for_expr(
+                    call.func.as_ref(),
+                    self.state,
+                    self.module_constants,
+                ) == Some(RuntimeName::List)
+                && let Some(instr_id) = call.try_semantic_instr_id()
+                && let [CallArgPositional::Positional(arg)] = call.args.as_slice()
+                && trusted_generator_instance_plan_for_expr(arg, self.state, self.plans_by_origin)
+                    .is_some()
+                && let Ok(arg_plan) = super::direct_function::plan_direct_call_args_for_target(
+                    self.target,
+                    1,
+                    0,
+                    false,
+                    false,
+                )
+            {
+                self.plans.insert(
+                    instr_id,
+                    TypedBuiltinImplementationPlan {
+                        source: RuntimeName::List,
+                        function_id: self.target.function_id,
+                        arg_plan: typed_direct_call_arg_plan_from_direct_plan(arg_plan),
+                    },
+                );
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let states = analyze_trusted_owner_states(
+        function,
+        module_constants,
+        trusted_constructor_calls,
+        trusted_constructor_init_owners,
+    );
+    let mut plans = HashMap::new();
+    for block in &function.blocks {
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            let Some(state) = states.body_before_instr.get(&TypedVirtualBodyInstr {
+                block: block.label,
+                instr_index,
+            }) else {
+                continue;
+            };
+            let mut collector = Collector {
+                module_constants,
+                state,
+                target,
+                plans_by_origin: &plans_by_origin,
+                plans: HashMap::new(),
+            };
+            collector.visit_instr(instr);
+            plans.extend(collector.plans);
+        }
+        let Some(state) = states.block_before_term.get(&block.label) else {
+            continue;
+        };
+        let mut collector = Collector {
+            module_constants,
+            state,
+            target,
+            plans_by_origin: &plans_by_origin,
+            plans: HashMap::new(),
+        };
+        visit_trusted_owner_term_instrs(&block.term, &mut collector);
+        plans.extend(collector.plans);
+    }
+    plans
+}
+
+fn annotate_typed_builtin_implementation_plans(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    plans: &HashMap<InstrId, TypedBuiltinImplementationPlan>,
+) -> Result<usize, String> {
+    if plans.is_empty() {
+        return Ok(0);
+    }
+    let live_instr_ids = collect_typed_semantic_instr_ids(function);
+    let expected = plans
+        .keys()
+        .filter(|instr_id| live_instr_ids.contains(instr_id))
+        .count();
+
+    struct Annotator<'a> {
+        plans: &'a HashMap<InstrId, TypedBuiltinImplementationPlan>,
+        used: HashSet<InstrId>,
+        count: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && let Some(instr_id) = call.try_semantic_instr_id()
+                && let Some(plan) = self.plans.get(&instr_id)
+            {
+                call.extra.set_builtin_implementation_plan(plan.clone());
+                self.used.insert(instr_id);
+                self.count += 1;
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        plans,
+        used: HashSet::new(),
+        count: 0,
+    };
+    annotator.visit_fn_mut(function);
+    if annotator.used.len() != expected {
+        let missing = plans
+            .keys()
+            .filter(|instr_id| live_instr_ids.contains(instr_id))
+            .filter(|instr_id| !annotator.used.contains(instr_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "typed builtin-implementation plans were not attached to call nodes: {missing}"
         ));
     }
     Ok(annotator.count)
@@ -4011,17 +4217,80 @@ fn trusted_generator_instance_owner(
     })
 }
 
-fn trusted_object_origins_in_expr(
+fn trusted_generator_resume_call_plan(
+    call: &TypedCall<InstrTyped>,
+    state: &TrustedOwnerState,
+    module_constants: &[ConstantExpr],
+) -> Option<TypedGeneratorResumePlan> {
+    if !call.keywords.is_empty()
+        || trusted_runtime_name_for_expr(call.func.as_ref(), state, module_constants)
+            != Some(RuntimeName::ResumeGenerator)
+    {
+        return None;
+    }
+    let [
+        CallArgPositional::Positional(resume_function),
+        CallArgPositional::Positional(owner),
+        ..,
+    ] = call.args.as_slice()
+    else {
+        return None;
+    };
+    let InstrTyped::Load(owner) = owner else {
+        return None;
+    };
+    let owner_location = owner.name.local_location()?;
+    let generator_origin = state.object_origins.get(&owner_location).copied()?;
+    let (resume_origin, function_id) =
+        trusted_field_function_id_for_expr(resume_function, state, module_constants)?;
+    (resume_origin == generator_origin).then_some(TypedGeneratorResumePlan {
+        function_id,
+        generator_origin,
+    })
+}
+
+fn trusted_escaping_object_origins_in_expr(
     expr: &InstrTyped,
     state: &TrustedOwnerState,
+    module_constants: &[ConstantExpr],
 ) -> HashSet<InstrId> {
     struct Collector<'a> {
         state: &'a TrustedOwnerState,
+        module_constants: &'a [ConstantExpr],
         origins: HashSet<InstrId>,
+    }
+
+    impl Collector<'_> {
+        fn visit_call_arg(&mut self, arg: &CallArgPositional<InstrTyped>) {
+            match arg {
+                CallArgPositional::Positional(expr) | CallArgPositional::Starred(expr) => {
+                    self.visit_instr(expr);
+                }
+            }
+        }
     }
 
     impl Visit<InstrTyped> for Collector<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && trusted_generator_resume_call_plan(call, self.state, self.module_constants)
+                    .is_some()
+            {
+                // `resume_generator` uses the implementation function and generator owner to
+                // resume the same instance; those two arguments do not expose the wrapper.
+                // Sent/exception payloads remain ordinary call arguments and may escape.
+                for arg in call.args.iter().skip(2) {
+                    self.visit_call_arg(arg);
+                }
+                for keyword in &call.keywords {
+                    match keyword {
+                        CallArgKeyword::Named { value, .. } | CallArgKeyword::Starred(value) => {
+                            self.visit_instr(value);
+                        }
+                    }
+                }
+                return;
+            }
             if let InstrTyped::Load(load) = expr
                 && let Some(location) = load.name.local_location()
                 && let Some(origin) = self.state.object_origins.get(&location)
@@ -4034,13 +4303,18 @@ fn trusted_object_origins_in_expr(
 
     let mut collector = Collector {
         state,
+        module_constants,
         origins: HashSet::new(),
     };
     collector.visit_instr(expr);
     collector.origins
 }
 
-fn mark_trusted_owner_escapes_for_instr(instr: &InstrTyped, state: &mut TrustedOwnerState) {
+fn mark_trusted_owner_escapes_for_instr(
+    instr: &InstrTyped,
+    state: &mut TrustedOwnerState,
+    module_constants: &[ConstantExpr],
+) {
     let escaped = match instr {
         InstrTyped::Store(store)
             if store.name.local_location().is_some()
@@ -4048,11 +4322,15 @@ fn mark_trusted_owner_escapes_for_instr(instr: &InstrTyped, state: &mut TrustedO
         {
             HashSet::new()
         }
-        InstrTyped::Store(store) => trusted_object_origins_in_expr(store.value.as_ref(), state),
-        InstrTyped::SetAttrTyped(op) => {
-            trusted_object_origins_in_expr(op.replacement.as_ref(), state)
+        InstrTyped::Store(store) => {
+            trusted_escaping_object_origins_in_expr(store.value.as_ref(), state, module_constants)
         }
-        _ => trusted_object_origins_in_expr(instr, state),
+        InstrTyped::SetAttrTyped(op) => trusted_escaping_object_origins_in_expr(
+            op.replacement.as_ref(),
+            state,
+            module_constants,
+        ),
+        _ => trusted_escaping_object_origins_in_expr(instr, state, module_constants),
     };
     state.escaped_origins.extend(escaped);
 }
@@ -4137,7 +4415,7 @@ fn transfer_trusted_owner_instr(
     trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
     trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
 ) {
-    mark_trusted_owner_escapes_for_instr(instr, state);
+    mark_trusted_owner_escapes_for_instr(instr, state, module_constants);
     match instr {
         InstrTyped::Store(store) => {
             let Some(location) = store.name.local_location() else {
@@ -4525,37 +4803,12 @@ fn trusted_generator_resume_plans_for_function(
     impl Visit<InstrTyped> for Collector<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped) {
             if let InstrTyped::CallTyped(call) = expr
-                && call.keywords.is_empty()
-                && trusted_runtime_name_for_expr(
-                    call.func.as_ref(),
-                    self.state,
-                    self.module_constants,
-                ) == Some(RuntimeName::ResumeGenerator)
                 && let Some(instr_id) = call.try_semantic_instr_id()
-                && let [
-                    CallArgPositional::Positional(resume_function),
-                    CallArgPositional::Positional(owner),
-                    ..,
-                ] = call.args.as_slice()
-                && let InstrTyped::Load(owner) = owner
-                && let Some(owner_location) = owner.name.local_location()
-                && let Some(generator_origin) =
-                    self.state.object_origins.get(&owner_location).copied()
-                && !self.state.escaped_origins.contains(&generator_origin)
-                && let Some((resume_origin, function_id)) = trusted_field_function_id_for_expr(
-                    resume_function,
-                    self.state,
-                    self.module_constants,
-                )
-                && resume_origin == generator_origin
+                && let Some(plan) =
+                    trusted_generator_resume_call_plan(call, self.state, self.module_constants)
+                && !self.state.escaped_origins.contains(&plan.generator_origin)
             {
-                self.plans.insert(
-                    instr_id,
-                    TypedGeneratorResumePlan {
-                        function_id,
-                        generator_origin,
-                    },
-                );
+                self.plans.insert(instr_id, plan);
             }
             expr.visit_children(self);
         }
@@ -4618,6 +4871,15 @@ fn generator_resume_inline_targets(
                 )],
             )
         })
+        .collect()
+}
+
+fn builtin_implementation_inline_targets(
+    plans: &HashMap<InstrId, TypedBuiltinImplementationPlan>,
+) -> TypedInlineTargets {
+    plans
+        .iter()
+        .map(|(source, plan)| (*source, vec![(plan.function_id, plan.arg_plan.clone())]))
         .collect()
 }
 
@@ -5559,6 +5821,13 @@ fn external_typed_inline_callees(
     );
     targets.extend(
         static_targets
+            .runtime_builtin_implementations
+            .values()
+            .map(|target| target.function_id)
+            .filter(|function_id| function_id.runtime_module_id().as_u32() != current_module_id),
+    );
+    targets.extend(
+        static_targets
             .strict_methods
             .values()
             .map(|target| target.function_id)
@@ -5741,6 +6010,17 @@ fn apply_typed_v3_module_rewrites(
                 &trusted_constructor_init_owners,
             );
             annotate_typed_generator_resume_plans(function, &generator_resume_plans)?;
+            let builtin_implementation_plans =
+                trusted_list_builtin_implementation_plans_for_function(
+                    function,
+                    &module.module_constants,
+                    trusted_static_constructor_calls
+                        .get(&function.function_id)
+                        .unwrap_or(&HashMap::new()),
+                    &trusted_constructor_init_owners,
+                    static_targets,
+                );
+            annotate_typed_builtin_implementation_plans(function, &builtin_implementation_plans)?;
             let mut runtime_protocol_call_instr_ids = runtime_protocol_call_instr_ids(function);
             runtime_protocol_call_instr_ids.extend(trusted_runtime_protocol_calls.keys().copied());
             let mut inline_targets = typed_inline_targets_for_function(
@@ -5754,6 +6034,9 @@ fn apply_typed_v3_module_rewrites(
             inline_targets.extend(static_method_inline_targets);
             inline_targets.extend(static_field_callable_inline_targets);
             inline_targets.extend(generator_resume_inline_targets(&generator_resume_plans));
+            inline_targets.extend(builtin_implementation_inline_targets(
+                &builtin_implementation_plans,
+            ));
             let inline_targets = staged_inline_targets_for_trusted_runtime_protocols(
                 inline_targets,
                 &runtime_protocol_call_instr_ids,
@@ -6703,6 +6986,7 @@ def caller(limit):
             .expect("typed caller should exist");
         let targets = StaticDirectCallTargets {
             runtime_names: HashMap::new(),
+            runtime_builtin_implementations: HashMap::new(),
             module_globals: HashMap::new(),
             module_global_generators: HashMap::from([(module_id, generator_targets)]),
             strict_methods: HashMap::new(),
@@ -6800,6 +7084,158 @@ def caller(limit):
                     },
                 )],
             )]),
+        );
+    }
+
+    #[test]
+    fn list_builtin_implementation_plans_follow_proven_generator_instances() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def list_from_iter(value):
+    return value
+
+def values(limit):
+    yield limit
+
+def caller(limit):
+    return list(values(limit))
+"#,
+        )
+        .expect("source should lower")
+        .blockpy_module;
+        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+        let helper = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "list_from_iter")
+            .cloned()
+            .expect("helper should exist");
+        let generator_targets = strict_module_global_generator_targets_for_module(&lowered);
+        let typed = lower_blockpy_module_to_typed(lowered);
+        let mut caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .cloned()
+            .expect("typed caller should exist");
+        let targets = StaticDirectCallTargets {
+            runtime_builtin_implementations: HashMap::from([(RuntimeName::List, helper.clone())]),
+            module_global_generators: HashMap::from([(module_id, generator_targets)]),
+            ..StaticDirectCallTargets::default()
+        };
+        let generator_plans = static_generator_instance_plans_for_function(&caller, &targets);
+        annotate_typed_generator_instance_plans(&mut caller, Some(&generator_plans))
+            .expect("generator instance annotation should succeed");
+
+        let plans = trusted_list_builtin_implementation_plans_for_function(
+            &caller,
+            &typed.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+            &targets,
+        );
+        let (source, plan) = plans
+            .iter()
+            .next()
+            .expect("list(generator) should get a builtin implementation plan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plan.source, RuntimeName::List);
+        assert_eq!(plan.function_id, helper.function_id);
+        assert_eq!(
+            plan.arg_plan,
+            TypedDirectCallArgPlan {
+                sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
+            }
+        );
+        assert_eq!(
+            builtin_implementation_inline_targets(&plans),
+            HashMap::from([(
+                *source,
+                vec![(
+                    helper.function_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+
+        annotate_typed_builtin_implementation_plans(&mut caller, &plans)
+            .expect("builtin implementation annotation should succeed");
+        assert!(
+            caller.blocks.iter().any(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::Return(expr)
+                        if expr.try_semantic_instr_id() == Some(*source)
+                            && expr
+                                .builtin_implementation_plan()
+                                .is_some_and(|plan| plan.function_id == helper.function_id)
+                )
+            }),
+            "list call should retain the selected helper on InstrTyped"
+        );
+
+        let escaped_lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def list_from_iter(value):
+    return value
+
+def values(limit):
+    yield limit
+
+def sink(value):
+    return None
+
+def caller(limit):
+    gen = values(limit)
+    sink(gen)
+    return list(gen)
+"#,
+        )
+        .expect("escaped source should lower")
+        .blockpy_module;
+        let escaped_module_id = escaped_lowered.module_name_gen.runtime_module_id().as_u32();
+        let escaped_helper = escaped_lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "list_from_iter")
+            .cloned()
+            .expect("escaped helper should exist");
+        let escaped_generator_targets =
+            strict_module_global_generator_targets_for_module(&escaped_lowered);
+        let escaped_typed = lower_blockpy_module_to_typed(escaped_lowered);
+        let mut escaped_caller = escaped_typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .cloned()
+            .expect("escaped typed caller should exist");
+        let escaped_targets = StaticDirectCallTargets {
+            runtime_builtin_implementations: HashMap::from([(RuntimeName::List, escaped_helper)]),
+            module_global_generators: HashMap::from([(
+                escaped_module_id,
+                escaped_generator_targets,
+            )]),
+            ..StaticDirectCallTargets::default()
+        };
+        let escaped_generator_plans =
+            static_generator_instance_plans_for_function(&escaped_caller, &escaped_targets);
+        annotate_typed_generator_instance_plans(
+            &mut escaped_caller,
+            Some(&escaped_generator_plans),
+        )
+        .expect("escaped generator instance annotation should succeed");
+        assert!(
+            trusted_list_builtin_implementation_plans_for_function(
+                &escaped_caller,
+                &escaped_typed.module_constants,
+                &HashMap::new(),
+                &HashMap::new(),
+                &escaped_targets,
+            )
+            .is_empty(),
+            "escaped generator instances must keep the ordinary builtin list path"
         );
     }
 
@@ -7027,6 +7463,7 @@ def caller(limit):
         }
         let static_targets = StaticDirectCallTargets {
             runtime_names: HashMap::new(),
+            runtime_builtin_implementations: HashMap::new(),
             module_globals: HashMap::new(),
             module_global_generators: HashMap::from([(module_id, generator_targets)]),
             strict_methods: HashMap::from([
@@ -7284,6 +7721,218 @@ def caller(limit):
     }
 
     #[test]
+    fn list_generator_calls_inline_resume_state_to_caller_locals() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def list_from_iter(value):
+    result = []
+    iterator = iter(value)
+    while True:
+        try:
+            item = next(iterator)
+            result.append(item)
+        except StopIteration:
+            return result
+
+class ClosureGenerator:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.send(None)
+
+    def send(self, value):
+        return resume_generator(self._resume_function, self, value, None)
+
+def caller(limit):
+    def values(limit):
+        yield limit
+    return list(values(limit))
+"#,
+        )
+        .expect("source should lower")
+        .blockpy_module;
+        let helper = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "list_from_iter")
+            .cloned()
+            .expect("test helper should exist");
+        let iter_function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "ClosureGenerator.__iter__")
+            .cloned()
+            .expect("test runtime iter method should exist");
+        let next_function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "ClosureGenerator.__next__")
+            .cloned()
+            .expect("test runtime next method should exist");
+        let send_function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "ClosureGenerator.send")
+            .cloned()
+            .expect("test runtime send method should exist");
+        let mut typed = lower_blockpy_module_to_typed(lowered);
+        for function in &mut typed.callable_defs {
+            if function.names.qualname != "ClosureGenerator.send" {
+                continue;
+            }
+            struct RuntimeResumeMarker;
+            impl VisitMut<InstrTyped> for RuntimeResumeMarker {
+                fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                    if let InstrTyped::CallTyped(call) = expr
+                        && matches!(
+                            call.func.as_ref(),
+                            InstrTyped::Load(load) if load.name.id_str() == "resume_generator"
+                        )
+                    {
+                        call.func = Box::new(
+                            Load::new(ResolvedName::runtime_name("resume_generator")).into(),
+                        );
+                        return;
+                    }
+                    expr.visit_children_mut(self);
+                }
+            }
+            RuntimeResumeMarker.visit_fn_mut(function);
+        }
+        let static_targets = StaticDirectCallTargets {
+            runtime_builtin_implementations: HashMap::from([(RuntimeName::List, helper)]),
+            strict_methods: HashMap::from([
+                (
+                    (
+                        "soac.runtime".to_string(),
+                        "ClosureGenerator".to_string(),
+                        "__iter__".to_string(),
+                    ),
+                    iter_function,
+                ),
+                (
+                    (
+                        "soac.runtime".to_string(),
+                        "ClosureGenerator".to_string(),
+                        "__next__".to_string(),
+                    ),
+                    next_function,
+                ),
+                (
+                    (
+                        "soac.runtime".to_string(),
+                        "ClosureGenerator".to_string(),
+                        "send".to_string(),
+                    ),
+                    send_function,
+                ),
+            ]),
+            ..StaticDirectCallTargets::default()
+        };
+        let static_generator_instances =
+            static_generator_instance_plans_for_module(&typed, &static_targets);
+        for function in &mut typed.callable_defs {
+            annotate_typed_generator_instance_plans(
+                function,
+                static_generator_instances.get(&function.function_id),
+            )
+            .expect("generator instance plans should attach");
+        }
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        apply_typed_v3_module_rewrites(
+            &mut typed,
+            &profile,
+            None,
+            &HashMap::new(),
+            &static_targets,
+            &HashMap::new(),
+        )
+        .expect("typed rewrite loop should inline the list(generator) path");
+
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        struct RuntimeCallCounter<'a> {
+            module_constants: &'a [ConstantExpr],
+            iter_calls: usize,
+            next_calls: usize,
+            resume_calls: usize,
+        }
+        impl Visit<InstrTyped> for RuntimeCallCounter<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr {
+                    self.iter_calls += usize::from(typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::Iter,
+                        self.module_constants,
+                    ));
+                    self.next_calls += usize::from(typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::Next,
+                        self.module_constants,
+                    ));
+                    self.resume_calls += usize::from(typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::ResumeGenerator,
+                        self.module_constants,
+                    ));
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut runtime_calls = RuntimeCallCounter {
+            module_constants: &typed.module_constants,
+            iter_calls: 0,
+            next_calls: 0,
+            resume_calls: 0,
+        };
+        runtime_calls.visit_fn(caller);
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .all(|instr| !matches!(
+                    instr,
+                    InstrTyped::Store(store)
+                        if matches!(
+                            store.value.as_ref(),
+                            InstrTyped::CallTyped(call)
+                                if call.extra.generator_instance_plan().is_some()
+                        )
+                )),
+            "list(generator) inlining should remove the generator construction; remaining iter={} next={} resume={}",
+            runtime_calls.iter_calls,
+            runtime_calls.next_calls,
+            runtime_calls.resume_calls,
+        );
+        assert_eq!(
+            (
+                runtime_calls.iter_calls,
+                runtime_calls.next_calls,
+                runtime_calls.resume_calls,
+            ),
+            (0, 0, 0),
+            "list(generator) inlining should consume the runtime generator protocol path",
+        );
+    }
+
+    #[test]
     fn trusted_owner_edge_remap_preserves_object_and_function_facts() {
         let source_location = LocalLocation(7);
         let target_location = LocalLocation(8);
@@ -7502,6 +8151,7 @@ def caller(limit):
             .function_id;
         let targets = StaticDirectCallTargets {
             runtime_names: HashMap::new(),
+            runtime_builtin_implementations: HashMap::new(),
             module_globals: HashMap::from([(
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "pkg.mod"),
@@ -7704,6 +8354,7 @@ class IterRange:
                         }),
                     },
                 )]),
+                runtime_builtin_implementations: HashMap::new(),
                 module_globals: HashMap::new(),
                 module_global_generators: HashMap::new(),
                 strict_methods: HashMap::new(),
@@ -7766,6 +8417,7 @@ class IterRange:
                         }),
                     },
                 )]),
+                runtime_builtin_implementations: HashMap::new(),
                 module_globals: HashMap::new(),
                 module_global_generators: HashMap::new(),
                 strict_methods: HashMap::new(),
@@ -7802,6 +8454,7 @@ def caller(value):
                 .expect("Box should have a constructor entry");
         let targets = StaticDirectCallTargets {
             runtime_names: HashMap::new(),
+            runtime_builtin_implementations: HashMap::new(),
             module_globals: HashMap::from([(
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "soac.runtime"),
@@ -7847,6 +8500,7 @@ def caller(value):
         let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
         let targets = StaticDirectCallTargets {
             runtime_names: HashMap::new(),
+            runtime_builtin_implementations: HashMap::new(),
             module_globals: HashMap::from([(
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "soac.runtime"),
@@ -7907,6 +8561,7 @@ def caller(value):
             .function_id;
         let targets = StaticDirectCallTargets {
             runtime_names: HashMap::new(),
+            runtime_builtin_implementations: HashMap::new(),
             module_globals: HashMap::from([(
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "pkg.mod"),
@@ -7946,6 +8601,7 @@ helper(1)
         let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
         let targets = StaticDirectCallTargets {
             runtime_names: HashMap::new(),
+            runtime_builtin_implementations: HashMap::new(),
             module_globals: HashMap::from([(
                 module_id,
                 strict_module_global_direct_call_targets_for_module(&lowered, "pkg.mod"),

@@ -1097,6 +1097,7 @@ enum TypedInlineResult {
 enum TypedInlineCall {
     DirectCallable(TypedDirectCallableCall<InstrTyped>),
     Callable(TypedGuardedCallableCall<InstrTyped>),
+    BuiltinImplementation(TypedCall<InstrTyped>),
     Method {
         call: TypedGuardedMethodCall<InstrTyped>,
         receiver: InstrTyped,
@@ -1122,6 +1123,7 @@ impl TypedInlineCall {
         match self {
             Self::DirectCallable(call) => call.meta(),
             Self::Callable(call) => call.meta(),
+            Self::BuiltinImplementation(call) => call.meta(),
             Self::Method { call, .. } => call.meta(),
             Self::DirectMethod { call, .. } => call.meta(),
             Self::RuntimeProtocolMethod { call, .. } => call.meta(),
@@ -1134,6 +1136,7 @@ impl TypedInlineCall {
         match self {
             Self::DirectCallable(call) => call.try_semantic_instr_id(),
             Self::Callable(call) => call.try_semantic_instr_id(),
+            Self::BuiltinImplementation(call) => call.try_semantic_instr_id(),
             Self::Method { call, .. } => call.try_semantic_instr_id(),
             Self::DirectMethod { call, .. } => call.try_semantic_instr_id(),
             Self::RuntimeProtocolMethod { call, .. } => call.try_semantic_instr_id(),
@@ -1146,6 +1149,7 @@ impl TypedInlineCall {
         match self {
             Self::DirectCallable(call) => call.args.clone(),
             Self::Callable(call) => call.args.clone(),
+            Self::BuiltinImplementation(call) => call.args.clone(),
             Self::Method { call, .. } => call.args.clone(),
             Self::DirectMethod { call, .. } => call.args.clone(),
             Self::RuntimeProtocolMethod { call, .. }
@@ -1162,6 +1166,7 @@ impl TypedInlineCall {
         match self {
             Self::DirectCallable(_) => &[],
             Self::Callable(call) => call.keywords.as_slice(),
+            Self::BuiltinImplementation(call) => call.keywords.as_slice(),
             Self::Method { call, .. } => call.keywords.as_slice(),
             Self::DirectMethod { call, .. } => call.keywords.as_slice(),
             Self::RuntimeProtocolMethod { call, .. } => call.keywords.as_slice(),
@@ -1206,6 +1211,7 @@ fn build_typed_direct_call_inline_rewrite(
     let receiver_temp = match &candidate.call {
         TypedInlineCall::DirectCallable(_)
         | TypedInlineCall::Callable(_)
+        | TypedInlineCall::BuiltinImplementation(_)
         | TypedInlineCall::GeneratorResume(_) => None,
         TypedInlineCall::Method { .. }
         | TypedInlineCall::DirectMethod { .. }
@@ -1235,6 +1241,7 @@ fn build_typed_direct_call_inline_rewrite(
         | TypedInlineCall::DirectMethod { .. }
         | TypedInlineCall::RuntimeProtocolMethod { .. }
         | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+        | TypedInlineCall::BuiltinImplementation(_)
         | TypedInlineCall::GeneratorResume(_) => None,
     };
     let arg_temps = match (0..positional_arg_exprs.len())
@@ -1278,6 +1285,7 @@ fn build_typed_direct_call_inline_rewrite(
     let has_generic_fallback = !matches!(
         candidate.call,
         TypedInlineCall::DirectCallable(_)
+            | TypedInlineCall::BuiltinImplementation(_)
             | TypedInlineCall::DirectMethod { .. }
             | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
             | TypedInlineCall::GeneratorResume(_)
@@ -1350,7 +1358,7 @@ fn build_typed_direct_call_inline_rewrite(
                     .into(),
             );
         }
-        TypedInlineCall::GeneratorResume(_) => {}
+        TypedInlineCall::BuiltinImplementation(_) | TypedInlineCall::GeneratorResume(_) => {}
     }
     for (arg_temp, arg_expr) in arg_temps.iter().zip(positional_arg_exprs) {
         before.push(
@@ -1363,6 +1371,7 @@ fn build_typed_direct_call_inline_rewrite(
     let entry_term = if matches!(
         candidate.call,
         TypedInlineCall::DirectCallable(_)
+            | TypedInlineCall::BuiltinImplementation(_)
             | TypedInlineCall::DirectMethod { .. }
             | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
             | TypedInlineCall::GeneratorResume(_)
@@ -2998,12 +3007,20 @@ fn typed_inline_candidate_for_expr(
             caller_id,
             direct_calls_by_instr_id,
         ),
-        InstrTyped::CallTyped(call) => typed_inline_candidate_for_generator_resume_call(
+        InstrTyped::CallTyped(call) => typed_inline_candidate_for_builtin_implementation_call(
             instr_index,
             result.clone(),
             call,
             caller_id,
         )
+        .or_else(|| {
+            typed_inline_candidate_for_generator_resume_call(
+                instr_index,
+                result.clone(),
+                call,
+                caller_id,
+            )
+        })
         .or_else(|| {
             typed_inline_candidate_for_direct_method_call(
                 instr_index,
@@ -3242,6 +3259,29 @@ fn typed_inline_candidate_for_generator_resume_call(
     })
 }
 
+fn typed_inline_candidate_for_builtin_implementation_call(
+    instr_index: usize,
+    result: TypedInlineResult,
+    call: &TypedCall<InstrTyped>,
+    caller_id: RuntimeFunctionId,
+) -> Option<TypedInlineStoreCandidate> {
+    let plan = call.extra.builtin_implementation_plan()?;
+    if plan.function_id == caller_id || !call.keywords.is_empty() {
+        return None;
+    }
+    typed_positional_arg_exprs(call.args.clone())?;
+    Some(TypedInlineStoreCandidate {
+        instr_index,
+        result,
+        call: TypedInlineCall::BuiltinImplementation(call.clone()),
+        inline_plans: vec![TypedInlineDirectCallPlan {
+            target: plan.function_id,
+            arg_plan: plan.arg_plan.clone(),
+            guard: TypedInlineGuardPlan::Direct,
+        }],
+    })
+}
+
 fn runtime_protocol_explicit_args(
     call: &TypedCall<InstrTyped>,
 ) -> Option<&[CallArgPositional<InstrTyped>]> {
@@ -3447,6 +3487,7 @@ fn typed_inline_guard_term(
         (
             TypedInlineGuardPlan::Direct,
             TypedInlineCall::DirectCallable(_)
+            | TypedInlineCall::BuiltinImplementation(_)
             | TypedInlineCall::DirectMethod { .. }
             | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
             | TypedInlineCall::GeneratorResume(_),
@@ -3526,6 +3567,9 @@ fn typed_inline_generic_fallback_body(
     match call {
         TypedInlineCall::DirectCallable(_) => {
             unreachable!("direct callable inlining does not emit a generic fallback")
+        }
+        TypedInlineCall::BuiltinImplementation(_) => {
+            unreachable!("builtin implementation inlining does not emit a generic fallback")
         }
         TypedInlineCall::DirectMethod { .. } => {
             unreachable!("direct method inlining does not emit a generic fallback")
@@ -6898,6 +6942,67 @@ def caller(fn, owner):\n    return helper(fn, owner, None, None)\n",
                     InstrTyped::Store(store) if store.name.id_str() == "_dp_self"
                 )),
             "resume inlining should seed _dp_self before the inlined body"
+        );
+    }
+
+    #[test]
+    fn inlines_builtin_implementation_calls_without_callable_guards() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def helper(value):\n    return value\n\n\
+def caller(value):\n    return list(value)\n",
+        )
+        .expect("source should lower");
+        let helper_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "helper");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let call_id = first_typed_call_instr_id(caller);
+        struct Marker {
+            call_id: InstrId,
+            function_id: RuntimeFunctionId,
+        }
+        impl VisitMut<InstrTyped> for Marker {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && call.try_semantic_instr_id() == Some(self.call_id)
+                {
+                    call.extra.set_builtin_implementation_plan(
+                        soac_ir_typed::TypedBuiltinImplementationPlan {
+                            source: RuntimeName::List,
+                            function_id: self.function_id,
+                            arg_plan: TypedDirectCallArgPlan {
+                                sources: vec![TypedDirectCallArgSource::Provided(0)],
+                            },
+                        },
+                    );
+                    return;
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+        Marker {
+            call_id,
+            function_id: helper_id,
+        }
+        .visit_fn_mut(caller);
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(stats.rewritten_returns, 1);
+        assert!(
+            caller.blocks.iter().all(|block| {
+                !matches!(
+                    &block.term,
+                    BlockTerm::Return(InstrTyped::CallTyped(call))
+                        if call.try_semantic_instr_id() == Some(call_id)
+                )
+            }),
+            "builtin implementation inlining should replace the original call"
         );
     }
 

@@ -523,6 +523,12 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   has no remaining observable uses after the resume body is inlined; synthetic
   alias/setup temps introduced while inlining trusted `next`/`send` paths are
   consumed with the wrapper.
+  Calls to builtin `list` with a proven nonescaping generator instance can also
+  carry an explicit typed builtin-implementation plan. That plan keeps the
+  observed callable as builtin `list`, but selects the visible
+  `soac.runtime.list_from_iter` helper as a fallback-free inline body so the
+  generator consumer loop can be exposed to later typed rewrites without
+  pretending that the builtin object itself is the helper target.
   Constructor-entry targets currently require all user arguments to be explicit
   because their type-stored metadata does not yet refresh `__init__` defaults.
 - In apply/verify mode, JIT module planning consumes the cached pre-opt module

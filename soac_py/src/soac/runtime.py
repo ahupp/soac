@@ -82,6 +82,17 @@ def tuple_from_iter(value):
     return _builtins.tuple(value)
 
 
+def list_from_iter(value):
+    result = []
+    iterator = iter(value)
+    while True:
+        try:
+            item = next(iterator)
+            result.append(item)
+        except StopIteration:
+            return result
+
+
 def constructor_call(cls, /, *args, **kwargs):
     return cls(*args, **kwargs)
 

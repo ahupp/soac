@@ -213,6 +213,7 @@ _unsupported_frame_builtin
 _index
 IterRange
 tuple_from_iter
+list_from_iter
 constructor_call
 __deepcopy__
 templatelib_Template

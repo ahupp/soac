@@ -120,6 +120,24 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-05-12 - Inline builtin list consumers for generators
+
+- jj change id: `qtrtxpvp`
+- summary: proven `list(generator)` calls now select the visible
+  `soac.runtime.list_from_iter` helper, inline through `iter` / `next`, and keep
+  trusted `resume_generator` owner arguments from falsely escaping the wrapper,
+  so the generator path can lower fully into caller locals.
+- throughput: `-0.25%` specialized pystone median versus the parent revision;
+  total pystone JIT code size unchanged
+- pre-change benchmark: `work/bench/stxxlynyvxwn_6d6da4130984`
+  - apply, refcounts enabled, median: `594817 loops/s`
+  - no-refcount diagnostic median: `719187 loops/s`
+  - total pystone code size: `223674 bytes`, `11837` machine blocks
+- post-change benchmark: `work/bench/qtrtxpvpwsrt_0b53007fa406`
+  - apply, refcounts enabled, median: `593351 loops/s`
+  - no-refcount diagnostic median: `732623 loops/s`
+  - total pystone code size: `223674 bytes`, `11837` machine blocks
+
 ## 2026-05-01 - Land nqueens generator instantiation series
 
 - jj change ids: `mkrvspvk`, `xxpnqpvv`, `yuonmzvz`, `xnpxqulv`, `wlpwtzzw`

@@ -1246,6 +1246,13 @@ pub struct TypedGeneratorInstancePlan {
     pub arg_plan: TypedDirectCallArgPlan,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedBuiltinImplementationPlan {
+    pub source: RuntimeName,
+    pub function_id: RuntimeFunctionId,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TypedGeneratorResumePlan {
     pub function_id: RuntimeFunctionId,
@@ -1262,6 +1269,7 @@ pub struct TypedInstrExtra {
     pub exact_int_branch: Option<TypedExactIntBranchPlan>,
     pub exact_int_return: Option<TypedExactIntReturnPlan>,
     pub constructor_init: Option<TypedConstructorInitPlan>,
+    pub builtin_implementation: Option<TypedBuiltinImplementationPlan>,
     pub generator_instance: Option<TypedGeneratorInstancePlan>,
     pub generator_resume: Option<TypedGeneratorResumePlan>,
     pub guard_miss_deopt: bool,
@@ -1418,6 +1426,25 @@ impl TypedInstrExtra {
         self.constructor_init.take().is_some()
     }
 
+    pub fn builtin_implementation_plan(&self) -> Option<&TypedBuiltinImplementationPlan> {
+        self.builtin_implementation.as_ref()
+    }
+
+    pub fn set_builtin_implementation_plan(
+        &mut self,
+        plan: TypedBuiltinImplementationPlan,
+    ) -> bool {
+        if self.builtin_implementation.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.builtin_implementation = Some(plan);
+        true
+    }
+
+    pub fn clear_builtin_implementation_plan(&mut self) -> bool {
+        self.builtin_implementation.take().is_some()
+    }
+
     pub fn generator_instance_plan(&self) -> Option<&TypedGeneratorInstancePlan> {
         self.generator_instance.as_ref()
     }
@@ -1530,6 +1557,11 @@ impl InstrTyped {
 
     pub fn planned_result(&self) -> Option<TypedPlannedResult> {
         self.typed_extra().and_then(TypedInstrExtra::planned_result)
+    }
+
+    pub fn builtin_implementation_plan(&self) -> Option<&TypedBuiltinImplementationPlan> {
+        self.typed_extra()
+            .and_then(TypedInstrExtra::builtin_implementation_plan)
     }
 
     pub fn generator_instance_plan(&self) -> Option<&TypedGeneratorInstancePlan> {
