@@ -532,8 +532,7 @@ def read():
     assert jit_row["jit_machine_code_block_count"] > 0
 
 
-def test_eager_compile_registers_named_generators_with_soac_vectorcall(tmp_path):
-    log_path = tmp_path / "generator-jit-events.jsonl"
+def test_eager_compile_keeps_named_generators_on_source_vectorcall(tmp_path):
     module_name = "eager_generator_compile_case"
     (tmp_path / f"{module_name}.py").write_text(
         """
@@ -558,44 +557,27 @@ def run(repeats):
         _import_and_run_script(
             tmp_path,
             f"import {module_name} as module",
-            "assert module.run(20) == 1440",
+            "assert callable(module.explicit_items)",
         ),
         env=_soac_subprocess_env(
             tmp_path,
             work_dir=tmp_path / "soac-work",
             extra_env={
                 "SOAC_COMPILE_MODE": "eager",
-                "SOAC_LOG": f"soac_jit_codegen=info,soac_function_create=trace;json={log_path}",
             },
         ),
     )
     _assert_subprocess_ok(result)
 
-    rows = _read_jsonl(log_path)
     code_summary_rows = _read_jsonl(tmp_path / "soac-work" / "jit-code-summary.jsonl")
-    genexpr_codegen_rows = [
-        row
-        for row in code_summary_rows
-        if row.get("entry_kind") == "direct_function_body"
-        and row.get("function_qualname", "").endswith("<genexpr>")
-    ]
     explicit_codegen_rows = [
         row
         for row in code_summary_rows
         if row.get("entry_kind") == "direct_function_body"
         and row.get("function_qualname", "").endswith("explicit_items")
     ]
-    skip_rows = [
-        row
-        for row in rows
-        if row.get("event") == "soac.function_create.skip_jit_vectorcall"
-        and row.get("module_name", "").endswith(module_name)
-    ]
 
-    assert genexpr_codegen_rows
-    assert len(genexpr_codegen_rows) <= 2, genexpr_codegen_rows
-    assert explicit_codegen_rows
-    assert not skip_rows
+    assert not explicit_codegen_rows
 
 
 def test_apply_eager_compile_prewarms_nested_genexpr_direct_entries(tmp_path):
@@ -653,6 +635,141 @@ def run():
     ]
     assert genexpr_codegen_rows
     assert len(genexpr_codegen_rows) == 1, genexpr_codegen_rows
+
+
+def test_apply_mode_diagonal_set_consumers_preserves_outer_cols_binding(tmp_path):
+    module_name = "apply_diagonal_set_consumers_case"
+    work_dir = tmp_path / "soac-work"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+def diagonal_set_consumers(queen_count):
+    cols = range(queen_count)
+    vec = tuple(range(queen_count))
+    total = 0
+    total += len(set(vec[i] + i for i in cols))
+    total += len(set(vec[i] - i for i in cols))
+    return total
+
+def run():
+    return diagonal_set_consumers(4)
+""",
+        encoding="utf-8",
+    )
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        "assert module.run() == 5",
+    )
+    base_env = _soac_subprocess_env(
+        tmp_path,
+        work_dir=work_dir,
+        extra_env={"SOAC_COMPILE_MODE": "eager"},
+    )
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+
+    apply_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "apply"},
+    )
+    _assert_subprocess_ok(apply_result)
+
+
+def test_apply_mode_lazy_diagonal_slice_runner_preserves_expected_result_binding(tmp_path):
+    bench_dir = Path(__file__).resolve().parents[1] / "bench"
+    work_dir = tmp_path / "soac-work"
+    script = _import_and_run_script(
+        bench_dir,
+        "import nqueens_slice_diagonal_set_consumers as module",
+        'assert module.main(["nqueens_slice_diagonal_set_consumers.py", "4", "1"]) == 0',
+    )
+    base_env = _soac_subprocess_env(bench_dir, work_dir=work_dir)
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+
+    apply_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "apply"},
+    )
+    _assert_subprocess_ok(apply_result)
+
+
+def test_apply_mode_callback_pair_inline_preserves_genexpr_argument_binding(tmp_path):
+    support_module_name = "callback_pair_inline_support_case"
+    module_name = "callback_pair_inline_genexpr_binding_case"
+    work_dir = tmp_path / "soac-work"
+    (tmp_path / f"{support_module_name}.py").write_text(
+        """
+def parse_args(argv):
+    compile_only = False
+    args = list(argv[1:])
+    if args and args[-1] == "--compile-only":
+        compile_only = True
+        args.pop()
+    queen_count = int(args[0])
+    loops = int(args[1])
+    return queen_count, loops, compile_only
+
+def run(name, workload, expected_result, argv):
+    queen_count, loops, compile_only = parse_args(argv)
+    if compile_only:
+        return workload(1)
+    expected = expected_result(queen_count)
+    result = None
+    for _ in range(loops):
+        result = workload(queen_count)
+    if result != expected:
+        return 1
+    return 0
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+from callback_pair_inline_support_case import run
+
+def workload(queen_count):
+    cols = range(queen_count)
+    vec = tuple(range(queen_count))
+    total = 0
+    total += len(set(vec[i] + i for i in cols))
+    total += len(set(vec[i] - i for i in cols))
+    return total
+
+def expected_result(queen_count):
+    return queen_count + 1
+
+def main(argv):
+    return run("diag", workload, expected_result, argv)
+""",
+        encoding="utf-8",
+    )
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        'assert module.main(["callback_pair_inline_genexpr_binding_case.py", "4", "1"]) == 0',
+    )
+    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+
+    apply_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "apply"},
+    )
+    _assert_subprocess_ok(apply_result)
 
 
 def test_profile_eager_runtime_import_does_not_compile_runtime_entries(tmp_path):

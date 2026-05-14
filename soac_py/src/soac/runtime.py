@@ -86,7 +86,7 @@ def tuple_from_iter(value):
             item = next(iterator)
             result.append(item)
         except StopIteration:
-            return _builtins.tuple(result)
+            return tuple(result)
 
 
 def list_from_iter(value):

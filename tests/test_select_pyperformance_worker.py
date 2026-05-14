@@ -54,6 +54,7 @@ def test_select_worker_prefers_measured_profile_record(monkeypatch, tmp_path):
     write_manifest(manifest, [calibration, apply, measured])
 
     assert module.select_worker(manifest, "nqueens") == measured
+    assert module.select_worker(manifest, "nqueens", worker="apply") == apply
 
 
 def test_select_worker_rejects_ambiguous_measured_workers(tmp_path):

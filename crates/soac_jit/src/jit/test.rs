@@ -91,8 +91,9 @@ mod tests {
         module_constant_object_symbol, module_constant_symbol_prefix_for_instance,
         module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
-        persistent_function_id_for_module_function, plan_direct_call_args_for_target,
-        plan_typed_v3_jit_module_for_test, precompiled_direct_function_symbol_scope_for_persistent,
+        nullable_stack_slot_decref_facts, persistent_function_id_for_module_function,
+        plan_direct_call_args_for_target, plan_typed_v3_jit_module_for_test,
+        precompiled_direct_function_symbol_scope_for_persistent,
         prepare_specialized_typed_function, push_direct_function_module_identity,
         push_shared_module_symbol_identity, refcount_family_source_loc_bits,
         register_runtime_type_for_key, render_pre_inline_clif_for_inspection,
@@ -4010,8 +4011,27 @@ def build(values):
         predeclared_direct_functions: Option<&HashMap<RuntimeFunctionId, DeclaredJitFunction>>,
         options: BuildSpecializedFunctionOptions,
     ) -> Result<BuiltSpecializedFunction, String> {
-        let jit_module_plan = optimize_blockpy(module, None, &typed_v3_env_config())?;
-        let planned_module = jit_module_plan.module.as_ref();
+        let baseline_module_plan = optimize_blockpy(module, None, &typed_v3_env_config())?;
+        let mut options = options;
+        let mut jit_planned_module = baseline_module_plan.module.as_ref().clone();
+        if let Some(planned_typed_function) = options.planned_typed_function.as_ref() {
+            let planned_function_slot = jit_planned_module
+                .callable_defs
+                .iter_mut()
+                .find(|candidate| candidate.function_id == planned_typed_function.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "missing override target function {} ({})",
+                        planned_typed_function.function_id, planned_typed_function.names.qualname
+                    )
+                })?;
+            *planned_function_slot = planned_typed_function.clone();
+        }
+        let jit_module_plan = super::super::planning::plan_jit_typed_module(
+            jit_planned_module,
+            baseline_module_plan.value_facts.clone(),
+        )?;
+        let planned_module = &jit_module_plan.module;
         let planned_function = planned_module
             .callable_defs
             .iter()
@@ -4055,7 +4075,6 @@ def build(values):
         )?;
         lower_typed_function_call_access_plan_instrs(&mut direct_call_typed_function);
         predeclare_typed_direct_call_imports(jit_module, &direct_call_typed_function)?;
-        let mut options = options;
         match options.planned_typed_function.as_mut() {
             Some(planned_typed_function) => {
                 apply_profile_typed_block_metadata_to_typed_function(
@@ -6967,6 +6986,9 @@ def build(values):
         let block_param_entry =
             planned_local_env_entry(PlannedLocalEnvEntrySource::BlockParam { param_index: 0 });
         let stack_slot_entry = planned_local_env_entry(PlannedLocalEnvEntrySource::StackSlotLoad);
+        let mut checked_stack_slot_entry =
+            planned_local_env_entry(PlannedLocalEnvEntrySource::StackSlotLoad);
+        checked_stack_slot_entry.binding.param_facts.binding = ParamBindingFacts::CheckedLocalValue;
 
         assert_eq!(
             local_env_entry_py_facts_for_materialization(&block_param_entry, true, true),
@@ -6979,6 +7001,22 @@ def build(values):
         assert_eq!(
             local_env_entry_py_facts_for_materialization(&stack_slot_entry, true, true),
             Some(PyObjFacts::known_not_none())
+        );
+        assert_eq!(
+            local_env_entry_py_facts_for_materialization(&checked_stack_slot_entry, true, true,),
+            Some(PyObjFacts::known_not_none().without_non_null_ref())
+        );
+    }
+
+    #[test]
+    fn nullable_stack_slot_decref_facts_keep_the_null_guard_live() {
+        let facts = nullable_stack_slot_decref_facts(Some(PyObjFacts::known_not_none()))
+            .expect("stack-slot decref facts should be retained");
+
+        assert_eq!(facts, PyObjFacts::known_not_none().without_non_null_ref());
+        assert!(
+            !facts.is_non_null_ref(),
+            "maybe-owned stack slots can still physically contain null"
         );
     }
 
@@ -19025,14 +19063,18 @@ def f(x, y):
                 caller_shared_state.as_ref(),
                 Some(&compile_session),
                 Some(&profile),
-                &typed_v3_env_config(),
+                compile_session
+                    .env_config()
+                    .expect("compile session env config should resolve"),
             )
             .expect("typed-v3 runtime should lower caller with external callee bodies visible");
             let cached_module_plan = optimize_blockpy_for_shared_state(
                 caller_shared_state.as_ref(),
                 Some(&compile_session),
                 Some(&profile),
-                &typed_v3_env_config(),
+                compile_session
+                    .env_config()
+                    .expect("compile session env config should resolve"),
             )
             .expect("typed-v3 runtime should reuse cached shared-state plans");
             assert!(

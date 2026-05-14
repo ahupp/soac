@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct TypedFieldScalarizationStats {
@@ -236,10 +237,10 @@ impl TypedFullyVirtualObjectLoweringStats {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct TypedVirtualLoweringAnalysis {
     block_in: HashMap<BlockLabel, TypedVirtualLoweringState>,
-    body_before_instr: HashMap<TypedVirtualBodyInstr, TypedVirtualLoweringState>,
-    block_before_term: HashMap<BlockLabel, TypedVirtualLoweringState>,
+    body_before_instr: HashMap<TypedVirtualBodyInstr, TypedVirtualState>,
+    block_before_term: HashMap<BlockLabel, TypedVirtualState>,
     block_out: HashMap<BlockLabel, TypedVirtualLoweringState>,
-    edge_out: HashMap<TypedVirtualFieldEdge, TypedVirtualLoweringState>,
+    edge_out: HashMap<TypedVirtualFieldEdge, TypedVirtualState>,
 }
 
 impl TypedVirtualLoweringAnalysis {
@@ -253,12 +254,24 @@ fn analyze_typed_virtual_field_states(
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
     generic_field_sources: &HashSet<InstrId>,
+    body_snapshot_locations: Option<&HashSet<TypedVirtualBodyInstr>>,
 ) -> TypedVirtualLoweringAnalysis {
     let predecessors = typed_scalar_block_predecessor_edges(function);
+    tracing::debug!(
+        target: "soac_typed_virtual_objects",
+        block_count = function.blocks.len(),
+        requested_body_snapshots = body_snapshot_locations.map_or(0, HashSet::len),
+        "typed virtual field-state analysis start"
+    );
+    let mut worklist_pops = 0usize;
+    let mut unchanged_in_state_skips = 0usize;
+    let mut recomputed_blocks = 0usize;
+    let mut snapshot_block_visits = 0usize;
+    let mut emitted_body_snapshots = 0usize;
     let mut in_states = vec![None::<TypedVirtualLoweringState>; function.blocks.len()];
     let mut body_before_instr_states =
-        vec![None::<Vec<TypedVirtualLoweringState>>; function.blocks.len()];
-    let mut before_term_states = vec![None::<TypedVirtualLoweringState>; function.blocks.len()];
+        vec![None::<Vec<(usize, TypedVirtualState)>>; function.blocks.len()];
+    let mut before_term_states = vec![None::<TypedVirtualState>; function.blocks.len()];
     let mut out_states = vec![None::<TypedVirtualLoweringState>; function.blocks.len()];
     let labels = typed_block_indices_by_label(function);
     let entry_label = function.blocks.first().map(|block| block.label);
@@ -279,6 +292,7 @@ fn analyze_typed_virtual_field_states(
         queued[0] = true;
     }
     while let Some(block_index) = pending.pop_front() {
+        worklist_pops += 1;
         queued[block_index] = false;
         let block = &function.blocks[block_index];
         let in_state = typed_field_scalar_in_state_for_block(
@@ -289,36 +303,46 @@ fn analyze_typed_virtual_field_states(
             &labels,
             &out_states,
         );
+        if in_states[block_index].as_ref() == in_state.as_deref()
+            && out_states[block_index].is_some()
+        {
+            unchanged_in_state_skips += 1;
+            continue;
+        }
+        recomputed_blocks += 1;
+        let in_state = in_state.map(Cow::into_owned);
         in_states[block_index] = in_state.clone();
         let (body_before_instr_state, before_term_state, out_state) = in_state
-            .map(|mut out_state| {
-                let mut block_clone = block.clone();
-                let mut ignored_stats = TypedFieldScalarizationStats::default();
-                let mut snapshot_state = out_state.clone();
-                let body_before_instr_state = typed_field_scalar_body_snapshots(
-                    block,
-                    &mut snapshot_state,
-                    module_constants,
-                    constructor_field_bindings,
-                    generic_field_sources,
-                );
-                transfer_typed_field_scalar_body(
-                    &mut block_clone.body,
+            .map(|mut out_state: TypedVirtualLoweringState| {
+                let body_before_instr_state = if body_snapshot_locations.is_some_and(|locations| {
+                    locations
+                        .iter()
+                        .any(|location| location.block == block.label)
+                }) {
+                    snapshot_block_visits += 1;
+                    let mut snapshot_state = out_state.clone();
+                    let snapshots = typed_field_scalar_body_snapshots(
+                        block,
+                        &mut snapshot_state,
+                        module_constants,
+                        constructor_field_bindings,
+                        generic_field_sources,
+                        body_snapshot_locations.expect("body snapshot locations checked"),
+                    );
+                    emitted_body_snapshots += snapshots.len();
+                    snapshots
+                } else {
+                    Vec::new()
+                };
+                analyze_typed_field_scalar_body(
+                    &block.body,
                     &mut out_state,
                     module_constants,
                     constructor_field_bindings,
                     generic_field_sources,
-                    &mut ignored_stats,
-                    false,
                 );
-                let before_term_state = out_state.clone();
-                transfer_typed_field_scalar_term(
-                    &mut block_clone.term,
-                    &mut out_state,
-                    module_constants,
-                    &mut ignored_stats,
-                    false,
-                );
+                let before_term_state = out_state.virtual_state.clone();
+                analyze_typed_field_scalar_term(&block.term, &mut out_state, module_constants);
                 (body_before_instr_state, before_term_state, out_state)
             })
             .map_or(
@@ -362,25 +386,25 @@ fn analyze_typed_virtual_field_states(
         .zip(before_term_states)
         .filter_map(|(block, state)| state.map(|state| (block.label, state)))
         .collect::<HashMap<_, _>>();
-    let body_before_instr =
-        function
-            .blocks
-            .iter()
-            .zip(body_before_instr_states)
-            .flat_map(|(block, states)| {
-                states.unwrap_or_default().into_iter().enumerate().map(
-                    move |(instr_index, state)| {
-                        (
-                            TypedVirtualBodyInstr {
-                                block: block.label,
-                                instr_index,
-                            },
-                            state,
-                        )
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
+    let body_before_instr = function
+        .blocks
+        .iter()
+        .zip(body_before_instr_states)
+        .flat_map(|(block, states)| {
+            states
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |(instr_index, state)| {
+                    (
+                        TypedVirtualBodyInstr {
+                            block: block.label,
+                            instr_index,
+                        },
+                        state,
+                    )
+                })
+        })
+        .collect::<HashMap<_, _>>();
     let edge_out = function
         .blocks
         .iter()
@@ -395,10 +419,20 @@ fn analyze_typed_virtual_field_states(
         .filter_map(|edge| {
             block_out
                 .get(&edge.from)
-                .cloned()
-                .map(|state| (edge, state))
+                .map(|state| (edge, state.virtual_state.clone()))
         })
         .collect();
+    tracing::debug!(
+        target: "soac_typed_virtual_objects",
+        worklist_pops,
+        unchanged_in_state_skips,
+        recomputed_blocks,
+        snapshot_block_visits,
+        emitted_body_snapshots,
+        block_count = function.blocks.len(),
+        requested_body_snapshots = body_snapshot_locations.map_or(0, HashSet::len),
+        "typed virtual field-state analysis summary"
+    );
     TypedVirtualLoweringAnalysis {
         block_in,
         body_before_instr,
@@ -450,12 +484,12 @@ fn project_typed_virtual_field_states(
         body_before_instr: analysis
             .body_before_instr
             .iter()
-            .map(|(location, state)| (*location, state.virtual_state.clone()))
+            .map(|(location, state)| (*location, state.clone()))
             .collect(),
         block_before_term: analysis
             .block_before_term
             .iter()
-            .map(|(label, state)| (*label, state.virtual_state.clone()))
+            .map(|(label, state)| (*label, state.clone()))
             .collect(),
         block_out: analysis
             .block_out
@@ -465,7 +499,7 @@ fn project_typed_virtual_field_states(
         edge_out: analysis
             .edge_out
             .iter()
-            .map(|(edge, state)| (*edge, state.virtual_state.clone()))
+            .map(|(edge, state)| (*edge, state.clone()))
             .collect(),
     }
 }
@@ -584,11 +618,27 @@ fn plan_typed_virtual_objects_impl(
             objects.push(plan);
         }
     }
+    let body_snapshot_locations =
+        typed_virtual_body_snapshot_locations(&materialization_boundaries);
+    tracing::debug!(
+        target: "soac_typed_virtual_objects",
+        object_count = objects.len(),
+        materializing_object_count = materializing_objects.len(),
+        field_lowering_binding_count = field_lowering_bindings.len(),
+        generic_field_source_count = field_lowering_generic_sources.len(),
+        materialization_boundary_count = materialization_boundaries.len(),
+        requested_body_snapshots = body_snapshot_locations.len(),
+        "typed virtual object plan candidates"
+    );
+    if objects.is_empty() && materializing_objects.is_empty() {
+        return TypedVirtualizationPlan::default();
+    }
     let field_states = project_typed_virtual_field_states(&analyze_typed_virtual_field_states(
         function,
         module_constants,
         &field_lowering_bindings,
         &field_lowering_generic_sources,
+        (!body_snapshot_locations.is_empty()).then_some(&body_snapshot_locations),
     ));
     let plan = TypedVirtualizationPlan {
         objects,
@@ -619,6 +669,21 @@ fn typed_virtual_reachable_blocks_after_materialization(
     }
 }
 
+fn typed_virtual_body_snapshot_locations(
+    materialization_boundaries: &[TypedVirtualMaterializationBoundary],
+) -> HashSet<TypedVirtualBodyInstr> {
+    materialization_boundaries
+        .iter()
+        .filter_map(|boundary| match boundary.location {
+            TypedVirtualBoundaryLocation::BodyInstr { block, instr_index } => {
+                Some(TypedVirtualBodyInstr { block, instr_index })
+            }
+            TypedVirtualBoundaryLocation::Term { .. }
+            | TypedVirtualBoundaryLocation::ExceptionEdge { .. } => None,
+        })
+        .collect()
+}
+
 pub fn lower_typed_fully_virtual_objects_to_locals_with_plan(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
@@ -626,12 +691,75 @@ pub fn lower_typed_fully_virtual_objects_to_locals_with_plan(
 ) -> TypedFullyVirtualObjectLoweringStats {
     let field_lowering =
         lower_typed_virtual_fields_to_locals_with_plan(function, module_constants, plan);
+    if !plan.objects.is_empty() {
+        let trusted_sources = plan.field_lowering_generic_sources.clone();
+        let constructor_field_bindings = plan.field_lowering_bindings.clone();
+        *plan = plan_typed_virtual_objects_impl(
+            function,
+            module_constants,
+            &constructor_field_bindings,
+            Some(&trusted_sources),
+            false,
+        );
+    }
+    plan.objects
+        .retain(|object| !typed_virtual_constructor_has_external_identity_uses(function, object));
     let virtualization =
         virtualize_typed_hot_constructor_plans(function, module_constants, &plan.objects);
     TypedFullyVirtualObjectLoweringStats {
         field_lowering,
         virtualization,
     }
+}
+
+fn typed_virtual_constructor_has_external_identity_uses(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    plan: &TypedVirtualObjectPlan,
+) -> bool {
+    struct Finder<'a> {
+        plan: &'a TypedVirtualObjectPlan,
+        found: bool,
+    }
+
+    impl Visit<InstrTyped> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.found {
+                return;
+            }
+            if typed_expr_is_virtual_constructor_load(expr, self.plan) {
+                self.found = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let labels = typed_block_indices_by_label(function);
+    let Some(reachable) =
+        typed_reachable_block_labels(function, &labels, plan.materialization_block)
+    else {
+        return false;
+    };
+
+    for block in &function.blocks {
+        if typed_virtual_constructor_plan_covers_block(plan, block.label)
+            || !reachable.contains(&block.label)
+        {
+            continue;
+        }
+        let mut finder = Finder { plan, found: false };
+        for instr in &block.body {
+            finder.visit_instr(instr);
+            if finder.found {
+                return true;
+            }
+        }
+        finder.visit_term(&block.term);
+        if finder.found {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn lower_typed_virtual_fields_to_locals_with_plan(
@@ -646,11 +774,14 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
     let generic_field_sources = plan.field_lowering_generic_sources.clone();
     let scalar_slots =
         allocate_typed_constructor_field_scalar_slots(function, &mut constructor_field_bindings);
+    let body_snapshot_locations =
+        typed_virtual_body_snapshot_locations(&plan.materialization_boundaries);
     let mut analysis = analyze_typed_virtual_field_states(
         function,
         module_constants,
         &constructor_field_bindings,
         &generic_field_sources,
+        None,
     );
     let removable_objects = plan
         .objects
@@ -667,6 +798,7 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
                 module_constants,
                 &constructor_field_bindings,
                 &generic_field_sources,
+                None,
             );
         }
         let next_block_param_stats =
@@ -679,6 +811,7 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
                 module_constants,
                 &constructor_field_bindings,
                 &generic_field_sources,
+                None,
             );
             refresh_typed_virtual_field_block_param_args(function, &analysis);
             analysis = analyze_typed_virtual_field_states(
@@ -686,6 +819,7 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
                 module_constants,
                 &constructor_field_bindings,
                 &generic_field_sources,
+                None,
             );
         }
         if split_edges == 0 && next_block_param_stats.inserted_block_params == 0 {
@@ -702,7 +836,18 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
     );
     stats.inserted_block_params = block_param_stats.inserted_block_params;
     stats.inserted_block_args = block_param_stats.inserted_block_args;
-    plan.field_states = Some(project_typed_virtual_field_states(&analysis));
+    let field_state_analysis = if body_snapshot_locations.is_empty() {
+        project_typed_virtual_field_states(&analysis)
+    } else {
+        project_typed_virtual_field_states(&analyze_typed_virtual_field_states(
+            function,
+            module_constants,
+            &constructor_field_bindings,
+            &generic_field_sources,
+            Some(&body_snapshot_locations),
+        ))
+    };
+    plan.field_states = Some(field_state_analysis);
     plan.field_lowering_bindings = constructor_field_bindings;
     for object in plan
         .objects
@@ -1909,39 +2054,68 @@ fn typed_virtual_constructor_should_remove_instr(
     false
 }
 
-fn typed_field_scalar_in_state_for_block(
+fn typed_field_scalar_in_state_for_block<'a>(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     block: &TypedBlock,
     entry_label: Option<BlockLabel>,
     predecessors: &HashMap<BlockLabel, Vec<TypedScalarPredecessorEdge>>,
     labels: &HashMap<BlockLabel, usize>,
-    out_states: &[Option<TypedVirtualLoweringState>],
-) -> Option<TypedVirtualLoweringState> {
+    out_states: &'a [Option<TypedVirtualLoweringState>],
+) -> Option<Cow<'a, TypedVirtualLoweringState>> {
     let Some(predecessors) = predecessors.get(&block.label) else {
-        return (Some(block.label) == entry_label).then(TypedVirtualLoweringState::default);
+        return (Some(block.label) == entry_label)
+            .then(|| Cow::Owned(TypedVirtualLoweringState::default()));
     };
-    let computed = predecessors
-        .iter()
-        .filter_map(|edge| {
-            labels
-                .get(&edge.from)
-                .and_then(|index| out_states.get(*index))
-                .and_then(|state| state.as_ref())
-                .map(|state| {
-                    remap_typed_field_scalar_state_for_edge(
-                        function,
-                        block,
-                        edge.explicit_args.as_deref(),
-                        state,
-                    )
-                })
-        })
-        .collect::<Vec<_>>();
-    if computed.is_empty() {
-        None
-    } else {
-        Some(merge_typed_field_scalar_states(computed.iter()))
+    let mut computed = predecessors.iter().filter_map(|edge| {
+        labels
+            .get(&edge.from)
+            .and_then(|index| out_states.get(*index))
+            .and_then(|state| state.as_ref())
+            .map(|state| {
+                remap_typed_field_scalar_state_for_edge_borrowed(
+                    function,
+                    block,
+                    edge.explicit_args.as_deref(),
+                    state,
+                )
+            })
+    });
+    let first = computed.next()?;
+    let mut first = Some(first);
+    let mut merge_inputs = None::<Vec<Cow<'a, TypedVirtualLoweringState>>>;
+    for state in computed {
+        if let Some(states) = merge_inputs.as_mut() {
+            states.push(state);
+            continue;
+        }
+        let existing = first
+            .as_ref()
+            .expect("first predecessor state should exist until a merge is needed");
+        if typed_virtual_lowering_states_equal(existing.as_ref(), state.as_ref()) {
+            continue;
+        }
+        merge_inputs = Some(vec![
+            first
+                .take()
+                .expect("first predecessor state should still be available"),
+            state,
+        ]);
     }
+    merge_inputs.map_or_else(
+        || first,
+        |states| {
+            Some(Cow::Owned(merge_typed_field_scalar_states(
+                states.iter().map(Cow::as_ref),
+            )))
+        },
+    )
+}
+
+fn typed_virtual_lowering_states_equal(
+    left: &TypedVirtualLoweringState,
+    right: &TypedVirtualLoweringState,
+) -> bool {
+    std::ptr::eq(left, right) || left == right
 }
 
 fn allocate_typed_constructor_field_scalar_slots(
@@ -2325,8 +2499,9 @@ impl TypedVirtualLoweringState {
             return value.clone();
         };
         let mut resolved = value.clone();
-        let mut seen = HashSet::new();
-        while seen.insert(location) {
+        let mut seen = Vec::new();
+        while !seen.contains(&location) {
+            seen.push(location);
             let Some(mapped) = self.value_aliases.get(&location) else {
                 break;
             };
@@ -2426,6 +2601,27 @@ impl TypedVirtualLoweringState {
         for object in objects {
             self.invalidate_object(object);
         }
+    }
+
+    fn remap_local_if_needed(&mut self, source: &ResolvedName, target: &ResolvedName) -> bool {
+        if source == target || !self.would_remap_local(source) {
+            return false;
+        }
+        self.remap_local(source, target);
+        true
+    }
+
+    fn would_remap_local(&self, source: &ResolvedName) -> bool {
+        let Some(source_location) = source.local_location() else {
+            return false;
+        };
+        self.virtual_state.aliases.contains_key(&source_location)
+            || self.value_aliases.values().any(|value| value == source)
+            || self
+                .virtual_state
+                .fields
+                .values()
+                .any(|value| value == source)
     }
 
     fn remap_local(&mut self, source: &ResolvedName, target: &ResolvedName) {
@@ -2559,10 +2755,20 @@ fn remap_typed_field_scalar_state_for_edge(
     explicit_args: Option<&[BlockArg]>,
     state: &TypedVirtualLoweringState,
 ) -> TypedVirtualLoweringState {
+    remap_typed_field_scalar_state_for_edge_borrowed(function, target, explicit_args, state)
+        .into_owned()
+}
+
+fn remap_typed_field_scalar_state_for_edge_borrowed<'a>(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    target: &TypedBlock,
+    explicit_args: Option<&[BlockArg]>,
+    state: &'a TypedVirtualLoweringState,
+) -> Cow<'a, TypedVirtualLoweringState> {
     let Some(args) = explicit_args else {
-        return state.clone();
+        return Cow::Borrowed(state);
     };
-    let mut remapped = state.clone();
+    let mut remapped = None::<TypedVirtualLoweringState>;
     for (param, arg) in target.params.iter().zip(args) {
         if param.role != BlockParamRole::Value {
             continue;
@@ -2576,9 +2782,15 @@ fn remap_typed_field_scalar_state_for_edge(
         let Some(target_name) = typed_resolved_local_for_name(function, &param.name) else {
             continue;
         };
-        remapped.remap_local(&source, &target_name);
+        if let Some(remapped) = remapped.as_mut() {
+            remapped.remap_local_if_needed(&source, &target_name);
+        } else if state.would_remap_local(&source) && source != target_name {
+            let mut next = state.clone();
+            next.remap_local(&source, &target_name);
+            remapped = Some(next);
+        }
     }
-    remapped
+    remapped.map_or(Cow::Borrowed(state), Cow::Owned)
 }
 
 fn typed_scalar_term_successors(term: &BlockTerm<InstrTyped>) -> Vec<BlockLabel> {
@@ -2648,30 +2860,60 @@ fn transfer_typed_field_scalar_body(
     *block_body = new_body;
 }
 
+fn analyze_typed_field_scalar_body(
+    block_body: &[InstrTyped],
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    generic_field_sources: &HashSet<InstrId>,
+) {
+    for instr in block_body {
+        analyze_typed_field_scalar_instr(
+            instr,
+            state,
+            module_constants,
+            constructor_field_bindings,
+            generic_field_sources,
+        );
+    }
+}
+
 fn typed_field_scalar_body_snapshots(
     block: &TypedBlock,
     state: &mut TypedVirtualLoweringState,
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
     generic_field_sources: &HashSet<InstrId>,
-) -> Vec<TypedVirtualLoweringState> {
-    let mut snapshots = Vec::with_capacity(block.body.len());
-    let mut ignored_stats = TypedFieldScalarizationStats::default();
-    for instr in &block.body {
-        snapshots.push(state.clone());
-        let mut instr = instr.clone();
-        let mut inserted_before = Vec::new();
-        let mut inserted_after = Vec::new();
-        transfer_typed_field_scalar_instr(
-            &mut instr,
+    requested_locations: &HashSet<TypedVirtualBodyInstr>,
+) -> Vec<(usize, TypedVirtualState)> {
+    let max_requested_index = requested_locations
+        .iter()
+        .filter(|location| location.block == block.label)
+        .map(|location| location.instr_index)
+        .max();
+    let Some(max_requested_index) = max_requested_index else {
+        return Vec::new();
+    };
+    let mut snapshots = Vec::new();
+    for (instr_index, instr) in block.body.iter().enumerate() {
+        if instr_index > max_requested_index {
+            break;
+        }
+        if requested_locations.contains(&TypedVirtualBodyInstr {
+            block: block.label,
+            instr_index,
+        }) {
+            snapshots.push((instr_index, state.virtual_state.clone()));
+        }
+        if instr_index == max_requested_index {
+            break;
+        }
+        analyze_typed_field_scalar_instr(
+            instr,
             state,
             module_constants,
             constructor_field_bindings,
             generic_field_sources,
-            &mut ignored_stats,
-            false,
-            &mut inserted_before,
-            &mut inserted_after,
         );
     }
     snapshots
@@ -2756,6 +2998,61 @@ fn transfer_typed_field_scalar_instr(
             Some(inserted_after),
         ),
         _ => rewrite_typed_field_scalar_expr(instr, state, module_constants, stats, rewrite),
+    }
+}
+
+fn analyze_typed_field_scalar_instr(
+    instr: &InstrTyped,
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    generic_field_sources: &HashSet<InstrId>,
+) {
+    match instr {
+        InstrTyped::Store(store) => {
+            if let Some((source, bindings, initialize_fields, allow_generic_field_accesses)) =
+                typed_constructor_field_bindings_for_store(
+                    store,
+                    constructor_field_bindings,
+                    generic_field_sources,
+                )
+            {
+                state
+                    .invalidate_objects(typed_virtual_objects_in_expr(store.value.as_ref(), state));
+                if let Some(location) = store.name.local_location() {
+                    state.seed_object(
+                        TypedVirtualObjectId(source.index()),
+                        location,
+                        bindings,
+                        initialize_fields,
+                        allow_generic_field_accesses,
+                    );
+                }
+                return;
+            }
+            analyze_typed_field_scalar_expr(store.value.as_ref(), state, module_constants);
+            let Some(target) = store.name.local_location() else {
+                return;
+            };
+            if let Some(source) = typed_instr_local_load_location(store.value.as_ref())
+                && let Some(object) = state.object_for_location(source)
+            {
+                state.set_alias(target, object);
+            } else if let InstrTyped::Load(source) = store.value.as_ref() {
+                state.set_value_alias(target, &source.name);
+            } else {
+                state.rebind_local(target);
+            }
+        }
+        InstrTyped::Del(del) => {
+            if let Some(location) = del.name.local_location() {
+                state.rebind_local(location);
+            }
+        }
+        InstrTyped::SetAttrTyped(op) => {
+            analyze_typed_field_scalar_setattr(op, state, module_constants)
+        }
+        _ => analyze_typed_field_scalar_expr(instr, state, module_constants),
     }
 }
 
@@ -2900,6 +3197,126 @@ fn transfer_typed_field_scalar_term(
             state.invalidate_objects(typed_virtual_objects_in_expr(value, state));
         }
         BlockTerm::Jump(_) => {}
+    }
+}
+
+fn analyze_typed_field_scalar_term(
+    term: &BlockTerm<InstrTyped>,
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+) {
+    match term {
+        BlockTerm::IfTerm(if_term) => {
+            analyze_typed_field_scalar_expr(&if_term.test, state, module_constants);
+            if !matches!(if_term.test, InstrTyped::DirectCallGuardTest(_)) {
+                state.invalidate_objects(typed_virtual_objects_in_expr(&if_term.test, state));
+            }
+        }
+        BlockTerm::BranchTable(branch) => {
+            analyze_typed_field_scalar_expr(&branch.index, state, module_constants);
+            state.invalidate_objects(typed_virtual_objects_in_expr(&branch.index, state));
+        }
+        BlockTerm::Raise(raise) => {
+            if let Some(exc) = raise.exc.as_ref() {
+                analyze_typed_field_scalar_expr(exc, state, module_constants);
+                state.invalidate_objects(typed_virtual_objects_in_expr(exc, state));
+            }
+        }
+        BlockTerm::Return(value) => {
+            analyze_typed_field_scalar_expr(value, state, module_constants);
+            state.invalidate_objects(typed_virtual_objects_in_expr(value, state));
+        }
+        BlockTerm::Jump(_) => {}
+    }
+}
+
+fn analyze_typed_field_scalar_expr(
+    expr: &InstrTyped,
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+) {
+    match expr {
+        InstrTyped::Load(_) | InstrTyped::IncrementCounter(_) | InstrTyped::CellRef(_) => {}
+        InstrTyped::GetAttrTyped(op) => {
+            analyze_typed_field_scalar_getattr(op, state, module_constants);
+        }
+        InstrTyped::SetAttrTyped(op) => {
+            analyze_typed_field_scalar_setattr(op, state, module_constants);
+        }
+        InstrTyped::DirectCallGuardTest(op) => {
+            analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants);
+        }
+        _ => {
+            analyze_typed_field_scalar_children(expr, state, module_constants);
+            state.invalidate_objects(typed_virtual_objects_in_expr(expr, state));
+        }
+    }
+}
+
+fn analyze_typed_field_scalar_getattr(
+    op: &TypedGetAttr<InstrTyped>,
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+) {
+    if typed_instr_local_load_location(op.value.as_ref()).is_none() {
+        analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants);
+    }
+    analyze_typed_field_scalar_expr(op.attr.as_ref(), state, module_constants);
+    if typed_field_scalar_getattr_replacement(op, state, module_constants).is_some() {
+        return;
+    }
+    if let Some(receiver) = typed_instr_local_load_location(op.value.as_ref())
+        && let Some(object) = state.object_for_location(receiver)
+    {
+        if (typed_attr_access_is_indexed_field(&op.access)
+            || state.allows_generic_field_accesses(object))
+            && let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants)
+        {
+            state.invalidate_field(object, field_name);
+            return;
+        }
+        state.invalidate_object(object);
+    } else {
+        state.invalidate_objects(typed_virtual_objects_in_expr(op.value.as_ref(), state));
+    }
+}
+
+fn analyze_typed_field_scalar_setattr(
+    op: &TypedSetAttr<InstrTyped>,
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+) {
+    analyze_typed_field_scalar_expr(op.replacement.as_ref(), state, module_constants);
+    state.invalidate_objects(typed_virtual_objects_in_expr(op.attr.as_ref(), state));
+    let Some(receiver) = typed_instr_local_load_location(op.value.as_ref()) else {
+        state.invalidate_objects(typed_virtual_objects_in_expr(op.value.as_ref(), state));
+        return;
+    };
+    let Some(object) = state.object_for_location(receiver) else {
+        return;
+    };
+    let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants) else {
+        state.invalidate_object(object);
+        return;
+    };
+    if !typed_attr_access_is_indexed_field(&op.access)
+        && !state.allows_generic_field_accesses(object)
+    {
+        state.invalidate_object(object);
+        return;
+    }
+    if let Some(scalar) = state.field_scalar(object, field_name).cloned() {
+        if typed_scalar_field_replacement_name(op.replacement.as_ref()).is_some()
+            || typed_scalar_field_can_precompute_replacement(op.replacement.as_ref())
+        {
+            state.set_field(object, field_name.to_string(), scalar);
+        } else {
+            state.invalidate_field(object, field_name);
+        }
+    } else if let Some(replacement) = typed_scalar_field_replacement_name(op.replacement.as_ref()) {
+        state.set_field(object, field_name.to_string(), replacement.clone());
+    } else {
+        state.invalidate_field(object, field_name);
     }
 }
 
@@ -3097,6 +3514,83 @@ mod tests {
 
         assert_eq!(merged.field_scalars.get(&field), Some(&scalar));
         assert!(!merged.virtual_state.fields.contains_key(&field));
+    }
+
+    #[test]
+    fn remap_local_if_needed_skips_untracked_sources() {
+        let mut state = TypedVirtualLoweringState::default();
+        let source = local_name("source", 0);
+        let target = local_name("target", 1);
+
+        assert!(!state.remap_local_if_needed(&source, &target));
+        assert!(state.virtual_state.aliases.is_empty());
+        assert!(state.value_aliases.is_empty());
+        assert!(state.virtual_state.fields.is_empty());
+    }
+
+    #[test]
+    fn remap_local_if_needed_updates_tracked_sources() {
+        let object = TypedVirtualObjectId(11);
+        let source = local_name("source", 0);
+        let target = local_name("target", 1);
+        let source_location = source
+            .local_location()
+            .expect("test source should have a local location");
+        let target_location = target
+            .local_location()
+            .expect("test target should have a local location");
+        let mut state = TypedVirtualLoweringState::default();
+        state.virtual_state.aliases.insert(source_location, object);
+
+        assert!(state.remap_local_if_needed(&source, &target));
+        assert_eq!(
+            state.virtual_state.aliases.get(&target_location),
+            Some(&object)
+        );
+    }
+
+    #[test]
+    fn empty_virtual_object_plans_skip_field_state_analysis_inputs() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def caller(value):\n    return value\n",
+        )
+        .expect("source should lower");
+        let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let function = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        let source = InstrId::new(77);
+        let constructor_field_bindings = HashMap::from([(
+            source,
+            TypedConstructorFieldBindings {
+                fields: vec![TypedConstructorFieldBinding {
+                    field_name: "value".to_string(),
+                    value: local_name("value", 0),
+                    scalar: None,
+                }],
+            },
+        )]);
+        let trusted_sources = HashSet::from([source]);
+
+        let mut plan = plan_typed_fully_virtual_objects(
+            function,
+            &typed.module_constants,
+            &constructor_field_bindings,
+            &trusted_sources,
+        );
+        assert!(plan.objects.is_empty());
+        assert!(plan.materializing_objects.is_empty());
+        assert!(plan.field_states.is_none());
+
+        let mut function = function.clone();
+        let stats = lower_typed_fully_virtual_objects_to_locals_with_plan(
+            &mut function,
+            &typed.module_constants,
+            &mut plan,
+        );
+        assert!(!stats.changed());
     }
 
     #[test]
@@ -3455,6 +3949,108 @@ fn rewrite_typed_field_scalar_children(
         | InstrTyped::MakeCell(_)
         | InstrTyped::IncrementCounter(_)
         | InstrTyped::CellRef(_) => {}
+    }
+}
+
+fn analyze_typed_field_scalar_children(
+    expr: &InstrTyped,
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+) {
+    match expr {
+        InstrTyped::Truthy(op) => {
+            analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants)
+        }
+        InstrTyped::BinOp(op) => {
+            analyze_typed_field_scalar_expr(op.left.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_expr(op.right.as_ref(), state, module_constants);
+        }
+        InstrTyped::Tuple(op) => {
+            for value in &op.values {
+                analyze_typed_field_scalar_expr(value, state, module_constants);
+            }
+        }
+        InstrTyped::UnaryOp(op) => {
+            analyze_typed_field_scalar_expr(op.operand.as_ref(), state, module_constants)
+        }
+        InstrTyped::CalleeFunctionId(op) => {
+            analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants)
+        }
+        InstrTyped::CallTyped(op) => {
+            analyze_typed_field_scalar_expr(op.func.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_call_args(&op.args, &op.keywords, state, module_constants);
+        }
+        InstrTyped::GuardedCallableCallTyped(op) => {
+            analyze_typed_field_scalar_expr(op.func.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_call_args(&op.args, &op.keywords, state, module_constants);
+        }
+        InstrTyped::GuardedMethodCallTyped(op) => {
+            analyze_typed_field_scalar_expr(op.func.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_call_args(&op.args, &op.keywords, state, module_constants);
+        }
+        InstrTyped::DirectCallableCallTyped(op) => {
+            analyze_typed_field_scalar_expr(op.func.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_positional_args(&op.args, state, module_constants);
+        }
+        InstrTyped::DirectMethodCallTyped(op) => {
+            analyze_typed_field_scalar_expr(op.receiver.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_positional_args(&op.args, state, module_constants);
+        }
+        InstrTyped::CallDirect(op) => {
+            analyze_typed_field_scalar_expr(op.callable.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_call_args(&op.args, &op.keywords, state, module_constants);
+        }
+        InstrTyped::GetItem(op) => {
+            analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_expr(op.index.as_ref(), state, module_constants);
+        }
+        InstrTyped::SetItem(op) => {
+            analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_expr(op.index.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_expr(op.replacement.as_ref(), state, module_constants);
+        }
+        InstrTyped::DelItem(op) => {
+            analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_expr(op.index.as_ref(), state, module_constants);
+        }
+        InstrTyped::Store(op) => {
+            analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants)
+        }
+        InstrTyped::MakeFunctionWithClosure(op) => {
+            analyze_typed_field_scalar_expr(op.captures.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_expr(op.param_defaults.as_ref(), state, module_constants);
+            analyze_typed_field_scalar_expr(op.annotate_fn.as_ref(), state, module_constants);
+        }
+        InstrTyped::Load(_)
+        | InstrTyped::GetAttrTyped(_)
+        | InstrTyped::SetAttrTyped(_)
+        | InstrTyped::DirectCallGuardTest(_)
+        | InstrTyped::Del(_)
+        | InstrTyped::MakeCell(_)
+        | InstrTyped::IncrementCounter(_)
+        | InstrTyped::CellRef(_) => {}
+    }
+}
+
+fn analyze_typed_field_scalar_call_args(
+    args: &[CallArgPositional<InstrTyped>],
+    keywords: &[CallArgKeyword<InstrTyped>],
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+) {
+    analyze_typed_field_scalar_positional_args(args, state, module_constants);
+    for keyword in keywords {
+        analyze_typed_field_scalar_expr(keyword.expr(), state, module_constants);
+    }
+}
+
+fn analyze_typed_field_scalar_positional_args(
+    args: &[CallArgPositional<InstrTyped>],
+    state: &mut TypedVirtualLoweringState,
+    module_constants: &[ConstantExpr],
+) {
+    for arg in args {
+        analyze_typed_field_scalar_expr(arg.expr(), state, module_constants);
     }
 }
 

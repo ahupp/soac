@@ -469,6 +469,14 @@ impl RuntimeJitDeoptTable {
         self.function_id
     }
 
+    pub(super) fn supported_resume_points(&self) -> Vec<LocalEnvResumePoint> {
+        self.points
+            .iter()
+            .filter(|record| record.continuation.unsupported_reason().is_none())
+            .map(|record| record.resume_point)
+            .collect()
+    }
+
     fn function(&self) -> &BlockPyFunction<BlockPyModuleShape> {
         self.function.as_ref()
     }
@@ -519,7 +527,7 @@ impl RuntimeJitDeoptTable {
     }
 }
 
-fn runtime_jit_deopt_continuation_for_point(
+pub(super) fn runtime_jit_deopt_continuation_for_point(
     function: &BlockPyFunction<BlockPyModuleShape>,
     instr_locations: &InstrLocationMap,
     point: LocalEnvResumePoint,
@@ -1268,6 +1276,7 @@ impl RuntimeJitDeoptInvocation<'_> {
 
     pub(super) fn materialize_locals(&self) -> Result<RuntimeJitDeoptLocals<'_>, String> {
         RuntimeJitDeoptLocals::from_live_bindings(self.live_bindings())
+            .map_err(|err| format!("{err}; while materializing locals for {}", self.describe()))
     }
 
     pub(super) fn describe(&self) -> String {
@@ -1327,14 +1336,14 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
             match binding.binding {
                 LocalEnvResumeBindingState::Bound if value.is_null() => {
                     return Err(format!(
-                        "deopt local {} at {:?} is definitely bound but has a null value",
-                        binding.name, binding.location
+                        "deopt local {} at {:?} from {:?} is definitely bound but has a null value",
+                        binding.name, binding.location, binding.source
                     ));
                 }
                 LocalEnvResumeBindingState::Unbound if !value.is_null() => {
                     return Err(format!(
-                        "deopt local {} at {:?} is unbound but has a non-null value",
-                        binding.name, binding.location
+                        "deopt local {} at {:?} from {:?} is unbound but has a non-null value",
+                        binding.name, binding.location, binding.source
                     ));
                 }
                 _ => {}

@@ -16,7 +16,7 @@ use soac_ir_typed::{
     FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockPyModuleShape,
     TypedPyObjectOwnershipPlan, ValueFacts,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalRefState {
@@ -169,6 +169,11 @@ pub struct RefcountPlan {
     pub functions: HashMap<RuntimeFunctionId, FunctionRefcountPlan>,
 }
 
+pub type TypedPreciseImmortalLocalEntryStates =
+    HashMap<BlockLabel, HashMap<LocalLocation, LocalRefState>>;
+pub type TypedModulePreciseImmortalLocalEntryStates =
+    HashMap<RuntimeFunctionId, TypedPreciseImmortalLocalEntryStates>;
+
 impl RefcountPlan {
     pub fn function(&self, function_id: RuntimeFunctionId) -> Option<&FunctionRefcountPlan> {
         self.functions.get(&function_id)
@@ -256,13 +261,31 @@ pub fn plan_typed_ownership_effects(
     module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> RefcountPlan {
+    let precise_immortal_entry_states =
+        compute_typed_module_precise_immortal_local_entry_states(module, facts);
+    plan_typed_ownership_effects_with_precise_immortal_states(
+        module,
+        facts,
+        &precise_immortal_entry_states,
+    )
+}
+
+pub fn plan_typed_ownership_effects_with_precise_immortal_states(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    facts: &FactStore,
+    precise_immortal_entry_states: &TypedModulePreciseImmortalLocalEntryStates,
+) -> RefcountPlan {
     let functions = module
         .callable_defs
         .iter()
         .map(|function| {
             (
                 function.function_id,
-                plan_typed_function_refcounts(function, facts),
+                plan_typed_function_refcounts(
+                    function,
+                    facts,
+                    precise_immortal_entry_states.get(&function.function_id),
+                ),
             )
         })
         .collect();
@@ -273,6 +296,22 @@ pub fn validate_typed_ownership_effects(
     module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
     plan: &RefcountPlan,
+) -> Result<(), String> {
+    let precise_immortal_entry_states =
+        compute_typed_module_precise_immortal_local_entry_states(module, facts);
+    validate_typed_ownership_effects_with_precise_immortal_states(
+        module,
+        facts,
+        plan,
+        &precise_immortal_entry_states,
+    )
+}
+
+pub fn validate_typed_ownership_effects_with_precise_immortal_states(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    facts: &FactStore,
+    plan: &RefcountPlan,
+    precise_immortal_entry_states: &TypedModulePreciseImmortalLocalEntryStates,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     let function_ids = module
@@ -290,7 +329,13 @@ pub fn validate_typed_ownership_effects(
     }
 
     for function in &module.callable_defs {
-        validate_typed_function_refcount_plan(function, facts, plan, &mut errors);
+        validate_typed_function_refcount_plan(
+            function,
+            facts,
+            plan,
+            precise_immortal_entry_states.get(&function.function_id),
+            &mut errors,
+        );
     }
 
     if errors.is_empty() {
@@ -396,6 +441,7 @@ fn validate_typed_function_refcount_plan(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
     plan: &RefcountPlan,
+    precise_immortal_entry_states: Option<&TypedPreciseImmortalLocalEntryStates>,
     errors: &mut Vec<String>,
 ) {
     let Some(function_plan) = plan.function(function.function_id) else {
@@ -443,14 +489,20 @@ fn validate_typed_function_refcount_plan(
     let local_liveness = compute_typed_local_liveness(function, &location_by_name);
     let local_must_bound = compute_typed_local_must_bound(function, &location_by_name);
     let owned_cell_locations = typed_owned_cell_locations(function, &location_by_name);
-    let precise_entry_states = compute_typed_precise_immortal_entry_states_from_parts(
-        function,
-        facts,
-        &location_by_name,
-        &owned_cell_locations,
-        &target_params,
-        &local_liveness,
-    );
+    let computed_precise_entry_states;
+    let precise_entry_states = if let Some(states) = precise_immortal_entry_states {
+        states
+    } else {
+        computed_precise_entry_states = compute_typed_precise_immortal_entry_states_from_parts(
+            function,
+            facts,
+            &location_by_name,
+            &owned_cell_locations,
+            &target_params,
+            &local_liveness,
+        );
+        &computed_precise_entry_states
+    };
     let entry_label = function.entry_block().label;
     let block_labels = function
         .blocks
@@ -557,6 +609,7 @@ fn plan_function_refcounts(
 fn plan_typed_function_refcounts(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
+    precise_immortal_entry_states: Option<&TypedPreciseImmortalLocalEntryStates>,
 ) -> FunctionRefcountPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return FunctionRefcountPlan::default();
@@ -590,14 +643,20 @@ fn plan_typed_function_refcounts(
     let local_liveness = compute_typed_local_liveness(function, &location_by_name);
     let local_must_bound = compute_typed_local_must_bound(function, &location_by_name);
     let owned_cell_locations = typed_owned_cell_locations(function, &location_by_name);
-    let precise_entry_states = compute_typed_precise_immortal_entry_states_from_parts(
-        function,
-        facts,
-        &location_by_name,
-        &owned_cell_locations,
-        &target_params,
-        &local_liveness,
-    );
+    let computed_precise_entry_states;
+    let precise_entry_states = if let Some(states) = precise_immortal_entry_states {
+        states
+    } else {
+        computed_precise_entry_states = compute_typed_precise_immortal_entry_states_from_parts(
+            function,
+            facts,
+            &location_by_name,
+            &owned_cell_locations,
+            &target_params,
+            &local_liveness,
+        );
+        &computed_precise_entry_states
+    };
 
     let blocks = function
         .blocks
@@ -624,10 +683,26 @@ fn plan_typed_function_refcounts(
     FunctionRefcountPlan { blocks }
 }
 
+pub fn compute_typed_module_precise_immortal_local_entry_states(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    facts: &FactStore,
+) -> TypedModulePreciseImmortalLocalEntryStates {
+    module
+        .callable_defs
+        .iter()
+        .map(|function| {
+            (
+                function.function_id,
+                compute_typed_function_precise_immortal_local_entry_states(function, facts),
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn compute_typed_function_precise_immortal_local_entry_states(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
-) -> HashMap<BlockLabel, HashMap<LocalLocation, LocalRefState>> {
+) -> TypedPreciseImmortalLocalEntryStates {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return HashMap::new();
     };
@@ -674,38 +749,62 @@ fn compute_typed_precise_immortal_entry_states_from_parts(
         .map(|(index, block)| (block.label, index))
         .collect::<HashMap<_, _>>();
     let mut entry_states = vec![HashMap::new(); function.blocks.len()];
-    let mut changed = true;
-    while changed {
-        let mut incoming =
-            vec![Vec::<HashMap<LocalLocation, LocalRefState>>::new(); function.blocks.len()];
-        for (source_index, block) in function.blocks.iter().enumerate() {
-            let exit_state = transfer_typed_precise_immortal_state_through_block(
-                function.function_id,
-                block,
-                facts,
-                &entry_states[source_index],
-                owned_cell_locations,
-            );
-            for (target, explicit_args) in typed_successor_edges(block) {
-                let Some(target_index) = block_indices_by_label.get(&target).copied() else {
-                    continue;
-                };
-                incoming[target_index].push(typed_successor_precise_immortal_state(
-                    target,
-                    explicit_args,
-                    &exit_state,
-                    target_params,
-                    local_liveness,
-                    location_by_name,
-                ));
-            }
+    let mut out_states = vec![None::<HashMap<LocalLocation, LocalRefState>>; function.blocks.len()];
+    let mut predecessor_edges =
+        vec![Vec::<(usize, BlockLabel, Option<Vec<BlockArg>>)>::new(); function.blocks.len()];
+    let mut successor_indices = vec![Vec::<usize>::new(); function.blocks.len()];
+    for (source_index, block) in function.blocks.iter().enumerate() {
+        for (target, explicit_args) in typed_successor_edges(block) {
+            let Some(target_index) = block_indices_by_label.get(&target).copied() else {
+                continue;
+            };
+            predecessor_edges[target_index].push((
+                source_index,
+                target,
+                explicit_args.map(<[BlockArg]>::to_vec),
+            ));
+            successor_indices[source_index].push(target_index);
         }
-        changed = false;
-        for (index, incoming_states) in incoming.iter().enumerate() {
-            let new_entry = merge_precise_immortal_incoming_states(incoming_states);
-            if entry_states[index] != new_entry {
-                entry_states[index] = new_entry;
-                changed = true;
+    }
+    let mut pending = (0..function.blocks.len()).collect::<VecDeque<_>>();
+    let mut queued = vec![true; function.blocks.len()];
+    while let Some(block_index) = pending.pop_front() {
+        queued[block_index] = false;
+        let incoming_states = predecessor_edges[block_index]
+            .iter()
+            .filter_map(|(source_index, target, explicit_args)| {
+                out_states[*source_index].as_ref().map(|out_state| {
+                    typed_successor_precise_immortal_state(
+                        *target,
+                        explicit_args.as_deref(),
+                        out_state,
+                        target_params,
+                        local_liveness,
+                        location_by_name,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let new_entry = merge_precise_immortal_incoming_states(&incoming_states);
+        if entry_states[block_index] == new_entry && out_states[block_index].is_some() {
+            continue;
+        }
+        entry_states[block_index] = new_entry;
+        let new_out = transfer_typed_precise_immortal_state_through_block(
+            function.function_id,
+            &function.blocks[block_index],
+            facts,
+            &entry_states[block_index],
+            owned_cell_locations,
+        );
+        if out_states[block_index].as_ref() == Some(&new_out) {
+            continue;
+        }
+        out_states[block_index] = Some(new_out);
+        for successor_index in &successor_indices[block_index] {
+            if !queued[*successor_index] {
+                pending.push_back(*successor_index);
+                queued[*successor_index] = true;
             }
         }
     }
@@ -2495,59 +2594,64 @@ fn compute_typed_local_liveness(
 ) -> LocalLiveness {
     let owned_cell_locations = typed_owned_cell_locations(function, location_by_name);
     let local_count = location_by_name.len();
-    let effects_by_block = function
+    let labels = function
         .blocks
         .iter()
-        .map(|block| {
-            (
-                block.label,
-                typed_block_local_effects(block, location_by_name, &owned_cell_locations),
-            )
-        })
+        .map(|block| block.label)
+        .collect::<Vec<_>>();
+    let block_indices_by_label = labels
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, label)| (label, index))
         .collect::<HashMap<_, _>>();
-    let successors_by_block = function
+    let effects_by_index = function
         .blocks
         .iter()
-        .map(|block| (block.label, typed_block_successors(block)))
-        .collect::<HashMap<_, _>>();
-    let mut live_in_by_block = function
-        .blocks
-        .iter()
-        .map(|block| (block.label, LocalBitSet::empty(local_count)))
-        .collect::<HashMap<_, _>>();
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in function.blocks.iter().rev() {
-            let effects = effects_by_block
-                .get(&block.label)
-                .expect("liveness effects should exist for every block");
-            let mut live_out = LocalBitSet::empty(local_count);
-            for successor in successors_by_block
-                .get(&block.label)
-                .expect("liveness successors should exist for every block")
-            {
-                if let Some(successor_live_in) = live_in_by_block.get(successor) {
-                    live_out.union_with(successor_live_in);
-                }
-            }
-
-            let mut new_live_in =
-                LocalBitSet::from_locations(local_count, effects.uses.iter().copied());
-            let defs = LocalBitSet::from_locations(local_count, effects.defs.iter().copied());
-            live_out.difference_with(&defs);
-            new_live_in.union_with(&live_out);
-            let entry = live_in_by_block
-                .get_mut(&block.label)
-                .expect("liveness entry should exist for every block");
-            if *entry != new_live_in {
-                *entry = new_live_in;
-                changed = true;
+        .map(|block| typed_block_local_effects(block, location_by_name, &owned_cell_locations))
+        .collect::<Vec<_>>();
+    let mut successors_by_index = vec![Vec::<usize>::new(); function.blocks.len()];
+    let mut predecessors_by_index = vec![Vec::<usize>::new(); function.blocks.len()];
+    for (source_index, block) in function.blocks.iter().enumerate() {
+        for successor in typed_block_successors(block) {
+            let successor_index = *block_indices_by_label
+                .get(&successor)
+                .expect("typed liveness successor target should exist");
+            successors_by_index[source_index].push(successor_index);
+            predecessors_by_index[successor_index].push(source_index);
+        }
+    }
+    let mut live_in_by_index = vec![LocalBitSet::empty(local_count); function.blocks.len()];
+    let mut pending = (0..function.blocks.len()).rev().collect::<VecDeque<_>>();
+    let mut queued = vec![true; function.blocks.len()];
+    while let Some(block_index) = pending.pop_front() {
+        queued[block_index] = false;
+        let effects = &effects_by_index[block_index];
+        let mut live_out = LocalBitSet::empty(local_count);
+        for successor_index in &successors_by_index[block_index] {
+            live_out.union_with(&live_in_by_index[*successor_index]);
+        }
+        let mut new_live_in =
+            LocalBitSet::from_locations(local_count, effects.uses.iter().copied());
+        let defs = LocalBitSet::from_locations(local_count, effects.defs.iter().copied());
+        live_out.difference_with(&defs);
+        new_live_in.union_with(&live_out);
+        if live_in_by_index[block_index] == new_live_in {
+            continue;
+        }
+        live_in_by_index[block_index] = new_live_in;
+        for predecessor_index in &predecessors_by_index[block_index] {
+            if !queued[*predecessor_index] {
+                pending.push_back(*predecessor_index);
+                queued[*predecessor_index] = true;
             }
         }
     }
 
+    let live_in_by_block = labels
+        .into_iter()
+        .zip(live_in_by_index)
+        .collect::<HashMap<_, _>>();
     LocalLiveness { live_in_by_block }
 }
 
@@ -2562,26 +2666,27 @@ fn compute_typed_local_must_bound(
         .iter()
         .map(|block| block.label)
         .collect::<Vec<_>>();
-    let successors_by_block = function
-        .blocks
-        .iter()
-        .map(|block| (block.label, typed_block_successors(block)))
-        .collect::<HashMap<_, _>>();
-    let mut predecessors_by_block = labels
+    let block_indices_by_label = labels
         .iter()
         .copied()
-        .map(|label| (label, Vec::new()))
+        .enumerate()
+        .map(|(index, label)| (label, index))
         .collect::<HashMap<_, _>>();
-    for (source, successors) in &successors_by_block {
-        for successor in successors {
-            predecessors_by_block
-                .get_mut(successor)
-                .expect("must-bound predecessor target should exist")
-                .push(*source);
+    let mut successors_by_index = vec![Vec::<usize>::new(); function.blocks.len()];
+    let mut predecessors_by_index = vec![Vec::<usize>::new(); function.blocks.len()];
+    for (source_index, block) in function.blocks.iter().enumerate() {
+        for successor in typed_block_successors(block) {
+            let successor_index = *block_indices_by_label
+                .get(&successor)
+                .expect("must-bound successor target should exist");
+            successors_by_index[source_index].push(successor_index);
+            predecessors_by_index[successor_index].push(source_index);
         }
     }
-
     let entry_label = function.entry_block().label;
+    let entry_index = *block_indices_by_label
+        .get(&entry_label)
+        .expect("must-bound entry block should exist");
     let entry_bound = LocalBitSet::from_locations(
         local_count,
         function
@@ -2590,88 +2695,74 @@ fn compute_typed_local_must_bound(
             .filter_map(|param| location_by_name.get(&param.name).copied()),
     );
 
-    let mut must_bound_in_by_block = labels
+    let mut must_bound_in_by_index = labels
         .iter()
-        .copied()
-        .map(|label| {
-            let state = if label == entry_label {
+        .enumerate()
+        .map(|(index, _label)| {
+            if index == entry_index {
                 entry_bound.clone()
             } else {
                 LocalBitSet::full(local_count)
-            };
-            (label, state)
+            }
         })
-        .collect::<HashMap<_, _>>();
-    let mut must_bound_out_by_block = labels
+        .collect::<Vec<_>>();
+    let mut must_bound_out_by_index = function
+        .blocks
         .iter()
-        .copied()
-        .map(|label| {
-            let initial_in = must_bound_in_by_block
-                .get(&label)
-                .expect("must-bound entry should exist for every block");
-            let out = transfer_typed_must_bound_through_block(
-                function,
-                function
-                    .blocks
-                    .iter()
-                    .find(|block| block.label == label)
-                    .expect("must-bound block should exist for label"),
-                initial_in,
-                &owned_cell_locations,
-            );
-            (label, out)
-        })
-        .collect::<HashMap<_, _>>();
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in &function.blocks {
-            let new_in = if block.label == entry_label {
-                entry_bound.clone()
-            } else {
-                let predecessors = predecessors_by_block
-                    .get(&block.label)
-                    .expect("must-bound predecessors should exist for every block");
-                if predecessors.is_empty() {
-                    LocalBitSet::empty(local_count)
-                } else {
-                    let mut intersection = must_bound_out_by_block
-                        .get(&predecessors[0])
-                        .expect("must-bound predecessor out should exist")
-                        .clone();
-                    for predecessor in &predecessors[1..] {
-                        let predecessor_out = must_bound_out_by_block
-                            .get(predecessor)
-                            .expect("must-bound predecessor out should exist");
-                        intersection.intersect_with(predecessor_out);
-                    }
-                    intersection
-                }
-            };
-            let new_out = transfer_typed_must_bound_through_block(
+        .enumerate()
+        .map(|(index, block)| {
+            transfer_typed_must_bound_through_block(
                 function,
                 block,
-                &new_in,
+                &must_bound_in_by_index[index],
                 &owned_cell_locations,
-            );
-            let in_entry = must_bound_in_by_block
-                .get_mut(&block.label)
-                .expect("must-bound in entry should exist for every block");
-            if *in_entry != new_in {
-                *in_entry = new_in;
-                changed = true;
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut pending = (0..function.blocks.len()).collect::<VecDeque<_>>();
+    let mut queued = vec![true; function.blocks.len()];
+    while let Some(block_index) = pending.pop_front() {
+        queued[block_index] = false;
+        let new_in = if block_index == entry_index {
+            entry_bound.clone()
+        } else {
+            let predecessors = &predecessors_by_index[block_index];
+            if predecessors.is_empty() {
+                LocalBitSet::empty(local_count)
+            } else {
+                let mut intersection = must_bound_out_by_index[predecessors[0]].clone();
+                for predecessor_index in &predecessors[1..] {
+                    intersection.intersect_with(&must_bound_out_by_index[*predecessor_index]);
+                }
+                intersection
             }
-            let out_entry = must_bound_out_by_block
-                .get_mut(&block.label)
-                .expect("must-bound out entry should exist for every block");
-            if *out_entry != new_out {
-                *out_entry = new_out;
-                changed = true;
+        };
+        if must_bound_in_by_index[block_index] == new_in {
+            continue;
+        }
+        must_bound_in_by_index[block_index] = new_in;
+        let new_out = transfer_typed_must_bound_through_block(
+            function,
+            &function.blocks[block_index],
+            &must_bound_in_by_index[block_index],
+            &owned_cell_locations,
+        );
+        if must_bound_out_by_index[block_index] == new_out {
+            continue;
+        }
+        must_bound_out_by_index[block_index] = new_out;
+        for successor_index in &successors_by_index[block_index] {
+            if !queued[*successor_index] {
+                pending.push_back(*successor_index);
+                queued[*successor_index] = true;
             }
         }
     }
 
+    let must_bound_in_by_block = labels
+        .into_iter()
+        .zip(must_bound_in_by_index)
+        .collect::<HashMap<_, _>>();
     LocalMustBound {
         must_bound_in_by_block,
     }

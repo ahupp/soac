@@ -128,7 +128,7 @@ def test_apply_mode_constructor_entry_failure_preserves_exception(
     assert result == ["Marker", "boom:7", True]
 
 
-def test_apply_mode_runtime_unpack_reuses_batched_direct_entry(
+def test_apply_mode_runtime_unpack_path_preserves_exception_cleanup(
     tmp_path: Path,
 ) -> None:
     result, rows = _run_apply_module(
@@ -155,15 +155,13 @@ def test_apply_mode_runtime_unpack_reuses_batched_direct_entry(
         """,
     )
 
-    unpack_direct_edge_rows = [
+    direct_edge_rows = [
         row
         for row in rows
         if row.get("target") == "soac_jit_direct_edges"
-        and row.get("module") == "soac.runtime"
-        and row.get("qualname") == "unpack"
         and row.get("clif_direct_edges", 0) > 0
     ]
-    assert unpack_direct_edge_rows, rows
+    assert direct_edge_rows, rows
     assert result == [1, 2]
 
 

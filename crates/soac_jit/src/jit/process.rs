@@ -50,7 +50,8 @@ use cranelift_module::{DataId, FuncId, Linkage, Module};
 use pyo3::{Py, PyAny, Python, ffi};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
-    BlockPyFunction, BlockPyModule, CounterDef, FunctionExecutionMode, InstrId, RuntimeFunctionId,
+    BlockPyFunction, BlockPyModule, CounterDef, FunctionExecutionMode, FunctionKind, InstrId,
+    RuntimeFunctionId,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1765,6 +1766,9 @@ impl ProcessJitState {
             Some(&plan.predeclared),
             BuildSpecializedFunctionOptions {
                 counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
+                runtime_supported_deopt_resume_points: Some(
+                    function_deopt_table.supported_resume_points(),
+                ),
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
@@ -2769,6 +2773,7 @@ impl ProcessJitEngine {
             .filter(|function| {
                 function.function_id != RuntimeFunctionId::global()
                     && function.execution_mode() == FunctionExecutionMode::Jit
+                    && !keeps_source_generator_vectorcall(&shared_state, function)
             })
             .cloned()
             .map(|function| ProcessJitBatchFunction {
@@ -3532,6 +3537,16 @@ impl From<DirectFunctionCompileResult> for DirectFunctionCompileAttempt {
     fn from(result: DirectFunctionCompileResult) -> Self {
         Self::Done(result)
     }
+}
+
+fn keeps_source_generator_vectorcall(
+    shared_state: &crate::module_type::SharedModuleState,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+) -> bool {
+    function.lowered_kind() == &FunctionKind::Generator
+        && shared_state
+            .lookup_original_code(function.function_id)
+            .is_some()
 }
 
 #[cfg(test)]

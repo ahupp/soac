@@ -6,9 +6,12 @@
 //! stack-slot loads, or another resume-state representation.
 
 use crate::passes::ownership_effects::{
-    LocalRefState, compute_function_local_live_ins, compute_function_local_must_bound_ins,
-    compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
+    LocalRefState, TypedModulePreciseImmortalLocalEntryStates,
+    TypedPreciseImmortalLocalEntryStates, compute_function_local_live_ins,
+    compute_function_local_must_bound_ins, compute_typed_function_local_live_ins,
+    compute_typed_function_local_must_bound_ins,
     compute_typed_function_precise_immortal_local_entry_states,
+    compute_typed_module_precise_immortal_local_entry_states,
 };
 use crate::passes::{BlockPyModuleShape, InstrBlockPy};
 use crate::typed::typed_expr_planned_pyobject_ownership;
@@ -388,13 +391,31 @@ pub fn plan_typed_local_env_module(
     module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> LocalEnvModulePlan {
+    let precise_immortal_entry_states =
+        compute_typed_module_precise_immortal_local_entry_states(module, facts);
+    plan_typed_local_env_module_with_precise_immortal_states(
+        module,
+        facts,
+        &precise_immortal_entry_states,
+    )
+}
+
+pub fn plan_typed_local_env_module_with_precise_immortal_states(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    facts: &FactStore,
+    precise_immortal_entry_states: &TypedModulePreciseImmortalLocalEntryStates,
+) -> LocalEnvModulePlan {
     let functions = module
         .callable_defs
         .iter()
         .map(|function| {
             (
                 function.function_id,
-                plan_typed_function_locals(function, facts),
+                plan_typed_function_locals_with_precise_immortal_states(
+                    function,
+                    facts,
+                    precise_immortal_entry_states.get(&function.function_id),
+                ),
             )
         })
         .collect();
@@ -603,6 +624,22 @@ pub fn validate_typed_local_env_module_plan(
     facts: &FactStore,
     plan: &LocalEnvModulePlan,
 ) -> Result<(), String> {
+    let precise_immortal_entry_states =
+        compute_typed_module_precise_immortal_local_entry_states(module, facts);
+    validate_typed_local_env_module_plan_with_precise_immortal_states(
+        module,
+        facts,
+        plan,
+        &precise_immortal_entry_states,
+    )
+}
+
+pub fn validate_typed_local_env_module_plan_with_precise_immortal_states(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    facts: &FactStore,
+    plan: &LocalEnvModulePlan,
+    precise_immortal_entry_states: &TypedModulePreciseImmortalLocalEntryStates,
+) -> Result<(), String> {
     let expected_function_ids = module
         .callable_defs
         .iter()
@@ -618,7 +655,11 @@ pub fn validate_typed_local_env_module_plan(
             ));
             continue;
         };
-        let expected = plan_typed_function_locals(function, facts);
+        let expected = plan_typed_function_locals_with_precise_immortal_states(
+            function,
+            facts,
+            precise_immortal_entry_states.get(&function.function_id),
+        );
         if &expected != function_plan {
             errors.push(format!(
                 "typed LocalEnv plan mismatch for function {} ({})\nexpected: {expected:#?}\nactual: {function_plan:#?}",
@@ -806,6 +847,14 @@ pub fn plan_typed_function_locals(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> FunctionLocalPlan {
+    plan_typed_function_locals_with_precise_immortal_states(function, facts, None)
+}
+
+fn plan_typed_function_locals_with_precise_immortal_states(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    facts: &FactStore,
+    precise_immortal_entry_states: Option<&TypedPreciseImmortalLocalEntryStates>,
+) -> FunctionLocalPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         let blocks = function
             .blocks
@@ -825,8 +874,14 @@ pub fn plan_typed_function_locals(
     let live_ins = compute_typed_function_local_live_ins(function);
     let must_bound_ins = compute_typed_function_local_must_bound_ins(function);
     let preserved_state_location = preserved_state_location(storage_layout);
-    let precise_entry_states =
-        compute_typed_function_precise_immortal_local_entry_states(function, facts);
+    let computed_precise_entry_states;
+    let precise_entry_states = if let Some(states) = precise_immortal_entry_states {
+        states
+    } else {
+        computed_precise_entry_states =
+            compute_typed_function_precise_immortal_local_entry_states(function, facts);
+        &computed_precise_entry_states
+    };
     let entry_label = function.entry_block().label;
     let mut blocks = HashMap::with_capacity(function.blocks.len());
     for block in &function.blocks {

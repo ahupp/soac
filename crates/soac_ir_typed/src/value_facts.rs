@@ -296,6 +296,11 @@ impl PyObjFacts {
         self
     }
 
+    pub const fn without_non_null_ref(mut self) -> Self {
+        self.nullability = PyObjectNullabilityFact::Unknown;
+        self
+    }
+
     pub const fn is_non_null_ref(self) -> bool {
         matches!(self.nullability, PyObjectNullabilityFact::NonNull)
     }

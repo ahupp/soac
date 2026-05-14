@@ -1620,6 +1620,7 @@ struct JitEmitCtx<'mc> {
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
+    runtime_supported_deopt_resume_points: Option<&'mc [LocalEnvResumePoint]>,
     refcount_plan: &'mc FunctionRefcountPlan,
     cleanup_root_slot_states: &'mc PlannedCleanupRootSlotStates,
     truthiness_only_local_locations: &'mc HashSet<LocalLocation>,
@@ -2087,8 +2088,20 @@ fn emit_deopt_live_value_for_binding(
     local_env: &LocalEnv,
     null_ptr: ir::Value,
 ) -> Result<ir::Value, String> {
-    if matches!(binding.source, LocalEnvResumeValueSource::Unbound) {
-        return Ok(null_ptr);
+    match binding.source {
+        LocalEnvResumeValueSource::Unbound => return Ok(null_ptr),
+        LocalEnvResumeValueSource::StackSlot(location) => {
+            let Some(slot) = deopt_binding_stack_slot_for_location(ctx, location) else {
+                return Err(format!(
+                    "cannot materialize stack-slot deopt value for local {} at location {:?}",
+                    binding.name, binding.location
+                ));
+            };
+            return Ok(fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0));
+        }
+        LocalEnvResumeValueSource::BlockParam(_)
+        | LocalEnvResumeValueSource::StoredValue(_)
+        | LocalEnvResumeValueSource::Unknown => {}
     }
     if let Some(index) = local_env
         .entry_index_for_location(binding.location)
@@ -2241,6 +2254,12 @@ impl JitEmitCtx<'_> {
         point: LocalEnvResumePoint,
         fallback_block: ir::Block,
     ) -> Result<JitGuardMissTarget, RuntimeJitDeoptUnsupportedReason> {
+        if self
+            .runtime_supported_deopt_resume_points
+            .is_some_and(|supported| !supported.contains(&point))
+        {
+            return Err(RuntimeJitDeoptUnsupportedReason::MissingInstruction);
+        }
         let function = self
             .module
             .callable_defs
@@ -2351,6 +2370,7 @@ struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv
     ctx: &'c JitEmitCtx<'mc>,
     codegen_env: &'a mut Env,
     func_imports: &'a mut FuncBuildImports<'d>,
+    owned_transfer_temp_load: Option<LocalLocation>,
 }
 
 #[derive(Clone)]
@@ -3482,6 +3502,42 @@ impl LocalEnv {
             .map(|index| self.entries.remove(index))
     }
 
+    fn can_transfer_owned_local_only_location(&self, location: LocalLocation, name: &str) -> bool {
+        self.entry_index_for_location(location)
+            .or_else(|| self.entry_index_for_name(name))
+            .map(|index| &self.entries[index])
+            .is_some_and(|entry| {
+                entry.storage == LocalEnvStorage::LocalOnly
+                    && entry.ref_kind() == LocalRefKind::Owned
+                    && !entry.binding_facts.requires_checked_local_load()
+            })
+    }
+
+    fn mark_owned_local_only_location_transferred(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        location: LocalLocation,
+        name: &str,
+        ptr_ty: ir::Type,
+    ) -> bool {
+        if !self.can_transfer_owned_local_only_location(location, name) {
+            return false;
+        }
+        let Some(entry) = self.remove_location_or_name(location, name) else {
+            return false;
+        };
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        self.entries.push(LocalEnvEntry::new(
+            Some(location),
+            name.to_string(),
+            entry.aliases,
+            LocalBindingValue::unbound(null_ptr),
+            LocalEnvStorage::LocalOnly,
+            local_binding_facts_for_stored_value(LocalRefKind::Unbound),
+        ));
+        true
+    }
+
     #[cfg(test)]
     fn local_only_cleanup_values(&self) -> Vec<ir::Value> {
         self.entries
@@ -3678,7 +3734,18 @@ fn local_env_entry_py_facts_for_materialization(
     let is_cleanup_root_block_param =
         matches!(entry.source, PlannedLocalEnvEntrySource::BlockParam { .. }) && is_cleanup_root;
     if propagate_entry_py_facts && !is_cleanup_root_block_param {
-        entry.binding.param_facts.value
+        entry.binding.param_facts.value.map(|facts| {
+            if entry
+                .binding
+                .param_facts
+                .binding
+                .requires_checked_local_load()
+            {
+                facts.without_non_null_ref()
+            } else {
+                facts
+            }
+        })
     } else {
         None
     }
@@ -4831,6 +4898,7 @@ fn emit_typed_cell_store_result_with_local_env(
         ctx: emit_ctx,
         codegen_env,
         func_imports,
+        owned_transfer_temp_load: None,
     };
     let value = intrinsics::OperationEmitState::<InstrTyped>::finish_owned_result(
         &mut intrinsic_state,
@@ -4908,6 +4976,7 @@ fn emit_typed_cell_delete_result_with_local_env(
         ctx: emit_ctx,
         codegen_env,
         func_imports,
+        owned_transfer_temp_load: None,
     };
     let value = intrinsics::emit_del_deref_raw_cell::<InstrTyped>(
         raw_cell,
@@ -5333,7 +5402,12 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_via_lowering(fb, refcounts, previous, previous_facts);
+            emit_decref_via_lowering(
+                fb,
+                refcounts,
+                previous,
+                nullable_stack_slot_decref_facts(previous_facts),
+            );
         }
         Some(())
     }
@@ -5435,7 +5509,12 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_via_lowering(fb, refcounts, previous, previous_facts);
+            emit_decref_via_lowering(
+                fb,
+                refcounts,
+                previous,
+                nullable_stack_slot_decref_facts(previous_facts),
+            );
         }
         Some(())
     }
@@ -5469,7 +5548,12 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_via_lowering(fb, refcounts, previous, previous_facts);
+            emit_decref_via_lowering(
+                fb,
+                refcounts,
+                previous,
+                nullable_stack_slot_decref_facts(previous_facts),
+            );
         }
         Some(())
     }
@@ -5549,7 +5633,12 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_via_lowering(fb, refcounts, previous, previous_facts);
+            emit_decref_via_lowering(
+                fb,
+                refcounts,
+                previous,
+                nullable_stack_slot_decref_facts(previous_facts),
+            );
         }
         Some(())
     }
@@ -5600,10 +5689,17 @@ impl StackSlots {
                 fb,
                 refcounts.with_family(RefcountFamily::ExitSweep),
                 value,
-                cleanup_root_facts.get(name).copied(),
+                nullable_stack_slot_decref_facts(cleanup_root_facts.get(name).copied()),
             );
         }
     }
+}
+
+fn nullable_stack_slot_decref_facts(facts: Option<PyObjFacts>) -> Option<PyObjFacts> {
+    // Maybe-owned frame roots can physically hold null on paths where no object
+    // has been stored. Preserve object facts, but never use them to skip the
+    // raw null guard for a stack-slot decref.
+    facts.map(PyObjFacts::without_non_null_ref)
 }
 
 fn emit_incref_if_not_null(
@@ -5902,7 +5998,10 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                 "typed intrinsic PyObject argument",
             )
             .unwrap_or_else(|err| panic!("{err}"));
-            arg_values.push((value, !ownership.is_owned()));
+            let transfers_owned_temp = self
+                .owned_transfer_temp_load
+                .is_some_and(|location| typed_expr_local_load_location(arg) == Some(location));
+            arg_values.push((value, !transfers_owned_temp && !ownership.is_owned()));
         }
         arg_values
     }
@@ -11279,6 +11378,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
             ctx: emit_ctx,
             codegen_env,
             func_imports,
+            owned_transfer_temp_load: None,
         };
         if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
             let (ownership, facts) = planned_owned_pyobject_result_for_typed_expr(expr, local_env);
@@ -11313,6 +11413,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
             ctx: emit_ctx,
             codegen_env,
             func_imports,
+            owned_transfer_temp_load: None,
         };
         if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
             let facts = expr
@@ -12211,13 +12312,17 @@ fn emit_typed_constructor_entry_call_with_local_env(
         emit_ctx,
         codegen_env,
     );
-    Ok(Some(emit_owned_pyobject_result_for_demand(
-        fb,
-        result,
-        PyObjFacts::unknown(),
-        emit_ctx,
-        demand,
-    )))
+    Ok(Some(
+        emit_owned_pyobject_result_for_demand_with_codegen_imports(
+            fb,
+            result,
+            PyObjFacts::unknown(),
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13441,6 +13546,7 @@ fn emit_codegen_expr_with_local_env(
             ctx: emit_ctx,
             codegen_env,
             func_imports,
+            owned_transfer_temp_load: None,
         };
         if let Some(value) = intrinsics::emit_operation(expr, &mut intrinsic_state) {
             return value;
@@ -13491,6 +13597,7 @@ fn emit_codegen_expr_with_local_env(
             ctx: emit_ctx,
             codegen_env,
             func_imports,
+            owned_transfer_temp_load: None,
         };
         return intrinsics::OperationEmitState::<InstrBlockPy>::finish_owned_result(
             &mut intrinsic_state,
@@ -13527,6 +13634,7 @@ fn emit_codegen_expr_with_local_env(
             ctx: emit_ctx,
             codegen_env,
             func_imports,
+            owned_transfer_temp_load: None,
         };
         return intrinsics::emit_del_deref_raw_cell::<InstrBlockPy>(
             raw_cell,
@@ -13699,6 +13807,17 @@ fn emit_owned_pyobject_result_for_demand(
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
+    emit_owned_pyobject_result_for_demand_with_truthiness(fb, value, facts, emit_ctx, demand, None)
+}
+
+fn emit_owned_pyobject_result_for_demand_with_truthiness(
+    fb: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    facts: PyObjFacts,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    is_true_ref: Option<ir::FuncRef>,
+) -> EmitResult {
     let ownership = if facts.is_immortal() {
         ValueOwnership::Immortal
     } else {
@@ -13709,8 +13828,32 @@ fn emit_owned_pyobject_result_for_demand(
         SoacValue::pyobject_with_ownership(value, ownership, facts),
         emit_ctx,
         demand,
-        None,
+        is_true_ref,
     )
+}
+
+fn emit_owned_pyobject_result_for_demand_with_codegen_imports(
+    fb: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    facts: PyObjFacts,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let is_true_ref = if demand == ResultDemand::I32Bool01 {
+        Some(func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?)
+    } else {
+        None
+    };
+    Ok(emit_owned_pyobject_result_for_demand_with_truthiness(
+        fb,
+        value,
+        facts,
+        emit_ctx,
+        demand,
+        is_true_ref,
+    ))
 }
 
 fn emit_promote_pyobject_to_owned_boundary(
@@ -14541,6 +14684,7 @@ fn emit_typed_guarded_i64_index_with_local_env(
                 ctx: emit_ctx,
                 codegen_env,
                 func_imports,
+                owned_transfer_temp_load: None,
             };
             Ok(Some(intrinsics::emit_v3_guarded_compact_long_i64(
                 &mut intrinsic_state,
@@ -15660,13 +15804,17 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
 
     fb.switch_to_block(result_block);
     let result = fb.block_params(result_block)[0];
-    Ok(Some(emit_owned_pyobject_result_for_demand(
-        fb,
-        result,
-        PyObjFacts::unknown(),
-        emit_ctx,
-        demand,
-    )))
+    Ok(Some(
+        emit_owned_pyobject_result_for_demand_with_codegen_imports(
+            fb,
+            result,
+            PyObjFacts::unknown(),
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16026,13 +16174,15 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
 
     fb.switch_to_block(result_block);
     let result = fb.block_params(result_block)[0];
-    Ok(emit_owned_pyobject_result_for_demand(
+    emit_owned_pyobject_result_for_demand_with_codegen_imports(
         fb,
         result,
         PyObjFacts::unknown(),
         emit_ctx,
         demand,
-    ))
+        codegen_env,
+        func_imports,
+    )
 }
 
 fn emit_typed_codegen_direct_callable_call_result_with_local_env(
@@ -16111,13 +16261,15 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
         codegen_env,
         func_imports,
     )?;
-    Ok(emit_owned_pyobject_result_for_demand(
+    emit_owned_pyobject_result_for_demand_with_codegen_imports(
         fb,
         result,
         PyObjFacts::unknown(),
         emit_ctx,
         demand,
-    ))
+        codegen_env,
+        func_imports,
+    )
 }
 
 fn emit_typed_codegen_direct_method_call_result_with_local_env(
@@ -16172,13 +16324,15 @@ fn emit_typed_codegen_direct_method_call_result_with_local_env(
         codegen_env,
         func_imports,
     )?;
-    Ok(emit_owned_pyobject_result_for_demand(
+    emit_owned_pyobject_result_for_demand_with_codegen_imports(
         fb,
         result,
         PyObjFacts::unknown(),
         emit_ctx,
         demand,
-    ))
+        codegen_env,
+        func_imports,
+    )
 }
 
 fn emit_codegen_stmt_result_with_local_env(
@@ -16267,9 +16421,15 @@ fn emit_codegen_stmt_result_with_local_env(
         emit_codegen_stmt_with_local_env(fb, expr, local_env, emit_ctx, codegen_env, func_imports);
     let facts = py_facts_for_codegen_expr_with_local_env(expr, local_env, emit_ctx)
         .unwrap_or_else(PyObjFacts::unknown);
-    Ok(emit_owned_pyobject_result_for_demand(
-        fb, value, facts, emit_ctx, demand,
-    ))
+    emit_owned_pyobject_result_for_demand_with_codegen_imports(
+        fb,
+        value,
+        facts,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )
 }
 
 fn emit_resolved_name_load_with_local_env(
@@ -16710,6 +16870,7 @@ fn emit_typed_codegen_stmt_with_local_env(
             ctx: emit_ctx,
             codegen_env,
             func_imports,
+            owned_transfer_temp_load: None,
         };
         if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
             return Ok(value);
@@ -17053,6 +17214,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
                 ctx: emit_ctx,
                 codegen_env,
                 func_imports,
+                owned_transfer_temp_load: None,
             };
             if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
                 let facts = expr
@@ -17095,6 +17257,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             ctx: emit_ctx,
             codegen_env,
             func_imports,
+            owned_transfer_temp_load: None,
         };
         if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
             let facts = expr
@@ -17437,6 +17600,12 @@ fn opt_v3_exact_int_deopt_miss_target_available(
         return false;
     }
     let point = exact_int_deopt_resume_point(emit_ctx, instr_id);
+    if emit_ctx
+        .runtime_supported_deopt_resume_points
+        .is_some_and(|supported| !supported.contains(&point))
+    {
+        return false;
+    }
     let Some(function) = emit_ctx
         .module
         .callable_defs
@@ -18675,6 +18844,7 @@ fn emit_opt_v3_mechanical_convert(
                     ctx: emit_ctx,
                     codegen_env,
                     func_imports,
+                    owned_transfer_temp_load: None,
                 };
                 intrinsics::emit_v3_guarded_compact_long_i64(
                     &mut intrinsic_state,
@@ -19359,6 +19529,7 @@ fn emit_typed_codegen_i32_bool01_result_with_local_env(
             ctx: emit_ctx,
             codegen_env,
             func_imports,
+            owned_transfer_temp_load: None,
         };
         if let Some(truth_i32) =
             intrinsics::emit_typed_i32_bool01_operation(direct_bool_expr, &mut intrinsic_state)
@@ -19698,6 +19869,31 @@ fn emit_typed_codegen_ops(
                 })
             });
         let stmt_emit_ctx = guard_miss_emit_ctx.as_ref().unwrap_or(stmt_emit_ctx);
+        if let Some((transfer_location, transfer_name)) =
+            typed_setitem_owned_transfer_temp(expr, ops.get(index + 1))
+            && local_env.can_transfer_owned_local_only_location(transfer_location, transfer_name)
+            && let Some(result) = emit_typed_intrinsic_statement_with_owned_transfer_temp(
+                fb,
+                expr,
+                local_env,
+                stmt_emit_ctx,
+                expr.result_demand().unwrap_or(ResultDemand::EffectOnly),
+                transfer_location,
+                codegen_env,
+                func_imports,
+            )
+        {
+            let transferred = local_env.mark_owned_local_only_location_transferred(
+                fb,
+                transfer_location,
+                transfer_name,
+                emit_ctx.consts.ptr_ty,
+            );
+            debug_assert!(transferred);
+            discard_emit_result(fb, result, emit_ctx)?;
+            index += 2;
+            continue;
+        }
         let result = emit_typed_codegen_stmt_result_with_local_env(
             fb,
             expr,
@@ -19721,7 +19917,63 @@ fn store_value_expr(expr: &InstrTyped) -> &InstrTyped {
 }
 
 fn is_generated_transfer_temp_name(name: &str) -> bool {
-    name.starts_with("_dp_tmp_") || name.starts_with("_dp_typed_inline_")
+    name.starts_with("_dp_tmp_")
+        || name.starts_with("_dp_typed_inline_")
+        || name.starts_with("_dp_typed_linearized_expr_")
+}
+
+fn typed_setitem_owned_transfer_temp<'a>(
+    expr: &'a InstrTyped,
+    next_expr: Option<&'a InstrTyped>,
+) -> Option<(LocalLocation, &'a str)> {
+    let InstrTyped::SetItem(setitem) = expr else {
+        return None;
+    };
+    let InstrTyped::Load(replacement) = setitem.replacement.as_ref() else {
+        return None;
+    };
+    let InstrTyped::Del(delete) = next_expr? else {
+        return None;
+    };
+    let replacement_location = replacement.name.local_location()?;
+    let delete_location = delete.name.local_location()?;
+    (replacement_location == delete_location
+        && replacement.name.id.as_str() == delete.name.id.as_str()
+        && is_generated_transfer_temp_name(replacement.name.id.as_str()))
+    .then_some((replacement_location, replacement.name.id.as_str()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_intrinsic_statement_with_owned_transfer_temp(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    transfer_location: LocalLocation,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<EmitResult> {
+    let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+        fb,
+        local_env,
+        ctx: emit_ctx,
+        codegen_env,
+        func_imports,
+        owned_transfer_temp_load: Some(transfer_location),
+    };
+    let value = intrinsics::emit_typed_operation(expr, &mut intrinsic_state)?;
+    let facts = expr
+        .result_facts()
+        .and_then(ValueFacts::as_pyobj)
+        .unwrap_or_else(PyObjFacts::unknown);
+    Some(emit_owned_pyobject_result_for_demand(
+        intrinsic_state.fb,
+        value,
+        facts,
+        emit_ctx,
+        demand,
+    ))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -19807,6 +20059,7 @@ fn typed_direct_call_guard_deopt_else_label(
     guard_miss_deopt_instr_ids: &HashSet<InstrId>,
     guard_miss_deopt_stub_available: bool,
     deopt_resume_plan: &PlannedJitDeoptResumeFunction,
+    runtime_supported_deopt_resume_points: Option<&[LocalEnvResumePoint]>,
 ) -> Option<BlockLabel> {
     if !guard_miss_deopt_stub_available {
         return None;
@@ -19833,6 +20086,11 @@ fn typed_direct_call_guard_deopt_else_label(
         function_id: function.function_id,
         block: block.label,
     };
+    if runtime_supported_deopt_resume_points
+        .is_some_and(|supported| !supported.contains(&resume_point))
+    {
+        return None;
+    }
     if runtime_jit_typed_deopt_continuation_for_point(function, instr_locations, resume_point)
         .unsupported_reason()
         .is_some()
@@ -19849,6 +20107,7 @@ fn typed_machine_deopt_suppressed_blocks(
     guard_miss_deopt_instr_ids: &HashSet<InstrId>,
     guard_miss_deopt_stub_available: bool,
     deopt_resume_plan: &PlannedJitDeoptResumeFunction,
+    runtime_supported_deopt_resume_points: Option<&[LocalEnvResumePoint]>,
 ) -> HashSet<BlockLabel> {
     let mut predecessors = HashMap::<BlockLabel, HashSet<BlockLabel>>::new();
     let mut deopt_edges = HashSet::<(BlockLabel, BlockLabel)>::new();
@@ -19872,6 +20131,7 @@ fn typed_machine_deopt_suppressed_blocks(
             guard_miss_deopt_instr_ids,
             guard_miss_deopt_stub_available,
             deopt_resume_plan,
+            runtime_supported_deopt_resume_points,
         ) {
             deopt_edges.insert((block.label, else_label));
         }
@@ -20844,6 +21104,7 @@ struct BuildSpecializedFunctionOptions {
     module_constant_accesses: ModuleConstantAccessTable,
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
     planned_typed_function: Option<BlockPyFunction<TypedBlockPyModuleShape>>,
+    runtime_supported_deopt_resume_points: Option<Vec<LocalEnvResumePoint>>,
     external_direct_call_target_functions:
         HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
 }
@@ -21675,6 +21936,7 @@ fn build_cranelift_run_bb_specialized_function(
             &guard_miss_deopt_instr_ids,
             guard_miss_deopt_stub_ref.is_some(),
             jit_deopt_resume_plan,
+            options.runtime_supported_deopt_resume_points.as_deref(),
         );
         let load_runtime_obj_by_id_ref = func_imports.get_or_panic(
             codegen_env,
@@ -22070,6 +22332,9 @@ fn build_cranelift_run_bb_specialized_function(
                 module_constants,
                 value_facts,
                 deopt_resume_plan: jit_deopt_resume_plan,
+                runtime_supported_deopt_resume_points: options
+                    .runtime_supported_deopt_resume_points
+                    .as_deref(),
                 refcount_plan,
                 cleanup_root_slot_states: &jit_local_plan.cleanup_root_slot_states,
                 truthiness_only_local_locations: &jit_local_plan.truthiness_only_local_locations,

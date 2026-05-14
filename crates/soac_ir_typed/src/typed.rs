@@ -309,6 +309,50 @@ impl<E: Instr> Mappable<E> for TypedCall<E> {
             access: self.access,
         })
     }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+    where
+        M: MapInstr<E, E>,
+    {
+        TypedCall {
+            _meta: self._meta,
+            extra: self.extra,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            access: self.access,
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
+    where
+        M: TryMapInstr<E, E, Error>,
+    {
+        Ok(TypedCall {
+            _meta: self._meta,
+            extra: self.extra,
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            access: self.access,
+        })
+    }
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -423,6 +467,40 @@ impl<E: Instr> Mappable<E> for TypedDirectCallableCall<E> {
         Ok(TypedDirectCallableCall {
             _meta: self._meta,
             extra: Default::default(),
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            guard: self.guard,
+        })
+    }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+    where
+        M: MapInstr<E, E>,
+    {
+        TypedDirectCallableCall {
+            _meta: self._meta,
+            extra: self.extra,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            guard: self.guard,
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
+    where
+        M: TryMapInstr<E, E, Error>,
+    {
+        Ok(TypedDirectCallableCall {
+            _meta: self._meta,
+            extra: self.extra,
             func: Box::new(map.try_map_instr(*self.func)?),
             args: self
                 .args
@@ -562,6 +640,50 @@ impl<E: Instr> Mappable<E> for TypedGuardedCallableCall<E> {
         Ok(TypedGuardedCallableCall {
             _meta: self._meta,
             extra: Default::default(),
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            function_guards: self.function_guards,
+        })
+    }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+    where
+        M: MapInstr<E, E>,
+    {
+        TypedGuardedCallableCall {
+            _meta: self._meta,
+            extra: self.extra,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            function_guards: self.function_guards,
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
+    where
+        M: TryMapInstr<E, E, Error>,
+    {
+        Ok(TypedGuardedCallableCall {
+            _meta: self._meta,
+            extra: self.extra,
             func: Box::new(map.try_map_instr(*self.func)?),
             args: self
                 .args
@@ -727,6 +849,52 @@ impl<E: Instr> Mappable<E> for TypedGuardedMethodCall<E> {
             method_guards: self.method_guards,
         })
     }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+    where
+        M: MapInstr<E, E>,
+    {
+        TypedGuardedMethodCall {
+            _meta: self._meta,
+            extra: self.extra,
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            method_name: self.method_name,
+            method_guards: self.method_guards,
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
+    where
+        M: TryMapInstr<E, E, Error>,
+    {
+        Ok(TypedGuardedMethodCall {
+            _meta: self._meta,
+            extra: self.extra,
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            method_name: self.method_name,
+            method_guards: self.method_guards,
+        })
+    }
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -836,6 +1004,42 @@ impl<E: Instr> Mappable<E> for TypedDirectMethodCall<E> {
         Ok(TypedDirectMethodCall {
             _meta: self._meta,
             extra: Default::default(),
+            receiver: Box::new(map.try_map_instr(*self.receiver)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            method_name: self.method_name,
+            guard: self.guard,
+        })
+    }
+
+    fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+    where
+        M: MapInstr<E, E>,
+    {
+        TypedDirectMethodCall {
+            _meta: self._meta,
+            extra: self.extra,
+            receiver: Box::new(map.map_instr(*self.receiver)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            method_name: self.method_name,
+            guard: self.guard,
+        }
+    }
+
+    fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
+    where
+        M: TryMapInstr<E, E, Error>,
+    {
+        Ok(TypedDirectMethodCall {
+            _meta: self._meta,
+            extra: self.extra,
             receiver: Box::new(map.try_map_instr(*self.receiver)?),
             args: self
                 .args
@@ -1265,6 +1469,8 @@ pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
     pub demand: Option<TypedResultDemand>,
     pub planned_result: Option<TypedPlannedResult>,
+    pub trusted_object_origin_candidates: Option<Vec<InstrId>>,
+    pub trusted_generator_resume_function: Option<RuntimeFunctionId>,
     pub indexed_global_access: Option<TypedIndexedGlobalAccessPlan>,
     pub exact_list_item_access: Option<TypedExactListItemAccessPlan>,
     pub exact_int_branch: Option<TypedExactIntBranchPlan>,
@@ -1337,6 +1543,44 @@ impl TypedInstrExtra {
 
     pub fn clear_planned_result(&mut self) -> bool {
         self.planned_result.take().is_some()
+    }
+
+    pub fn trusted_object_origin_candidates(&self) -> Option<&[InstrId]> {
+        self.trusted_object_origin_candidates.as_deref()
+    }
+
+    pub fn set_trusted_object_origin_candidates(
+        &mut self,
+        candidate_origins: Vec<InstrId>,
+    ) -> bool {
+        if self.trusted_object_origin_candidates.as_ref() == Some(&candidate_origins) {
+            return false;
+        }
+        self.trusted_object_origin_candidates = Some(candidate_origins);
+        true
+    }
+
+    pub fn clear_trusted_object_origin_candidates(&mut self) -> bool {
+        self.trusted_object_origin_candidates.take().is_some()
+    }
+
+    pub fn trusted_generator_resume_function(&self) -> Option<RuntimeFunctionId> {
+        self.trusted_generator_resume_function
+    }
+
+    pub fn set_trusted_generator_resume_function(
+        &mut self,
+        function_id: RuntimeFunctionId,
+    ) -> bool {
+        if self.trusted_generator_resume_function == Some(function_id) {
+            return false;
+        }
+        self.trusted_generator_resume_function = Some(function_id);
+        true
+    }
+
+    pub fn clear_trusted_generator_resume_function(&mut self) -> bool {
+        self.trusted_generator_resume_function.take().is_some()
     }
 
     pub fn indexed_global_access_plan(&self) -> Option<&TypedIndexedGlobalAccessPlan> {

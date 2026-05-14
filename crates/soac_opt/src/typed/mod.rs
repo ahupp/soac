@@ -34,9 +34,11 @@ use soac_ir_typed::{
 };
 use std::collections::{HashMap, HashSet};
 
+mod linearize;
 mod trusted_owner;
 mod virtual_objects;
 
+pub use linearize::*;
 pub use trusted_owner::*;
 pub use virtual_objects::*;
 
@@ -646,6 +648,10 @@ pub fn lower_typed_function_call_emission_plans(
                     method_name,
                     method_guards,
                 } => {
+                    if !matches!(call.func.as_ref(), InstrTyped::GetAttrTyped(_)) {
+                        *expr = InstrTyped::CallTyped(call);
+                        return;
+                    }
                     *expr = InstrTyped::GuardedMethodCallTyped(
                         TypedGuardedMethodCall::from_typed_call(
                             call,
@@ -754,9 +760,23 @@ pub struct TypedInlineInstrIdMapping {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct TypedInlineConstantMapping {
+    pub callee: RuntimeFunctionId,
+    pub inline_instance: u32,
+    pub callee_index: u32,
+    pub caller_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct TypedInlineInstanceSource {
     pub inline_instance: u32,
     pub source_instr_id: InstrId,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct TypedInlineSyntheticInstrId {
+    pub inline_instance: u32,
+    pub instr_id: InstrId,
 }
 
 #[derive(Debug, Clone)]
@@ -777,6 +797,8 @@ pub struct TypedInlineRewriteStats {
     pub inline_instance_sources: Vec<TypedInlineInstanceSource>,
     pub materialized_generator_args: Vec<TypedInlineMaterializedGeneratorArg>,
     pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
+    pub synthetic_instr_ids: Vec<TypedInlineSyntheticInstrId>,
+    pub constant_mappings: Vec<TypedInlineConstantMapping>,
     pub local_mappings: Vec<TypedInlineLocalMapping>,
     pub hot_state_cleanup_labels: Vec<BlockLabel>,
 }
@@ -1383,6 +1405,8 @@ pub struct TypedGeneratorStateLoweringPlan {
     pub generator_origin: InstrId,
     pub function_id: RuntimeFunctionId,
     pub body_instr_ids: HashSet<InstrId>,
+    pub pending_alias_use_instr_ids: HashSet<InstrId>,
+    pub alias_cleanup_active_blocks: Option<HashSet<BlockLabel>>,
     pub materialized_constructor: Option<TypedGeneratorStateConstructor>,
 }
 
@@ -1600,6 +1624,15 @@ impl TypedInlineInstrIdAllocator {
     }
 }
 
+fn typed_instr_with_fresh_synthetic_instr_id(
+    instr: InstrTyped,
+    allocator: &mut TypedInlineInstrIdAllocator,
+) -> InstrTyped {
+    let mut meta = instr.meta();
+    meta.instr_id = Some(allocator.alloc());
+    instr.with_meta(meta)
+}
+
 struct TypedInlineInstrIdRemapper<'a> {
     callee: RuntimeFunctionId,
     inline_instance: u32,
@@ -1646,6 +1679,12 @@ impl<'a> TypedInlineInstrIdRemapper<'a> {
         instr.with_meta(meta)
     }
 
+    fn assign_fresh_instr_id(&mut self, instr: InstrTyped) -> InstrTyped {
+        let mut meta = instr.meta();
+        meta.instr_id = Some(self.allocator.alloc());
+        instr.with_meta(meta)
+    }
+
     fn finish(self) -> Vec<TypedInlineInstrIdMapping> {
         self.mappings
     }
@@ -1663,6 +1702,8 @@ pub fn inline_typed_function_direct_call_stores(
         None,
         TypedInlineExternalCallees::Plain(external_callees),
         direct_calls_by_instr_id,
+        &HashMap::new(),
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     )
@@ -1683,6 +1724,8 @@ pub fn inline_typed_function_direct_call_stores_with_external_callees(
         direct_calls_by_instr_id,
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
     )
 }
 
@@ -1693,6 +1736,8 @@ pub fn inline_typed_function_direct_call_stores_with_external_callees_and_truste
     external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_direct_method_call_origin_candidates: &HashMap<InstrId, Vec<InstrId>>,
+    trusted_direct_method_call_resume_functions: &HashMap<InstrId, RuntimeFunctionId>,
     materialized_generator_constructors: &HashMap<InstrId, TypedGeneratorStateConstructor>,
 ) -> TypedInlineRewriteStats {
     inline_typed_function_direct_call_stores_impl(
@@ -1702,6 +1747,8 @@ pub fn inline_typed_function_direct_call_stores_with_external_callees_and_truste
         TypedInlineExternalCallees::Contextual(external_callees),
         direct_calls_by_instr_id,
         trusted_direct_method_calls,
+        trusted_direct_method_call_origin_candidates,
+        trusted_direct_method_call_resume_functions,
         materialized_generator_constructors,
     )
 }
@@ -1719,6 +1766,8 @@ fn inline_typed_function_direct_call_stores_impl(
     external_callees: TypedInlineExternalCallees<'_>,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_direct_method_call_origin_candidates: &HashMap<InstrId, Vec<InstrId>>,
+    trusted_direct_method_call_resume_functions: &HashMap<InstrId, RuntimeFunctionId>,
     materialized_generator_constructors: &HashMap<InstrId, TypedGeneratorStateConstructor>,
 ) -> TypedInlineRewriteStats {
     let mut stats = TypedInlineRewriteStats::default();
@@ -1735,6 +1784,8 @@ fn inline_typed_function_direct_call_stores_impl(
             block,
             direct_calls_by_instr_id,
             trusted_direct_method_calls,
+            trusted_direct_method_call_origin_candidates,
+            trusted_direct_method_call_resume_functions,
             materialized_generator_constructors,
             &mut instr_id_allocator,
             &mut next_inline_instance,
@@ -1782,6 +1833,7 @@ enum TypedInlineCall {
     DirectMethod {
         call: TypedCall<InstrTyped>,
         receiver: InstrTyped,
+        linearized_func_temp: Option<ResolvedName>,
     },
     RuntimeProtocolMethod {
         call: TypedCall<InstrTyped>,
@@ -1881,6 +1933,8 @@ fn build_typed_direct_call_inline_rewrite(
     block: TypedBlock,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    trusted_direct_method_call_origin_candidates: &HashMap<InstrId, Vec<InstrId>>,
+    trusted_direct_method_call_resume_functions: &HashMap<InstrId, RuntimeFunctionId>,
     materialized_generator_constructors: &HashMap<InstrId, TypedGeneratorStateConstructor>,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
     next_inline_instance: &mut u32,
@@ -1900,6 +1954,8 @@ fn build_typed_direct_call_inline_rewrite(
             external_callees,
             block.clone(),
             candidate,
+            trusted_direct_method_call_origin_candidates,
+            trusted_direct_method_call_resume_functions,
             materialized_generator_constructors,
             instr_id_allocator,
             next_inline_instance,
@@ -1922,6 +1978,8 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
     external_callees: TypedInlineExternalCallees<'_>,
     block: TypedBlock,
     candidate: TypedInlineStoreCandidate,
+    trusted_direct_method_call_origin_candidates: &HashMap<InstrId, Vec<InstrId>>,
+    trusted_direct_method_call_resume_functions: &HashMap<InstrId, RuntimeFunctionId>,
     materialized_generator_constructors: &HashMap<InstrId, TypedGeneratorStateConstructor>,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
     next_inline_instance: &mut u32,
@@ -1940,6 +1998,24 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
         trace_builtin_implementation_inline_skip(&candidate, "non_positional_args");
         return TypedInlineBlockRewrite::Unchanged(block);
     };
+    tracing::info!(
+        target: "soac_typed_inline_args",
+        caller_function = ?caller.function_id,
+        source_instr_id = ?candidate.call.try_semantic_instr_id(),
+        inline_targets = ?candidate.inline_plans
+            .iter()
+            .map(|plan| plan.target)
+            .collect::<Vec<_>>(),
+        positional_arg_names = ?positional_arg_exprs
+            .iter()
+            .map(|expr| match expr {
+                InstrTyped::Load(load) => load.name.id_str().to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        positional_arg_exprs = ?positional_arg_exprs,
+        "typed_inline_candidate_args",
+    );
 
     let receiver_temp = match &candidate.call {
         TypedInlineCall::DirectCallable(_)
@@ -2062,6 +2138,21 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
         before.truncate(candidate.instr_index);
         (after, block.term)
     };
+    if let TypedInlineCall::DirectMethod {
+        linearized_func_temp: Some(linearized_func_temp),
+        ..
+    } = &candidate.call
+        && let Some(store_index) = before.iter().rposition(|instr| {
+            matches!(
+                instr,
+                InstrTyped::Store(store)
+                    if store.name == *linearized_func_temp
+                        && matches!(store.value.as_ref(), InstrTyped::GetAttrTyped(_))
+            )
+        })
+    {
+        before.remove(store_index);
+    }
     match &candidate.call {
         TypedInlineCall::DirectCallable(call) => {
             let callable_temp = callable_temp
@@ -2090,8 +2181,24 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
             let receiver_temp = receiver_temp
                 .as_ref()
                 .expect("method inline candidate should allocate receiver temp");
+            let mut receiver = receiver.clone();
+            if let Some(candidate_origins) = candidate
+                .call
+                .try_semantic_instr_id()
+                .and_then(|instr_id| trusted_direct_method_call_origin_candidates.get(&instr_id))
+                && let Some(extra) = receiver.typed_extra_mut()
+            {
+                extra.set_trusted_object_origin_candidates(candidate_origins.clone());
+                if let Some(function_id) = candidate
+                    .call
+                    .try_semantic_instr_id()
+                    .and_then(|instr_id| trusted_direct_method_call_resume_functions.get(&instr_id))
+                {
+                    extra.set_trusted_generator_resume_function(*function_id);
+                }
+            }
             before.push(
-                Store::new(receiver_temp.resolved_name(), receiver.clone())
+                Store::new(receiver_temp.resolved_name(), receiver)
                     .with_meta(Meta::synthetic())
                     .into(),
             );
@@ -2296,6 +2403,17 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
                     (bindings, HashMap::new(), Vec::new(), Vec::new(), None)
                 }
             };
+        tracing::info!(
+            target: "soac_typed_inline_bindings",
+            caller_function = ?caller.function_id,
+            source_instr_id = ?candidate.call.try_semantic_instr_id(),
+            callee_function = ?callee.function.function_id,
+            callee_qualname = %callee.function.names.qualname,
+            arg_plan = ?plan.arg_plan,
+            provided_values = ?provided_values,
+            bindings = ?bindings,
+            "typed_inline_fragment_bindings",
+        );
         let inline_instance = *next_inline_instance;
         *next_inline_instance = next_inline_instance
             .checked_add(1)
@@ -2351,6 +2469,15 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
         }
         extra_cleanup_temps.extend(preserved_abi_temps);
         instr_id_mappings.extend(fragment.instr_id_mappings);
+        stats
+            .synthetic_instr_ids
+            .extend(fragment.synthetic_instr_ids.into_iter().map(|instr_id| {
+                TypedInlineSyntheticInstrId {
+                    inline_instance,
+                    instr_id,
+                }
+            }));
+        stats.constant_mappings.extend(fragment.constant_mappings);
         local_mappings.extend(fragment.local_mappings);
         blocks.extend(fragment.blocks);
     }
@@ -2580,6 +2707,10 @@ fn build_typed_constructor_init_body_inline_rewrite(
         .inline_stats
         .instr_id_mappings
         .extend(fragment.instr_id_mappings);
+    stats
+        .inline_stats
+        .constant_mappings
+        .extend(fragment.constant_mappings);
     stats
         .inline_stats
         .local_mappings
@@ -3239,6 +3370,8 @@ fn find_typed_constructor_hot_continuation_split_candidate(
 ) -> Option<TypedHotContinuationSplitCandidate> {
     let labels = typed_block_indices_by_label(function);
     let predecessors = typed_block_predecessors(function);
+    let hot_predecessors = typed_hot_block_predecessors(function);
+    let mut reachable_by_entry = HashMap::new();
     function.blocks.iter().find_map(|block| {
         let original_entry = typed_constructor_hot_continuation_entry(
             function,
@@ -3247,7 +3380,13 @@ fn find_typed_constructor_hot_continuation_split_candidate(
             block,
             module_constants,
         )?;
-        let reachable = typed_hot_clone_block_labels(function, &labels, original_entry)?;
+        let reachable = typed_hot_clone_block_labels_cached(
+            function,
+            &labels,
+            &hot_predecessors,
+            original_entry,
+            &mut reachable_by_entry,
+        )?;
         if reachable.contains(&block.label)
             || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
             || !typed_reachable_subgraph_has_external_predecessor(
@@ -3274,7 +3413,9 @@ fn find_typed_alias_hot_continuation_split_candidate(
 ) -> Option<TypedHotContinuationSplitCandidate> {
     let labels = typed_block_indices_by_label(function);
     let predecessors = typed_block_predecessors(function);
+    let hot_predecessors = typed_hot_block_predecessors(function);
     let none_placeholder_alias_targets = typed_none_placeholder_alias_target_locations(function);
+    let mut reachable_by_entry = HashMap::new();
     function.blocks.iter().find_map(|block| {
         if cyclic_hot_blocks.contains(&block.label) {
             return None;
@@ -3288,7 +3429,13 @@ fn find_typed_alias_hot_continuation_split_candidate(
             module_constants,
             suppressed_alias_store_instr_ids,
         )?;
-        let reachable = typed_hot_clone_block_labels(function, &labels, original_entry)?;
+        let reachable = typed_hot_clone_block_labels_cached(
+            function,
+            &labels,
+            &hot_predecessors,
+            original_entry,
+            &mut reachable_by_entry,
+        )?;
         let exceeds_budget = reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS;
         let has_external_predecessor = typed_reachable_subgraph_has_external_predecessor(
             &reachable,
@@ -3439,13 +3586,21 @@ fn find_typed_inline_cleanup_hot_continuation_split_candidate(
 ) -> Option<TypedHotContinuationSplitCandidate> {
     let labels = typed_block_indices_by_label(function);
     let predecessors = typed_block_predecessors(function);
+    let hot_predecessors = typed_hot_block_predecessors(function);
     let hot_path_labels = typed_direct_call_hot_path_labels(function, &labels);
+    let mut reachable_by_entry = HashMap::new();
     function.blocks.iter().find_map(|block| {
         if cleanup_labels.is_some_and(|cleanup_labels| !cleanup_labels.contains(&block.label)) {
             return None;
         }
         let original_entry = typed_inline_cleanup_hot_continuation_entry(&hot_path_labels, block)?;
-        let reachable = typed_hot_clone_block_labels(function, &labels, original_entry)?;
+        let reachable = typed_hot_clone_block_labels_cached(
+            function,
+            &labels,
+            &hot_predecessors,
+            original_entry,
+            &mut reachable_by_entry,
+        )?;
         if reachable.contains(&block.label)
             || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
             || !typed_reachable_subgraph_has_external_predecessor(
@@ -3909,6 +4064,45 @@ fn typed_reachable_block_labels(
     Some(seen)
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TypedReachableBlockView {
+    labels: HashSet<BlockLabel>,
+}
+
+impl TypedReachableBlockView {
+    pub fn for_function(function: &BlockPyFunction<TypedBlockPyModuleShape>) -> Self {
+        let Some(entry) = function.blocks.first().map(|block| block.label) else {
+            return Self::default();
+        };
+        let labels = typed_block_indices_by_label(function);
+        Self {
+            labels: typed_reachable_block_labels(function, &labels, entry).unwrap_or_default(),
+        }
+    }
+
+    pub fn contains(&self, label: BlockLabel) -> bool {
+        self.labels.contains(&label)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.labels.is_empty()
+    }
+
+    pub fn labels(&self) -> &HashSet<BlockLabel> {
+        &self.labels
+    }
+
+    pub fn iter_blocks<'a>(
+        &'a self,
+        function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
+    ) -> impl Iterator<Item = &'a TypedBlock> + 'a {
+        function
+            .blocks
+            .iter()
+            .filter(move |block| self.contains(block.label))
+    }
+}
+
 fn typed_direct_call_hot_path_labels(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     labels: &HashMap<BlockLabel, usize>,
@@ -3935,19 +4129,32 @@ fn typed_hot_reachable_block_labels(
 fn typed_hot_clone_block_labels(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     labels: &HashMap<BlockLabel, usize>,
+    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
     entry: BlockLabel,
 ) -> Option<HashSet<BlockLabel>> {
     let reachable = typed_hot_reachable_block_labels(function, labels, entry)?;
-    let predecessors = typed_hot_block_predecessors(function);
     let mut region = HashSet::new();
     let mut pending = vec![entry];
+    let mut cyclic_components = HashMap::<BlockLabel, Option<HashSet<BlockLabel>>>::new();
     while let Some(label) = pending.pop() {
         if !region.insert(label) {
             continue;
         }
-        if let Some(component) =
-            typed_hot_cyclic_component(function, labels, &predecessors, &reachable, label)?
-        {
+        let component = if let Some(component) = cyclic_components.get(&label) {
+            component.clone()
+        } else {
+            let component =
+                typed_hot_cyclic_component(function, labels, predecessors, &reachable, label)?;
+            if let Some(component_labels) = component.as_ref() {
+                for component_label in component_labels {
+                    cyclic_components.insert(*component_label, Some(component_labels.clone()));
+                }
+            } else {
+                cyclic_components.insert(label, None);
+            }
+            component
+        };
+        if let Some(component) = component {
             region.extend(component);
             continue;
         }
@@ -3958,6 +4165,21 @@ fn typed_hot_clone_block_labels(
         );
     }
     Some(region)
+}
+
+fn typed_hot_clone_block_labels_cached(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+    entry: BlockLabel,
+    reachable_by_entry: &mut HashMap<BlockLabel, Option<HashSet<BlockLabel>>>,
+) -> Option<HashSet<BlockLabel>> {
+    if let Some(reachable) = reachable_by_entry.get(&entry) {
+        return reachable.clone();
+    }
+    let reachable = typed_hot_clone_block_labels(function, labels, predecessors, entry);
+    reachable_by_entry.insert(entry, reachable.clone());
+    reachable
 }
 
 fn typed_hot_block_predecessors(
@@ -4371,6 +4593,46 @@ fn typed_constructor_call_instr_ids(
     collector.instr_ids
 }
 
+type TypedLinearizedGetAttrDefs<'a> = HashMap<ResolvedName, (&'a InstrTyped, &'a InstrTyped)>;
+
+fn typed_inline_call_get_attr_parts<'a>(
+    func: &'a InstrTyped,
+    linearized_get_attrs: &'a TypedLinearizedGetAttrDefs<'a>,
+) -> Option<(&'a InstrTyped, &'a InstrTyped, Option<ResolvedName>)> {
+    match func {
+        InstrTyped::GetAttrTyped(get_attr) => {
+            Some((get_attr.value.as_ref(), get_attr.attr.as_ref(), None))
+        }
+        InstrTyped::Load(load) => linearized_get_attrs
+            .get(&load.name)
+            .copied()
+            .map(|(value, attr)| (value, attr, Some(load.name.clone()))),
+        _ => None,
+    }
+}
+
+fn update_typed_inline_linearized_get_attr_defs<'a>(
+    defs: &mut TypedLinearizedGetAttrDefs<'a>,
+    instr: &'a InstrTyped,
+) {
+    match instr {
+        InstrTyped::Store(store) => {
+            if let InstrTyped::GetAttrTyped(get_attr) = store.value.as_ref() {
+                defs.insert(
+                    store.name.clone(),
+                    (get_attr.value.as_ref(), get_attr.attr.as_ref()),
+                );
+            } else {
+                defs.remove(&store.name);
+            }
+        }
+        InstrTyped::Del(del) => {
+            defs.remove(&del.name);
+        }
+        _ => {}
+    }
+}
+
 fn typed_inline_candidate_for_expr(
     instr_index: usize,
     result: TypedInlineResult,
@@ -4378,6 +4640,7 @@ fn typed_inline_candidate_for_expr(
     caller_id: RuntimeFunctionId,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    linearized_get_attrs: &TypedLinearizedGetAttrDefs<'_>,
 ) -> Option<TypedInlineStoreCandidate> {
     match expr {
         InstrTyped::DirectCallableCallTyped(call) => {
@@ -4443,6 +4706,7 @@ fn typed_inline_candidate_for_expr(
                 caller_id,
                 direct_calls_by_instr_id,
                 trusted_direct_method_calls,
+                linearized_get_attrs,
             )
         })
         .or_else(|| {
@@ -4531,32 +4795,34 @@ fn find_typed_inline_candidates(
     {
         candidates.push(candidate);
     }
-    candidates.extend(
-        block
-            .body
-            .iter()
-            .enumerate()
-            .filter_map(|(instr_index, instr)| {
-                let InstrTyped::Store(store) = instr else {
-                    return typed_inline_candidate_for_expr(
-                        instr_index,
-                        TypedInlineResult::EffectOnly,
-                        instr,
-                        caller_id,
-                        direct_calls_by_instr_id,
-                        trusted_direct_method_calls,
-                    );
-                };
-                typed_inline_candidate_for_expr(
-                    instr_index,
-                    TypedInlineResult::StoreTo(store.name.clone()),
-                    store.value.as_ref(),
-                    caller_id,
-                    direct_calls_by_instr_id,
-                    trusted_direct_method_calls,
-                )
-            }),
-    );
+    let mut linearized_get_attrs = TypedLinearizedGetAttrDefs::new();
+    for (instr_index, instr) in block.body.iter().enumerate() {
+        let candidate = if let InstrTyped::Store(store) = instr {
+            typed_inline_candidate_for_expr(
+                instr_index,
+                TypedInlineResult::StoreTo(store.name.clone()),
+                store.value.as_ref(),
+                caller_id,
+                direct_calls_by_instr_id,
+                trusted_direct_method_calls,
+                &linearized_get_attrs,
+            )
+        } else {
+            typed_inline_candidate_for_expr(
+                instr_index,
+                TypedInlineResult::EffectOnly,
+                instr,
+                caller_id,
+                direct_calls_by_instr_id,
+                trusted_direct_method_calls,
+                &linearized_get_attrs,
+            )
+        };
+        if let Some(candidate) = candidate {
+            candidates.push(candidate);
+        }
+        update_typed_inline_linearized_get_attr_defs(&mut linearized_get_attrs, instr);
+    }
     if let BlockTerm::Return(value) = &block.term
         && let Some(candidate) = typed_inline_candidate_for_expr(
             block.body.len(),
@@ -4565,6 +4831,7 @@ fn find_typed_inline_candidates(
             caller_id,
             direct_calls_by_instr_id,
             trusted_direct_method_calls,
+            &linearized_get_attrs,
         )
     {
         candidates.push(candidate);
@@ -4684,15 +4951,15 @@ fn typed_inline_candidate_for_direct_method_call(
     caller_id: RuntimeFunctionId,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
+    linearized_get_attrs: &TypedLinearizedGetAttrDefs<'_>,
 ) -> Option<TypedInlineStoreCandidate> {
     if !matches!(call.access, TypedCallAccessPlan::Generic) {
         return None;
     }
     let instr_id = call.try_semantic_instr_id()?;
     trusted_direct_method_calls.get(&instr_id)?;
-    let InstrTyped::GetAttrTyped(get_attr) = call.func.as_ref() else {
-        return None;
-    };
+    let (get_attr_value, _, linearized_func_temp) =
+        typed_inline_call_get_attr_parts(call.func.as_ref(), linearized_get_attrs)?;
     let [(target, arg_plan)] = direct_calls_by_instr_id.get(&instr_id)?.as_slice() else {
         return None;
     };
@@ -4704,7 +4971,8 @@ fn typed_inline_candidate_for_direct_method_call(
         result,
         call: TypedInlineCall::DirectMethod {
             call: call.clone(),
-            receiver: get_attr.value.as_ref().clone(),
+            receiver: get_attr_value.clone(),
+            linearized_func_temp,
         },
         inline_plans: vec![TypedInlineDirectCallPlan {
             target: *target,
@@ -5212,7 +5480,7 @@ fn append_typed_cleanup_dels_to_body(body: &mut Vec<InstrTyped>, temp_names: &[T
 
 fn append_typed_cleanup_del_to_body(body: &mut Vec<InstrTyped>, temp_name: &ResolvedName) {
     body.push(
-        Del::new(temp_name.clone(), false)
+        Del::new(temp_name.clone(), true)
             .with_meta(Meta::synthetic())
             .into(),
     );
@@ -5448,22 +5716,27 @@ fn typed_generator_resume_inline_closure_bindings(
             return Ok(bindings);
         }
     }
-    if let Some(bindings) =
-        typed_inline_resume_capture_cell_bindings_from_candidate_origins(
-            caller,
+    if let Some(bindings) = typed_inline_resume_capture_cell_bindings_from_candidate_origins(
+        caller,
+        materialized_generator_constructors,
+        callee.function_id,
+        callee_layout.freevars.len(),
+        &resume_plan.candidate_origins,
+    )
+    .or_else(|| {
+        typed_inline_resume_capture_cell_bindings_from_compatible_materialized_snapshots(
             materialized_generator_constructors,
             callee.function_id,
             callee_layout.freevars.len(),
-            &resume_plan.candidate_origins,
         )
-        .or_else(|| {
-            typed_inline_resume_capture_cell_bindings_from_compatible_materializations(
-                caller,
-                callee.function_id,
-                callee_layout.freevars.len(),
-            )
-        })
-    {
+    })
+    .or_else(|| {
+        typed_inline_resume_capture_cell_bindings_from_compatible_materializations(
+            caller,
+            callee.function_id,
+            callee_layout.freevars.len(),
+        )
+    }) {
         tracing::info!(
             target: "soac_generator_state_lowering",
             caller = ?caller.function_id,
@@ -5515,6 +5788,41 @@ fn typed_inline_resume_capture_cell_bindings_from_candidate_origins(
         }?;
         if let Some(expected) = expected.as_ref()
             && bindings != *expected
+        {
+            return None;
+        }
+        expected.get_or_insert_with(|| bindings.clone());
+    }
+    expected
+}
+
+fn typed_inline_resume_capture_cell_bindings_from_compatible_materialized_snapshots(
+    materialized_generator_constructors: &HashMap<InstrId, TypedGeneratorStateConstructor>,
+    callee_function_id: RuntimeFunctionId,
+    expected_capture_count: usize,
+) -> Option<HashMap<u32, CellLocation>> {
+    let mut expected = None;
+    for constructor in materialized_generator_constructors.values() {
+        let Some(function_id) = constructor
+            .call
+            .extra
+            .generator_instance_plan()
+            .map(|plan| plan.function_id)
+        else {
+            continue;
+        };
+        if function_id != callee_function_id {
+            continue;
+        }
+        let Some(bindings) = constructor
+            .closure_cell_bindings
+            .as_ref()
+            .filter(|bindings| bindings.len() == expected_capture_count)
+        else {
+            continue;
+        };
+        if let Some(expected) = expected.as_ref()
+            && bindings != expected
         {
             return None;
         }
@@ -6021,6 +6329,8 @@ fn build_typed_direct_call_inline_fragment_to_target(
 struct TypedInlineFragment {
     blocks: Vec<TypedBlock>,
     instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
+    synthetic_instr_ids: Vec<InstrId>,
+    constant_mappings: Vec<TypedInlineConstantMapping>,
     local_mappings: Vec<TypedInlineLocalMapping>,
 }
 
@@ -6063,7 +6373,6 @@ fn build_single_block_typed_inline_fragment_to_target(
     let BlockTerm::Return(return_value) = &callee_block.term else {
         return Err(TypedInlineUnsupportedReason::NonReturnTerm);
     };
-
     let locals =
         allocate_typed_inline_locals(caller, callee_layout, value_bindings, preassigned_locals)?;
     let local_mappings = typed_inline_local_mappings(
@@ -6094,11 +6403,17 @@ fn build_single_block_typed_inline_fragment_to_target(
         .collect::<Result<Vec<_>, _>>()?;
     let return_value = remapper.try_map_instr(return_value.clone())?;
     let return_meta = return_value.meta();
-    body.push(
+    let return_store = remapper.assign_fresh_instr_id(
         Store::new(return_target, Box::new(return_value))
             .with_meta(return_meta)
             .into(),
     );
+    let synthetic_instr_ids = vec![
+        return_store
+            .try_semantic_instr_id()
+            .expect("synthetic inline return store should carry an instruction id"),
+    ];
+    body.push(return_store);
 
     Ok(TypedInlineFragment {
         blocks: vec![Block::new_with_extra(
@@ -6110,6 +6425,8 @@ fn build_single_block_typed_inline_fragment_to_target(
             TypedBlockExtra::default(),
         )],
         instr_id_mappings: instr_id_remapper.finish(),
+        synthetic_instr_ids,
+        constant_mappings: constant_scope.mappings(callee.function_id, inline_instance),
         local_mappings,
     })
 }
@@ -6167,6 +6484,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
         &mut constant_scope,
     );
     let mut blocks: Vec<TypedBlock> = Vec::with_capacity(callee.blocks.len());
+    let mut synthetic_instr_ids = Vec::new();
     for callee_block in &callee.blocks {
         let label = typed_remapped_label(&label_map, callee_block.label)?;
         let mut body = callee_block
@@ -6180,11 +6498,17 @@ fn build_multi_block_typed_inline_fragment_to_target(
             BlockTerm::Return(value) => {
                 let return_value = remapper.try_map_instr(value.clone())?;
                 let return_meta = return_value.meta();
-                body.push(
+                let return_store = remapper.assign_fresh_instr_id(
                     Store::new(return_target.clone(), Box::new(return_value))
                         .with_meta(return_meta)
                         .into(),
                 );
+                synthetic_instr_ids.push(
+                    return_store
+                        .try_semantic_instr_id()
+                        .expect("synthetic inline return store should carry an instruction id"),
+                );
+                body.push(return_store);
                 BlockTerm::Jump(BlockEdge::new(continuation))
             }
             term => typed_remap_inline_term_labels(
@@ -6216,6 +6540,8 @@ fn build_multi_block_typed_inline_fragment_to_target(
     Ok(TypedInlineFragment {
         blocks,
         instr_id_mappings: instr_id_remapper.finish(),
+        synthetic_instr_ids,
+        constant_mappings: constant_scope.mappings(callee.function_id, inline_instance),
         local_mappings,
     })
 }
@@ -6373,6 +6699,17 @@ impl TypedInlineConstantScope<'_> {
             (Self::CrossModule(_), location) => Ok(location),
         }
     }
+
+    fn mappings(
+        &self,
+        callee: RuntimeFunctionId,
+        inline_instance: u32,
+    ) -> Vec<TypedInlineConstantMapping> {
+        match self {
+            Self::SameModule => Vec::new(),
+            Self::CrossModule(remapper) => remapper.mappings(callee, inline_instance),
+        }
+    }
 }
 
 struct TypedInlineConstantRemapper<'a> {
@@ -6409,6 +6746,27 @@ impl<'a> TypedInlineConstantRemapper<'a> {
         self.caller_constants.push(constant);
         self.mapped_indices.insert(callee_index, caller_index);
         Ok(caller_index)
+    }
+
+    fn mappings(
+        &self,
+        callee: RuntimeFunctionId,
+        inline_instance: u32,
+    ) -> Vec<TypedInlineConstantMapping> {
+        let mut mappings = self
+            .mapped_indices
+            .iter()
+            .map(
+                |(&callee_index, &caller_index)| TypedInlineConstantMapping {
+                    callee,
+                    inline_instance,
+                    callee_index,
+                    caller_index,
+                },
+            )
+            .collect::<Vec<_>>();
+        mappings.sort_by_key(|mapping| mapping.callee_index);
+        mappings
     }
 }
 
@@ -6526,6 +6884,10 @@ impl<'locals, 'bindings, 'constants, 'remapper, 'allocator>
                 .ok_or(TypedInlineUnsupportedReason::UnsupportedGeneratorClosureCapture),
             CellLocation::Owned(_) | CellLocation::Preserved(_) => Ok(location),
         }
+    }
+
+    fn assign_fresh_instr_id(&mut self, instr: InstrTyped) -> InstrTyped {
+        self.instr_id_remapper.assign_fresh_instr_id(instr)
     }
 }
 
@@ -7096,20 +7458,17 @@ fn typed_i64_binop_const_bool(
     }
 }
 
-fn prune_unreachable_typed_blocks(
+pub fn prune_unreachable_typed_blocks(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> usize {
-    let Some(entry) = function.blocks.first().map(|block| block.label) else {
+    let reachable = TypedReachableBlockView::for_function(function);
+    if reachable.is_empty() {
         return 0;
-    };
-    let labels = typed_block_indices_by_label(function);
-    let Some(reachable) = typed_reachable_block_labels(function, &labels, entry) else {
-        return 0;
-    };
+    }
     let before = function.blocks.len();
     function
         .blocks
-        .retain(|block| reachable.contains(&block.label));
+        .retain(|block| reachable.contains(block.label));
     before - function.blocks.len()
 }
 
@@ -7195,6 +7554,22 @@ pub fn typed_generator_state_origin_can_lower_aliases(
     generator_origin: InstrId,
     inlined_resume_instr_ids: &HashSet<InstrId>,
 ) -> bool {
+    typed_generator_state_origin_can_lower_aliases_in_blocks(
+        function,
+        module_constants,
+        generator_origin,
+        inlined_resume_instr_ids,
+        None,
+    )
+}
+
+pub fn typed_generator_state_origin_can_lower_aliases_in_blocks(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    generator_origin: InstrId,
+    inlined_resume_instr_ids: &HashSet<InstrId>,
+    active_blocks: Option<&HashSet<BlockLabel>>,
+) -> bool {
     let Some((_, _, constructor_target, _)) =
         find_typed_generator_constructor_store(function, generator_origin)
     else {
@@ -7224,6 +7599,7 @@ pub fn typed_generator_state_origin_can_lower_aliases(
         module_constants,
         generator_location,
         inlined_resume_instr_ids,
+        active_blocks,
     )
     .is_some();
     if !can_lower {
@@ -7237,6 +7613,68 @@ pub fn typed_generator_state_origin_can_lower_aliases(
         );
     }
     can_lower
+}
+
+fn typed_generator_alias_locations_for_origin(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    generator_origin: InstrId,
+) -> Option<HashSet<LocalLocation>> {
+    let (_, _, constructor_target, _) =
+        find_typed_generator_constructor_store(function, generator_origin)?;
+    let generator_location = constructor_target.local_location()?;
+    Some(collect_typed_generator_alias_locations(
+        function,
+        module_constants,
+        generator_location,
+        None,
+    ))
+}
+
+pub fn typed_generator_alias_ignored_instr_ids_by_origin(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    pending_alias_use_instr_ids_by_origin: &HashMap<InstrId, HashSet<InstrId>>,
+) -> HashMap<InstrId, HashSet<InstrId>> {
+    let mut alias_locations_by_origin = HashMap::<InstrId, HashSet<LocalLocation>>::new();
+    let mut shared_alias_use_instr_ids_by_location =
+        HashMap::<LocalLocation, HashSet<InstrId>>::new();
+
+    for (&generator_origin, pending_alias_use_instr_ids) in pending_alias_use_instr_ids_by_origin {
+        let Some(alias_locations) = typed_generator_alias_locations_for_origin(
+            function,
+            module_constants,
+            generator_origin,
+        ) else {
+            continue;
+        };
+        for alias_location in &alias_locations {
+            shared_alias_use_instr_ids_by_location
+                .entry(*alias_location)
+                .or_default()
+                .extend(pending_alias_use_instr_ids.iter().copied());
+        }
+        alias_locations_by_origin.insert(generator_origin, alias_locations);
+    }
+
+    pending_alias_use_instr_ids_by_origin
+        .iter()
+        .map(|(&generator_origin, pending_alias_use_instr_ids)| {
+            let grouped_alias_use_instr_ids = alias_locations_by_origin
+                .get(&generator_origin)
+                .map(|alias_locations| {
+                    alias_locations
+                        .iter()
+                        .filter_map(|location| shared_alias_use_instr_ids_by_location.get(location))
+                        .flatten()
+                        .copied()
+                        .collect::<HashSet<_>>()
+                })
+                .filter(|grouped| !grouped.is_empty())
+                .unwrap_or_else(|| pending_alias_use_instr_ids.clone());
+            (generator_origin, grouped_alias_use_instr_ids)
+        })
+        .collect()
 }
 
 fn lower_typed_generator_state_origin_to_locals(
@@ -7266,7 +7704,11 @@ fn lower_typed_generator_state_origin_to_locals(
                 plan.materialized_constructor
                     .as_ref()
                     .and_then(|constructor| {
-                        find_typed_materialized_generator_constructor_store(function, constructor)
+                        find_typed_materialized_generator_constructor_store(
+                            function,
+                            plan.generator_origin,
+                            constructor,
+                        )
                     })
             })
             .or_else(|| {
@@ -7282,11 +7724,42 @@ fn lower_typed_generator_state_origin_to_locals(
         trace_typed_generator_state_lowering_skip(function, plan, "non_local_constructor_target");
         None
     })?;
+    let dominated_body_instr_ids = typed_generator_state_constructor_dominated_body_instr_ids(
+        function,
+        constructor_block_index,
+        constructor_instr_index,
+        &plan.body_instr_ids,
+        plan.alias_cleanup_active_blocks.as_ref(),
+    );
+    if dominated_body_instr_ids.is_empty() {
+        trace_typed_generator_state_lowering_skip(
+            function,
+            plan,
+            "constructor_does_not_dominate_body",
+        );
+        return None;
+    }
+    let mut effective_plan = plan.clone();
+    if dominated_body_instr_ids.len() != plan.body_instr_ids.len() {
+        effective_plan.pending_alias_use_instr_ids.extend(
+            plan.body_instr_ids
+                .difference(&dominated_body_instr_ids)
+                .copied(),
+        );
+        effective_plan.body_instr_ids = dominated_body_instr_ids;
+    }
+    let ignored_alias_use_instr_ids = effective_plan
+        .body_instr_ids
+        .iter()
+        .chain(effective_plan.pending_alias_use_instr_ids.iter())
+        .copied()
+        .collect::<HashSet<_>>();
     let alias_cleanup = typed_generator_alias_cleanup(
         function,
         module_constants,
         generator_location,
-        &HashSet::new(),
+        &ignored_alias_use_instr_ids,
+        plan.alias_cleanup_active_blocks.as_ref(),
     )
     .or_else(|| {
         trace_typed_generator_state_lowering_skip(function, plan, "residual_alias_use");
@@ -7452,7 +7925,7 @@ fn lower_typed_generator_state_origin_to_locals(
                 .get(&PreservedLocation(
                     u32::try_from(slot_index).expect("preserved slot index should fit in u32"),
                 ))
-                .cloned()
+                .map(TypedTempLocal::resolved_name)
                 .map(|local| (slot.logical_name.clone(), local))
         })
         .collect::<HashMap<_, _>>();
@@ -7465,14 +7938,18 @@ fn lower_typed_generator_state_origin_to_locals(
     let helper_remaps = rewrite_typed_generator_state_helper_calls(
         function,
         &alias_cleanup.alias_locations,
+        &alias_cleanup.is_closed_value_locations,
         &preserved_locals_by_name,
     );
-    let removed_owner_stores =
-        remove_typed_generator_alias_setup(function, module_constants, &alias_cleanup);
+    let removed_owner_stores = if effective_plan.pending_alias_use_instr_ids.is_empty() {
+        remove_typed_generator_alias_setup(function, module_constants, &alias_cleanup)
+    } else {
+        0
+    };
     let remapped_instrs = helper_remaps
         + remap_typed_generator_preserved_instrs(
             function,
-            &plan.body_instr_ids,
+            &effective_plan.body_instr_ids,
             &preserved_local_names,
         );
     trace_typed_generator_state_remaining_preserved(function, plan);
@@ -7485,6 +7962,48 @@ fn lower_typed_generator_state_origin_to_locals(
         },
         preserved_local_names,
     ))
+}
+
+fn typed_generator_state_constructor_dominated_body_instr_ids(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    constructor_block_index: usize,
+    constructor_instr_index: usize,
+    body_instr_ids: &HashSet<InstrId>,
+    active_blocks: Option<&HashSet<BlockLabel>>,
+) -> HashSet<InstrId> {
+    if body_instr_ids.is_empty() {
+        return HashSet::new();
+    }
+    let Some(constructor_block) = function.blocks.get(constructor_block_index) else {
+        return HashSet::new();
+    };
+    let constructor_label = constructor_block.label;
+    let dominators = typed_block_dominators(function);
+    let mut dominated = HashSet::new();
+
+    for block in &function.blocks {
+        if active_blocks.is_some_and(|active_blocks| !active_blocks.contains(&block.label)) {
+            continue;
+        }
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            let instruction_is_dominated = if block.label == constructor_label {
+                constructor_instr_index < instr_index
+            } else {
+                dominators.block_dominates(constructor_label, block.label)
+            };
+            if !instruction_is_dominated {
+                continue;
+            }
+            dominated.extend(typed_instr_matching_instr_ids(instr, body_instr_ids));
+        }
+        if block.label == constructor_label
+            || dominators.block_dominates(constructor_label, block.label)
+        {
+            dominated.extend(typed_term_matching_instr_ids(&block.term, body_instr_ids));
+        }
+    }
+
+    dominated
 }
 
 fn trace_typed_generator_state_lowering_skip(
@@ -7570,20 +8089,35 @@ fn trace_typed_generator_state_remaining_preserved(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     plan: &TypedGeneratorStateLoweringPlan,
 ) {
+    #[derive(Clone, Copy)]
+    enum CurrentTopLevel<'a> {
+        Instr(&'a InstrTyped),
+        Term(&'a BlockTerm<InstrTyped>),
+    }
+
+    impl std::fmt::Debug for CurrentTopLevel<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Instr(instr) => instr.fmt(f),
+                Self::Term(term) => term.fmt(f),
+            }
+        }
+    }
+
     struct Finder<'a> {
         function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
         plan: &'a TypedGeneratorStateLoweringPlan,
-        current_top_level: Option<String>,
+        current_top_level: Option<CurrentTopLevel<'a>>,
     }
 
-    impl Finder<'_> {
-        fn visit_top_level_instr(&mut self, expr: &InstrTyped) {
-            self.current_top_level = Some(format!("{expr:?}"));
+    impl<'a> Finder<'a> {
+        fn visit_top_level_instr(&mut self, expr: &'a InstrTyped) {
+            self.current_top_level = Some(CurrentTopLevel::Instr(expr));
             self.visit_instr(expr);
         }
 
-        fn visit_top_level_term(&mut self, term: &BlockTerm<InstrTyped>) {
-            self.current_top_level = Some(format!("{term:?}"));
+        fn visit_top_level_term(&mut self, term: &'a BlockTerm<InstrTyped>) {
+            self.current_top_level = Some(CurrentTopLevel::Term(term));
             self.visit_term(term);
         }
 
@@ -7594,7 +8128,7 @@ fn trace_typed_generator_state_remaining_preserved(
                 generator_origin = ?self.plan.generator_origin,
                 callee = ?self.plan.function_id,
                 kind,
-                top_level = self.current_top_level.as_deref().unwrap_or("<unknown>"),
+                top_level = ?self.current_top_level,
                 "typed_generator_state_lowering_remaining_preserved",
             );
         }
@@ -7682,9 +8216,10 @@ fn find_typed_generator_constructor_store(
 
 fn find_typed_materialized_generator_constructor_store(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    generator_origin: InstrId,
     constructor: &TypedGeneratorStateConstructor,
 ) -> Option<(usize, usize, ResolvedName, TypedCall<InstrTyped>)> {
-    function
+    let matching_store = function
         .blocks
         .iter()
         .enumerate()
@@ -7697,7 +8232,9 @@ fn find_typed_materialized_generator_constructor_store(
                     let InstrTyped::Store(store) = instr else {
                         return None;
                     };
-                    (store.name == constructor.target).then(|| {
+                    (store.name == constructor.target
+                        && store.value.try_semantic_instr_id() == Some(generator_origin))
+                    .then(|| {
                         (
                             block_index,
                             instr_index,
@@ -7706,7 +8243,32 @@ fn find_typed_materialized_generator_constructor_store(
                         )
                     })
                 })
-        })
+        });
+    matching_store.or_else(|| {
+        function
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .body
+                    .iter()
+                    .enumerate()
+                    .find_map(|(instr_index, instr)| {
+                        let InstrTyped::Store(store) = instr else {
+                            return None;
+                        };
+                        (store.name == constructor.target).then(|| {
+                            (
+                                block_index,
+                                instr_index,
+                                store.name.clone(),
+                                constructor.call.clone(),
+                            )
+                        })
+                    })
+            })
+    })
 }
 
 struct TypedGeneratorAliasCleanup {
@@ -7715,6 +8277,7 @@ struct TypedGeneratorAliasCleanup {
     owner_locations: HashSet<LocalLocation>,
     state_locations: HashSet<LocalLocation>,
     state_value_locations: HashSet<LocalLocation>,
+    is_closed_value_locations: HashSet<LocalLocation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7748,33 +8311,45 @@ fn typed_generator_alias_cleanup(
     module_constants: &[ConstantExpr],
     generator_location: LocalLocation,
     ignored_alias_use_instr_ids: &HashSet<InstrId>,
+    active_blocks: Option<&HashSet<BlockLabel>>,
 ) -> Option<TypedGeneratorAliasCleanup> {
-    let alias_locations =
-        collect_typed_generator_alias_locations(function, module_constants, generator_location);
-    let loaded_locations = collect_typed_loaded_local_locations(function);
-    let resume_function_locations = function
-        .blocks
-        .iter()
-        .flat_map(|block| block.body.iter())
-        .filter_map(|instr| {
-            let InstrTyped::Store(store) = instr else {
-                return None;
-            };
-            let location = store.name.local_location()?;
-            (!loaded_locations.contains(&location)
-                && typed_generator_resume_function_attr_load(
+    let alias_locations = collect_typed_generator_alias_locations(
+        function,
+        module_constants,
+        generator_location,
+        active_blocks,
+    );
+    let resume_function_locations = collect_typed_local_copy_closure(
+        function,
+        function
+            .blocks
+            .iter()
+            .filter(|block| {
+                active_blocks.is_none_or(|active_blocks| active_blocks.contains(&block.label))
+            })
+            .flat_map(|block| block.body.iter())
+            .filter_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let location = store.name.local_location()?;
+                typed_generator_resume_function_attr_load(
                     store.value.as_ref(),
                     module_constants,
                     &alias_locations,
-                ))
-            .then_some(location)
-        })
-        .collect::<HashSet<_>>();
+                )
+                .then_some(location)
+            })
+            .collect::<HashSet<_>>(),
+    );
     let state_value_locations = collect_typed_local_copy_closure(
         function,
         function
             .blocks
             .iter()
+            .filter(|block| {
+                active_blocks.is_none_or(|active_blocks| active_blocks.contains(&block.label))
+            })
             .flat_map(|block| block.body.iter())
             .filter_map(|instr| {
                 let InstrTyped::Store(store) = instr else {
@@ -7790,6 +8365,37 @@ fn typed_generator_alias_cleanup(
             })
             .collect::<HashSet<_>>(),
     );
+    let is_closed_value_locations = function
+        .blocks
+        .iter()
+        .filter(|block| {
+            active_blocks.is_none_or(|active_blocks| active_blocks.contains(&block.label))
+        })
+        .flat_map(|block| block.body.iter())
+        .filter_map(|instr| {
+            let InstrTyped::Store(store) = instr else {
+                return None;
+            };
+            let location = store.name.local_location()?;
+            (typed_generator_state_helper_alias_call(store.value.as_ref(), &alias_locations)
+                == Some(TypedGeneratorStateHelperKind::IsClosed))
+            .then_some(location)
+        })
+        .collect::<HashSet<_>>();
+    #[derive(Clone, Copy)]
+    enum CurrentTopLevel<'a> {
+        Instr(&'a InstrTyped),
+        Term(&'a BlockTerm<InstrTyped>),
+    }
+
+    impl std::fmt::Debug for CurrentTopLevel<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Instr(instr) => instr.fmt(f),
+                Self::Term(term) => term.fmt(f),
+            }
+        }
+    }
 
     struct Uses<'a> {
         alias_locations: HashSet<LocalLocation>,
@@ -7797,15 +8403,16 @@ fn typed_generator_alias_cleanup(
         owner_locations: HashSet<LocalLocation>,
         state_locations: HashSet<LocalLocation>,
         state_value_locations: HashSet<LocalLocation>,
+        is_closed_value_locations: HashSet<LocalLocation>,
         module_constants: &'a [ConstantExpr],
         ignored_alias_use_instr_ids: &'a HashSet<InstrId>,
-        current_top_level: Option<String>,
+        current_top_level: Option<CurrentTopLevel<'a>>,
         residual: bool,
     }
 
-    impl Uses<'_> {
-        fn visit_top_level_instr(&mut self, expr: &InstrTyped) {
-            self.current_top_level = Some(format!("{expr:?}"));
+    impl<'a> Uses<'a> {
+        fn visit_top_level_instr(&mut self, expr: &'a InstrTyped) {
+            self.current_top_level = Some(CurrentTopLevel::Instr(expr));
             match expr {
                 InstrTyped::Store(store)
                     if store
@@ -7832,6 +8439,16 @@ fn typed_generator_alias_cleanup(
                     return;
                 }
                 InstrTyped::Store(store)
+                    if store.name.local_location().is_some_and(|location| {
+                        self.resume_function_locations.contains(&location)
+                    }) && typed_generator_resume_function_value_load(
+                        store.value.as_ref(),
+                        &self.resume_function_locations,
+                    ) =>
+                {
+                    return;
+                }
+                InstrTyped::Store(store)
                     if store
                         .name
                         .local_location()
@@ -7844,6 +8461,17 @@ fn typed_generator_alias_cleanup(
                             store.value.as_ref(),
                             &self.state_value_locations,
                         )) =>
+                {
+                    return;
+                }
+                InstrTyped::Store(store)
+                    if store.name.local_location().is_some_and(|location| {
+                        self.is_closed_value_locations.contains(&location)
+                    }) && typed_generator_is_closed_value_expr(
+                        store.value.as_ref(),
+                        &self.alias_locations,
+                        &self.is_closed_value_locations,
+                    ) =>
                 {
                     return;
                 }
@@ -7887,6 +8515,7 @@ fn typed_generator_alias_cleanup(
                             || self.owner_locations.contains(&location)
                             || self.state_locations.contains(&location)
                             || self.state_value_locations.contains(&location)
+                            || self.is_closed_value_locations.contains(&location)
                     }) =>
                 {
                     return;
@@ -7896,8 +8525,8 @@ fn typed_generator_alias_cleanup(
             self.visit_instr(expr);
         }
 
-        fn visit_top_level_term(&mut self, term: &BlockTerm<InstrTyped>) {
-            self.current_top_level = Some(format!("{term:?}"));
+        fn visit_top_level_term(&mut self, term: &'a BlockTerm<InstrTyped>) {
+            self.current_top_level = Some(CurrentTopLevel::Term(term));
             self.visit_term(term);
         }
     }
@@ -7913,7 +8542,37 @@ fn typed_generator_alias_cleanup(
             {
                 return;
             }
-            if typed_generator_state_helper_alias_call(expr, &self.alias_locations).is_some() {
+            if let InstrTyped::Store(store) = expr
+                && store
+                    .value
+                    .try_semantic_instr_id()
+                    .is_some_and(|instr_id| self.ignored_alias_use_instr_ids.contains(&instr_id))
+            {
+                return;
+            }
+            if let InstrTyped::Truthy(truthy) = expr
+                && typed_generator_is_closed_value_expr(
+                    truthy.value(),
+                    &self.alias_locations,
+                    &self.is_closed_value_locations,
+                )
+            {
+                return;
+            }
+            if typed_generator_is_closed_value_expr(
+                expr,
+                &self.alias_locations,
+                &self.is_closed_value_locations,
+            ) {
+                return;
+            }
+            if matches!(
+                typed_generator_state_helper_alias_call(expr, &self.alias_locations),
+                Some(
+                    TypedGeneratorStateHelperKind::CurrentYieldFrom
+                        | TypedGeneratorStateHelperKind::CurrentThrowContext
+                )
+            ) {
                 return;
             }
             if let InstrTyped::Load(load) = expr
@@ -7923,12 +8582,26 @@ fn typed_generator_alias_cleanup(
                         || self.owner_locations.contains(&location)
                         || self.state_locations.contains(&location)
                         || self.state_value_locations.contains(&location)
+                        || self.is_closed_value_locations.contains(&location)
                 })
             {
+                eprintln!(
+                    "typed generator residual alias load instr={:?} location={:?} top_level_value={:?} ignored={:?} top_level={:?}",
+                    expr.try_semantic_instr_id(),
+                    load.name.local_location(),
+                    match self.current_top_level {
+                        Some(CurrentTopLevel::Instr(InstrTyped::Store(store))) => {
+                            store.value.try_semantic_instr_id()
+                        }
+                        _ => None,
+                    },
+                    self.ignored_alias_use_instr_ids,
+                    self.current_top_level,
+                );
                 tracing::info!(
                     target: "soac_generator_state_lowering",
                     alias_location = ?load.name.local_location(),
-                    top_level = self.current_top_level.as_deref().unwrap_or("<unknown>"),
+                    top_level = ?self.current_top_level,
                     "typed_generator_state_lowering_residual_alias_use",
                 );
                 self.residual = true;
@@ -7944,12 +8617,16 @@ fn typed_generator_alias_cleanup(
         owner_locations: HashSet::new(),
         state_locations: HashSet::new(),
         state_value_locations,
+        is_closed_value_locations,
         module_constants,
         ignored_alias_use_instr_ids,
         current_top_level: None,
         residual: false,
     };
     for block in &function.blocks {
+        if active_blocks.is_some_and(|active_blocks| !active_blocks.contains(&block.label)) {
+            continue;
+        }
         for instr in &block.body {
             uses.visit_top_level_instr(instr);
         }
@@ -7961,6 +8638,7 @@ fn typed_generator_alias_cleanup(
         owner_locations: uses.owner_locations,
         state_locations: uses.state_locations,
         state_value_locations: uses.state_value_locations,
+        is_closed_value_locations: uses.is_closed_value_locations,
     })
 }
 
@@ -7968,11 +8646,19 @@ fn collect_typed_generator_alias_locations(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
     generator_location: LocalLocation,
+    active_blocks: Option<&HashSet<BlockLabel>>,
 ) -> HashSet<LocalLocation> {
     let mut aliases = HashSet::from([generator_location]);
     loop {
         let mut changed = false;
-        for instr in function.blocks.iter().flat_map(|block| block.body.iter()) {
+        for instr in function
+            .blocks
+            .iter()
+            .filter(|block| {
+                active_blocks.is_none_or(|active_blocks| active_blocks.contains(&block.label))
+            })
+            .flat_map(|block| block.body.iter())
+        {
             let InstrTyped::Store(store) = instr else {
                 continue;
             };
@@ -8082,6 +8768,17 @@ fn typed_generator_preserved_state_value_load(
     )
 }
 
+fn typed_generator_resume_function_value_load(
+    expr: &InstrTyped,
+    locations: &HashSet<LocalLocation>,
+) -> bool {
+    matches!(
+        expr,
+        InstrTyped::Load(load)
+            if load.name.local_location().is_some_and(|location| locations.contains(&location))
+    )
+}
+
 fn typed_generator_state_helper_alias_call(
     expr: &InstrTyped,
     aliases: &HashSet<LocalLocation>,
@@ -8099,6 +8796,27 @@ fn typed_generator_state_helper_alias_call(
     typed_generator_alias_load(owner, aliases).then_some(helper)
 }
 
+fn typed_generator_is_closed_value_load(
+    expr: &InstrTyped,
+    locations: &HashSet<LocalLocation>,
+) -> bool {
+    matches!(
+        expr,
+        InstrTyped::Load(load)
+            if load.name.local_location().is_some_and(|location| locations.contains(&location))
+    )
+}
+
+fn typed_generator_is_closed_value_expr(
+    expr: &InstrTyped,
+    aliases: &HashSet<LocalLocation>,
+    locations: &HashSet<LocalLocation>,
+) -> bool {
+    typed_generator_state_helper_alias_call(expr, aliases)
+        == Some(TypedGeneratorStateHelperKind::IsClosed)
+        || typed_generator_is_closed_value_load(expr, locations)
+}
+
 fn remove_typed_generator_alias_setup(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
@@ -8107,6 +8825,22 @@ fn remove_typed_generator_alias_setup(
     let mut removed_owner_stores = 0;
     for block in &mut function.blocks {
         block.body.retain(|instr| {
+            if let InstrTyped::Store(store) = instr
+                && store.name.id_str() == "cols"
+            {
+                let location = store.name.local_location();
+                tracing::info!(
+                    target: "soac_generator_state_lowering",
+                    location = ?location,
+                    alias = location.is_some_and(|location| cleanup.alias_locations.contains(&location)),
+                    resume = location.is_some_and(|location| cleanup.resume_function_locations.contains(&location)),
+                    owner = location.is_some_and(|location| cleanup.owner_locations.contains(&location)),
+                    state = location.is_some_and(|location| cleanup.state_locations.contains(&location)),
+                    state_value = location.is_some_and(|location| cleanup.state_value_locations.contains(&location)),
+                    value = ?store.value,
+                    "typed_generator_alias_cleanup_cols_candidate",
+                );
+            }
             let remove =
                 match instr {
                     InstrTyped::Store(store)
@@ -8133,6 +8867,16 @@ fn remove_typed_generator_alias_setup(
                     }
                     InstrTyped::Store(store)
                         if store.name.local_location().is_some_and(|location| {
+                            cleanup.resume_function_locations.contains(&location)
+                        }) && typed_generator_resume_function_value_load(
+                            store.value.as_ref(),
+                            &cleanup.resume_function_locations,
+                        ) =>
+                    {
+                        true
+                    }
+                    InstrTyped::Store(store)
+                        if store.name.local_location().is_some_and(|location| {
                             cleanup.state_value_locations.contains(&location)
                         }) && (typed_generator_preserved_state_attr_load(
                             store.value.as_ref(),
@@ -8142,6 +8886,17 @@ fn remove_typed_generator_alias_setup(
                             store.value.as_ref(),
                             &cleanup.state_value_locations,
                         )) =>
+                    {
+                        true
+                    }
+                    InstrTyped::Store(store)
+                        if store.name.local_location().is_some_and(|location| {
+                            cleanup.is_closed_value_locations.contains(&location)
+                        }) && typed_generator_is_closed_value_expr(
+                            store.value.as_ref(),
+                            &cleanup.alias_locations,
+                            &cleanup.is_closed_value_locations,
+                        ) =>
                     {
                         true
                     }
@@ -8183,6 +8938,7 @@ fn remove_typed_generator_alias_setup(
                                 || cleanup.owner_locations.contains(&location)
                                 || cleanup.state_locations.contains(&location)
                                 || cleanup.state_value_locations.contains(&location)
+                                || cleanup.is_closed_value_locations.contains(&location)
                         }) =>
                     {
                         true
@@ -8198,16 +8954,18 @@ fn remove_typed_generator_alias_setup(
 fn rewrite_typed_generator_state_helper_calls(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     aliases: &HashSet<LocalLocation>,
-    preserved_locals_by_name: &HashMap<String, TypedTempLocal>,
+    is_closed_value_locations: &HashSet<LocalLocation>,
+    preserved_locals_by_name: &HashMap<String, ResolvedName>,
 ) -> usize {
     struct Rewriter<'a> {
         aliases: &'a HashSet<LocalLocation>,
-        preserved_locals_by_name: &'a HashMap<String, TypedTempLocal>,
+        is_closed_value_locations: &'a HashSet<LocalLocation>,
+        preserved_locals_by_name: &'a HashMap<String, ResolvedName>,
         changed: usize,
     }
 
     impl Rewriter<'_> {
-        fn local_for(&self, helper: TypedGeneratorStateHelperKind) -> Option<&TypedTempLocal> {
+        fn local_for(&self, helper: TypedGeneratorStateHelperKind) -> Option<&ResolvedName> {
             self.preserved_locals_by_name
                 .get(helper.preserved_logical_name())
         }
@@ -8216,14 +8974,26 @@ fn rewrite_typed_generator_state_helper_calls(
     impl VisitMut<InstrTyped> for Rewriter<'_> {
         fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
             if let InstrTyped::Truthy(truthy) = expr
-                && typed_generator_state_helper_alias_call(truthy.value(), self.aliases)
-                    == Some(TypedGeneratorStateHelperKind::IsClosed)
+                && typed_generator_is_closed_value_expr(
+                    truthy.value(),
+                    self.aliases,
+                    self.is_closed_value_locations,
+                )
                 && let Some(local) = self.local_for(TypedGeneratorStateHelperKind::IsClosed)
             {
                 let meta = truthy.meta();
-                *expr = InstrTyped::Truthy(
-                    TypedTruthy::new(typed_load_temp(&local.resolved_name())).with_meta(meta),
-                );
+                *expr =
+                    InstrTyped::Truthy(TypedTruthy::new(typed_load_temp(local)).with_meta(meta));
+                self.changed += 1;
+                return;
+            }
+            if typed_generator_is_closed_value_expr(
+                expr,
+                self.aliases,
+                self.is_closed_value_locations,
+            ) && let Some(local) = self.local_for(TypedGeneratorStateHelperKind::IsClosed)
+            {
+                *expr = typed_load_temp(local);
                 self.changed += 1;
                 return;
             }
@@ -8232,7 +9002,7 @@ fn rewrite_typed_generator_state_helper_calls(
                 typed_generator_state_helper_alias_call(expr, self.aliases)
                 && let Some(local) = self.local_for(helper)
             {
-                *expr = typed_load_temp(&local.resolved_name());
+                *expr = typed_load_temp(local);
                 self.changed += 1;
                 return;
             }
@@ -8242,11 +9012,39 @@ fn rewrite_typed_generator_state_helper_calls(
 
     let mut rewriter = Rewriter {
         aliases,
+        is_closed_value_locations,
         preserved_locals_by_name,
         changed: 0,
     };
     rewriter.visit_fn_mut(function);
     rewriter.changed
+}
+
+pub fn rewrite_lowered_typed_generator_state_helper_calls_with_existing_constructor(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    constructor: &TypedGeneratorStateConstructor,
+    preserved_locals_by_name: &HashMap<String, ResolvedName>,
+    ignored_alias_use_instr_ids: &HashSet<InstrId>,
+) -> usize {
+    let Some(generator_location) = constructor.target.local_location() else {
+        return 0;
+    };
+    let Some(cleanup) = typed_generator_alias_cleanup(
+        function,
+        module_constants,
+        generator_location,
+        ignored_alias_use_instr_ids,
+        None,
+    ) else {
+        return 0;
+    };
+    rewrite_typed_generator_state_helper_calls(
+        function,
+        &cleanup.alias_locations,
+        &cleanup.is_closed_value_locations,
+        preserved_locals_by_name,
+    )
 }
 
 pub fn remap_typed_generator_preserved_instrs_with_existing_locals(
@@ -8261,6 +9059,7 @@ pub fn cleanup_lowered_typed_generator_alias_setup_with_existing_constructor(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
     constructor: &TypedGeneratorStateConstructor,
+    ignored_alias_use_instr_ids: &HashSet<InstrId>,
 ) -> usize {
     let Some(generator_location) = constructor.target.local_location() else {
         return 0;
@@ -8269,7 +9068,8 @@ pub fn cleanup_lowered_typed_generator_alias_setup_with_existing_constructor(
         function,
         module_constants,
         generator_location,
-        &HashSet::new(),
+        ignored_alias_use_instr_ids,
+        None,
     ) else {
         return 0;
     };
@@ -8374,6 +9174,7 @@ pub fn lower_typed_generator_resume_preserved_state_to_locals_and_collect_preser
         .collect::<HashMap<_, _>>();
     let remapped_instrs =
         remap_typed_generator_preserved_instrs_everywhere(function, &preserved_locals);
+    let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
 
     let entry_label = function.entry_block().label;
     let entry = function
@@ -8384,9 +9185,12 @@ pub fn lower_typed_generator_resume_preserved_state_to_locals_and_collect_preser
     let mut entry_transfers = Vec::new();
     for (location, storage_name, storage, local) in &lowered_slots {
         let preserved_name = typed_preserved_slot_name(storage_name, *location);
-        entry_transfers.push(typed_store_temp(
-            local.resolved_name(),
-            InstrTyped::Load(Load::new(preserved_name.clone()).with_meta(Meta::synthetic())),
+        entry_transfers.push(typed_instr_with_fresh_synthetic_instr_id(
+            typed_store_temp(
+                local.resolved_name(),
+                InstrTyped::Load(Load::new(preserved_name.clone()).with_meta(Meta::synthetic())),
+            ),
+            &mut instr_id_allocator,
         ));
         if matches!(
             storage,
@@ -8395,11 +9199,12 @@ pub fn lower_typed_generator_resume_preserved_state_to_locals_and_collect_preser
             // The resume-local slot owns the active value while the function is running.
             // Clearing the preserved owner here keeps overwrite/delete decrefs observable
             // at the original statement boundary instead of delaying them until yield.
-            entry_transfers.push(
+            entry_transfers.push(typed_instr_with_fresh_synthetic_instr_id(
                 Del::new(preserved_name, true)
                     .with_meta(Meta::synthetic())
                     .into(),
-            );
+                &mut instr_id_allocator,
+            ));
         }
     }
     let entry_transfer_count = entry_transfers.len();
@@ -8418,14 +9223,15 @@ pub fn lower_typed_generator_resume_preserved_state_to_locals_and_collect_preser
             if terminally_cleared_here {
                 continue;
             }
-            writebacks.push(
+            writebacks.push(typed_instr_with_fresh_synthetic_instr_id(
                 Store::new(
                     typed_preserved_slot_name(storage_name, *location),
                     Box::new(typed_load_temp(&local.resolved_name())),
                 )
                 .with_meta(Meta::synthetic())
                 .into(),
-            );
+                &mut instr_id_allocator,
+            ));
         }
         boundary_writebacks += writebacks.len();
         block.body.extend(writebacks);
@@ -8456,6 +9262,7 @@ pub fn ensure_typed_generator_resume_boundary_writebacks(
     let preserved_delete_blocks = typed_preserved_delete_blocks(function);
     let lowered_local_delete_blocks =
         typed_generator_resume_lowered_local_delete_blocks(function, preserved_locals);
+    let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
     let mut inserted = 0;
 
     for block in &mut function.blocks {
@@ -8480,14 +9287,15 @@ pub fn ensure_typed_generator_resume_boundary_writebacks(
             {
                 continue;
             }
-            block.body.push(
+            block.body.push(typed_instr_with_fresh_synthetic_instr_id(
                 Store::new(
                     typed_preserved_slot_name(slot.storage_name.as_str(), *location),
                     Box::new(typed_load_temp(local)),
                 )
                 .with_meta(Meta::synthetic())
                 .into(),
-            );
+                &mut instr_id_allocator,
+            ));
             inserted += 1;
         }
     }
@@ -8736,9 +9544,16 @@ fn remap_typed_generator_preserved_instrs_everywhere(
 }
 
 fn typed_instr_contains_any_instr_id(instr: &InstrTyped, instr_ids: &HashSet<InstrId>) -> bool {
+    !typed_instr_matching_instr_ids(instr, instr_ids).is_empty()
+}
+
+fn typed_instr_matching_instr_ids(
+    instr: &InstrTyped,
+    instr_ids: &HashSet<InstrId>,
+) -> HashSet<InstrId> {
     struct Collector<'a> {
         instr_ids: &'a HashSet<InstrId>,
-        found: bool,
+        matched: HashSet<InstrId>,
     }
 
     impl Visit<InstrTyped> for Collector<'_> {
@@ -8747,8 +9562,10 @@ fn typed_instr_contains_any_instr_id(instr: &InstrTyped, instr_ids: &HashSet<Ins
                 .try_semantic_instr_id()
                 .is_some_and(|instr_id| self.instr_ids.contains(&instr_id))
             {
-                self.found = true;
-                return;
+                self.matched.insert(
+                    expr.try_semantic_instr_id()
+                        .expect("matched instruction should retain its semantic id"),
+                );
             }
             expr.visit_children(self);
         }
@@ -8756,19 +9573,26 @@ fn typed_instr_contains_any_instr_id(instr: &InstrTyped, instr_ids: &HashSet<Ins
 
     let mut collector = Collector {
         instr_ids,
-        found: false,
+        matched: HashSet::new(),
     };
     collector.visit_instr(instr);
-    collector.found
+    collector.matched
 }
 
 fn typed_term_contains_any_instr_id(
     term: &BlockTerm<InstrTyped>,
     instr_ids: &HashSet<InstrId>,
 ) -> bool {
+    !typed_term_matching_instr_ids(term, instr_ids).is_empty()
+}
+
+fn typed_term_matching_instr_ids(
+    term: &BlockTerm<InstrTyped>,
+    instr_ids: &HashSet<InstrId>,
+) -> HashSet<InstrId> {
     struct Collector<'a> {
         instr_ids: &'a HashSet<InstrId>,
-        found: bool,
+        matched: HashSet<InstrId>,
     }
 
     impl Visit<InstrTyped> for Collector<'_> {
@@ -8777,8 +9601,10 @@ fn typed_term_contains_any_instr_id(
                 .try_semantic_instr_id()
                 .is_some_and(|instr_id| self.instr_ids.contains(&instr_id))
             {
-                self.found = true;
-                return;
+                self.matched.insert(
+                    expr.try_semantic_instr_id()
+                        .expect("matched instruction should retain its semantic id"),
+                );
             }
             expr.visit_children(self);
         }
@@ -8786,10 +9612,10 @@ fn typed_term_contains_any_instr_id(
 
     let mut collector = Collector {
         instr_ids,
-        found: false,
+        matched: HashSet::new(),
     };
     collector.visit_term(term);
-    collector.found
+    collector.matched
 }
 
 struct TypedGeneratorPreservedLocalRemapper<'a> {
@@ -10731,6 +11557,8 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
                     generator_origin: origin,
                     function_id: values_id,
                     body_instr_ids: HashSet::from([remapped_instr_id]),
+                    pending_alias_use_instr_ids: HashSet::new(),
+                    alias_cleanup_active_blocks: None,
                     materialized_constructor: None,
                 }],
             )
@@ -10773,6 +11601,518 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
                         if del.name.id_str().starts_with("_dp_typed_gen_arg_")
                 )),
             "generator-call argument spills should be cleaned immediately after state init"
+        );
+    }
+
+    #[test]
+    fn generator_alias_lowering_ignores_linearized_next_store_protocol_uses() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    gen = values(limit)\n    item = next(gen)\n    return item\n",
+        )
+        .expect("source should lower");
+        let values_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "values");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let origin = caller
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.body.iter_mut())
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::CallTyped(call) = store.value.as_mut() else {
+                    return None;
+                };
+                let origin = call.try_semantic_instr_id()?;
+                call.extra
+                    .set_generator_instance_plan(soac_ir_typed::TypedGeneratorInstancePlan {
+                        function_id: values_id,
+                        kind: soac_core::block_py::FunctionKind::Generator,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    });
+                Some(origin)
+            })
+            .expect("caller should construct the generator");
+        let next_instr_id =
+            typed_runtime_name_call_instr_ids(caller, RuntimeName::Next, &module_constants)
+                .into_iter()
+                .next()
+                .expect("caller should contain the linearized next(generator) call");
+
+        assert!(
+            typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                origin,
+                &HashSet::from([next_instr_id]),
+            ),
+            "the protocol-call source slated for rewrite should not count as residual generator-alias use"
+        );
+    }
+
+    #[test]
+    fn generator_alias_lowering_ignores_residual_uses_outside_active_blocks() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    gen = values(limit)\n    item = next(gen)\n    return item\n",
+        )
+        .expect("source should lower");
+        let values_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "values");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let (origin, generator_name) = caller
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.body.iter_mut())
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::CallTyped(call) = store.value.as_mut() else {
+                    return None;
+                };
+                let origin = call.try_semantic_instr_id()?;
+                call.extra
+                    .set_generator_instance_plan(soac_ir_typed::TypedGeneratorInstancePlan {
+                        function_id: values_id,
+                        kind: soac_core::block_py::FunctionKind::Generator,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    });
+                Some((origin, store.name.clone()))
+            })
+            .expect("caller should construct the generator");
+        let next_instr_id =
+            typed_runtime_name_call_instr_ids(caller, RuntimeName::Next, &module_constants)
+                .into_iter()
+                .next()
+                .expect("caller should contain the linearized next(generator) call");
+
+        let next_label_index = caller
+            .blocks
+            .iter()
+            .map(|block| block.label.as_u32())
+            .filter(|index| *index != BlockLabel::FALLTHROUGH_INDEX)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let inactive_label = BlockLabel::from_index(
+            usize::try_from(next_label_index).expect("block label should fit usize"),
+        );
+        let mut inactive_block = caller
+            .blocks
+            .first()
+            .cloned()
+            .expect("caller should have an entry block");
+        inactive_block.label = inactive_label;
+        inactive_block.body = vec![
+            Load::new(generator_name)
+                .with_meta(Meta::synthetic())
+                .into(),
+        ];
+        caller.blocks.push(inactive_block);
+
+        let ignored_resume_instr_ids = HashSet::from([next_instr_id]);
+        assert!(
+            !typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                origin,
+                &ignored_resume_instr_ids,
+            ),
+            "the default scan should keep seeing residual alias uses in physically present blocks"
+        );
+
+        let active_blocks = caller
+            .blocks
+            .iter()
+            .map(|block| block.label)
+            .filter(|label| *label != inactive_label)
+            .collect::<HashSet<_>>();
+        assert!(
+            typed_generator_state_origin_can_lower_aliases_in_blocks(
+                caller,
+                &module_constants,
+                origin,
+                &ignored_resume_instr_ids,
+                Some(&active_blocks),
+            ),
+            "the semantic block filter should ignore residual alias uses outside the trusted-owner view"
+        );
+    }
+
+    #[test]
+    fn generator_alias_lowering_groups_pending_protocol_uses_for_shared_constructor_locals() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    gen = values(limit)\n    item = next(gen)\n    return item\n",
+        )
+        .expect("source should lower");
+        let values_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "values");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let (first_origin, generator_store) = caller
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.body.iter_mut())
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::CallTyped(call) = store.value.as_mut() else {
+                    return None;
+                };
+                let origin = call.try_semantic_instr_id()?;
+                call.extra
+                    .set_generator_instance_plan(soac_ir_typed::TypedGeneratorInstancePlan {
+                        function_id: values_id,
+                        kind: soac_core::block_py::FunctionKind::Generator,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    });
+                Some((origin, InstrTyped::Store(store.clone())))
+            })
+            .expect("caller should construct the generator");
+        let (first_next_instr_id, next_store) = caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.body.iter())
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+                    return None;
+                };
+                typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::Next,
+                    &module_constants,
+                )
+                .then(|| {
+                    call.try_semantic_instr_id()
+                        .map(|instr_id| (instr_id, InstrTyped::Store(store.clone())))
+                })
+                .flatten()
+            })
+            .expect("caller should contain the linearized next(generator) call");
+
+        let second_origin = InstrId::new(910);
+        let second_next_instr_id = InstrId::new(911);
+        let mut second_generator_store = generator_store.clone();
+        let InstrTyped::Store(second_generator_store_inner) = &mut second_generator_store else {
+            unreachable!("generator store should stay a store");
+        };
+        second_generator_store_inner.value = Box::new(
+            second_generator_store_inner
+                .value
+                .as_ref()
+                .clone()
+                .with_meta(Meta {
+                    instr_id: Some(second_origin),
+                    ..Meta::synthetic()
+                }),
+        );
+        let mut second_next_store = next_store.clone();
+        let InstrTyped::Store(second_next_store_inner) = &mut second_next_store else {
+            unreachable!("next store should stay a store");
+        };
+        second_next_store_inner.value = Box::new(
+            second_next_store_inner
+                .value
+                .as_ref()
+                .clone()
+                .with_meta(Meta {
+                    instr_id: Some(second_next_instr_id),
+                    ..Meta::synthetic()
+                }),
+        );
+        let entry = caller
+            .blocks
+            .first_mut()
+            .expect("caller should have an entry block");
+        entry.body.push(second_generator_store);
+        entry.body.push(second_next_store);
+
+        let pending_alias_use_instr_ids_by_origin = HashMap::from([
+            (first_origin, HashSet::from([first_next_instr_id])),
+            (second_origin, HashSet::from([second_next_instr_id])),
+        ]);
+        assert!(
+            !typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                first_origin,
+                pending_alias_use_instr_ids_by_origin
+                    .get(&first_origin)
+                    .expect("first origin should have its own pending protocol use"),
+            ),
+            "a sibling pending protocol use should block per-origin alias lowering before grouping"
+        );
+        assert!(
+            !typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                second_origin,
+                pending_alias_use_instr_ids_by_origin
+                    .get(&second_origin)
+                    .expect("second origin should have its own pending protocol use"),
+            ),
+            "a sibling pending protocol use should block per-origin alias lowering before grouping"
+        );
+
+        let grouped_alias_use_instr_ids_by_origin =
+            typed_generator_alias_ignored_instr_ids_by_origin(
+                caller,
+                &module_constants,
+                &pending_alias_use_instr_ids_by_origin,
+            );
+        let expected_grouped_alias_use_instr_ids =
+            HashSet::from([first_next_instr_id, second_next_instr_id]);
+        assert_eq!(
+            grouped_alias_use_instr_ids_by_origin
+                .get(&first_origin)
+                .expect("first origin should retain grouped alias ids"),
+            &expected_grouped_alias_use_instr_ids,
+        );
+        assert_eq!(
+            grouped_alias_use_instr_ids_by_origin
+                .get(&second_origin)
+                .expect("second origin should retain grouped alias ids"),
+            &expected_grouped_alias_use_instr_ids,
+        );
+        assert!(
+            typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                first_origin,
+                grouped_alias_use_instr_ids_by_origin
+                    .get(&first_origin)
+                    .expect("first origin should retain grouped alias ids"),
+            ),
+            "shared-constructor sibling protocol uses should be ignored together for the first origin"
+        );
+        assert!(
+            typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                second_origin,
+                grouped_alias_use_instr_ids_by_origin
+                    .get(&second_origin)
+                    .expect("second origin should retain grouped alias ids"),
+            ),
+            "shared-constructor sibling protocol uses should be ignored together for the second origin"
+        );
+    }
+
+    #[test]
+    fn generator_alias_lowering_groups_pending_protocol_uses_for_shared_alias_locals() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    gen = values(limit)\n    alias = gen\n    item = next(alias)\n    return item\n",
+        )
+        .expect("source should lower");
+        let values_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "values");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let (first_origin, generator_store, generator_name) = caller
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.body.iter_mut())
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::CallTyped(call) = store.value.as_mut() else {
+                    return None;
+                };
+                let origin = call.try_semantic_instr_id()?;
+                call.extra
+                    .set_generator_instance_plan(soac_ir_typed::TypedGeneratorInstancePlan {
+                        function_id: values_id,
+                        kind: soac_core::block_py::FunctionKind::Generator,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    });
+                Some((origin, InstrTyped::Store(store.clone()), store.name.clone()))
+            })
+            .expect("caller should construct the generator");
+        let (alias_store, alias_location) = caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.body.iter())
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::Load(load) = store.value.as_ref() else {
+                    return None;
+                };
+                (load.name == generator_name).then_some((
+                    InstrTyped::Store(store.clone()),
+                    store
+                        .name
+                        .local_location()
+                        .expect("alias assignment should use a local"),
+                ))
+            })
+            .expect("caller should copy the generator through an alias local");
+        let (first_next_instr_id, next_store) = caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.body.iter())
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+                    return None;
+                };
+                typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::Next,
+                    &module_constants,
+                )
+                .then(|| {
+                    call.try_semantic_instr_id()
+                        .map(|instr_id| (instr_id, InstrTyped::Store(store.clone())))
+                })
+                .flatten()
+            })
+            .expect("caller should contain the linearized next(alias) call");
+
+        let second_origin = InstrId::new(920);
+        let second_next_instr_id = InstrId::new(921);
+        let second_generator_name = typed_test_local("other_gen", LocalLocation(920));
+        let mut second_generator_store = generator_store.clone();
+        let InstrTyped::Store(second_generator_store_inner) = &mut second_generator_store else {
+            unreachable!("generator store should stay a store");
+        };
+        second_generator_store_inner.name = second_generator_name.clone();
+        second_generator_store_inner.value = Box::new(
+            second_generator_store_inner
+                .value
+                .as_ref()
+                .clone()
+                .with_meta(Meta {
+                    instr_id: Some(second_origin),
+                    ..Meta::synthetic()
+                }),
+        );
+
+        let mut second_alias_store = alias_store.clone();
+        let InstrTyped::Store(second_alias_store_inner) = &mut second_alias_store else {
+            unreachable!("alias store should stay a store");
+        };
+        second_alias_store_inner.name = typed_test_local("shared_alias", alias_location);
+        second_alias_store_inner.value = Box::new(
+            Load::new(second_generator_name)
+                .with_meta(Meta::synthetic())
+                .into(),
+        );
+
+        let mut second_next_store = next_store.clone();
+        let InstrTyped::Store(second_next_store_inner) = &mut second_next_store else {
+            unreachable!("next store should stay a store");
+        };
+        second_next_store_inner.value = Box::new(
+            second_next_store_inner
+                .value
+                .as_ref()
+                .clone()
+                .with_meta(Meta {
+                    instr_id: Some(second_next_instr_id),
+                    ..Meta::synthetic()
+                }),
+        );
+
+        let entry = caller
+            .blocks
+            .first_mut()
+            .expect("caller should have an entry block");
+        entry.body.push(second_generator_store);
+        entry.body.push(second_alias_store);
+        entry.body.push(second_next_store);
+
+        let pending_alias_use_instr_ids_by_origin = HashMap::from([
+            (first_origin, HashSet::from([first_next_instr_id])),
+            (second_origin, HashSet::from([second_next_instr_id])),
+        ]);
+        assert!(
+            !typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                first_origin,
+                pending_alias_use_instr_ids_by_origin
+                    .get(&first_origin)
+                    .expect("first origin should have its own pending protocol use"),
+            ),
+            "a sibling next(alias) use should block per-origin alias lowering before grouping"
+        );
+        assert!(
+            !typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                second_origin,
+                pending_alias_use_instr_ids_by_origin
+                    .get(&second_origin)
+                    .expect("second origin should have its own pending protocol use"),
+            ),
+            "shared alias locals should still expose sibling protocol uses before grouping"
+        );
+
+        let grouped_alias_use_instr_ids_by_origin =
+            typed_generator_alias_ignored_instr_ids_by_origin(
+                caller,
+                &module_constants,
+                &pending_alias_use_instr_ids_by_origin,
+            );
+        let expected_grouped_alias_use_instr_ids =
+            HashSet::from([first_next_instr_id, second_next_instr_id]);
+        assert_eq!(
+            grouped_alias_use_instr_ids_by_origin
+                .get(&first_origin)
+                .expect("first origin should retain grouped alias ids"),
+            &expected_grouped_alias_use_instr_ids,
+        );
+        assert_eq!(
+            grouped_alias_use_instr_ids_by_origin
+                .get(&second_origin)
+                .expect("second origin should retain grouped alias ids"),
+            &expected_grouped_alias_use_instr_ids,
+        );
+        assert!(
+            typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                first_origin,
+                grouped_alias_use_instr_ids_by_origin
+                    .get(&first_origin)
+                    .expect("first origin should retain grouped alias ids"),
+            ),
+            "shared alias sibling protocol uses should be ignored together for the first origin"
+        );
+        assert!(
+            typed_generator_state_origin_can_lower_aliases(
+                caller,
+                &module_constants,
+                second_origin,
+                grouped_alias_use_instr_ids_by_origin
+                    .get(&second_origin)
+                    .expect("second origin should retain grouped alias ids"),
+            ),
+            "shared alias sibling protocol uses should be ignored together for the second origin"
         );
     }
 
@@ -10900,6 +12240,8 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
                     generator_origin: origin,
                     function_id: values_id,
                     body_instr_ids: HashSet::from([remapped_instr_id, remapped_cell_name_instr_id]),
+                    pending_alias_use_instr_ids: HashSet::new(),
+                    alias_cleanup_active_blocks: None,
                     materialized_constructor: None,
                 }],
             )
@@ -11303,6 +12645,8 @@ def caller(it):\n    return next(it)\n",
                         qualname: "IterRange".to_string(),
                     },
                 )]),
+                &HashMap::new(),
+                &HashMap::new(),
                 &HashMap::new(),
             )
         };
@@ -12414,6 +13758,8 @@ def caller(it):\n    value = next(it)\n    return value\n",
                 },
             )]),
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(stats.rewritten_stores, 1);
@@ -12536,6 +13882,25 @@ def caller(it):\n    try:\n        value = it.__next__()\n    except StopIterati
                         if matches!(if_term.test, InstrTyped::DirectCallGuardTest(_))
                 )
         }));
+        let synthetic_cleanup_dels = caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.body.iter())
+            .filter_map(|instr| match instr {
+                InstrTyped::Del(del) if del.name.id_str().starts_with("_dp_typed_inline_") => {
+                    Some(del)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !synthetic_cleanup_dels.is_empty(),
+            "method inline cleanup should delete optimizer-owned temps"
+        );
+        assert!(
+            synthetic_cleanup_dels.iter().all(|del| del.quietly),
+            "optimizer-owned inline cleanup must tolerate paths that bypass temp initialization"
+        );
     }
 
     #[test]
@@ -15031,7 +16396,6 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
                 .as_ref()
                 .is_some_and(|states| {
                     !states.block_in.is_empty()
-                        && !states.body_before_instr.is_empty()
                         && !states.block_out.is_empty()
                         && !states.edge_out.is_empty()
                 }),
@@ -15062,7 +16426,6 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
                 .as_ref()
                 .is_some_and(|states| {
                     !states.block_in.is_empty()
-                        && !states.body_before_instr.is_empty()
                         && !states.block_out.is_empty()
                         && !states.edge_out.is_empty()
                 }),
@@ -15459,6 +16822,98 @@ def caller(a):\n    return add(a)\n",
         counter.visit_fn(caller);
         assert_eq!(counter.typed_calls, 0);
         assert_eq!(counter.guarded_method_calls, 1);
+    }
+
+    #[test]
+    fn linearized_method_emission_plan_leaves_generic_call_in_place() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def caller(box):\n    return box.get(1)\n",
+        )
+        .expect("source should lower");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        linearize_typed_function_expressions(caller)
+            .expect("typed expression linearization should succeed");
+        let call_id = first_typed_call_instr_id(caller);
+        let target = RuntimeFunctionId::from_raw_parts(0, 9);
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                call_id,
+                TypedCallEmissionPlan::Method {
+                    method_name: "get".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: target,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "test".to_string(),
+                            qualname: "Box".to_string(),
+                        },
+                        type_version: 11,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+            )]),
+        };
+
+        assert_eq!(
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("linearized method emission should fall back locally"),
+            0
+        );
+        validate_typed_function_call_access_plans(caller)
+            .expect("linearized method fallback should remain valid");
+
+        let mut counter = TypedInstrCounter::default();
+        counter.visit_fn(caller);
+        assert_eq!(counter.typed_calls, 1);
+        assert_eq!(counter.guarded_method_calls, 0);
+    }
+
+    #[test]
+    fn linearization_demotes_guarded_method_access_when_getattr_target_is_lifted() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def caller(box):\n    return box.get(1)\n",
+        )
+        .expect("source should lower");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        replace_first_typed_call_access(
+            caller,
+            TypedCallAccessPlan::GuardedMethod {
+                method_name: "get".to_string(),
+                method_guards: vec![TypedDirectMethodCallGuard {
+                    function_id: RuntimeFunctionId::from_raw_parts(0, 9),
+                    owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                        module_name: "test".to_string(),
+                        qualname: "Box".to_string(),
+                    },
+                    type_version: 11,
+                    arg_plan: TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                }],
+            },
+        );
+
+        linearize_typed_function_expressions(caller)
+            .expect("typed expression linearization should succeed");
+        validate_typed_function_call_access_plans(caller)
+            .expect("linearization should keep guarded method invariants valid");
+
+        let mut counter = TypedInstrCounter::default();
+        counter.visit_fn(caller);
+        assert_eq!(counter.typed_calls, 1);
+        assert_eq!(counter.guarded_method_calls, 0);
+        assert!(caller.blocks.iter().all(|block| {
+            block.body.iter().all(|instr| {
+                !matches!(
+                    instr,
+                    InstrTyped::CallTyped(call)
+                        if matches!(call.access, TypedCallAccessPlan::GuardedMethod { .. })
+                )
+            })
+        }));
     }
 
     #[test]

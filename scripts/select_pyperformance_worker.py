@@ -47,16 +47,6 @@ def _measurement_records(
         if record.get("benchmark_name") == benchmark_name
         and not _is_calibration_record(record)
     ]
-    profile_records = [record for record in matching if record.get("opt_mode") == "profile"]
-    if profile_records:
-        matching = profile_records
-
-    deduped_by_work_dir: dict[str, dict[str, Any]] = {}
-    for record in matching:
-        work_dir = record.get("work_dir")
-        if isinstance(work_dir, str):
-            deduped_by_work_dir[work_dir] = record
-    matching = list(deduped_by_work_dir.values())
 
     if worker is not None:
         matching = [
@@ -64,6 +54,19 @@ def _measurement_records(
             for record in matching
             if Path(str(record.get("work_dir", ""))).name == worker
         ]
+    else:
+        profile_records = [
+            record for record in matching if record.get("opt_mode") == "profile"
+        ]
+        if profile_records:
+            matching = profile_records
+
+    deduped_by_work_dir: dict[str, dict[str, Any]] = {}
+    for record in matching:
+        work_dir = record.get("work_dir")
+        if isinstance(work_dir, str):
+            deduped_by_work_dir[work_dir] = record
+    matching = list(deduped_by_work_dir.values())
 
     return matching
 

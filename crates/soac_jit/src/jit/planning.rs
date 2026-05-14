@@ -1,4 +1,6 @@
-use super::deopt::typed_nested_guard_misses_can_resume_before_instr;
+use super::deopt::{
+    runtime_jit_deopt_continuation_for_point, typed_nested_guard_misses_can_resume_before_instr,
+};
 #[cfg(test)]
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
@@ -6,7 +8,6 @@ use soac_core::block_py::{
     ConstantExpr, HasSemanticInstrId, InstrId, InstrKey, InstrLocationMap, Literal, LocalLocation,
     NumberLiteralValue, RuntimeFunctionId, Visit, current_instr_locations, is_internal_symbol,
 };
-#[cfg(test)]
 use soac_ir_blockpy::BlockPyModuleShape;
 use soac_ir_typed::emit_v3::{MechanicalExitKind, MechanicalStepOp};
 use soac_ir_typed::plan_v3::{MaterializeKind, PlanValue, Rep};
@@ -23,10 +24,13 @@ use soac_opt::passes::{
     LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
     LocalEnvResumeValueSource, LocalRefState, RefcountActionKind, RefcountLocal, RefcountPlan,
     RefcountReleaseReason, RefcountSite, compute_typed_function_local_live_ins,
-    compute_typed_function_local_must_bound_ins, plan_typed_local_env_module,
-    plan_typed_local_env_resume_module, plan_typed_ownership_effects,
-    validate_typed_local_env_module_plan, validate_typed_local_env_resume_module_plan,
-    validate_typed_ownership_effects,
+    compute_typed_function_local_must_bound_ins,
+    compute_typed_module_precise_immortal_local_entry_states,
+    plan_typed_local_env_module_with_precise_immortal_states, plan_typed_local_env_resume_module,
+    plan_typed_ownership_effects_with_precise_immortal_states,
+    validate_typed_local_env_module_plan_with_precise_immortal_states,
+    validate_typed_local_env_resume_module_plan,
+    validate_typed_ownership_effects_with_precise_immortal_states,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
@@ -41,7 +45,6 @@ pub struct PreparedJitTypedModulePlan {
     pub module: BlockPyModule<TypedBlockPyModuleShape>,
     pub value_facts: FactStore,
     pub local_env_plan: LocalEnvModulePlan,
-    pub local_env_resume_plan: LocalEnvResumeModulePlan,
     pub locals: PlannedJitModuleLocals,
     pub deopt_resume: PlannedJitDeoptResumeModule,
 }
@@ -287,7 +290,6 @@ pub struct PlannedJitDeoptPoint {
     pub point: LocalEnvResumePoint,
     pub resume_point: LocalEnvResumePoint,
     pub precision: LocalEnvResumeStatePrecision,
-    pub local_locations: Vec<LocalLocation>,
 }
 
 impl PlannedJitModuleLocals {
@@ -414,29 +416,6 @@ impl PlannedJitDeoptResumeFunction {
                     deopt_point.precision,
                     entry.precision
                 ));
-            }
-
-            let mut seen_locations = HashSet::new();
-            for location in &deopt_point.local_locations {
-                if !seen_locations.insert(*location) {
-                    errors.push(format!(
-                        "JIT deopt point {:?} for function {} ({}) duplicates local location {}",
-                        deopt_point.point,
-                        function.function_id,
-                        function.names.qualname,
-                        location.0
-                    ));
-                }
-                if entry.binding_for_location(*location).is_none() {
-                    errors.push(format!(
-                        "JIT deopt point {:?} for function {} ({}) references unavailable local \
-                         location {}",
-                        deopt_point.point,
-                        function.function_id,
-                        function.names.qualname,
-                        location.0
-                    ));
-                }
             }
         }
 
@@ -952,6 +931,9 @@ fn build_jit_typed_module_locals_from_validated_passes(
     local_env_plan: &LocalEnvModulePlan,
     local_env_resume_plan: &LocalEnvResumeModulePlan,
     refcount_plan: &RefcountPlan,
+    runtime_supported_deopt_resume_points: Option<
+        &HashMap<RuntimeFunctionId, Vec<LocalEnvResumePoint>>,
+    >,
 ) -> Result<PlannedJitModuleLocals, String> {
     let mut functions = HashMap::with_capacity(module.callable_defs.len());
     for function in &module.callable_defs {
@@ -982,6 +964,9 @@ fn build_jit_typed_module_locals_from_validated_passes(
             function_refcount_plan,
             function_resume_plan,
             &module.module_constants,
+            runtime_supported_deopt_resume_points
+                .and_then(|resume_points| resume_points.get(&function.function_id))
+                .map(Vec::as_slice),
         )?;
         if functions
             .insert(function.function_id, function_plan)
@@ -998,13 +983,13 @@ fn build_jit_typed_module_locals_from_validated_passes(
 
 fn build_jit_typed_deopt_resume_module_from_validated_passes(
     module: &BlockPyModule<TypedBlockPyModuleShape>,
-    resume_plan: &LocalEnvResumeModulePlan,
+    mut resume_plan: LocalEnvResumeModulePlan,
 ) -> Result<PlannedJitDeoptResumeModule, String> {
     let mut functions = HashMap::with_capacity(module.callable_defs.len());
     for function in &module.callable_defs {
         let resume_plan = resume_plan
-            .function(function.function_id)
-            .cloned()
+            .functions
+            .remove(&function.function_id)
             .ok_or_else(|| {
                 format!(
                     "missing LocalEnv resume plan for function {} ({})",
@@ -1034,23 +1019,75 @@ fn build_jit_typed_deopt_resume_module_from_validated_passes(
     Ok(plan)
 }
 
-pub fn plan_jit_typed_module(
+fn runtime_supported_deopt_resume_points_for_module(
+    runtime_replay_module: &BlockPyModule<BlockPyModuleShape>,
+    local_env_resume_plan: &LocalEnvResumeModulePlan,
+) -> HashMap<RuntimeFunctionId, Vec<LocalEnvResumePoint>> {
+    let runtime_functions = runtime_replay_module
+        .callable_defs
+        .iter()
+        .map(|function| (function.function_id, function))
+        .collect::<HashMap<_, _>>();
+    local_env_resume_plan
+        .functions
+        .iter()
+        .filter_map(|(function_id, resume_plan)| {
+            let function = runtime_functions.get(function_id).copied()?;
+            let instr_locations = current_instr_locations(function);
+            let supported = resume_plan
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    runtime_jit_deopt_continuation_for_point(
+                        function,
+                        &instr_locations,
+                        entry.point,
+                    )
+                    .unsupported_reason()
+                    .is_none()
+                    .then_some(entry.point)
+                })
+                .collect::<Vec<_>>();
+            Some((*function_id, supported))
+        })
+        .collect()
+}
+
+pub fn plan_jit_typed_module_with_runtime_replay_module(
     module: BlockPyModule<TypedBlockPyModuleShape>,
     value_facts: FactStore,
+    runtime_replay_module: Option<&BlockPyModule<BlockPyModuleShape>>,
 ) -> Result<PreparedJitTypedModulePlan, String> {
     let total_start = Instant::now();
+    let precise_immortal_start = Instant::now();
+    let precise_immortal_entry_states =
+        compute_typed_module_precise_immortal_local_entry_states(&module, &value_facts);
+    let precise_immortal_elapsed = precise_immortal_start.elapsed();
     let local_env_start = Instant::now();
-    let local_env_plan = plan_typed_local_env_module(&module, &value_facts);
+    let local_env_plan = plan_typed_local_env_module_with_precise_immortal_states(
+        &module,
+        &value_facts,
+        &precise_immortal_entry_states,
+    );
     let local_env_elapsed = local_env_start.elapsed();
     let local_env_resume_start = Instant::now();
     let local_env_resume_plan =
         plan_typed_local_env_resume_module(&module, &local_env_plan, &value_facts);
     let local_env_resume_elapsed = local_env_resume_start.elapsed();
     let refcount_start = Instant::now();
-    let refcount_plan = plan_typed_ownership_effects(&module, &value_facts);
+    let refcount_plan = plan_typed_ownership_effects_with_precise_immortal_states(
+        &module,
+        &value_facts,
+        &precise_immortal_entry_states,
+    );
     let refcount_elapsed = refcount_start.elapsed();
     let validate_local_env_start = Instant::now();
-    validate_typed_local_env_module_plan(&module, &value_facts, &local_env_plan)?;
+    validate_typed_local_env_module_plan_with_precise_immortal_states(
+        &module,
+        &value_facts,
+        &local_env_plan,
+        &precise_immortal_entry_states,
+    )?;
     let validate_local_env_elapsed = validate_local_env_start.elapsed();
     let validate_local_env_resume_start = Instant::now();
     validate_typed_local_env_resume_module_plan(
@@ -1061,25 +1098,35 @@ pub fn plan_jit_typed_module(
     )?;
     let validate_local_env_resume_elapsed = validate_local_env_resume_start.elapsed();
     let validate_refcount_start = Instant::now();
-    validate_typed_ownership_effects(&module, &value_facts, &refcount_plan)?;
+    validate_typed_ownership_effects_with_precise_immortal_states(
+        &module,
+        &value_facts,
+        &refcount_plan,
+        &precise_immortal_entry_states,
+    )?;
     let validate_refcount_elapsed = validate_refcount_start.elapsed();
+    let runtime_supported_deopt_resume_points = runtime_replay_module.map(|module| {
+        runtime_supported_deopt_resume_points_for_module(module, &local_env_resume_plan)
+    });
     let locals_start = Instant::now();
     let locals = build_jit_typed_module_locals_from_validated_passes(
         &module,
         &local_env_plan,
         &local_env_resume_plan,
         &refcount_plan,
+        runtime_supported_deopt_resume_points.as_ref(),
     )?;
     let locals_elapsed = locals_start.elapsed();
     let deopt_resume_start = Instant::now();
     let deopt_resume =
-        build_jit_typed_deopt_resume_module_from_validated_passes(&module, &local_env_resume_plan)?;
+        build_jit_typed_deopt_resume_module_from_validated_passes(&module, local_env_resume_plan)?;
     let deopt_resume_elapsed = deopt_resume_start.elapsed();
     tracing::info!(
         target: "soac_jit_codegen",
         event = "soac.jit_typed_plan_detail",
         runtime_module_id = module.module_name_gen.runtime_module_id().as_u32(),
         function_count = u64::try_from(module.callable_defs.len()).unwrap_or(u64::MAX),
+        precise_immortal_us = duration_micros(precise_immortal_elapsed),
         local_env_us = duration_micros(local_env_elapsed),
         local_env_resume_us = duration_micros(local_env_resume_elapsed),
         refcount_us = duration_micros(refcount_elapsed),
@@ -1095,10 +1142,16 @@ pub fn plan_jit_typed_module(
         module,
         value_facts,
         local_env_plan,
-        local_env_resume_plan,
         locals,
         deopt_resume,
     })
+}
+
+pub fn plan_jit_typed_module(
+    module: BlockPyModule<TypedBlockPyModuleShape>,
+    value_facts: FactStore,
+) -> Result<PreparedJitTypedModulePlan, String> {
+    plan_jit_typed_module_with_runtime_replay_module(module, value_facts, None)
 }
 
 #[cfg(test)]
@@ -1110,7 +1163,11 @@ pub(super) fn plan_typed_v3_jit_module_for_test(
         module,
         &SoacEnvConfig::default(),
     )?;
-    plan_jit_typed_module(prepared.module, prepared.value_facts)
+    plan_jit_typed_module_with_runtime_replay_module(
+        prepared.module,
+        prepared.value_facts,
+        Some(module),
+    )
 }
 
 fn planned_deopt_points_from_resume_plan(
@@ -1129,11 +1186,6 @@ fn planned_deopt_points_from_resume_plan(
             point: entry.point,
             resume_point: entry.point,
             precision: entry.precision,
-            local_locations: entry
-                .locals
-                .iter()
-                .map(|binding| binding.location)
-                .collect(),
         })
         .collect()
 }
@@ -1189,16 +1241,7 @@ pub fn render_jit_deopt_resume_function(
                 deopt_point.precision
             )
             .expect("writing to String should not fail");
-            for location in &deopt_point.local_locations {
-                let binding = entry.binding_for_location(*location).ok_or_else(|| {
-                    format!(
-                        "deopt point {:?} for function {} ({}) references missing local location {}",
-                        deopt_point.point,
-                        function.function_id,
-                        function.names.qualname,
-                        location.0
-                    )
-                })?;
+            for binding in &entry.locals {
                 writeln!(
                     out,
                     "      {}@{} binding={:?} source={:?} ownership={:?} value={:?}",
@@ -2323,11 +2366,13 @@ fn runtime_block_param_reprs_known(
 fn exact_int_scalar_deopt_instr_ids_for_typed_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     resume_plan: &FunctionLocalEnvResumePlan,
+    runtime_supported_deopt_resume_points: Option<&[LocalEnvResumePoint]>,
 ) -> HashSet<InstrId> {
     struct Collector<'a> {
         function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
         instr_locations: InstrLocationMap,
         resume_plan: &'a FunctionLocalEnvResumePlan,
+        runtime_supported_deopt_resume_points: Option<&'a [LocalEnvResumePoint]>,
         instr_ids: HashSet<InstrId>,
     }
 
@@ -2349,6 +2394,7 @@ fn exact_int_scalar_deopt_instr_ids_for_typed_function(
         function: &BlockPyFunction<TypedBlockPyModuleShape>,
         instr_locations: &InstrLocationMap,
         resume_plan: &FunctionLocalEnvResumePlan,
+        runtime_supported_deopt_resume_points: Option<&[LocalEnvResumePoint]>,
         instr_id: InstrId,
     ) -> bool {
         let Some(stmt) = enclosing_top_level_instr(function, instr_locations, instr_id) else {
@@ -2361,6 +2407,11 @@ fn exact_int_scalar_deopt_instr_ids_for_typed_function(
             key: InstrKey::new(function.function_id, stmt_id),
         };
         if resume_plan.entry(point).is_none() {
+            return false;
+        }
+        if runtime_supported_deopt_resume_points
+            .is_some_and(|resume_points| !resume_points.contains(&point))
+        {
             return false;
         }
         instr_id == stmt_id || typed_nested_guard_misses_can_resume_before_instr(stmt)
@@ -2389,6 +2440,7 @@ fn exact_int_scalar_deopt_instr_ids_for_typed_function(
                 self.function,
                 &self.instr_locations,
                 self.resume_plan,
+                self.runtime_supported_deopt_resume_points,
                 plan.instr_id,
             ) {
                 self.instr_ids.insert(plan.instr_id);
@@ -2407,6 +2459,7 @@ fn exact_int_scalar_deopt_instr_ids_for_typed_function(
         function,
         instr_locations: current_instr_locations(function),
         resume_plan,
+        runtime_supported_deopt_resume_points,
         instr_ids: HashSet::new(),
     };
     collector.visit_fn(function);
@@ -2616,11 +2669,8 @@ fn planned_stack_slot_entry_seeds_for_typed_function_with_live_ins(
         .blocks
         .iter()
         .map(|block| {
-            let live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
-            let must_bound_locations = must_bound_ins
-                .get(&block.label)
-                .cloned()
-                .unwrap_or_default();
+            let live_in_locations = live_ins.get(&block.label);
+            let must_bound_locations = must_bound_ins.get(&block.label);
             let deopt_stack_slot_locations = local_env_resume_plan
                 .entries_for_block(block.label, &instr_locations)
                 .flat_map(|entry| entry.locals.iter())
@@ -2640,8 +2690,10 @@ fn planned_stack_slot_entry_seeds_for_typed_function_with_live_ins(
                             if binding.storage != PlannedLocalStorage::StackSlot {
                                 return None;
                             }
-                            if !live_in_locations.contains(&binding.location)
-                                && !must_bound_locations.contains(&binding.location)
+                            if !live_in_locations
+                                .is_some_and(|locations| locations.contains(&binding.location))
+                                && !must_bound_locations
+                                    .is_some_and(|locations| locations.contains(&binding.location))
                                 && !deopt_stack_slot_locations.contains(&binding.location)
                             {
                                 return None;
@@ -3192,10 +3244,14 @@ fn cleanup_root_entry_facts_for_block(
         // entry bindings describe the value already resident in the slot.
         .filter(|binding| binding.storage == PlannedLocalStorage::StackSlot)
         .filter_map(|binding| {
-            binding
-                .param_facts
-                .value
-                .map(|facts| (binding.name.clone(), facts))
+            binding.param_facts.value.map(|facts| {
+                let facts = if binding.param_facts.binding.requires_checked_local_load() {
+                    facts.without_non_null_ref()
+                } else {
+                    facts
+                };
+                (binding.name.clone(), facts)
+            })
         })
         .collect()
 }
@@ -3522,29 +3578,48 @@ pub fn typed_exc_dispatch_plan(
     refcount_plan: &FunctionRefcountPlan,
     cleanup_root_names: &HashSet<String>,
 ) -> Option<BlockExcDispatchPlan> {
-    let exc_edge = block.exc_edge.as_ref()?;
     let block_indices_by_label = typed_block_indices_by_label(function);
-    let target_index =
-        typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
-    let target_block = &function.blocks[target_index];
-    let stack_slot_name_set = function
+    let stack_slot_name_set = stack_slot_name_set_for_typed_function(function);
+    typed_exc_dispatch_plan_with_shared_inputs(
+        function,
+        block,
+        runtime_target_params,
+        refcount_plan,
+        cleanup_root_names,
+        &block_indices_by_label,
+        &stack_slot_name_set,
+    )
+}
+
+fn stack_slot_name_set_for_typed_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashSet<String> {
+    function
         .storage_layout()
         .as_ref()
-        .map(|layout| {
-            layout
-                .stack_slots()
-                .iter()
-                .cloned()
-                .into_iter()
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
+        .map(|layout| layout.stack_slots().iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn typed_exc_dispatch_plan_with_shared_inputs(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block: &TypedBlock,
+    runtime_target_params: &[RuntimeBlockParamPlan],
+    refcount_plan: &FunctionRefcountPlan,
+    cleanup_root_names: &HashSet<String>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    stack_slot_name_set: &HashSet<String>,
+) -> Option<BlockExcDispatchPlan> {
+    let exc_edge = block.exc_edge.as_ref()?;
+    let target_index =
+        typed_block_index_for_label(function, block_indices_by_label, exc_edge.target);
+    let target_block = &function.blocks[target_index];
     let full_target_param_names = target_block.param_name_vec();
     let transport = plan_edge_transport(
         &full_target_param_names,
         &exc_edge.args,
         runtime_target_params,
-        &stack_slot_name_set,
+        stack_slot_name_set,
     );
     let release_reason = RefcountReleaseReason::ExceptionEdge {
         target: exc_edge.target,
@@ -3613,14 +3688,18 @@ pub fn plan_jit_typed_function_locals_from_plans(
     refcount_plan: FunctionRefcountPlan,
     local_env_resume_plan: &FunctionLocalEnvResumePlan,
     module_constants: &[ConstantExpr],
+    runtime_supported_deopt_resume_points: Option<&[LocalEnvResumePoint]>,
 ) -> Result<PlannedJitFunctionLocals, String> {
     let total_start = Instant::now();
     let setup_start = Instant::now();
     let block_indices_by_label = typed_block_indices_by_label(function);
     let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(&refcount_plan);
     let truthiness_only_local_locations = typed_truthiness_only_internal_local_locations(function);
-    let exact_int_scalar_deopt_instr_ids =
-        exact_int_scalar_deopt_instr_ids_for_typed_function(function, local_env_resume_plan);
+    let exact_int_scalar_deopt_instr_ids = exact_int_scalar_deopt_instr_ids_for_typed_function(
+        function,
+        local_env_resume_plan,
+        runtime_supported_deopt_resume_points,
+    );
     let setup_elapsed = setup_start.elapsed();
     let live_ins_start = Instant::now();
     let live_ins = compute_typed_function_local_live_ins(function);
@@ -3671,6 +3750,7 @@ pub fn plan_jit_typed_function_locals_from_plans(
     )?;
     let entries_elapsed = entries_start.elapsed();
     let exc_dispatch_start = Instant::now();
+    let stack_slot_name_set = stack_slot_name_set_for_typed_function(function);
     let exc_dispatches = function
         .blocks
         .iter()
@@ -3684,12 +3764,14 @@ pub fn plan_jit_typed_function_locals_from_plans(
                     runtime_block_params[target_index].as_slice()
                 })
                 .unwrap_or(&[]);
-            typed_exc_dispatch_plan(
+            typed_exc_dispatch_plan_with_shared_inputs(
                 function,
                 block,
                 runtime_target_params,
                 &refcount_plan,
                 &cleanup_root_names,
+                &block_indices_by_label,
+                &stack_slot_name_set,
             )
         })
         .collect::<Vec<_>>();
@@ -4116,10 +4198,11 @@ def f(flag):
         let runtime_params =
             planned_jit_params_for_typed_function(function, plan, &cleanup_root_names)
                 .expect("runtime params should bind");
-        let resume_plan = prepared
-            .local_env_resume_plan
+        let resume_plan = &prepared
+            .deopt_resume
             .function(function.function_id)
-            .expect("missing typed resume plan");
+            .expect("missing typed resume plan")
+            .resume_plan;
         let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan, resume_plan);
         let block_indices_by_label = typed_block_indices_by_label(function);
         let else_index =
@@ -4268,7 +4351,11 @@ def f(flag):
         assert!(block_param_facts.is_empty());
         assert_eq!(
             stack_slot_facts.get("x"),
-            Some(&PyObjFacts::exact_type(PyExactType::Int))
+            Some(&PyObjFacts::exact_type(PyExactType::Int).without_non_null_ref())
+        );
+        assert!(
+            !stack_slot_facts["x"].is_non_null_ref(),
+            "checked-local cleanup facts must keep the null guard alive"
         );
     }
 
@@ -4531,10 +4618,11 @@ def f(flag):
             .expect("missing typed local plan");
         let runtime_params = planned_jit_params_for_typed_function(function, plan, &HashSet::new())
             .expect("runtime params should bind");
-        let resume_plan = prepared
-            .local_env_resume_plan
+        let resume_plan = &prepared
+            .deopt_resume
             .function(function.function_id)
-            .expect("missing typed resume plan");
+            .expect("missing typed resume plan")
+            .resume_plan;
         let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan, resume_plan);
         let entry_label = function.entry_block().label;
         let entry_plan = plan.block(entry_label).expect("missing entry local plan");
@@ -4936,12 +5024,6 @@ def f():
             .expect("before-term resume point should have a planned deopt point");
         assert_eq!(planned_deopt.resume_point, before_term.point);
         assert_eq!(planned_deopt.precision, before_term.precision);
-        assert!(
-            planned_deopt
-                .local_locations
-                .iter()
-                .any(|location| *location == x_binding.location)
-        );
         assert_eq!(
             function_plan.deopt_point_by_id(planned_deopt.id),
             Some(planned_deopt)
