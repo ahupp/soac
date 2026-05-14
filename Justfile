@@ -969,6 +969,84 @@ py-fast *args='': build-test-runtime-fast
   set -- {{args}}
   "$VENV_DIR/bin/python" "$@"
 
+nqueens-slice slice queen_count loops="1" opt_mode="none" work_dir="": build-test-runtime-fast
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  SLICE="{{slice}}"
+  QUEEN_COUNT="{{queen_count}}"
+  LOOPS="{{loops}}"
+  OPT_MODE="{{opt_mode}}"
+  COUNTERS_DIR="{{work_dir}}"
+
+  if [[ "$COUNTERS_DIR" == work_dir=* ]]; then
+    echo "nqueens-slice: pass the work dir path as the fifth positional argument, without a work_dir= prefix" >&2
+    exit 2
+  fi
+
+  if [[ -z "$COUNTERS_DIR" ]]; then
+    COUNTERS_DIR="$REPO_ROOT/work/bench/nqueens-slices/$SLICE"
+  elif [[ "$COUNTERS_DIR" != /* ]]; then
+    COUNTERS_DIR="$REPO_ROOT/$COUNTERS_DIR"
+  fi
+
+  mkdir -p "$COUNTERS_DIR"
+  export SOAC_WORK_DIR="$COUNTERS_DIR"
+  export SOAC_OPT_MODE="$OPT_MODE"
+  export SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$BENCHMARK_SOURCE_DIR}"
+  export NQUEENS_SLICE="$SLICE"
+  export NQUEENS_QUEEN_COUNT="$QUEEN_COUNT"
+  export NQUEENS_LOOPS="$LOOPS"
+
+  "$VENV_DIR/bin/python" -c 'import importlib, os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); module = importlib.import_module("nqueens_slice_" + os.environ["NQUEENS_SLICE"]); raise SystemExit(module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], os.environ["NQUEENS_LOOPS"]]))'
+
+nqueens-slice-compile slice queen_count loops="1" opt_mode="apply" work_dir="": build-test-runtime-fast
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  SLICE="{{slice}}"
+  QUEEN_COUNT="{{queen_count}}"
+  LOOPS="{{loops}}"
+  OPT_MODE="{{opt_mode}}"
+  COUNTERS_DIR="{{work_dir}}"
+
+  if [[ "$COUNTERS_DIR" == work_dir=* ]]; then
+    echo "nqueens-slice-compile: pass the work dir path as the fifth positional argument, without a work_dir= prefix" >&2
+    exit 2
+  fi
+
+  if [[ -z "$COUNTERS_DIR" ]]; then
+    COUNTERS_DIR="$REPO_ROOT/work/bench/nqueens-slices/$SLICE"
+  elif [[ "$COUNTERS_DIR" != /* ]]; then
+    COUNTERS_DIR="$REPO_ROOT/$COUNTERS_DIR"
+  fi
+
+  mkdir -p "$COUNTERS_DIR"
+  export SOAC_WORK_DIR="$COUNTERS_DIR"
+  export SOAC_OPT_MODE="$OPT_MODE"
+  export SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$BENCHMARK_SOURCE_DIR}"
+  export NQUEENS_SLICE="$SLICE"
+  export NQUEENS_QUEEN_COUNT="$QUEEN_COUNT"
+  export NQUEENS_LOOPS="$LOOPS"
+
+  "$VENV_DIR/bin/python" -c 'import importlib, os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); module = importlib.import_module("nqueens_slice_" + os.environ["NQUEENS_SLICE"]); raise SystemExit(module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], os.environ["NQUEENS_LOOPS"], "--compile-only"]))'
+
+nqueens-slice-stock slice queen_count loops="1":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  "$CPYTHON_BIN" \
+    "$REPO_ROOT/bench/nqueens_slices.py" \
+    "{{slice}}" \
+    "{{queen_count}}" \
+    "{{loops}}"
+
 cpython *args='':
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

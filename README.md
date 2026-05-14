@@ -397,6 +397,27 @@ Benchmark sources live under the tracked `bench/` directory. Generated
 benchmark results and other local artifacts live under the ignored `work/`
 tree, with pystone benchmark runs writing to `work/bench/`.
 
+- `just nqueens-slice <slice> <queen-count> [loops] [opt_mode] [work_dir]`
+  Run one repo-local N-Queens-derived slice through the transformed runtime.
+  The available slices isolate the `permutations()` tuple consumer, the two
+  diagonal `set(genexpr)` consumers, their recomposed search loop, and the full
+  `list(n_queens(...))` consumer. Each transformed run imports only that slice's
+  module, so optimizer/JIT traces stay local to the selected repro. Use
+  `opt_mode=profile` and then
+  `opt_mode=apply` with the same bare fifth-argument work-dir path when you
+  want a small staged specialization repro outside pyperformance, for example
+  `just nqueens-slice diagonal_set_consumers 8 1 profile work/bench/nqueens-slices/diag`.
+
+- `just nqueens-slice-compile <slice> <queen-count> [loops] [opt_mode] [work_dir]`
+  Import the same N-Queens slice module, run only the selected slice once with
+  a tiny compile-seed input of `1`, then exit. Use this with an existing profiled
+  `work_dir` to trigger the selected apply-mode compile path without paying for
+  the full benchmark runtime or compiling unrelated sibling slices.
+
+- `just nqueens-slice-stock <slice> <queen-count> [loops]`
+  Run the same slice on plain vendored CPython for sanity checks or rough local
+  timing comparison.
+
 - `just benchmark`
   The default benchmark recipe runs the transformed profile, verify,
   and specialized apply passes and writes the raw result directory under
