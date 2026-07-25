@@ -464,10 +464,10 @@ another revision's cache.
   benchmark import and any pyperf warmups. Use this instead of manually
   reconstructing worker commands when profiling one pyperformance benchmark.
 - Repo-local uv state
-  `.envrc` and `Justfile` keep uv, XDG, and cargo state under the repo with
+  `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, and `CARGO_HOME`. `XDG_RUNTIME_DIR`
-  defaults under `work/tmp/`, and `CARGO_HOME` defaults to `work/cargo-home`.
+  `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`. `XDG_RUNTIME_DIR` defaults under
+  `work/tmp/`. Cargo uses the caller's normal `CARGO_HOME`.
   Module artifacts are rooted under the
   active `$SOAC_WORK_DIR/modules` directory. The `Justfile` respects pre-set
   values for those repo-local state variables. `just setup-dev-env` reuses an
@@ -481,9 +481,9 @@ another revision's cache.
   Optional override for `just setup-dev-env` in a jj worktree. The setup recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
   owns shared offline state and `work/` as a regular artifact directory. The setup
-  recipe symlinks `vendor/cpython`, `work/`, `.uv-cache`, `.uv/`, `.xdg/`, and
-  `work/cargo-home` from that parent into the worktree, and errors instead of
-  creating isolated empty offline caches when neither
+  recipe symlinks `vendor/cpython`, `work/`, `.uv-cache`, `.uv/`, and `.xdg/`
+  from that parent into the worktree, and errors instead of creating isolated
+  empty offline caches when neither
   inference nor the override can identify the parent.
   When sandboxing would otherwise block shared benchmark writes or jj metadata
   updates, run Codex with the worktree and parent checkout as writable roots.
