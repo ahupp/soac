@@ -46,6 +46,8 @@ use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
 use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_plans_from_v3};
 #[cfg(test)]
 use soac_opt::passes::TypedVirtualObjectId;
+#[cfg(test)]
+use soac_opt::passes::trusted_generator_origin_for_name;
 use soac_opt::passes::{
     TrustedGeneratorResumePlanLookup, TrustedGeneratorResumePlanMissReason, TrustedOwnerState,
     TrustedOwnerStateAnalysis, TypedConstructorFieldBindings, TypedExternalInlineCallee,
@@ -74,18 +76,15 @@ use soac_opt::passes::{
     split_typed_inline_cleanup_hot_continuations_for_labels_with_budget, summarize_module_escapes,
     trusted_fully_virtual_constructor_owner, trusted_function_field_target_for_origin,
     trusted_function_id_for_expr, trusted_generator_instance_owner,
-    trusted_generator_origin_has_escaped, trusted_generator_resume_plan_lookup_for_expr,
-    trusted_object_origin_for_name, trusted_owner_state_for_name, trusted_runtime_name_for_expr,
+    trusted_generator_origin_has_escaped, trusted_generator_resume_function_fact_for_name,
+    trusted_generator_resume_plan_lookup_for_expr, trusted_object_origin_for_name,
+    trusted_owner_state_for_name, trusted_runtime_name_for_expr,
     typed_constructor_field_bindings_from_inline_stats_with_external_callees,
     typed_constructor_init_plans_from_inline_stats_with_external_callees,
     typed_generator_alias_ignored_instr_ids_by_origin,
     typed_generator_constructor_capture_bindings_by_origin,
     typed_generator_state_origin_can_lower_aliases_in_blocks, validate_typed_function_value_facts,
     visit_trusted_owner_term_instrs,
-};
-#[cfg(test)]
-use soac_opt::passes::{
-    trusted_generator_origin_for_name, trusted_generator_resume_function_fact_for_name,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
