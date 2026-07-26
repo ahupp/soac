@@ -209,7 +209,8 @@ pub(super) struct ParsedRuntimeClifFunction {
 pub(super) fn parse_runtime_clif_functions() -> Result<Vec<ParsedRuntimeClifFunction>, String> {
     let mut parsed_functions = Vec::new();
     for (symbol, clif_text) in SOAC_JIT_RUNTIME_CLIF {
-        let mut functions = parse_functions(clif_text)
+        let reader_clif = runtime_clif_for_reader(clif_text);
+        let mut functions = parse_functions(&reader_clif)
             .map_err(|err| format!("failed to parse runtime CLIF for {symbol}: {err}"))?;
         if functions.len() != 1 {
             return Err(format!(
@@ -229,6 +230,28 @@ pub(super) fn parse_runtime_clif_functions() -> Result<Vec<ParsedRuntimeClifFunc
         });
     }
     Ok(parsed_functions)
+}
+
+fn runtime_clif_for_reader(clif_text: &str) -> Cow<'_, str> {
+    const DISABLED_COMPACT_UNWIND: &str = "set enable_compact_unwind_abi=0";
+
+    if !clif_text
+        .lines()
+        .any(|line| line.trim() == DISABLED_COMPACT_UNWIND)
+    {
+        return Cow::Borrowed(clif_text);
+    }
+
+    // rustc-codegen-cranelift from newer nightlies emits this disabled setting
+    // before the crates.io Cranelift reader exposes it. It has no effect on the
+    // function body that SOAC imports and recompiles with its own target ISA.
+    Cow::Owned(
+        clif_text
+            .lines()
+            .filter(|line| line.trim() != DISABLED_COMPACT_UNWIND)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 fn parse_runtime_clif_extern_symbols(
