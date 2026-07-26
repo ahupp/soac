@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub const EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG: u64 = 1;
+pub const EXACT_TUPLE_EXACT_INT_ITEM_SHAPE_TAG: u64 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ModuleOptimizationPlanV3 {
@@ -134,6 +135,7 @@ pub enum ExactListItemAccessKind {
 )]
 pub enum ExactListItemShape {
     ExactListExactInt,
+    ExactTupleExactInt,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -146,6 +148,7 @@ pub struct ExactListItemGuardPlan {
 )]
 pub enum ExactListItemGuardKind {
     ExactListExactCompactIntInBounds,
+    ExactTupleExactCompactIntInBounds,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -910,11 +913,33 @@ fn validate_exact_list_item_plans(function: &FunctionOptimizationPlanV3, errors:
                 function.function.function, item.access, item.shape, item.source
             ));
         }
-        if item.guard.kind != ExactListItemGuardKind::ExactListExactCompactIntInBounds {
-            errors.push(format!(
-                "function {} exact-list item at {} has unsupported guard {:?}",
-                function.function.function, item.source, item.guard.kind
-            ));
+        let expected_guard = match (item.shape, item.access) {
+            (ExactListItemShape::ExactListExactInt, _) => {
+                Some(ExactListItemGuardKind::ExactListExactCompactIntInBounds)
+            }
+            (ExactListItemShape::ExactTupleExactInt, ExactListItemAccessKind::Get) => {
+                Some(ExactListItemGuardKind::ExactTupleExactCompactIntInBounds)
+            }
+            (ExactListItemShape::ExactTupleExactInt, ExactListItemAccessKind::Set) => None,
+        };
+        match expected_guard {
+            Some(expected_guard) if item.guard.kind != expected_guard => {
+                errors.push(format!(
+                    "function {} exact-list item {:?} at {} has unsupported guard {:?}; expected {:?}",
+                    function.function.function,
+                    item.shape,
+                    item.source,
+                    item.guard.kind,
+                    expected_guard,
+                ));
+            }
+            None => {
+                errors.push(format!(
+                    "function {} exact-tuple item at {} does not support {:?}",
+                    function.function.function, item.source, item.access,
+                ));
+            }
+            Some(_) => {}
         }
         if item.fallback.kind != ExactListItemFallbackKind::OriginalItemAccess {
             errors.push(format!(
@@ -2272,6 +2297,68 @@ mod tests {
         }]);
 
         validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn validates_exact_tuple_item_get_selection() {
+        let plan = module_with_exact_list_items(vec![ExactListItemSpecializationPlan {
+            source: instr_id(7),
+            access: ExactListItemAccessKind::Get,
+            shape: ExactListItemShape::ExactTupleExactInt,
+            guard: ExactListItemGuardPlan {
+                kind: ExactListItemGuardKind::ExactTupleExactCompactIntInBounds,
+            },
+            fallback: ExactListItemFallbackPlan {
+                kind: ExactListItemFallbackKind::OriginalItemAccess,
+            },
+            reason: "profiled getitem_hot_shapes selected exact-tuple/exact-int".to_string(),
+        }]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_exact_tuple_item_set_selection() {
+        let plan = module_with_exact_list_items(vec![ExactListItemSpecializationPlan {
+            source: instr_id(7),
+            access: ExactListItemAccessKind::Set,
+            shape: ExactListItemShape::ExactTupleExactInt,
+            guard: ExactListItemGuardPlan {
+                kind: ExactListItemGuardKind::ExactTupleExactCompactIntInBounds,
+            },
+            fallback: ExactListItemFallbackPlan {
+                kind: ExactListItemFallbackKind::OriginalItemAccess,
+            },
+            reason: "tuple item stores must remain generic".to_string(),
+        }]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(err.to_string().contains("exact-tuple item"), "{err}");
+        assert!(err.to_string().contains("does not support Set"), "{err}");
+    }
+
+    #[test]
+    fn rejects_exact_tuple_item_with_exact_list_guard() {
+        let plan = module_with_exact_list_items(vec![ExactListItemSpecializationPlan {
+            source: instr_id(7),
+            access: ExactListItemAccessKind::Get,
+            shape: ExactListItemShape::ExactTupleExactInt,
+            guard: ExactListItemGuardPlan {
+                kind: ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+            },
+            fallback: ExactListItemFallbackPlan {
+                kind: ExactListItemFallbackKind::OriginalItemAccess,
+            },
+            reason: "tuple loads must use the tuple-specific guard".to_string(),
+        }]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(err.to_string().contains("unsupported guard"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("ExactTupleExactCompactIntInBounds"),
+            "{err}"
+        );
     }
 
     #[test]

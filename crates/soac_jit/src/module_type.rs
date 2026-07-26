@@ -5,12 +5,12 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyAnyMethods, PyList, PyTuple};
+use pyo3::types::{PyAnyMethods, PyList, PyModule, PyTuple};
 use soac_config::SoacEnvConfig;
 use soac_config::SpecializationMode;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
-    DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
+    DeoptEntrySource, FunctionExecutionMode, FunctionKind, RuntimeFunctionId, RuntimeName,
     current_instr_locations,
 };
 use soac_core::profile::{
@@ -19,7 +19,7 @@ use soac_core::profile::{
 };
 use soac_instrument::InstrumentationConfig;
 use soac_ir_blockpy::BlockPyModuleShape;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
@@ -875,6 +875,77 @@ pub(crate) fn build_module_constant_objects(
     )
 }
 
+type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
+
+fn collect_original_code_objects(
+    code: &Bound<'_, PyAny>,
+    code_type: &Bound<'_, PyAny>,
+    by_qualname: &mut OriginalCodeByQualname,
+) -> PyResult<()> {
+    let qualname = code.getattr("co_qualname")?.extract::<String>()?;
+    by_qualname
+        .entry(qualname)
+        .or_default()
+        .push_back(code.clone().unbind());
+
+    let consts = code.getattr("co_consts")?;
+    let const_count = unsafe { ffi::PyTuple_Size(consts.as_ptr()) };
+    if const_count < 0 {
+        return Err(PyErr::fetch(code.py()));
+    }
+    for index in 0..const_count {
+        let item = unsafe { ffi::PyTuple_GetItem(consts.as_ptr(), index) };
+        if item.is_null() {
+            return Err(PyErr::fetch(code.py()));
+        }
+        let item = unsafe { Bound::from_borrowed_ptr(code.py(), item) };
+        if item.is_instance(code_type)? {
+            collect_original_code_objects(&item, code_type, by_qualname)?;
+        }
+    }
+    Ok(())
+}
+
+fn original_code_lookup_key(function: &BlockPyFunction<BlockPyModuleShape>) -> Option<&str> {
+    if function.execution_mode() == FunctionExecutionMode::Interpreted {
+        return None;
+    }
+    let qualname = function.names.qualname.as_str();
+    if qualname == "_dp_module_init"
+        || function.names.fn_name == "_dp_resume"
+        || function.names.bind_name.starts_with("_dp_class_ns_")
+        || function.names.bind_name.starts_with("_dp_define_class_")
+    {
+        return None;
+    }
+    Some(qualname)
+}
+
+pub fn match_original_code_to_functions(
+    py: Python<'_>,
+    module_code: &Bound<'_, PyAny>,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
+) -> PyResult<HashMap<RuntimeFunctionId, Py<PyAny>>> {
+    let code_type = PyModule::import(py, "types")?.getattr("CodeType")?;
+    let mut code_by_qualname = HashMap::new();
+    collect_original_code_objects(module_code, &code_type, &mut code_by_qualname)?;
+
+    let mut code_by_function_id = HashMap::new();
+    for function in &lowered_module.callable_defs {
+        let Some(qualname) = original_code_lookup_key(function) else {
+            continue;
+        };
+        let Some(codes) = code_by_qualname.get_mut(qualname) else {
+            continue;
+        };
+        let Some(code) = codes.pop_front() else {
+            continue;
+        };
+        code_by_function_id.insert(function.function_id, code);
+    }
+    Ok(code_by_function_id)
+}
+
 pub fn build_shared_state_for_inspection(
     py: Python<'_>,
     lowered_module: BlockPyModule<BlockPyModuleShape>,
@@ -1014,7 +1085,7 @@ fn build_shared_state_for_inspection_with_original_code(
     )
 }
 
-fn build_shared_state_for_inspection_with_original_code_and_source_hash(
+pub fn build_shared_state_for_inspection_with_original_code_and_source_hash(
     py: Python<'_>,
     lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
@@ -1523,6 +1594,13 @@ unsafe fn soac_init_indexed_module_object(
         return Err(err);
     }
 
+    unsafe { soac_init_module_info(module, module_info) }
+}
+
+unsafe fn soac_init_module_info(
+    module: *mut ffi::PyObject,
+    module_info: ModuleInfo,
+) -> PyResult<()> {
     let info_slot = unsafe { soac_indexed_module_info_slot(module) };
     if unsafe { !(*info_slot).is_null() } {
         return Err(PyRuntimeError::new_err(
@@ -1711,6 +1789,20 @@ fn ensure_module_dict_metadata_names(global_names: &mut Vec<String>) {
     }
 }
 
+fn source_named_generator_globals_require_ordinary_dict(
+    module_name: &str,
+    specialization_mode: Option<SpecializationMode>,
+    function_kind: &FunctionKind,
+    display_name: &str,
+    has_original_runtime_code: bool,
+) -> bool {
+    module_name != "soac.runtime"
+        && specialization_mode == Some(SpecializationMode::Apply)
+        && *function_kind == FunctionKind::Generator
+        && display_name != "<genexpr>"
+        && has_original_runtime_code
+}
+
 unsafe fn tuple_from_global_names<'py>(
     py: Python<'py>,
     global_names: &[String],
@@ -1718,7 +1810,7 @@ unsafe fn tuple_from_global_names<'py>(
     let tuple = unsafe { ffi::PyTuple_New(global_names.len() as ffi::Py_ssize_t) };
     let tuple = unsafe { Bound::from_owned_ptr_or_err(py, tuple)? }.cast_into::<PyTuple>()?;
     for (index, name) in global_names.iter().enumerate() {
-        let item = unsafe {
+        let mut item = unsafe {
             ffi::PyUnicode_FromStringAndSize(
                 name.as_ptr().cast::<c_char>(),
                 name.len() as ffi::Py_ssize_t,
@@ -1727,6 +1819,7 @@ unsafe fn tuple_from_global_names<'py>(
         if item.is_null() {
             return Err(PyErr::fetch(py));
         }
+        unsafe { ffi::PyUnicode_InternInPlace(&mut item) };
         if unsafe { ffi::PyTuple_SetItem(tuple.as_ptr(), index as ffi::Py_ssize_t, item) } != 0 {
             return Err(PyErr::fetch(py));
         }
@@ -1756,13 +1849,31 @@ impl SoacExtModule {
             .getattr("parent")?
             .extract::<String>()
             .map_err(|_| PyTypeError::new_err("expected a module spec with a string 'parent'"))?;
+        let specialization_mode = compile_session
+            .env_config()
+            .map_err(PyRuntimeError::new_err)?
+            .specialization_mode();
+        let use_ordinary_source_named_generator_globals =
+            lowered_module.callable_defs.iter().any(|function| {
+                source_named_generator_globals_require_ordinary_dict(
+                    module_name.as_str(),
+                    specialization_mode,
+                    function.lowered_kind(),
+                    function.names.display_name.as_str(),
+                    original_code_by_function_id.contains_key(&function.function_id),
+                )
+            });
         let module = unsafe {
             Bound::from_owned_ptr_or_err(
                 py,
                 ffi::PyModule_FromDefAndSpec(soac_ext_module_def(), spec.as_ptr()),
             )?
         };
-        unsafe { soac_init_indexed_module_object(py, module.as_ptr(), module_info)? };
+        if use_ordinary_source_named_generator_globals {
+            unsafe { soac_init_module_info(module.as_ptr(), module_info)? };
+        } else {
+            unsafe { soac_init_indexed_module_object(py, module.as_ptr(), module_info)? };
+        }
         if unsafe { ffi::PyModule_ExecDef(module.as_ptr(), soac_ext_module_def()) } != 0 {
             return Err(PyErr::fetch(py));
         }
@@ -1798,13 +1909,131 @@ impl SoacExtModule {
 #[cfg(test)]
 mod test {
     use super::*;
-    use pyo3::types::PyModule;
     use soac_core::profile::COUNTER_DUMP_MAGIC;
     use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
     use soac_ir_typed::lower_blockpy_module_to_typed;
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn original_code_matching_preserves_named_and_nested_generator_code() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let source = r#"
+def values(limit):
+    yield from range(limit)
+
+def consume(limit):
+    return tuple(values(limit))
+
+def generated(limit):
+    return (value for value in range(limit))
+"#;
+            let lowered = lower_python_to_blockpy_for_testing(source)
+                .expect("source-backed generators should lower")
+                .blockpy_module;
+            let original_module_code = PyModule::import(py, "builtins")
+                .and_then(|builtins| builtins.getattr("compile"))
+                .and_then(|compile| compile.call1((source, "<source-generator-test>", "exec")))
+                .expect("source-backed generators should compile");
+            let originals =
+                match_original_code_to_functions(py, original_module_code.as_any(), &lowered)
+                    .expect("original generator code should match the lowered module");
+
+            for qualname in [
+                "values",
+                "consume",
+                "generated",
+                "generated.<locals>.<genexpr>",
+            ] {
+                let function = lowered
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.qualname == qualname)
+                    .unwrap_or_else(|| panic!("lowered module should contain {qualname}"));
+                let code = originals
+                    .get(&function.function_id)
+                    .unwrap_or_else(|| panic!("source code should contain {qualname}"));
+                let original_qualname = code
+                    .bind(py)
+                    .getattr("co_qualname")
+                    .and_then(|value| value.extract::<String>())
+                    .expect("original code should expose its qualified name");
+                assert_eq!(original_qualname, qualname);
+            }
+        });
+    }
+
+    #[test]
+    fn apply_source_named_generator_globals_require_ordinary_dict() {
+        assert!(source_named_generator_globals_require_ordinary_dict(
+            "pkg.workload",
+            Some(SpecializationMode::Apply),
+            &FunctionKind::Generator,
+            "items",
+            true,
+        ));
+    }
+
+    #[test]
+    fn countered_and_unspecialized_generator_globals_remain_indexed() {
+        for specialization_mode in [
+            None,
+            Some(SpecializationMode::Profile),
+            Some(SpecializationMode::Verify),
+        ] {
+            assert!(!source_named_generator_globals_require_ordinary_dict(
+                "pkg.workload",
+                specialization_mode,
+                &FunctionKind::Generator,
+                "items",
+                true,
+            ));
+        }
+    }
+
+    #[test]
+    fn generator_expression_globals_remain_indexed() {
+        assert!(!source_named_generator_globals_require_ordinary_dict(
+            "pkg.workload",
+            Some(SpecializationMode::Apply),
+            &FunctionKind::Generator,
+            "<genexpr>",
+            true,
+        ));
+    }
+
+    #[test]
+    fn generated_and_ordinary_function_globals_remain_indexed() {
+        assert!(!source_named_generator_globals_require_ordinary_dict(
+            "pkg.workload",
+            Some(SpecializationMode::Apply),
+            &FunctionKind::Generator,
+            "items",
+            false,
+        ));
+        assert!(!source_named_generator_globals_require_ordinary_dict(
+            "pkg.workload",
+            Some(SpecializationMode::Apply),
+            &FunctionKind::Function,
+            "items",
+            true,
+        ));
+    }
+
+    #[test]
+    fn compiler_runtime_generator_globals_remain_indexed() {
+        assert!(!source_named_generator_globals_require_ordinary_dict(
+            "soac.runtime",
+            Some(SpecializationMode::Apply),
+            &FunctionKind::Generator,
+            "code_template_gen",
+            true,
+        ));
+    }
 
     fn define_module_block_entry_counters(module: &mut BlockPyModule<BlockPyModuleShape>) {
         let config = InstrumentationConfig::from_env_config(

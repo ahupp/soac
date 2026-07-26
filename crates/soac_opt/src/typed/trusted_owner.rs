@@ -685,15 +685,55 @@ fn trusted_identity_iter_store_value(
     if !is_iter_call || !call.keywords.is_empty() {
         return None;
     }
-    let Some(CallArgPositional::Positional(InstrTyped::Load(receiver))) = call.args.first() else {
+    let [CallArgPositional::Positional(receiver)] = call.args.as_slice() else {
         return None;
     };
-    let owner_type_ref = trusted_owner_state_for_name(&receiver.name, state)?.clone();
+    let (owner_type_ref, origin) = if let InstrTyped::Load(receiver) = receiver {
+        (
+            trusted_owner_state_for_name(&receiver.name, state)?.clone(),
+            trusted_object_origin_for_name(&receiver.name, state)?,
+        )
+    } else {
+        let plan = receiver.generator_instance_plan()?;
+        if plan.kind != FunctionKind::Generator {
+            return None;
+        }
+        (
+            trusted_generator_instance_owner(plan)?,
+            receiver.try_semantic_instr_id()?,
+        )
+    };
     if !trusted_runtime_iterator_owner_type(&owner_type_ref) {
         return None;
     }
-    let origin = trusted_object_origin_for_name(&receiver.name, state)?;
     Some((owner_type_ref, origin))
+}
+
+fn trusted_identity_iter_resume_function_for_store_value(
+    value: &InstrTyped,
+    state: &TrustedOwnerState,
+    module_constants: &[ConstantExpr],
+) -> Option<TrustedResumeFunctionFact> {
+    let (_, origin) = trusted_identity_iter_store_value(value, state, module_constants)?;
+    let InstrTyped::CallTyped(call) = value else {
+        return None;
+    };
+    let [CallArgPositional::Positional(receiver)] = call.args.as_slice() else {
+        return None;
+    };
+
+    if let Some(plan) = receiver.generator_instance_plan() {
+        return (plan.kind == FunctionKind::Generator
+            && receiver.try_semantic_instr_id() == Some(origin))
+        .then(|| TrustedResumeFunctionFact::new(plan.function_id, origin));
+    }
+
+    let InstrTyped::Load(receiver) = receiver else {
+        return None;
+    };
+    trusted_resume_function_fact_for_name(&receiver.name, state)
+        .filter(|fact| fact.exact_origin() == Some(origin))
+        .cloned()
 }
 
 fn trusted_runtime_next_receiver_is_internal_consumption(
@@ -937,6 +977,11 @@ fn trusted_resume_function_for_store_value(
             value.try_semantic_instr_id()?,
         ));
     }
+    if let Some(fact) =
+        trusted_identity_iter_resume_function_for_store_value(value, state, module_constants)
+    {
+        return Some(fact);
+    }
     if let Some((origin, function_id)) =
         trusted_field_function_id_for_expr(value, state, module_constants)
     {
@@ -1139,15 +1184,15 @@ fn trusted_generator_resume_plan_lookup_from_parts(
                 InstrTyped::Load(load) => Some(load.name.id_str()),
                 _ => None,
             };
-            eprintln!(
-                "missing trusted resume function instr_id={instr_id:?} resume_name={resume_name:?} resume_function={resume_function:?} owner={} owner_origin={owner_origin:?} owner_origin_candidates={owner_origin_candidates:?} owner_resume_target={owner_resume_target:?} resume_temp_fact={resume_temp_fact:?} owner_fact={owner_fact:?}",
-                owner.name.id_str(),
-            );
             tracing::debug!(
                 target: "soac_generator_resume_planning",
                 instr_id = ?instr_id,
+                resume_name = ?resume_name,
                 resume_function = ?resume_function,
                 owner_name = owner.name.id_str(),
+                owner_origin = ?owner_origin,
+                owner_origin_candidates = ?owner_origin_candidates,
+                owner_resume_target = ?owner_resume_target,
                 resume_temp_fact = ?resume_temp_fact,
                 owner_fact = ?owner_fact,
                 "typed_generator_resume_plan_skipped_missing_resume_function",
@@ -1512,6 +1557,74 @@ fn transfer_trusted_owner_instr(
     mark_trusted_owner_escapes_for_instr(instr, state, module_constants);
     match instr {
         InstrTyped::Store(store) => {
+            if tracing::enabled!(
+                target: "soac_generator_protocol_planning",
+                tracing::Level::DEBUG
+            ) && let InstrTyped::CallTyped(call) = store.value.as_ref()
+            {
+                let is_iter_call = match &call.access {
+                    soac_ir_typed::TypedCallAccessPlan::Generic => typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::Iter,
+                        module_constants,
+                    ),
+                    soac_ir_typed::TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                        runtime_name,
+                        ..
+                    } => *runtime_name == RuntimeName::Iter,
+                    _ => false,
+                };
+                if is_iter_call {
+                    let receiver = match call.args.as_slice() {
+                        [CallArgPositional::Positional(InstrTyped::Load(receiver))] => {
+                            Some(&receiver.name)
+                        }
+                        _ => None,
+                    };
+                    let identity = trusted_identity_iter_store_value(
+                        store.value.as_ref(),
+                        state,
+                        module_constants,
+                    );
+                    tracing::debug!(
+                        target: "soac_generator_protocol_planning",
+                        store_name = store.name.id_str(),
+                        store_location = ?store.name.location,
+                        receiver_name = receiver.map(NameLike::id_str),
+                        receiver_location = ?receiver.map(|name| name.location),
+                        receiver_owner = ?receiver
+                            .and_then(|name| trusted_owner_state_for_name(name, state)),
+                        receiver_origin = ?receiver
+                            .and_then(|name| trusted_object_origin_for_name(name, state)),
+                        receiver_resume_function = ?receiver
+                            .and_then(|name| {
+                                trusted_generator_resume_function_fact_for_name(name, state)
+                            })
+                            .map(|fact| fact.function_id),
+                        identity_owner = ?identity.as_ref().map(|(owner, _)| owner),
+                        identity_origin = ?identity.as_ref().map(|(_, origin)| origin),
+                        nested_generator_plan = ?call.args.first().and_then(|arg| {
+                            let CallArgPositional::Positional(receiver) = arg else {
+                                return None;
+                            };
+                            receiver.generator_instance_plan().map(|plan| {
+                                (plan.function_id, plan.kind, receiver.try_semantic_instr_id())
+                            })
+                        }),
+                        "typed_generator_identity_iter_owner_transfer",
+                    );
+                }
+            }
+            if let Some(fact) = trusted_identity_iter_resume_function_for_store_value(
+                store.value.as_ref(),
+                state,
+                module_constants,
+            ) && let Some(origin) = fact.exact_origin()
+            {
+                state
+                    .function_fields
+                    .insert((origin, "_resume_function".to_string()), fact.function_id);
+            }
             if let Some(location) = store.name.local_location() {
                 if let Some(owner_type_ref) = trusted_owner_state_for_store_value(
                     store.value.as_ref(),
@@ -2925,6 +3038,340 @@ pub fn analyze_trusted_function_states(
     analysis
 }
 
+fn trace_trusted_generator_protocol_owner_components(
+    function_id: RuntimeFunctionId,
+    block: BlockLabel,
+    instr_index: usize,
+    instr: &InstrTyped,
+    state: &TrustedOwnerState,
+    component_states: &[TrustedOwnerState],
+    module_constants: &[ConstantExpr],
+) {
+    if !tracing::enabled!(
+        target: "soac_generator_protocol_planning",
+        tracing::Level::DEBUG
+    ) {
+        return;
+    }
+
+    struct Collector<'a> {
+        function_id: RuntimeFunctionId,
+        block: BlockLabel,
+        instr_index: usize,
+        state: &'a TrustedOwnerState,
+        component_states: &'a [TrustedOwnerState],
+        module_constants: &'a [ConstantExpr],
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr {
+                let is_next_call = match &call.access {
+                    soac_ir_typed::TypedCallAccessPlan::Generic => typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::Next,
+                        self.module_constants,
+                    ),
+                    soac_ir_typed::TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                        runtime_name,
+                        ..
+                    } => *runtime_name == RuntimeName::Next,
+                    _ => false,
+                };
+                if is_next_call
+                    && let [CallArgPositional::Positional(InstrTyped::Load(receiver))] =
+                        call.args.as_slice()
+                {
+                    let merged_origin = trusted_object_origin_for_name(&receiver.name, self.state);
+                    let component_facts = self
+                        .component_states
+                        .iter()
+                        .map(|component| {
+                            let origin = trusted_object_origin_for_name(&receiver.name, component);
+                            (
+                                trusted_owner_state_for_name(&receiver.name, component).cloned(),
+                                origin,
+                                trusted_generator_resume_function_fact_for_name(
+                                    &receiver.name,
+                                    component,
+                                )
+                                .map(|fact| fact.function_id),
+                                origin.is_some_and(|origin| {
+                                    trusted_generator_origin_has_escaped(origin, component)
+                                }),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    tracing::debug!(
+                        target: "soac_generator_protocol_planning",
+                        function_id = ?self.function_id,
+                        block = ?self.block,
+                        instr_index = self.instr_index,
+                        instr_id = ?call.try_semantic_instr_id(),
+                        receiver_name = receiver.name.id_str(),
+                        receiver_location = ?receiver.name.location,
+                        merged_owner = ?trusted_owner_state_for_name(&receiver.name, self.state),
+                        merged_origin = ?merged_origin,
+                        merged_resume_function = ?trusted_generator_resume_function_fact_for_name(
+                            &receiver.name,
+                            self.state,
+                        )
+                        .map(|fact| fact.function_id),
+                        merged_escaped = merged_origin.is_some_and(|origin| {
+                            trusted_generator_origin_has_escaped(origin, self.state)
+                        }),
+                        component_count = self.component_states.len(),
+                        component_facts = ?component_facts,
+                        "typed_generator_protocol_owner_component_facts",
+                    );
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    Collector {
+        function_id,
+        block,
+        instr_index,
+        state,
+        component_states,
+        module_constants,
+    }
+    .visit_instr(instr);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrustedPreservedGeneratorIdentity {
+    owner: TypedAttrOwnerRef,
+    origin: InstrId,
+    resume_function: RuntimeFunctionId,
+    definition_block: BlockLabel,
+    definition_instr_index: usize,
+    cleared_reachable_blocks: HashMap<BlockLabel, usize>,
+}
+
+fn trusted_unique_preserved_generator_identities(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    analysis: &TrustedOwnerStateAnalysis,
+) -> HashMap<PreservedLocation, TrustedPreservedGeneratorIdentity> {
+    struct GeneratorPlanCollector {
+        targets: HashMap<InstrId, RuntimeFunctionId>,
+        conflicting_origins: HashSet<InstrId>,
+    }
+
+    impl Visit<InstrTyped> for GeneratorPlanCollector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let Some(plan) = expr.generator_instance_plan()
+                && plan.kind == FunctionKind::Generator
+                && let Some(origin) = expr.try_semantic_instr_id()
+            {
+                match self.targets.entry(origin) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(plan.function_id);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry)
+                        if *entry.get() != plan.function_id =>
+                    {
+                        self.conflicting_origins.insert(origin);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut generator_plans = GeneratorPlanCollector {
+        targets: HashMap::new(),
+        conflicting_origins: HashSet::new(),
+    };
+    generator_plans.visit_fn(function);
+
+    let mut identities = HashMap::new();
+    let mut store_counts = HashMap::<PreservedLocation, usize>::new();
+    let mut clear_sites = HashMap::<PreservedLocation, Vec<(BlockLabel, usize)>>::new();
+
+    for block in &function.blocks {
+        if !analysis.reachable_blocks.contains(block.label) {
+            continue;
+        }
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            match instr {
+                InstrTyped::Store(store) => {
+                    let Some(location) = store.name.preserved_location() else {
+                        continue;
+                    };
+                    *store_counts.entry(location).or_default() += 1;
+                    let Some(state) = analysis.body_before_instr.get(&TypedVirtualBodyInstr {
+                        block: block.label,
+                        instr_index,
+                    }) else {
+                        continue;
+                    };
+                    let Some((owner, origin)) = trusted_identity_iter_store_value(
+                        store.value.as_ref(),
+                        state,
+                        module_constants,
+                    ) else {
+                        continue;
+                    };
+                    if !matches!(
+                        &owner,
+                        TypedAttrOwnerRef::TypeKey {
+                            module_name,
+                            qualname,
+                        } if module_name == "soac.runtime" && qualname == "ClosureGenerator"
+                    ) || generator_plans.conflicting_origins.contains(&origin)
+                        || trusted_generator_origin_has_escaped(origin, state)
+                    {
+                        continue;
+                    }
+                    let Some(resume_fact) = trusted_identity_iter_resume_function_for_store_value(
+                        store.value.as_ref(),
+                        state,
+                        module_constants,
+                    ) else {
+                        continue;
+                    };
+                    if resume_fact.exact_origin() != Some(origin)
+                        || generator_plans.targets.get(&origin) != Some(&resume_fact.function_id)
+                    {
+                        continue;
+                    }
+                    identities.insert(
+                        location,
+                        TrustedPreservedGeneratorIdentity {
+                            owner,
+                            origin,
+                            resume_function: resume_fact.function_id,
+                            definition_block: block.label,
+                            definition_instr_index: instr_index,
+                            cleared_reachable_blocks: HashMap::new(),
+                        },
+                    );
+                }
+                InstrTyped::Del(del) => {
+                    if let Some(location) = del.name.preserved_location() {
+                        clear_sites
+                            .entry(location)
+                            .or_default()
+                            .push((block.label, instr_index));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    identities.retain(|location, _| store_counts.get(location) == Some(&1));
+
+    let predecessors = trusted_owner_block_predecessor_edges(function);
+    let mut successors = HashMap::<BlockLabel, Vec<BlockLabel>>::new();
+    for (&target, edges) in &predecessors {
+        if !analysis.reachable_blocks.contains(target) {
+            continue;
+        }
+        for edge in edges {
+            if analysis.reachable_blocks.contains(edge.from) {
+                successors.entry(edge.from).or_default().push(target);
+            }
+        }
+    }
+
+    for (&location, identity) in &mut identities {
+        let mut pending = VecDeque::new();
+        if let Some(clears) = clear_sites.get(&location) {
+            pending.extend(
+                clears
+                    .iter()
+                    .map(|&(block, index)| (block, index.saturating_add(1))),
+            );
+        }
+
+        while let Some((block, start)) = pending.pop_front() {
+            if identity
+                .cleared_reachable_blocks
+                .get(&block)
+                .is_some_and(|&previous| previous <= start)
+            {
+                continue;
+            }
+            identity.cleared_reachable_blocks.insert(block, start);
+
+            if block == identity.definition_block && start <= identity.definition_instr_index {
+                continue;
+            }
+
+            if let Some(block_successors) = successors.get(&block) {
+                pending.extend(block_successors.iter().map(|&successor| (successor, 0)));
+            }
+        }
+    }
+
+    identities
+}
+
+fn restore_trusted_preserved_generator_identities(
+    state: &mut TrustedOwnerState,
+    identities: &HashMap<PreservedLocation, TrustedPreservedGeneratorIdentity>,
+    block: BlockLabel,
+    instr_index: Option<usize>,
+) {
+    let site_index = instr_index.unwrap_or(usize::MAX);
+    for (&location, identity) in identities {
+        if identity
+            .cleared_reachable_blocks
+            .get(&block)
+            .is_some_and(|&clear_start| {
+                clear_start <= site_index
+                    && !(block == identity.definition_block
+                        && clear_start <= identity.definition_instr_index
+                        && identity.definition_instr_index < site_index)
+            })
+        {
+            continue;
+        }
+
+        let Some(resume_fact) = state.preserved_resume_functions.get(&location) else {
+            continue;
+        };
+        if resume_fact.function_id != identity.resume_function
+            || resume_fact.exact_origin() != Some(identity.origin)
+            || trusted_generator_origin_has_escaped(identity.origin, state)
+            || state
+                .preserved_owners
+                .get(&location)
+                .is_some_and(|owner| owner != &identity.owner)
+            || state
+                .preserved_object_origins
+                .get(&location)
+                .is_some_and(|origin| *origin != identity.origin)
+            || state
+                .function_fields
+                .get(&(identity.origin, "_resume_function".to_string()))
+                .is_some_and(|function_id| *function_id != identity.resume_function)
+        {
+            continue;
+        }
+
+        state
+            .preserved_owners
+            .insert(location, identity.owner.clone());
+        state
+            .preserved_object_origins
+            .insert(location, identity.origin);
+        state
+            .preserved_object_origin_candidates
+            .insert(location, HashSet::from([identity.origin]));
+        state.function_fields.insert(
+            (identity.origin, "_resume_function".to_string()),
+            identity.resume_function,
+        );
+    }
+}
+
 pub fn analyze_trusted_owner_states(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
@@ -3418,6 +3865,15 @@ pub fn analyze_trusted_owner_states(
                 block: block.label,
                 instr_index,
             };
+            trace_trusted_generator_protocol_owner_components(
+                function.function_id,
+                block.label,
+                instr_index,
+                instr,
+                &state,
+                &component_states_before_instr,
+                module_constants,
+            );
             analysis.body_before_instr.insert(site, state.clone());
             if !component_states_before_instr.is_empty() {
                 analysis
@@ -3446,6 +3902,47 @@ pub fn analyze_trusted_owner_states(
             analysis
                 .block_before_term_components
                 .insert(block.label, component_states_before_instr);
+        }
+    }
+
+    let preserved_generator_identities =
+        trusted_unique_preserved_generator_identities(function, module_constants, &analysis);
+    if !preserved_generator_identities.is_empty() {
+        for (site, state) in &mut analysis.body_before_instr {
+            restore_trusted_preserved_generator_identities(
+                state,
+                &preserved_generator_identities,
+                site.block,
+                Some(site.instr_index),
+            );
+        }
+        for (site, states) in &mut analysis.body_before_instr_components {
+            for state in states {
+                restore_trusted_preserved_generator_identities(
+                    state,
+                    &preserved_generator_identities,
+                    site.block,
+                    Some(site.instr_index),
+                );
+            }
+        }
+        for (&block, state) in &mut analysis.block_before_term {
+            restore_trusted_preserved_generator_identities(
+                state,
+                &preserved_generator_identities,
+                block,
+                None,
+            );
+        }
+        for (&block, states) in &mut analysis.block_before_term_components {
+            for state in states {
+                restore_trusted_preserved_generator_identities(
+                    state,
+                    &preserved_generator_identities,
+                    block,
+                    None,
+                );
+            }
         }
     }
     let materialize_elapsed = materialize_start.elapsed();
@@ -3507,5 +4004,572 @@ pub fn visit_trusted_owner_term_instrs(
         }
         BlockTerm::Return(value) => visitor.visit_instr(value),
         BlockTerm::Jump(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soac_ir_typed::lower_blockpy_module_to_typed;
+
+    struct NestedIdentityIterFixture {
+        function: BlockPyFunction<TypedBlockPyModuleShape>,
+        module_constants: Vec<ConstantExpr>,
+        generator_function_id: RuntimeFunctionId,
+        generator_origin: Option<InstrId>,
+        analysis: TrustedOwnerStateAnalysis,
+    }
+
+    struct GeneratorInstancePlanAnnotator {
+        function_id: RuntimeFunctionId,
+        kind: FunctionKind,
+        origin: Option<InstrId>,
+    }
+
+    impl VisitMut<InstrTyped> for GeneratorInstancePlanAnnotator {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && matches!(
+                    call.func.as_ref(),
+                    InstrTyped::Load(load) if load.name.id_str() == "values"
+                )
+            {
+                let origin = call
+                    .try_semantic_instr_id()
+                    .expect("the values call must have an exact semantic origin");
+                assert!(
+                    self.origin.replace(origin).is_none(),
+                    "the source-shaped fixture must contain exactly one values call"
+                );
+                call.extra
+                    .set_generator_instance_plan(TypedGeneratorInstancePlan {
+                        function_id: self.function_id,
+                        kind: self.kind,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    });
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    fn nested_identity_iter_fixture(
+        source: &str,
+        generator_kind: Option<FunctionKind>,
+    ) -> NestedIdentityIterFixture {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("the nested identity-iterator fixture must lower");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let generator_function_id = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "values")
+            .expect("the nested identity-iterator fixture must contain values")
+            .function_id;
+        let module_constants = typed.module_constants.clone();
+        let function = typed
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "caller")
+            .expect("the nested identity-iterator fixture must contain caller");
+
+        let generator_origin = generator_kind.and_then(|kind| {
+            let mut annotator = GeneratorInstancePlanAnnotator {
+                function_id: generator_function_id,
+                kind,
+                origin: None,
+            };
+            annotator.visit_fn_mut(function);
+            annotator.origin
+        });
+        if generator_kind.is_some() {
+            assert!(
+                generator_origin.is_some(),
+                "the fixture must attach its exact plan to the nested values call"
+            );
+        }
+
+        let analysis = analyze_trusted_owner_states(
+            function,
+            &module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        NestedIdentityIterFixture {
+            function: function.clone(),
+            module_constants,
+            generator_function_id,
+            generator_origin,
+            analysis,
+        }
+    }
+
+    struct NextReceiverCollector<'a> {
+        module_constants: &'a [ConstantExpr],
+        receivers: Vec<ResolvedName>,
+    }
+
+    impl Visit<InstrTyped> for NextReceiverCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::Next,
+                    self.module_constants,
+                )
+                && let [CallArgPositional::Positional(InstrTyped::Load(receiver))] =
+                    call.args.as_slice()
+            {
+                self.receivers.push(receiver.name.clone());
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    fn next_receiver_states(
+        fixture: &NestedIdentityIterFixture,
+    ) -> Vec<(ResolvedName, &TrustedOwnerState)> {
+        let mut receiver_states = Vec::new();
+
+        for block in &fixture.function.blocks {
+            for (instr_index, instr) in block.body.iter().enumerate() {
+                let mut collector = NextReceiverCollector {
+                    module_constants: &fixture.module_constants,
+                    receivers: Vec::new(),
+                };
+                collector.visit_instr(instr);
+                if collector.receivers.is_empty() {
+                    continue;
+                }
+                let state = fixture
+                    .analysis
+                    .body_before_instr
+                    .get(&TypedVirtualBodyInstr {
+                        block: block.label,
+                        instr_index,
+                    })
+                    .expect("a reachable next call must have trusted owner state");
+                receiver_states.extend(
+                    collector
+                        .receivers
+                        .into_iter()
+                        .map(|receiver| (receiver, state)),
+                );
+            }
+
+            let mut collector = NextReceiverCollector {
+                module_constants: &fixture.module_constants,
+                receivers: Vec::new(),
+            };
+            visit_trusted_owner_term_instrs(&block.term, &mut collector);
+            if collector.receivers.is_empty() {
+                continue;
+            }
+            let state = fixture
+                .analysis
+                .block_before_term
+                .get(&block.label)
+                .expect("a reachable next term must have trusted owner state");
+            receiver_states.extend(
+                collector
+                    .receivers
+                    .into_iter()
+                    .map(|receiver| (receiver, state)),
+            );
+        }
+
+        assert!(
+            !receiver_states.is_empty(),
+            "the source-shaped fixture must contain an iterator next call"
+        );
+        receiver_states
+    }
+
+    fn assert_exact_generator_identity_iter(fixture: &NestedIdentityIterFixture) {
+        let origin = fixture
+            .generator_origin
+            .expect("a generator identity iterator must have an exact origin");
+        let owner = TypedAttrOwnerRef::TypeKey {
+            module_name: "soac.runtime".to_string(),
+            qualname: "ClosureGenerator".to_string(),
+        };
+        let iter_transfer_facts = fixture
+            .function
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .body
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(instr_index, instr)| {
+                        let InstrTyped::Store(store) = instr else {
+                            return None;
+                        };
+                        let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+                            return None;
+                        };
+                        if !typed_expr_is_runtime_name_load(
+                            call.func.as_ref(),
+                            RuntimeName::Iter,
+                            &fixture.module_constants,
+                        ) {
+                            return None;
+                        }
+                        let [CallArgPositional::Positional(InstrTyped::Load(receiver))] =
+                            call.args.as_slice()
+                        else {
+                            return None;
+                        };
+                        let site = TypedVirtualBodyInstr {
+                            block: block.label,
+                            instr_index,
+                        };
+                        let state = fixture.analysis.body_before_instr.get(&site)?;
+                        let components = fixture
+                            .analysis
+                            .body_before_instr_components
+                            .get(&site)
+                            .into_iter()
+                            .flat_map(|states| states.iter())
+                            .map(|component| {
+                                (
+                                    trusted_owner_state_for_name(&receiver.name, component)
+                                        .cloned(),
+                                    trusted_object_origin_for_name(&receiver.name, component),
+                                    trusted_generator_resume_function_fact_for_name(
+                                        &receiver.name,
+                                        component,
+                                    )
+                                    .map(|fact| fact.function_id),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        Some((
+                            block.label,
+                            store.name.id_str().to_string(),
+                            store.name.location,
+                            receiver.name.id_str().to_string(),
+                            receiver.name.location,
+                            trusted_owner_state_for_name(&receiver.name, state).cloned(),
+                            trusted_object_origin_for_name(&receiver.name, state),
+                            trusted_identity_iter_store_value(
+                                store.value.as_ref(),
+                                state,
+                                &fixture.module_constants,
+                            ),
+                            components,
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        for (receiver, state) in next_receiver_states(fixture) {
+            let preserved_slot_updates = receiver
+                .preserved_location()
+                .into_iter()
+                .flat_map(|receiver_location| {
+                    fixture
+                        .function
+                        .blocks
+                        .iter()
+                        .filter(|block| fixture.analysis.reachable_blocks.contains(block.label))
+                        .flat_map(move |block| {
+                            block
+                                .body
+                                .iter()
+                                .enumerate()
+                                .filter_map(move |(index, instr)| {
+                                    let (kind, name, value) = match instr {
+                                        InstrTyped::Store(store)
+                                            if store.name.preserved_location()
+                                                == Some(receiver_location) =>
+                                        {
+                                            ("store", &store.name, Some(store.value.as_ref()))
+                                        }
+                                        InstrTyped::Del(del)
+                                            if del.name.preserved_location()
+                                                == Some(receiver_location) =>
+                                        {
+                                            ("del", &del.name, None)
+                                        }
+                                        _ => return None,
+                                    };
+                                    let site = TypedVirtualBodyInstr {
+                                        block: block.label,
+                                        instr_index: index,
+                                    };
+                                    let site_state = fixture.analysis.body_before_instr.get(&site);
+                                    let identity = value.and_then(|value| {
+                                        trusted_identity_iter_store_value(
+                                            value,
+                                            site_state?,
+                                            &fixture.module_constants,
+                                        )
+                                    });
+                                    Some((
+                                        block.label,
+                                        kind,
+                                        name.id_str().to_string(),
+                                        instr.try_semantic_instr_id(),
+                                        identity,
+                                    ))
+                                })
+                        })
+                })
+                .collect::<Vec<_>>();
+            let proven_preserved_identities = trusted_unique_preserved_generator_identities(
+                &fixture.function,
+                &fixture.module_constants,
+                &fixture.analysis,
+            );
+            let receiver_resume_fact =
+                trusted_generator_resume_function_fact_for_name(&receiver, state)
+                    .map(|fact| (fact.function_id, fact.exact_origin(), fact.origins.clone()));
+            let receiver_component_facts = fixture
+                .analysis
+                .body_before_instr_components
+                .iter()
+                .filter_map(|(site, states)| {
+                    let block = fixture
+                        .function
+                        .blocks
+                        .iter()
+                        .find(|block| block.label == site.block)?;
+                    let instr = block.body.get(site.instr_index)?;
+                    let mut collector = NextReceiverCollector {
+                        module_constants: &fixture.module_constants,
+                        receivers: Vec::new(),
+                    };
+                    collector.visit_instr(instr);
+                    if !collector.receivers.contains(&receiver) {
+                        return None;
+                    }
+                    let facts = states
+                        .iter()
+                        .map(|component| {
+                            (
+                                trusted_owner_state_for_name(&receiver, component).cloned(),
+                                trusted_object_origin_for_name(&receiver, component),
+                                trusted_generator_resume_function_fact_for_name(
+                                    &receiver, component,
+                                )
+                                .map(|fact| fact.function_id),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    Some((site.block, site.instr_index, facts))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                trusted_owner_state_for_name(&receiver, state),
+                Some(&owner),
+                "receiver={} location={:?} expected_origin={origin:?} receiver_resume_fact={receiver_resume_fact:?} proven_preserved_identities={proven_preserved_identities:?} preserved_slot_updates={preserved_slot_updates:?} iter_transfer_facts={iter_transfer_facts:?} receiver_component_facts={receiver_component_facts:?}",
+                receiver.id_str(),
+                receiver.location,
+            );
+            assert_eq!(
+                trusted_object_origin_for_name(&receiver, state),
+                Some(origin)
+            );
+            assert_eq!(
+                trusted_object_origin_candidates_for_name(&receiver, state),
+                Some(vec![origin])
+            );
+            let resume_function = trusted_generator_resume_function_fact_for_name(&receiver, state)
+                .expect("an exact generator iterator must preserve its resume function");
+            assert_eq!(resume_function.function_id, fixture.generator_function_id);
+            assert_eq!(resume_function.exact_origin(), Some(origin));
+            assert_eq!(
+                trusted_function_field_target_for_origin(origin, "_resume_function", state),
+                Some(fixture.generator_function_id)
+            );
+            assert!(
+                !trusted_generator_origin_has_escaped(origin, state),
+                "identity iteration alone must not make a generator escape"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_generator_identity_iter_preserves_exact_owner_and_resume_function() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    iterator = iter(values(limit))\n    return next(iterator)\n",
+            Some(FunctionKind::Generator),
+        );
+
+        assert_exact_generator_identity_iter(&fixture);
+    }
+
+    #[test]
+    fn nested_generator_for_loop_preserves_exact_owner_and_resume_function() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    for value in values(limit):\n        return value\n    return None\n",
+            Some(FunctionKind::Generator),
+        );
+
+        assert_exact_generator_identity_iter(&fixture);
+    }
+
+    #[test]
+    fn suspended_generator_for_loop_preserves_exact_iterator_owner_and_resume_function() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n    yield limit + 1\n\n\
+def caller(limit):\n    for value in values(limit):\n        yield value\n",
+            Some(FunctionKind::Generator),
+        );
+
+        assert_exact_generator_identity_iter(&fixture);
+    }
+
+    #[test]
+    fn suspended_generator_try_finally_preserves_exact_iterator_owner_and_resume_function() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n    yield limit + 1\n\n\
+def caller(limit):\n    iterable = values(limit)\n    try:\n        iterator = iter(iterable)\n    finally:\n        del iterable\n    yield next(iterator)\n    yield next(iterator)\n",
+            Some(FunctionKind::Generator),
+        );
+
+        assert_exact_generator_identity_iter(&fixture);
+    }
+
+    #[test]
+    fn loaded_generator_identity_iter_preserves_exact_owner_and_resume_function() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    gen = values(limit)\n    iterator = iter(gen)\n    return next(iterator)\n",
+            Some(FunctionKind::Generator),
+        );
+
+        assert_exact_generator_identity_iter(&fixture);
+    }
+
+    #[test]
+    fn suspended_generator_identity_iter_rejects_reachable_iterator_deletion() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit, clear):\n    iterator = iter(values(limit))\n    if clear:\n        del iterator\n    yield next(iterator)\n",
+            Some(FunctionKind::Generator),
+        );
+
+        for (receiver, state) in next_receiver_states(&fixture) {
+            assert!(
+                trusted_owner_state_for_name(&receiver, state).is_none(),
+                "a reachable physical-slot deletion must not recover the generator owner",
+            );
+            assert!(
+                trusted_object_origin_for_name(&receiver, state).is_none(),
+                "a reachable physical-slot deletion must not recover the generator origin",
+            );
+        }
+    }
+
+    #[test]
+    fn suspended_generator_identity_iter_rejects_reachable_iterator_rebinding() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit, replace):\n    iterator = iter(values(limit))\n    if replace:\n        iterator = range(limit)\n    yield next(iterator)\n",
+            Some(FunctionKind::Generator),
+        );
+
+        for (receiver, state) in next_receiver_states(&fixture) {
+            assert!(
+                trusted_owner_state_for_name(&receiver, state).is_none(),
+                "a reachable physical-slot rebinding must not recover the generator owner",
+            );
+            assert!(
+                trusted_object_origin_for_name(&receiver, state).is_none(),
+                "a reachable physical-slot rebinding must not recover the generator origin",
+            );
+        }
+    }
+
+    #[test]
+    fn nested_identity_iter_requires_proven_generator_instance_plan() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    iterator = iter(values(limit))\n    return next(iterator)\n",
+            None,
+        );
+
+        for (receiver, state) in next_receiver_states(&fixture) {
+            assert!(trusted_owner_state_for_name(&receiver, state).is_none());
+            assert!(trusted_object_origin_for_name(&receiver, state).is_none());
+            assert!(trusted_generator_resume_function_fact_for_name(&receiver, state).is_none());
+        }
+    }
+
+    #[test]
+    fn nested_identity_iter_rejects_non_generator_instance_plans() {
+        let cases = [
+            (
+                "async def values(limit):\n    return limit\n\n\
+def caller(limit):\n    iterator = iter(values(limit))\n    return next(iterator)\n",
+                FunctionKind::Coroutine,
+            ),
+            (
+                "async def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    iterator = iter(values(limit))\n    return next(iterator)\n",
+                FunctionKind::AsyncGenerator,
+            ),
+            (
+                "def values(limit):\n    return limit\n\n\
+def caller(limit):\n    iterator = iter(values(limit))\n    return next(iterator)\n",
+                FunctionKind::Function,
+            ),
+        ];
+
+        for (source, kind) in cases {
+            let fixture = nested_identity_iter_fixture(source, Some(kind));
+            for (receiver, state) in next_receiver_states(&fixture) {
+                assert!(
+                    trusted_owner_state_for_name(&receiver, state).is_none(),
+                    "a {kind:?} return must not be treated as a ClosureGenerator"
+                );
+                assert!(trusted_object_origin_for_name(&receiver, state).is_none());
+                assert!(
+                    trusted_generator_resume_function_fact_for_name(&receiver, state).is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_argument_iter_does_not_preserve_generator_identity() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    iterator = iter(values(limit), limit)\n    return next(iterator)\n",
+            Some(FunctionKind::Generator),
+        );
+
+        for (receiver, state) in next_receiver_states(&fixture) {
+            assert!(trusted_owner_state_for_name(&receiver, state).is_none());
+            assert!(trusted_object_origin_for_name(&receiver, state).is_none());
+            assert!(trusted_generator_resume_function_fact_for_name(&receiver, state).is_none());
+        }
+    }
+
+    #[test]
+    fn nested_generator_identity_iter_still_records_external_escape() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def sink(value):\n    return None\n\n\
+def caller(limit):\n    iterator = iter(values(limit))\n    sink(iterator)\n    return next(iterator)\n",
+            Some(FunctionKind::Generator),
+        );
+        let origin = fixture
+            .generator_origin
+            .expect("the escaping generator must have an exact origin");
+
+        for (_, state) in next_receiver_states(&fixture) {
+            assert!(
+                trusted_generator_origin_has_escaped(origin, state),
+                "passing the iterator to an arbitrary callable must remain an observable escape"
+            );
+        }
     }
 }

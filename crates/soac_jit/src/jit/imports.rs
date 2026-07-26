@@ -491,6 +491,17 @@ pub(super) static DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT: ImportSpec = Im
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+pub(super) static DP_JIT_VECTORCALL_PREVIOUS_FOR_CHANGED_CODE_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_vectorcall_previous_for_changed_code",
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
 pub(super) static DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_direct_compile_function_env",
     &[SigType::Pointer, SigType::Pointer],
@@ -501,6 +512,17 @@ pub(super) static SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT: ImportSpec = Impor
     &[
         SigType::I64,
         SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_RESUME_GENERATOR_IMPORT: ImportSpec = ImportSpec::new(
+    direct_abi::SOAC_JIT_RESUME_GENERATOR_SYMBOL,
+    &[
+        SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
@@ -580,8 +602,10 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_DEOPT_RESUME_IMPORT,
     &DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT,
     &DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
+    &DP_JIT_VECTORCALL_PREVIOUS_FOR_CHANGED_CODE_IMPORT,
     &DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
     &SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
+    &SOAC_JIT_RESUME_GENERATOR_IMPORT,
 ];
 
 pub(super) struct ModuleFuncImports {
@@ -654,6 +678,7 @@ pub(super) fn predeclare_jit_runtime_imports(jit_module: &mut JITModule) -> Resu
         CpythonTypeSymbol::Type,
         CpythonTypeSymbol::Long,
         CpythonTypeSymbol::List,
+        CpythonTypeSymbol::Tuple,
         CpythonTypeSymbol::Unicode,
     ] {
         let _ = declare_type_ptr_import(jit_module, cpython_type_symbol_name(symbol))?;

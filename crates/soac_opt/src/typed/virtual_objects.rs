@@ -80,6 +80,7 @@ pub struct TypedVirtualizationPlan {
     field_lowering_bindings: HashMap<InstrId, TypedConstructorFieldBindings>,
     field_lowering_generic_sources: HashSet<InstrId>,
     materialization_boundaries: Vec<TypedVirtualMaterializationBoundary>,
+    virtual_field_edge_block_budget: Option<usize>,
     pub field_states: Option<TypedVirtualFieldStateAnalysis>,
 }
 
@@ -90,6 +91,10 @@ impl TypedVirtualizationPlan {
 
     pub fn materialization_boundaries(&self) -> &[TypedVirtualMaterializationBoundary] {
         &self.materialization_boundaries
+    }
+
+    pub fn set_virtual_field_edge_block_budget(&mut self, max_additional_blocks: usize) {
+        self.virtual_field_edge_block_budget = Some(max_additional_blocks);
     }
 }
 
@@ -547,12 +552,8 @@ fn plan_typed_virtual_objects_impl(
     let mut objects = Vec::new();
     let mut materializing_objects = Vec::new();
     let mut materialization_boundaries = Vec::new();
-    let field_lowering_bindings = constructor_field_bindings
-        .iter()
-        .filter(|(source, _)| allowed_sources.is_none_or(|allowed| allowed.contains(source)))
-        .map(|(source, bindings)| (*source, bindings.clone()))
-        .collect::<HashMap<_, _>>();
-    let field_lowering_generic_sources = allowed_sources.cloned().unwrap_or_default();
+    let mut field_lowering_bindings = HashMap::new();
+    let mut field_lowering_generic_sources = HashSet::new();
     for block in &function.blocks {
         for (instr_index, instr) in block.body.iter().enumerate() {
             let Some((source, root)) = typed_virtual_constructor_materialization(instr) else {
@@ -567,6 +568,10 @@ fn plan_typed_virtual_objects_impl(
             let Some(root_location) = root.local_location() else {
                 continue;
             };
+            field_lowering_bindings.insert(source, bindings.clone());
+            if allowed_sources.is_some() {
+                field_lowering_generic_sources.insert(source);
+            }
             let Some(reachable) = typed_virtual_reachable_blocks_after_materialization(
                 function,
                 &labels,
@@ -576,7 +581,8 @@ fn plan_typed_virtual_objects_impl(
                 continue;
             };
             if reachable.contains(&block.label)
-                || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
+                || (include_materializing_objects
+                    && reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS)
             {
                 continue;
             }
@@ -630,7 +636,8 @@ fn plan_typed_virtual_objects_impl(
         requested_body_snapshots = body_snapshot_locations.len(),
         "typed virtual object plan candidates"
     );
-    if objects.is_empty() && materializing_objects.is_empty() {
+    if objects.is_empty() && materializing_objects.is_empty() && field_lowering_bindings.is_empty()
+    {
         return TypedVirtualizationPlan::default();
     }
     let field_states = project_typed_virtual_field_states(&analyze_typed_virtual_field_states(
@@ -646,6 +653,7 @@ fn plan_typed_virtual_objects_impl(
         field_lowering_bindings,
         field_lowering_generic_sources,
         materialization_boundaries,
+        virtual_field_edge_block_budget: None,
         field_states: Some(field_states),
     };
     plan
@@ -789,9 +797,16 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
         .map(|object| object.object_id)
         .collect::<HashSet<_>>();
     let mut block_param_stats = TypedVirtualFieldBlockParamStats::default();
+    let mut remaining_edge_block_budget =
+        plan.virtual_field_edge_block_budget.unwrap_or(usize::MAX);
     loop {
-        let split_edges =
-            split_typed_virtual_field_block_param_edges(function, &analysis, &removable_objects);
+        let split_edges = split_typed_virtual_field_block_param_edges(
+            function,
+            &analysis,
+            &removable_objects,
+            remaining_edge_block_budget,
+        );
+        remaining_edge_block_budget = remaining_edge_block_budget.saturating_sub(split_edges);
         if split_edges != 0 {
             analysis = analyze_typed_virtual_field_states(
                 function,
@@ -2283,7 +2298,11 @@ fn split_typed_virtual_field_block_param_edges(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     analysis: &TypedVirtualLoweringAnalysis,
     removable_objects: &HashSet<TypedVirtualObjectId>,
+    max_additional_blocks: usize,
 ) -> usize {
+    if max_additional_blocks == 0 {
+        return 0;
+    }
     let predecessors = typed_scalar_block_predecessor_edges(function);
     let mut edges_to_split = HashSet::<(BlockLabel, BlockLabel)>::new();
     for block in &function.blocks {
@@ -2344,8 +2363,10 @@ fn split_typed_virtual_field_block_param_edges(
         }
     }
 
+    let mut edges_to_split = edges_to_split.into_iter().collect::<Vec<_>>();
+    edges_to_split.sort_unstable();
     let mut inserted = 0;
-    for (from, target) in edges_to_split {
+    for (from, target) in edges_to_split.into_iter().take(max_additional_blocks) {
         let trampoline = function.name_gen.next_block_name();
         let Some(source) = function.blocks.iter_mut().find(|block| block.label == from) else {
             continue;
@@ -2963,6 +2984,11 @@ fn transfer_typed_field_scalar_instr(
                 }
                 return;
             }
+            let escaping_objects = store
+                .name
+                .local_location()
+                .is_none()
+                .then(|| typed_virtual_objects_in_expr(store.value.as_ref(), state));
             rewrite_typed_field_scalar_expr(
                 store.value.as_mut(),
                 state,
@@ -2971,6 +2997,9 @@ fn transfer_typed_field_scalar_instr(
                 rewrite,
             );
             let Some(target) = store.name.local_location() else {
+                if let Some(escaping_objects) = escaping_objects {
+                    state.invalidate_objects(escaping_objects);
+                }
                 return;
             };
             if let Some(source) = typed_instr_local_load_location(store.value.as_ref())
@@ -3030,8 +3059,16 @@ fn analyze_typed_field_scalar_instr(
                 }
                 return;
             }
+            let escaping_objects = store
+                .name
+                .local_location()
+                .is_none()
+                .then(|| typed_virtual_objects_in_expr(store.value.as_ref(), state));
             analyze_typed_field_scalar_expr(store.value.as_ref(), state, module_constants);
             let Some(target) = store.name.local_location() else {
+                if let Some(escaping_objects) = escaping_objects {
+                    state.invalidate_objects(escaping_objects);
+                }
                 return;
             };
             if let Some(source) = typed_instr_local_load_location(store.value.as_ref())
@@ -3663,11 +3700,36 @@ mod tests {
             edge_out: HashMap::new(),
         };
 
+        let mut zero_budget_function = function.clone();
+        let original_block_count = zero_budget_function.blocks.len();
+        assert_eq!(
+            split_typed_virtual_field_block_param_edges(
+                &mut zero_budget_function,
+                &analysis,
+                &HashSet::from([object]),
+                0,
+            ),
+            0,
+            "an exhausted field-edge budget must not create CFG trampolines"
+        );
+        assert_eq!(zero_budget_function.blocks.len(), original_block_count);
+        let BlockTerm::BranchTable(zero_budget_branch) = &zero_budget_function
+            .blocks
+            .iter()
+            .find(|block| block.label == branch_from)
+            .expect("zero-budget branch block should remain present")
+            .term
+        else {
+            panic!("zero-budget branch source should stay a branch table");
+        };
+        assert_eq!(zero_budget_branch.default_label, target);
+
         assert_eq!(
             split_typed_virtual_field_block_param_edges(
                 function,
                 &analysis,
                 &HashSet::from([object]),
+                1,
             ),
             1,
             "branch-table joins needing field phis should be split through jump trampolines"

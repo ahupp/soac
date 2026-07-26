@@ -431,6 +431,66 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   Run the same slice on plain vendored CPython for sanity checks or rough local
   timing comparison.
 
+- `just nqueens-slice-release <slice> <queen-count> [loops] [opt_mode] [work_dir]`
+  Stage the `target/release-ext` SOAC extension before running an isolated
+  N-Queens slice. Unlike `just nqueens-slice`, this recipe never stages the
+  debug extension. It defaults to the production `speed_and_size` Cranelift
+  optimization level, keeps refcounts enabled, and uses the existing benchmark
+  CPU-mode wrapper for both stock CPython and SOAC. Run `stock`, `profile`,
+  `verify`, and `apply` with the same bare fifth-argument work directory;
+  verify and apply require that directory's `profile.bin`. For an
+  apples-to-apples, checked eight-queen comparison:
+
+  ```bash
+  just nqueens-slice-release full_nqueens_list_consumer 8 10 stock \
+    work/bench/nqueens-slices/release/full
+
+  just nqueens-slice-release full_nqueens_list_consumer 8 1 profile \
+    work/bench/nqueens-slices/release/full
+
+  just nqueens-slice-release full_nqueens_list_consumer 8 1 verify \
+    work/bench/nqueens-slices/release/full
+
+  just nqueens-slice-release full_nqueens_list_consumer 8 10 apply \
+    work/bench/nqueens-slices/release/full
+  ```
+
+  Both stock and transformed full slices validate the same 92-solution result
+  and report `elapsed_s` and `iterations_per_s` for the workload itself. Do not
+  call `just nqueens-slice` between release phases: its debug-runtime preflight
+  deliberately restages the debug extension.
+
+- `just nqueens-slice-perf <stock|apply> <slice> <queen-count> [loops] [work_dir] [output_prefix]`
+  Capture Linux native perf for identical stock and release-specialized
+  N-Queens slices without pyperformance, Inferno, or Speedscope. The release
+  extension is built and staged before recording; apply mode consumes the
+  existing profiled work directory. Recording uses the portable `cpu-clock`
+  event with a fixed 1024-page (4 MiB) mmap buffer and rejects captures without
+  actual samples, including empty JIT-injected results. It fails if the recorder
+  reports lost samples or chunks, or if the symbol report contains nonzero lost
+  samples. Both modes first run the slice's one-queen
+  `--compile-only` warmup, stop the real benchmark Python process, and attach
+  `perf` only for the measured workload; the existing CPU-mode wrapper remains
+  active. Defaults are `PERF_FREQUENCY=99`,
+  `PERF_CALL_GRAPH=dwarf,65528`, and `PERF_PERCENT_LIMIT=0.5`. Run the release
+  profile command above first, then capture comparable workloads:
+
+  ```bash
+  just nqueens-slice-perf stock full_nqueens_list_consumer 8 10 \
+    work/bench/nqueens-slices/release/full
+
+  just nqueens-slice-perf apply full_nqueens_list_consumer 8 10 \
+    work/bench/nqueens-slices/release/full
+  ```
+
+  Reports default to `work/logs/nqueens-slices/` and include `<slice>-<mode>.data`,
+  `<slice>-<mode>_record.txt`, `<slice>-<mode>_report.txt`,
+  `<slice>-<mode>_by_dso.txt`, `<slice>-<mode>_by_dso_symbol.txt`, and
+  `<slice>-<mode>_callgraph.txt`. The apply capture also enables `SOAC_JIT_BB_MAP`
+  for attribution and attempts to write `<slice>-apply.injected.data`; if JIT
+  injection is unavailable, reports are generated from the original perf data.
+  Leave `SOAC_JIT_BB_MAP` disabled in the separate headline-throughput runs.
+
 - `just benchmark`
   The default benchmark recipe runs the transformed profile, verify,
   and specialized apply passes and writes the raw result directory under
@@ -580,9 +640,12 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   the first-pass profiling loop count used to derive specializations.
 
 - `PERF_FREQUENCY=<int>`
-  In recipe `perf-pystone-jit-warm`, at
+  Set the `perf record -F` sample frequency. The warmed N-Queens recipe
+  defaults to `99` so full DWARF call stacks do not produce excessively large
+  profiles or lose samples; `perf-pystone-jit-warm` defaults to `999`. In
+  `perf-pystone-jit-warm`, at
   [Justfile:272](/home/adam/project/soac-profile/Justfile#L272), set the
-  `perf record -F` sample frequency.
+  sampling frequency for the pystone workflow.
 
 - `PERF_CALL_GRAPH=<mode>`
   In recipe `perf-pystone-jit-warm`, at

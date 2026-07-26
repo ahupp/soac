@@ -17,7 +17,8 @@ use soac_core::block_py::{
 use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
 use soac_ir_blockpy::InstrBlockPy;
 use soac_ir_typed::plan_v3::{
-    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind,
+    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, EXACT_TUPLE_EXACT_INT_ITEM_SHAPE_TAG,
+    ExactListItemAccessKind, ExactListItemShape,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
 };
 use soac_ir_typed::{
@@ -54,18 +55,46 @@ struct RawPyLongObject {
     long_value: RawPyLongValue,
 }
 
+#[repr(C)]
+struct RawPyTupleObject {
+    ob_base: ffi::PyVarObject,
+    ob_hash: isize,
+    ob_item: [*mut ffi::PyObject; 1],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ExactListItemLoweringPlan {
     access: ExactListItemAccessKind,
+    shape: ExactListItemShape,
     counter_source: Option<(RuntimeFunctionId, InstrId)>,
 }
 
 impl ExactListItemLoweringPlan {
+    fn receiver_type(self) -> CpythonTypeSymbol {
+        match self.shape {
+            ExactListItemShape::ExactListExactInt => CpythonTypeSymbol::List,
+            ExactListItemShape::ExactTupleExactInt => CpythonTypeSymbol::Tuple,
+        }
+    }
+
     fn expect_exact_list_exact_int(self, expected_access: ExactListItemAccessKind) {
         assert_eq!(
             self.access, expected_access,
             "exact-list item plan {:?} reached {:?} lowering",
             self.access, expected_access
+        );
+        assert!(
+            matches!(
+                (self.shape, expected_access),
+                (ExactListItemShape::ExactListExactInt, _)
+                    | (
+                        ExactListItemShape::ExactTupleExactInt,
+                        ExactListItemAccessKind::Get
+                    )
+            ),
+            "exact item plan {:?} does not support {:?} lowering",
+            self.shape,
+            expected_access,
         );
     }
 }
@@ -77,6 +106,7 @@ pub(super) fn lowering_plan_from_typed_exact_list_item(
     debug_assert_eq!(plan.access, expected_access);
     ExactListItemLoweringPlan {
         access: plan.access,
+        shape: plan.shape,
         counter_source: plan
             .counter_source
             .map(|source| (source.function_id, source.instr_id)),
@@ -700,6 +730,11 @@ fn emit_item_dispatch_shape_from_arg_values<'fb, E>(
     else {
         return state.fb().ins().iconst(i64_ty, 0);
     };
+    let Some(tuple_type) =
+        state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Tuple))
+    else {
+        return state.fb().ins().iconst(i64_ty, 0);
+    };
     let Some(long_type) =
         state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Long))
     else {
@@ -712,6 +747,10 @@ fn emit_item_dispatch_shape_from_arg_values<'fb, E>(
         .fb()
         .ins()
         .iconst(i64_ty, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG as i64);
+    let exact_tuple_exact_int_shape = state
+        .fb()
+        .ins()
+        .iconst(i64_ty, EXACT_TUPLE_EXACT_INT_ITEM_SHAPE_TAG as i64);
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, i64_ty);
     let obj = arg_values[0].0;
@@ -741,16 +780,32 @@ fn emit_item_dispatch_shape_from_arg_values<'fb, E>(
         .fb()
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, obj_type, list_type);
+    let tuple_guard_block = state.fb().create_block();
     let key_guard_block = state.fb().create_block();
+    state.fb().append_block_param(key_guard_block, i64_ty);
     state.fb().ins().brif(
         is_exact_list,
         key_guard_block,
+        &[ir::BlockArg::Value(exact_list_exact_int_shape)],
+        tuple_guard_block,
         &[],
+    );
+
+    state.fb().switch_to_block(tuple_guard_block);
+    let is_exact_tuple = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, obj_type, tuple_type);
+    state.fb().ins().brif(
+        is_exact_tuple,
+        key_guard_block,
+        &[ir::BlockArg::Value(exact_tuple_exact_int_shape)],
         result_block,
         &[ir::BlockArg::Value(zero_shape)],
     );
 
     state.fb().switch_to_block(key_guard_block);
+    let exact_item_shape = state.fb().block_params(key_guard_block)[0];
     let key_is_null = state
         .fb()
         .ins()
@@ -778,7 +833,7 @@ fn emit_item_dispatch_shape_from_arg_values<'fb, E>(
     state.fb().ins().brif(
         key_is_exact_long,
         result_block,
-        &[ir::BlockArg::Value(exact_list_exact_int_shape)],
+        &[ir::BlockArg::Value(exact_item_shape)],
         result_block,
         &[ir::BlockArg::Value(zero_shape)],
     );
@@ -853,7 +908,7 @@ fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb, E>(
     expected_access: ExactListItemAccessKind,
     obj: ir::Value,
     key: ir::Value,
-    list_type: ir::Value,
+    sequence_type: ir::Value,
     long_type: ir::Value,
     guard_miss_block: ir::Block,
 ) -> ir::Value {
@@ -880,15 +935,19 @@ fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb, E>(
         obj,
         offset_of!(ffi::PyObject, ob_type) as i32,
     );
-    let is_exact_list = state
-        .fb()
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, obj_type, list_type);
+    let is_exact_sequence =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, obj_type, sequence_type);
     let key_guard_block = state.fb().create_block();
-    state
-        .fb()
-        .ins()
-        .brif(is_exact_list, key_guard_block, &[], guard_miss_block, &[]);
+    state.fb().ins().brif(
+        is_exact_sequence,
+        key_guard_block,
+        &[],
+        guard_miss_block,
+        &[],
+    );
 
     state.fb().switch_to_block(key_guard_block);
     let key_is_null = state
@@ -957,12 +1016,11 @@ fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb, E>(
 
     state.fb().switch_to_block(index_block);
     let raw_index = state.fb().block_params(index_block)[0];
-    let list_len = state.fb().ins().load(
+    let sequence_len = state.fb().ins().load(
         i64_ty,
         ir::MemFlags::trusted(),
         obj,
-        offset_of!(ffi::PyListObject, ob_base) as i32
-            + offset_of!(ffi::PyVarObject, ob_size) as i32,
+        offset_of!(ffi::PyVarObject, ob_size) as i32,
     );
     let negative_index_block = state.fb().create_block();
     let nonnegative_index_block = state.fb().create_block();
@@ -984,7 +1042,7 @@ fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb, E>(
     );
 
     state.fb().switch_to_block(negative_index_block);
-    let adjusted_index = state.fb().ins().iadd(raw_index, list_len);
+    let adjusted_index = state.fb().ins().iadd(raw_index, sequence_len);
     state.fb().ins().jump(
         normalized_index_block,
         &[ir::BlockArg::Value(adjusted_index)],
@@ -1006,7 +1064,7 @@ fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb, E>(
     let index_lt_len = state.fb().ins().icmp(
         ir::condcodes::IntCC::SignedLessThan,
         normalized_index,
-        list_len,
+        sequence_len,
     );
     let index_in_bounds = state.fb().ins().band(index_ge_zero, index_lt_len);
     let direct_access_block = state.fb().create_block();
@@ -1028,7 +1086,7 @@ fn emit_exact_list_i64_index_in_bounds_guard<'fb, E>(
     expected_access: ExactListItemAccessKind,
     obj: ir::Value,
     raw_index: ir::Value,
-    list_type: ir::Value,
+    sequence_type: ir::Value,
     guard_miss_block: ir::Block,
 ) -> ir::Value {
     plan.expect_exact_list_exact_int(expected_access);
@@ -1053,23 +1111,23 @@ fn emit_exact_list_i64_index_in_bounds_guard<'fb, E>(
         obj,
         offset_of!(ffi::PyObject, ob_type) as i32,
     );
-    let is_exact_list = state
-        .fb()
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, obj_type, list_type);
+    let is_exact_sequence =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, obj_type, sequence_type);
     let index_block = state.fb().create_block();
     state
         .fb()
         .ins()
-        .brif(is_exact_list, index_block, &[], guard_miss_block, &[]);
+        .brif(is_exact_sequence, index_block, &[], guard_miss_block, &[]);
 
     state.fb().switch_to_block(index_block);
-    let list_len = state.fb().ins().load(
+    let sequence_len = state.fb().ins().load(
         i64_ty,
         ir::MemFlags::trusted(),
         obj,
-        offset_of!(ffi::PyListObject, ob_base) as i32
-            + offset_of!(ffi::PyVarObject, ob_size) as i32,
+        offset_of!(ffi::PyVarObject, ob_size) as i32,
     );
     let negative_index_block = state.fb().create_block();
     let nonnegative_index_block = state.fb().create_block();
@@ -1091,7 +1149,7 @@ fn emit_exact_list_i64_index_in_bounds_guard<'fb, E>(
     );
 
     state.fb().switch_to_block(negative_index_block);
-    let adjusted_index = state.fb().ins().iadd(raw_index, list_len);
+    let adjusted_index = state.fb().ins().iadd(raw_index, sequence_len);
     state.fb().ins().jump(
         normalized_index_block,
         &[ir::BlockArg::Value(adjusted_index)],
@@ -1113,7 +1171,7 @@ fn emit_exact_list_i64_index_in_bounds_guard<'fb, E>(
     let index_lt_len = state.fb().ins().icmp(
         ir::condcodes::IntCC::SignedLessThan,
         normalized_index,
-        list_len,
+        sequence_len,
     );
     let index_in_bounds = state.fb().ins().band(index_ge_zero, index_lt_len);
     let direct_access_block = state.fb().create_block();
@@ -1129,6 +1187,30 @@ fn emit_exact_list_i64_index_in_bounds_guard<'fb, E>(
     normalized_index
 }
 
+fn emit_exact_sequence_item_address<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    obj: ir::Value,
+    normalized_index: ir::Value,
+    shape: ExactListItemShape,
+) -> ir::Value {
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let items = match shape {
+        ExactListItemShape::ExactListExactInt => state.fb().ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            obj,
+            offset_of!(ffi::PyListObject, ob_item) as i32,
+        ),
+        ExactListItemShape::ExactTupleExactInt => state.fb().ins().iadd_imm(
+            obj,
+            i64::try_from(offset_of!(RawPyTupleObject, ob_item))
+                .expect("raw tuple item offset should fit in i64"),
+        ),
+    };
+    let item_offset = state.fb().ins().ishl_imm(normalized_index, 3);
+    state.fb().ins().iadd(items, item_offset)
+}
+
 fn emit_exact_list_exact_int_getitem<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
@@ -1136,8 +1218,8 @@ fn emit_exact_list_exact_int_getitem<'fb, E>(
     specialized_hit_counter_id: Option<CounterRef>,
     specialized_fallback_counter_id: Option<CounterRef>,
 ) -> ir::Value {
-    let Some(list_type) =
-        state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::List))
+    let Some(sequence_type) =
+        state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(plan.receiver_type()))
     else {
         let result = emit_generic_getitem_from_arg_values(state, arg_values);
         state.release_arg_values(arg_values);
@@ -1167,19 +1249,12 @@ fn emit_exact_list_exact_int_getitem<'fb, E>(
         ExactListItemAccessKind::Get,
         obj,
         key,
-        list_type,
+        sequence_type,
         long_type,
         guard_miss_block,
     );
     increment_counter_with_state(state, specialized_hit_counter_id);
-    let items = state.fb().ins().load(
-        ptr_ty,
-        ir::MemFlags::trusted(),
-        obj,
-        offset_of!(ffi::PyListObject, ob_item) as i32,
-    );
-    let item_offset = state.fb().ins().ishl_imm(normalized_index, 3);
-    let item_addr = state.fb().ins().iadd(items, item_offset);
+    let item_addr = emit_exact_sequence_item_address(state, obj, normalized_index, plan.shape);
     let item = state
         .fb()
         .ins()
@@ -1217,8 +1292,8 @@ fn emit_exact_list_item_getitem_from_guarded_i64_index<'fb, E: Instr>(
     specialized_fallback_counter_id: Option<CounterRef>,
 ) -> ir::Value {
     plan.expect_exact_list_exact_int(ExactListItemAccessKind::Get);
-    let Some(list_type) =
-        state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::List))
+    let Some(sequence_type) =
+        state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(plan.receiver_type()))
     else {
         return emit_generic_getitem_from_exprs(op, state);
     };
@@ -1241,18 +1316,11 @@ fn emit_exact_list_item_getitem_from_guarded_i64_index<'fb, E: Instr>(
         ExactListItemAccessKind::Get,
         obj,
         raw_index,
-        list_type,
+        sequence_type,
         fallback_block,
     );
     increment_counter_with_state(state, specialized_hit_counter_id);
-    let items = state.fb().ins().load(
-        ptr_ty,
-        ir::MemFlags::trusted(),
-        obj,
-        offset_of!(ffi::PyListObject, ob_item) as i32,
-    );
-    let item_offset = state.fb().ins().ishl_imm(normalized_index, 3);
-    let item_addr = state.fb().ins().iadd(items, item_offset);
+    let item_addr = emit_exact_sequence_item_address(state, obj, normalized_index, plan.shape);
     let item = state
         .fb()
         .ins()

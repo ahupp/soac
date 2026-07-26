@@ -1604,6 +1604,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         crate::vectorcall_compile_function_env as *const u8,
     );
     builder.symbol(
+        "dp_jit_vectorcall_previous_for_changed_code",
+        crate::vectorcall_previous_for_changed_code as *const u8,
+    );
+    builder.symbol(
         "dp_jit_direct_compile_function_env",
         crate::direct_compile_function_env as *const u8,
     );

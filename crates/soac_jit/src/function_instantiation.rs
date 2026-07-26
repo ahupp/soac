@@ -14,7 +14,7 @@ use soac_core::block_py::{
     BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
-use std::ffi::{CString, c_void};
+use std::ffi::{CString, c_int, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,10 +23,35 @@ use tracing::{info, trace};
 pub(crate) const SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL: &str =
     "soac_jit_make_function_with_closure";
 const MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS: usize = 17;
+const FIRST_VALID_CPYTHON_FUNCTION_VERSION: u32 = 2;
+
+// The pinned CPython's `_PyCode_DEF` places `co_version` after this prefix.
+// Keep the layout local to the ABI boundary used to restore MAKE_FUNCTION
+// semantics for source-backed generators that retain CPython vectorcall.
+#[repr(C)]
+struct RawPyCodeVersionPrefix {
+    ob_base: ffi::PyVarObject,
+    co_consts: *mut ffi::PyObject,
+    co_names: *mut ffi::PyObject,
+    co_exceptiontable: *mut ffi::PyObject,
+    co_flags: c_int,
+    co_argcount: c_int,
+    co_posonlyargcount: c_int,
+    co_kwonlyargcount: c_int,
+    co_stacksize: c_int,
+    co_firstlineno: c_int,
+    co_nlocalsplus: c_int,
+    co_framesize: c_int,
+    co_nlocals: c_int,
+    co_ncellvars: c_int,
+    co_nfreevars: c_int,
+    co_version: u32,
+}
 
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    fn _PyFunction_SetVersion(func: *mut ffi::PyFunctionObject, version: u32);
 }
 
 pub(crate) fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
@@ -262,15 +287,18 @@ fn update_function_metadata(
     ignore_attr_or_type_error(py, func.setattr("__qualname__", qualname))?;
     ignore_attr_or_type_error(py, func.setattr("__name__", name))?;
     if func.cast::<PyFunction>().is_ok() {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("co_name", name)?;
-        kwargs.set_item("co_qualname", qualname)?;
-        if let Some(replaced) = ignore_attr_or_value_error(
-            py,
-            func.getattr("__code__")?
-                .call_method("replace", (), Some(&kwargs)),
-        )? {
-            ignore_attr_or_type_error(py, func.setattr("__code__", replaced))?;
+        let code = func.getattr("__code__")?;
+        let has_matching_name = code.getattr("co_name")?.eq(name)?;
+        let has_matching_qualname = code.getattr("co_qualname")?.eq(qualname)?;
+        if !has_matching_name || !has_matching_qualname {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("co_name", name)?;
+            kwargs.set_item("co_qualname", qualname)?;
+            if let Some(replaced) =
+                ignore_attr_or_value_error(py, code.call_method("replace", (), Some(&kwargs)))?
+            {
+                ignore_attr_or_type_error(py, func.setattr("__code__", replaced))?;
+            }
         }
     }
     if let Some(doc) = doc {
@@ -694,6 +722,21 @@ fn apply_function_defaults(
     Ok(())
 }
 
+fn restore_source_generator_cpython_function_version(
+    py: Python<'_>,
+    func: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let code = unsafe { ffi::PyFunction_GetCode(func.as_ptr()) };
+    if code.is_null() {
+        return Err(PyErr::fetch(py));
+    }
+    let version = unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_version };
+    if version >= FIRST_VALID_CPYTHON_FUNCTION_VERSION {
+        unsafe { _PyFunction_SetVersion(func.as_ptr().cast::<ffi::PyFunctionObject>(), version) };
+    }
+    Ok(())
+}
+
 pub fn instantiate_bb_function(
     py: Python<'_>,
     dp: &Bound<'_, PyModule>,
@@ -756,12 +799,13 @@ fn instantiate_bb_function_inner(
     annotate_fn: &Bound<'_, PyAny>,
     module_runtime: &ModuleRuntimeContext,
 ) -> PyResult<Py<PyAny>> {
-    let records_specialization_counters = module_runtime
+    let specialization_mode = module_runtime
         .compile_session
         .env_config()
         .map_err(PyRuntimeError::new_err)?
-        .specialization_mode()
-        .is_some_and(|mode| mode.records_counters());
+        .specialization_mode();
+    let records_specialization_counters =
+        specialization_mode.is_some_and(|mode| mode.records_counters());
     let has_original_runtime_code = module_runtime
         .shared_module_state_owner
         .lookup_original_code(function.function_id)
@@ -772,8 +816,12 @@ fn instantiate_bb_function_inner(
         has_original_runtime_code,
         records_specialization_counters,
     );
-    let keep_source_generator =
-        keep_source_generator_vectorcall(function.lowered_kind(), has_original_runtime_code);
+    let keep_source_generator = keep_source_generator_vectorcall(
+        function.lowered_kind(),
+        function.names.display_name.as_str(),
+        has_original_runtime_code,
+        records_specialization_counters,
+    );
     let instantiated_entry = instantiate_closure_backed_entry(
         py,
         dp,
@@ -833,6 +881,7 @@ fn instantiate_bb_function_inner(
         }
         .map_err(|()| PyErr::fetch(py))?;
         maybe_attach_ready_clif_direct_entry(py, &entry, module_runtime, function.function_id)?;
+        restore_source_generator_cpython_function_version(py, &entry)?;
     } else if keep_source_runtime_helper {
         let owned_runtime =
             unsafe { clone_module_runtime_context(module_runtime) }.map_err(|_| {
@@ -874,9 +923,14 @@ fn keep_source_runtime_helper_vectorcall(
 
 fn keep_source_generator_vectorcall(
     function_kind: &FunctionKind,
+    display_name: &str,
     has_original_runtime_code: bool,
+    records_specialization_counters: bool,
 ) -> bool {
-    has_original_runtime_code && *function_kind == FunctionKind::Generator
+    has_original_runtime_code
+        && *function_kind == FunctionKind::Generator
+        && display_name != "<genexpr>"
+        && !records_specialization_counters
 }
 
 fn instantiate_closure_backed_entry<'py>(
@@ -1284,10 +1338,38 @@ mod tests {
     }
 
     #[test]
-    fn source_generators_keep_cpython_vectorcall() {
+    fn source_named_generators_keep_cpython_vectorcall_outside_counter_modes() {
         assert!(keep_source_generator_vectorcall(
             &FunctionKind::Generator,
-            true
+            "items",
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn source_named_generators_use_transformed_vectorcall_in_counter_modes() {
+        assert!(!keep_source_generator_vectorcall(
+            &FunctionKind::Generator,
+            "items",
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn source_generator_expressions_always_use_transformed_vectorcall() {
+        assert!(!keep_source_generator_vectorcall(
+            &FunctionKind::Generator,
+            "<genexpr>",
+            true,
+            false,
+        ));
+        assert!(!keep_source_generator_vectorcall(
+            &FunctionKind::Generator,
+            "<genexpr>",
+            true,
+            true,
         ));
     }
 
@@ -1295,11 +1377,15 @@ mod tests {
     fn generated_or_non_generator_functions_still_use_transformed_vectorcall() {
         assert!(!keep_source_generator_vectorcall(
             &FunctionKind::Generator,
-            false
+            "items",
+            false,
+            false,
         ));
         assert!(!keep_source_generator_vectorcall(
             &FunctionKind::Function,
-            true
+            "items",
+            true,
+            false,
         ));
     }
 }

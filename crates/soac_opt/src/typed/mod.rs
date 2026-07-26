@@ -1565,6 +1565,7 @@ struct TypedInlineDirectCallPlan {
 #[derive(Clone)]
 enum TypedInlineGuardPlan {
     Direct,
+    TrustedRuntime,
     Callable,
     Method(TypedDirectMethodCallGuard),
 }
@@ -2096,14 +2097,19 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
         }
     };
     let continuation_label = caller.name_gen.next_block_name();
-    let has_generic_fallback = !matches!(
-        candidate.call,
-        TypedInlineCall::DirectCallable(_)
-            | TypedInlineCall::BuiltinImplementation(_)
-            | TypedInlineCall::DirectMethod { .. }
-            | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
-            | TypedInlineCall::GeneratorResume(_)
-    );
+    let has_trusted_runtime_target = matches!(&candidate.call, TypedInlineCall::DirectCallable(_))
+        && candidate
+            .inline_plans
+            .iter()
+            .all(|plan| matches!(plan.guard, TypedInlineGuardPlan::TrustedRuntime));
+    let has_generic_fallback = !has_trusted_runtime_target
+        && !matches!(
+            candidate.call,
+            TypedInlineCall::BuiltinImplementation(_)
+                | TypedInlineCall::DirectMethod { .. }
+                | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+                | TypedInlineCall::GeneratorResume(_)
+        );
     let generic_label = has_generic_fallback.then(|| caller.name_gen.next_block_name());
     let cleanup_label = caller.name_gen.next_block_name();
     let guard_labels = (0..if has_generic_fallback {
@@ -2239,14 +2245,14 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
         );
     }
 
-    let entry_term = if matches!(
-        candidate.call,
-        TypedInlineCall::DirectCallable(_)
-            | TypedInlineCall::BuiltinImplementation(_)
-            | TypedInlineCall::DirectMethod { .. }
-            | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
-            | TypedInlineCall::GeneratorResume(_)
-    ) {
+    let entry_term = if has_trusted_runtime_target
+        || matches!(
+            candidate.call,
+            TypedInlineCall::BuiltinImplementation(_)
+                | TypedInlineCall::DirectMethod { .. }
+                | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
+                | TypedInlineCall::GeneratorResume(_)
+        ) {
         debug_assert_eq!(candidate.inline_plans.len(), 1);
         BlockTerm::Jump(BlockEdge::new(hot_labels[0]))
     } else {
@@ -4863,7 +4869,14 @@ fn typed_inline_candidate_for_direct_callable_call(
         inline_plans: vec![TypedInlineDirectCallPlan {
             target: guard.function_id,
             arg_plan: guard.arg_plan.clone(),
-            guard: TypedInlineGuardPlan::Direct,
+            guard: if matches!(
+                call.func.as_ref(),
+                InstrTyped::Load(load) if load.name.runtime_name_id().is_some()
+            ) {
+                TypedInlineGuardPlan::TrustedRuntime
+            } else {
+                TypedInlineGuardPlan::Direct
+            },
         }],
     })
 }
@@ -4990,6 +5003,17 @@ fn typed_inline_candidate_for_generator_resume_call(
 ) -> Option<TypedInlineStoreCandidate> {
     let plan = call.extra.generator_resume_plan()?;
     if plan.function_id == caller_id || call.args.len() != 5 || !call.keywords.is_empty() {
+        return None;
+    }
+    if plan.generator_origin.is_none() && !matches!(plan.candidate_origins.as_slice(), [_]) {
+        tracing::info!(
+            target: "soac_generator_state_lowering",
+            caller = ?caller_id,
+            source_instr_id = ?call.try_semantic_instr_id(),
+            callee = ?plan.function_id,
+            candidate_origins = ?plan.candidate_origins,
+            "typed_generator_resume_inline_rejected_ambiguous_state_origin",
+        );
         return None;
     }
     if typed_positional_arg_exprs(call.args.clone()).is_none() {
@@ -5271,6 +5295,7 @@ fn typed_direct_call_guard_term(
     callable_temp: &ResolvedName,
     function_id: RuntimeFunctionId,
     source_meta: Meta,
+    guard_miss_deopt: bool,
     then_label: BlockLabel,
     else_label: BlockLabel,
 ) -> BlockTerm<InstrTyped> {
@@ -5278,7 +5303,9 @@ fn typed_direct_call_guard_term(
         typed_load_temp(callable_temp),
         TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id },
     );
-    guard.extra.set_guard_miss_deopt_enabled(true);
+    if guard_miss_deopt {
+        guard.extra.set_guard_miss_deopt_enabled(true);
+    }
     BlockTerm::IfTerm(TermIf {
         test: InstrTyped::DirectCallGuardTest(guard.with_meta(source_meta)),
         then_label,
@@ -5296,10 +5323,22 @@ fn typed_inline_guard_term(
     else_label: BlockLabel,
 ) -> BlockTerm<InstrTyped> {
     match (&plan.guard, call) {
+        (TypedInlineGuardPlan::Direct, TypedInlineCall::DirectCallable(_)) => {
+            let callable_temp = callable_temp
+                .expect("direct callable inline guard requires callable temp")
+                .resolved_name();
+            typed_direct_call_guard_term(
+                &callable_temp,
+                plan.target,
+                source_meta,
+                false,
+                then_label,
+                else_label,
+            )
+        }
         (
             TypedInlineGuardPlan::Direct,
-            TypedInlineCall::DirectCallable(_)
-            | TypedInlineCall::BuiltinImplementation(_)
+            TypedInlineCall::BuiltinImplementation(_)
             | TypedInlineCall::DirectMethod { .. }
             | TypedInlineCall::DirectRuntimeProtocolMethod { .. }
             | TypedInlineCall::GeneratorResume(_),
@@ -5312,6 +5351,7 @@ fn typed_inline_guard_term(
                 &callable_temp,
                 plan.target,
                 source_meta,
+                true,
                 then_label,
                 else_label,
             )
@@ -5377,9 +5417,6 @@ fn typed_inline_generic_fallback_body(
     discard_result: Option<&ResolvedName>,
 ) -> Vec<InstrTyped> {
     match call {
-        TypedInlineCall::DirectCallable(_) => {
-            unreachable!("direct callable inlining does not emit a generic fallback")
-        }
         TypedInlineCall::BuiltinImplementation(_) => {
             unreachable!("builtin implementation inlining does not emit a generic fallback")
         }
@@ -5392,7 +5429,7 @@ fn typed_inline_generic_fallback_body(
         TypedInlineCall::GeneratorResume(_) => {
             unreachable!("generator-resume inlining does not emit a generic fallback")
         }
-        TypedInlineCall::Callable(_) => {
+        TypedInlineCall::DirectCallable(_) | TypedInlineCall::Callable(_) => {
             let callable_temp = callable_temp
                 .expect("callable inline fallback requires callable temp")
                 .resolved_name();
@@ -6352,7 +6389,7 @@ fn build_single_block_typed_inline_fragment_to_target(
         .storage_layout
         .as_ref()
         .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
-    if !allow_nonstack_storage && typed_inline_callee_has_nonstack_storage(callee_layout) {
+    if !allow_nonstack_storage && typed_inline_callee_has_nonstack_storage(callee, callee_layout) {
         return Err(TypedInlineUnsupportedReason::NonStackStorage);
     }
     for location in value_bindings.keys().copied() {
@@ -6449,7 +6486,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
         .storage_layout
         .as_ref()
         .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
-    if !allow_nonstack_storage && typed_inline_callee_has_nonstack_storage(callee_layout) {
+    if !allow_nonstack_storage && typed_inline_callee_has_nonstack_storage(callee, callee_layout) {
         return Err(TypedInlineUnsupportedReason::NonStackStorage);
     }
     for location in value_bindings.keys().copied() {
@@ -6547,11 +6584,52 @@ fn build_multi_block_typed_inline_fragment_to_target(
 }
 
 fn typed_inline_callee_has_nonstack_storage(
+    callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     storage_layout: &soac_core::block_py::StorageLayout,
 ) -> bool {
-    // Preserved slots belong to the generator wrapper, not to addressable
-    // storage inside the visible factory body being inlined here.
-    !storage_layout.freevars.is_empty() || !storage_layout.cellvars.is_empty()
+    if !storage_layout.freevars.is_empty() || !storage_layout.cellvars.is_empty() {
+        return true;
+    }
+
+    // A generator factory may describe preserved wrapper slots without using
+    // them. Its resume body, however, must only be inlined through the explicit
+    // generator-resume path, which binds and remaps the preserved owner.
+    struct PreservedStorageFinder {
+        found: bool,
+    }
+
+    impl Visit<InstrTyped> for PreservedStorageFinder {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.found {
+                return;
+            }
+
+            self.found = match expr {
+                InstrTyped::Load(load) => {
+                    load.name.preserved_location().is_some()
+                        || matches!(load.name.cell_location(), Some(CellLocation::Preserved(_)))
+                }
+                InstrTyped::Store(store) => {
+                    store.name.preserved_location().is_some()
+                        || matches!(store.name.cell_location(), Some(CellLocation::Preserved(_)))
+                }
+                InstrTyped::Del(del) => {
+                    del.name.preserved_location().is_some()
+                        || matches!(del.name.cell_location(), Some(CellLocation::Preserved(_)))
+                }
+                InstrTyped::CellRef(cell_ref) => cell_ref.location.is_preserved(),
+                _ => false,
+            };
+
+            if !self.found {
+                expr.visit_children(self);
+            }
+        }
+    }
+
+    let mut finder = PreservedStorageFinder { found: false };
+    finder.visit_fn(callee);
+    finder.found
 }
 
 fn allocate_typed_inline_locals(
@@ -8585,19 +8663,6 @@ fn typed_generator_alias_cleanup(
                         || self.is_closed_value_locations.contains(&location)
                 })
             {
-                eprintln!(
-                    "typed generator residual alias load instr={:?} location={:?} top_level_value={:?} ignored={:?} top_level={:?}",
-                    expr.try_semantic_instr_id(),
-                    load.name.local_location(),
-                    match self.current_top_level {
-                        Some(CurrentTopLevel::Instr(InstrTyped::Store(store))) => {
-                            store.value.try_semantic_instr_id()
-                        }
-                        _ => None,
-                    },
-                    self.ignored_alias_use_instr_ids,
-                    self.current_top_level,
-                );
                 tracing::info!(
                     target: "soac_generator_state_lowering",
                     alias_location = ?load.name.local_location(),
@@ -13588,23 +13653,98 @@ def caller(a, b):\n    return add(a, b)\n",
     fn typed_direct_call_inlining_allows_generator_factories_with_preserved_state() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "def gen():\n    yield 1\n\n\
-def caller():\n    value = gen()\n    return value\n",
+def make_gen():\n    return gen()\n\n\
+def caller():\n    value = make_gen()\n    return value\n",
         )
         .expect("source should lower");
-        let gen_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "gen");
+        let factory_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "make_gen");
         let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
-        let generator_factory = typed
+        let generator_resume = typed
             .callable_defs
             .iter()
             .find(|function| function.names.qualname == "gen")
+            .expect("missing typed generator resume");
+        assert!(generator_resume.body_params.is_some());
+        assert!(
+            !generator_resume
+                .public_storage_layout()
+                .expect("generator should record public storage layout")
+                .preserved_slots
+                .is_empty()
+        );
+        let generator_factory = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "make_gen")
             .expect("missing typed generator factory");
+        assert!(matches!(
+            generator_factory.kind,
+            soac_core::block_py::FunctionKind::Function
+        ));
         let layout = generator_factory
             .storage_layout
             .as_ref()
             .expect("generator factory should record storage layout");
         assert!(layout.freevars.is_empty(), "{layout:?}");
         assert!(layout.cellvars.is_empty(), "{layout:?}");
-        assert!(!layout.preserved_slots.is_empty(), "{layout:?}");
+        assert!(layout.preserved_slots.is_empty(), "{layout:?}");
+
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: factory_id,
+                        arg_plan: TypedDirectCallArgPlan { sources: vec![] },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(factory_id, TypedDirectCallArgPlan { sources: vec![] })],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
+        assert_eq!(stats.skipped_candidates, 0);
+    }
+
+    #[test]
+    fn typed_direct_call_inlining_rejects_unbound_generator_preserved_storage() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def gen():\n    yield 1\n\n\
+def caller():\n    value = gen()\n    return value\n",
+        )
+        .expect("source should lower");
+        let gen_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "gen");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        {
+            let generator_factory = typed_function_by_qualname_mut(&mut typed, "gen");
+            let layout = generator_factory
+                .storage_layout
+                .as_ref()
+                .expect("generator factory should record storage layout");
+            assert!(!layout.preserved_slots.is_empty(), "{layout:?}");
+            generator_factory.blocks[0].body.insert(
+                0,
+                InstrTyped::Load(Load::new(ResolvedName {
+                    id: "unbound_generator_state".into(),
+                    location: NameLocation::Preserved(PreservedLocation(0)),
+                })),
+            );
+        }
 
         let call_id;
         {
@@ -13624,6 +13764,7 @@ def caller():\n    value = gen()\n    return value\n",
 
         let callee_module = typed.clone();
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let original_storage_layout = caller.storage_layout.clone();
         let stats = inline_typed_function_direct_call_stores(
             caller,
             &callee_module,
@@ -13634,12 +13775,18 @@ def caller():\n    value = gen()\n    return value\n",
             )]),
         );
 
-        assert_eq!(stats.rewritten_stores, 1);
-        assert_eq!(stats.skipped_candidates, 0);
+        assert_eq!(stats.rewritten_stores, 0);
+        assert!(stats.skipped_candidates > 0);
+        assert_eq!(caller.storage_layout, original_storage_layout);
+        assert!(caller.blocks.iter().all(|block| {
+            block.body.iter().all(|instr| {
+                !matches!(instr, InstrTyped::Load(load) if load.name.preserved_location().is_some())
+            })
+        }));
     }
 
     #[test]
-    fn typed_direct_callable_inlining_omits_guard_and_generic_fallback() {
+    fn typed_direct_callable_inlining_guards_mutable_function_identity() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "def add(a):\n    return a\n\n\
 def caller(a):\n    value = add(a)\n    return value\n",
@@ -13686,16 +13833,111 @@ def caller(a):\n    value = add(a)\n    return value\n",
         );
 
         assert_eq!(stats.rewritten_stores, 1);
+        assert!(caller.blocks.iter().any(|block| {
+            matches!(
+                &block.term,
+                BlockTerm::IfTerm(if_term)
+                    if matches!(
+                        &if_term.test,
+                        InstrTyped::DirectCallGuardTest(guard)
+                            if matches!(
+                                &guard.kind,
+                                TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id }
+                                    if *function_id == add_id
+                            ) && !if_term.test.guard_miss_deopt_enabled()
+                    )
+            )
+        }));
+        assert!(caller.blocks.iter().any(|block| {
+            block.body.iter().any(|instr| match instr {
+                InstrTyped::Store(store) => matches!(
+                    store.value.as_ref(),
+                    InstrTyped::CallTyped(call)
+                        if call.access == TypedCallAccessPlan::Generic
+                ),
+                InstrTyped::CallTyped(call) => call.access == TypedCallAccessPlan::Generic,
+                _ => false,
+            })
+        }));
+    }
+
+    #[test]
+    fn typed_trusted_runtime_callable_inlining_omits_guard_and_generic_fallback() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def runtime_target(a):\n    return a\n\n\
+def caller(a):\n    value = runtime_target(a)\n    return value\n",
+        )
+        .expect("source should lower");
+        let target_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "runtime_target");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            let plans = TypedCallEmissionPlans {
+                by_source: HashMap::from([(
+                    call_id,
+                    TypedCallEmissionPlan::DirectCallable {
+                        function_guard: TypedDirectFunctionCallGuard {
+                            function_id: target_id,
+                            arg_plan: TypedDirectCallArgPlan {
+                                sources: vec![TypedDirectCallArgSource::Provided(0)],
+                            },
+                        },
+                    },
+                )]),
+            };
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("typed trusted runtime callable emission plan should lower");
+
+            let direct_call = caller
+                .blocks
+                .iter_mut()
+                .flat_map(|block| block.body.iter_mut())
+                .find_map(|instr| match instr {
+                    InstrTyped::Store(store) => match store.value.as_mut() {
+                        InstrTyped::DirectCallableCallTyped(call) => Some(call),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("caller should contain the lowered direct callable");
+            direct_call.func = Box::new(InstrTyped::Load(
+                Load::new(ResolvedName::runtime_name("range")).with_meta(Meta::synthetic()),
+            ));
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    target_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
         assert!(caller.blocks.iter().all(|block| {
             !matches!(
                 &block.term,
                 BlockTerm::IfTerm(if_term)
                     if matches!(if_term.test, InstrTyped::DirectCallGuardTest(_))
-            )
-        }));
-        assert!(caller.blocks.iter().all(|block| {
-            block.body.iter().all(|instr| {
-                !matches!(instr, InstrTyped::CallTyped(call) if call.access == TypedCallAccessPlan::Generic)
+            ) && block.body.iter().all(|instr| match instr {
+                InstrTyped::Store(store) => !matches!(
+                    store.value.as_ref(),
+                    InstrTyped::CallTyped(call)
+                        if call.access == TypedCallAccessPlan::Generic
+                ),
+                InstrTyped::CallTyped(call) => call.access != TypedCallAccessPlan::Generic,
+                _ => true,
             })
         }));
     }
@@ -16232,9 +16474,9 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             &module_constants,
             &mut materializing_store_plan,
         );
-        assert!(
-            materializing_store_scalar_stats.rewritten_loads >= 3,
-            "field lowering should still scalarize uses before the explicit store materialization boundary"
+        assert_eq!(
+            materializing_store_scalar_stats.rewritten_loads, 0,
+            "field accesses after an immediate global escape must remain observable"
         );
         let materializing_store_stats = materialize_typed_virtual_store_boundaries_with_plan(
             &mut materializing_store_caller,
@@ -16246,34 +16488,60 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             "the original concrete allocation should stay in place when explicit init values are not yet available at the boundary"
         );
         let mut escaping_store_caller = caller.clone();
-        let escaping_store_block = escaping_store_caller
+        let (escaping_block_index, escaping_store_index, escaping_root) = escaping_store_caller
             .blocks
-            .iter_mut()
-            .find(|block| {
-                typed_virtual_constructor_plan_covers_block(&removable_plan, block.label)
-                    && block
-                        .body
-                        .iter()
-                        .any(|instr| matches!(instr, InstrTyped::Del(_)))
-            })
-            .expect("virtual constructor region should contain an inline-temp cleanup block");
-        let escaping_store_index = escaping_store_block
-            .body
             .iter()
-            .position(|instr| matches!(instr, InstrTyped::Del(_)))
-            .expect("allocation block should clean up inline temps after explicit init work");
-        escaping_store_block.body.insert(
-            escaping_store_index,
-            Store::new(
-                ResolvedName {
-                    id: "sink".to_string().into(),
-                    location: NameLocation::GlobalName,
-                },
-                typed_load_temp(&removable_plan.root),
-            )
-            .with_meta(Meta::synthetic())
-            .into(),
-        );
+            .enumerate()
+            .filter(|(_, block)| {
+                typed_virtual_constructor_plan_covers_block(&removable_plan, block.label)
+            })
+            .find_map(|(block_index, block)| {
+                let mut seen_fields = 0_u8;
+                for (instr_index, instr) in block.body.iter().enumerate() {
+                    let InstrTyped::Store(store) = instr else {
+                        continue;
+                    };
+                    let InstrTyped::GetAttrTyped(get_attr) = store.value.as_ref() else {
+                        continue;
+                    };
+                    let field_bit =
+                        match typed_constant_string(get_attr.attr.as_ref(), &module_constants) {
+                            Some("current") => 0b001,
+                            Some("stop") => 0b010,
+                            Some("step") => 0b100,
+                            _ => continue,
+                        };
+                    let InstrTyped::Load(receiver) = get_attr.value.as_ref() else {
+                        continue;
+                    };
+                    let Some(location) = receiver.name.local_location() else {
+                        continue;
+                    };
+                    if !removable_plan.virtual_locations.contains(&location) {
+                        continue;
+                    }
+                    seen_fields |= field_bit;
+                    if seen_fields == 0b111 {
+                        return Some((block_index, instr_index + 1, receiver.name.clone()));
+                    }
+                }
+                None
+            })
+            .expect("iterator hot block should read current, stop, and step before escape");
+        escaping_store_caller.blocks[escaping_block_index]
+            .body
+            .insert(
+                escaping_store_index,
+                Store::new(
+                    ResolvedName {
+                        id: "sink".to_string().into(),
+                        location: NameLocation::GlobalName,
+                    },
+                    typed_load_temp(&escaping_root),
+                )
+                .with_meta(Meta::synthetic())
+                .into(),
+            );
         let mut escaping_store_plan = plan_typed_virtual_objects(
             &escaping_store_caller,
             &module_constants,
@@ -16289,9 +16557,9 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             &module_constants,
             &mut escaping_store_plan,
         );
-        assert!(
-            escaping_store_scalar_stats.rewritten_loads >= 3,
-            "field lowering should still scalarize uses before the escaping store while leaving the concrete object alive"
+        assert_eq!(
+            escaping_store_scalar_stats.rewritten_loads, 0,
+            "a global escape on a loop backedge must invalidate fields on later iterations"
         );
         let escaping_store_materialization_stats =
             materialize_typed_virtual_store_boundaries_with_plan(

@@ -28,6 +28,7 @@ from .sim import (
 
 next = _builtins.next
 iter = _builtins.iter
+range = _builtins.range
 anext = _builtins.anext
 isinstance = _builtins.isinstance
 getattr = _builtins.getattr
@@ -106,9 +107,9 @@ def set_from_iter(value):
     while True:
         try:
             item = next(iterator)
-            result.add(item)
         except StopIteration:
             return result
+        result.add(item)
 
 
 def constructor_call(cls, /, *args, **kwargs):
@@ -227,7 +228,17 @@ def make_generator_instance(
     preserved_values = make_preserved_state(initial_values, slot_kinds)
     is_async_gen = kind == 2
     template = code_template_async_gen if is_async_gen else code_template_gen
-    code = template.__code__.replace(co_name=name, co_qualname=qualname)
+    source_code = getattr(resume_function, "__code__", None)
+    required_code_flag = 0x200 if is_async_gen else 0x80 if kind == 1 else 0x20
+    if (
+        source_code is not None
+        and source_code.co_name == name
+        and source_code.co_qualname == qualname
+        and source_code.co_flags & required_code_flag
+    ):
+        code = source_code
+    else:
+        code = template.__code__.replace(co_name=name, co_qualname=qualname)
     if is_async_gen:
         return ClosureAsyncGenerator(
             resume_function,
@@ -783,52 +794,6 @@ async def asynccontextmanager_exit(exit_fn, exc):
 # exception helpers, and generator/coroutine support helpers lets future
 # bootstrapping treat `__soac__.X` inside this module as ordinary module-global
 # references instead of installing duplicate bootstrap helper implementations.
-class range:
-    def __init__(self, *args):
-        argc = len(args)
-        if argc == 1:
-            start = 0
-            stop = _index(args[0])
-            step = 1
-        elif argc == 2:
-            start = _index(args[0])
-            stop = _index(args[1])
-            step = 1
-        elif argc == 3:
-            start = _index(args[0])
-            stop = _index(args[1])
-            step = _index(args[2])
-            if step == 0:
-                raise ValueError("range() arg 3 must not be zero")
-        else:
-            raise TypeError(f"range expected at least 1 argument, got {argc}")
-
-        self.start = start
-        self.stop = stop
-        self.step = step
-
-    def __iter__(self):
-        return IterRange(self.start, self.stop, self.step)
-
-    def __reversed__(self):
-        start = self.start
-        stop = self.stop
-        step = self.step
-        if step > 0:
-            if start >= stop:
-                return IterRange(0, 0, 1)
-            count = (stop - start + step - 1) // step
-            last = start + (count - 1) * step
-            return IterRange(last, start - 1, -step)
-
-        if start <= stop:
-            return IterRange(0, 0, 1)
-        reverse_step = -step
-        count = (start - stop + reverse_step - 1) // reverse_step
-        last = start + (count - 1) * step
-        return IterRange(last, start + 1, reverse_step)
-
-
 class IterRange:
 
     def __init__(self, start, stop, step, /):

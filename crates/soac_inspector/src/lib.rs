@@ -20,8 +20,9 @@ use soac_ir_typed::plan_v3::{
 };
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
+    SharedModuleState, build_shared_state_for_inspection_with_original_code_and_source_hash,
     build_shared_state_for_inspection_with_placeholder_constants_and_source_hash,
-    build_shared_state_for_inspection_with_source_hash,
+    build_shared_state_for_inspection_with_source_hash, match_original_code_to_functions,
 };
 use soac_jit::{
     CompileSession, PreparedJitTypedModulePlan, plan_jit_typed_module,
@@ -40,6 +41,7 @@ use soac_opt::{
 };
 use std::ffi::{CString, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::services::ServeDir;
 
@@ -203,6 +205,14 @@ fn find_venv_site_packages(repo_root: &Path) -> Option<PathBuf> {
     None
 }
 
+fn repo_python_support_paths(repo_root: &Path) -> [PathBuf; 3] {
+    [
+        repo_root.to_path_buf(),
+        repo_root.join("bench"),
+        repo_root.join("soac_py").join("src"),
+    ]
+}
+
 fn ensure_python_support_paths(py: Python<'_>, repo_root: &Path) -> Result<(), ApiError> {
     let sys = PyModule::import(py, "sys").map_err(|err| ApiError::internal(err.to_string()))?;
     let path = sys
@@ -211,9 +221,11 @@ fn ensure_python_support_paths(py: Python<'_>, repo_root: &Path) -> Result<(), A
     let path = path
         .cast::<PyList>()
         .map_err(|err| ApiError::internal(err.to_string()))?;
+    let [repo_path, benchmark_path, soac_source_path] = repo_python_support_paths(repo_root);
     let support_paths = [
-        repo_root.to_path_buf(),
-        repo_root.join("soac_py").join("src"),
+        repo_path,
+        benchmark_path,
+        soac_source_path,
         find_venv_site_packages(repo_root)
             .ok_or_else(|| ApiError::internal("repo venv site-packages not found".to_string()))?,
     ];
@@ -505,6 +517,37 @@ fn execute_module_for_runtime_render_state(
     register_function_owner_types_for_rendered_module(py, module.as_any(), indexed_module_keys)
 }
 
+fn build_source_backed_runtime_render_state(
+    py: Python<'_>,
+    source_path: &Path,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    module_name: &str,
+    source_hash: u64,
+) -> Result<Arc<SharedModuleState>, String> {
+    let source = std::fs::read_to_string(source_path)
+        .map_err(|err| format!("failed to read {}: {err}", source_path.display()))?;
+    let filename = source_path
+        .to_str()
+        .ok_or_else(|| format!("source path is not valid utf-8: {}", source_path.display()))?;
+    let module_code = PyModule::import(py, "builtins")
+        .and_then(|builtins| builtins.getattr("compile"))
+        .and_then(|compile| compile.call1((source.as_str(), filename, "exec")))
+        .map_err(|err| err.to_string())?;
+    let original_code_by_function_id =
+        match_original_code_to_functions(py, module_code.as_any(), module)
+            .map_err(|err| err.to_string())?;
+
+    build_shared_state_for_inspection_with_original_code_and_source_hash(
+        py,
+        module.clone(),
+        module_name,
+        module_package_name(module_name),
+        source_hash,
+        original_code_by_function_id,
+    )
+    .map_err(|err| err.to_string())
+}
+
 fn register_function_owner_types_for_rendered_module(
     py: Python<'_>,
     module: &Bound<'_, PyAny>,
@@ -606,16 +649,25 @@ pub fn render_jit_clif_for_module_with_options(
             PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
         }
         let runtime_state = if options.load_runtime_specializations {
-            if let Some(source_path) = options.runtime_source_path.as_deref() {
-                execute_module_for_runtime_render_state(
-                    py,
-                    source_path,
-                    module_name,
-                    &module.global_names,
-                )?;
-            } else {
-                PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
-            }
+            let rendered_module_state =
+                if let Some(source_path) = options.runtime_source_path.as_deref() {
+                    execute_module_for_runtime_render_state(
+                        py,
+                        source_path,
+                        module_name,
+                        &module.global_names,
+                    )?;
+                    Some(build_source_backed_runtime_render_state(
+                        py,
+                        source_path,
+                        module,
+                        module_name,
+                        options.module_source_hash.unwrap_or(0),
+                    )?)
+                } else {
+                    PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+                    None
+                };
             let runtime_module =
                 PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
             let (runtime_lowered, runtime_source_hash) =
@@ -637,8 +689,9 @@ pub fn render_jit_clif_for_module_with_options(
             compile_session
                 .retain_shared_module_state_for_inspection(runtime_shared_state)
                 .map_err(|err| err.to_string())?;
-            Some(
-                build_shared_state_for_inspection_with_source_hash(
+            Some(match rendered_module_state {
+                Some(shared_state) => shared_state,
+                None => build_shared_state_for_inspection_with_source_hash(
                     py,
                     module.clone(),
                     module_name,
@@ -646,7 +699,7 @@ pub fn render_jit_clif_for_module_with_options(
                     options.module_source_hash.unwrap_or(0),
                 )
                 .map_err(|err| err.to_string())?,
-            )
+            })
         } else {
             None
         };
@@ -765,16 +818,25 @@ pub fn render_instr_typed_for_module_with_options(
                 PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
             }
             let runtime_state = if options.load_runtime_specializations {
-                if let Some(source_path) = options.runtime_source_path.as_deref() {
-                    execute_module_for_runtime_render_state(
-                        py,
-                        source_path,
-                        module_name,
-                        &module.global_names,
-                    )?;
-                } else {
-                    PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
-                }
+                let rendered_module_state =
+                    if let Some(source_path) = options.runtime_source_path.as_deref() {
+                        execute_module_for_runtime_render_state(
+                            py,
+                            source_path,
+                            module_name,
+                            &module.global_names,
+                        )?;
+                        Some(build_source_backed_runtime_render_state(
+                            py,
+                            source_path,
+                            module,
+                            module_name,
+                            options.module_source_hash.unwrap_or(0),
+                        )?)
+                    } else {
+                        PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
+                        None
+                    };
                 let runtime_module =
                     PyModule::import(py, "soac.runtime").map_err(|err| err.to_string())?;
                 let (runtime_lowered, runtime_source_hash) =
@@ -796,8 +858,9 @@ pub fn render_instr_typed_for_module_with_options(
                 compile_session
                     .retain_shared_module_state_for_inspection(runtime_shared_state)
                     .map_err(|err| err.to_string())?;
-                Some(
-                    build_shared_state_for_inspection_with_source_hash(
+                Some(match rendered_module_state {
+                    Some(shared_state) => shared_state,
+                    None => build_shared_state_for_inspection_with_source_hash(
                         py,
                         module.clone(),
                         module_name,
@@ -805,7 +868,7 @@ pub fn render_instr_typed_for_module_with_options(
                         options.module_source_hash.unwrap_or(0),
                     )
                     .map_err(|err| err.to_string())?,
-                )
+                })
             } else {
                 None
             };
@@ -1415,6 +1478,20 @@ mod test {
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use tower::ServiceExt;
+
+    #[test]
+    fn embedded_python_support_paths_include_repository_benchmarks() {
+        let root = Path::new("/repo/soac");
+
+        assert_eq!(
+            super::repo_python_support_paths(root),
+            [
+                root.to_path_buf(),
+                root.join("bench"),
+                root.join("soac_py").join("src"),
+            ]
+        );
+    }
 
     async fn response_text(response: axum::response::Response) -> String {
         let bytes = response

@@ -63,7 +63,7 @@ struct PyFunctionJitExtraPrefix {
 }
 
 #[repr(C)]
-struct PyFunctionObjectSoacMetadataPrefix {
+struct RawPyFunctionObjectSoacMetadataPrefix {
     ob_refcnt: isize,
     ob_type: *mut ffi::PyTypeObject,
     func_globals: *mut ffi::PyObject,
@@ -83,6 +83,8 @@ struct PyFunctionObjectSoacMetadataPrefix {
     func_typeparams: *mut ffi::PyObject,
     vectorcall: ffi::vectorcallfunc,
     func_soac_metadata: *mut c_void,
+    func_soac_metadata_destructor: *mut c_void,
+    func_soac_function_id: u64,
 }
 
 pub struct ModuleRuntimeContext {
@@ -117,6 +119,14 @@ pub const FUNCTION_ENV_GLOBALS_OBJ_OFFSET: i32 = offset_of!(FunctionEnvPrefix, g
 pub const FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET: i32 = size_of::<FunctionEnvPrefix>() as i32;
 pub const PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET: i32 =
     offset_of!(PyFunctionJitExtraPrefix, function_env) as i32;
+pub const PY_FUNCTION_CODE_OFFSET: i32 =
+    offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_code) as i32;
+pub const PY_FUNCTION_DEFAULTS_OFFSET: i32 =
+    offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_defaults) as i32;
+pub const PY_FUNCTION_KWDEFAULTS_OFFSET: i32 =
+    offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_kwdefaults) as i32;
+pub const PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 =
+    offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_soac_function_id) as i32;
 pub const PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET: i32 =
     offset_of!(PyThreadStateCurrentExceptionPrefix, current_exception) as i32;
 
@@ -139,8 +149,13 @@ pub(super) fn load_py_function_soac_metadata_obj(
         ptr_ty,
         ir::MemFlags::trusted(),
         function_obj,
-        offset_of!(PyFunctionObjectSoacMetadataPrefix, func_soac_metadata) as i32,
+        offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_soac_metadata) as i32,
     )
+}
+
+pub(crate) unsafe fn invalidate_py_function_soac_function_id(function: *mut ffi::PyFunctionObject) {
+    let raw_function = function.cast::<RawPyFunctionObjectSoacMetadataPrefix>();
+    unsafe { (*raw_function).func_soac_function_id = 0 };
 }
 
 #[derive(Clone, Debug)]

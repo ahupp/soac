@@ -1,4 +1,5 @@
 use super::codegen_env::JitCodegenEnv;
+use super::direct_abi::SOAC_JIT_RESUME_GENERATOR_SYMBOL;
 use super::inspection::{
     ClifBlockRole, ClifBlockRoles, ClifFunctionDisplayAliases,
     annotate_clif_instruction_purpose_source_locs, clif_block_role_name_from_source_loc_bits,
@@ -20,12 +21,13 @@ use super::symbols::{
 };
 use super::{
     _PyDict_IndexedValueTombstone, PyFunction_Type, PyList_Type, PyLong_Type, PyMethod_Type,
-    PyType_Type, PyUnicode_Type,
+    PyTuple_Type, PyType_Type, PyUnicode_Type,
 };
 use crate::config::CraneliftTargetConfig;
 use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, soac_jit_make_function_with_closure,
 };
+use crate::soac_jit_resume_generator;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir;
 use cranelift_codegen::isa::TargetIsa;
@@ -80,6 +82,10 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
         std::ptr::addr_of_mut!(PyList_Type).cast::<u8>(),
     );
     builder.symbol(
+        cpython_type_symbol_name(CpythonTypeSymbol::Tuple),
+        std::ptr::addr_of_mut!(PyTuple_Type).cast::<u8>(),
+    );
+    builder.symbol(
         cpython_type_symbol_name(CpythonTypeSymbol::Unicode),
         std::ptr::addr_of_mut!(PyUnicode_Type).cast::<u8>(),
     );
@@ -90,6 +96,10 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL,
         soac_jit_make_function_with_closure as *const u8,
+    );
+    builder.symbol(
+        SOAC_JIT_RESUME_GENERATOR_SYMBOL,
+        soac_jit_resume_generator as *const u8,
     );
     builder.symbol_lookup_fn(Box::new(lookup_registered_jit_data_symbol));
     register_specialized_jit_symbols(builder);

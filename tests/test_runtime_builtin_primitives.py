@@ -96,6 +96,9 @@ def collect_reversed_stop(stop):
 def collect_reversed_step(start, stop, step):
     return list(reversed(range(start, stop, step)))
 
+def make_range(stop):
+    return range(stop)
+
 def iterator_type_name(stop):
     return type(iter(range(stop))).__name__
 
@@ -139,8 +142,12 @@ def no_index():
         assert module.collect_reversed_stop(4) == [3, 2, 1, 0]
         assert module.collect_reversed_step(1, 8, 2) == [7, 5, 3, 1]
         assert module.collect_reversed_step(8, 1, -3) == [2, 5, 8]
-        assert module.iterator_type_name(3) == "IterRange"
-        assert module.range_type_name(3) == ("soac.runtime", "range")
+        actual_range = module.make_range(3)
+        assert type(actual_range) is range
+        assert actual_range == range(3)
+        assert actual_range[1:] == range(1, 3)
+        assert module.iterator_type_name(3) == type(iter(range(3))).__name__
+        assert module.range_type_name(3) == (range.__module__, range.__name__)
         assert module.collect_indexable() == [1, 3]
         with pytest.raises(ValueError):
             module.zero_step()

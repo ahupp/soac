@@ -1,3 +1,4 @@
+use crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_CODE_OFFSET;
 use crate::function_instantiation::make_function_kind_abi_tag;
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
@@ -75,6 +76,7 @@ unsafe extern "C" {
     static mut PyType_Type: ffi::PyTypeObject;
     static mut PyLong_Type: ffi::PyTypeObject;
     static mut PyList_Type: ffi::PyTypeObject;
+    static mut PyTuple_Type: ffi::PyTypeObject;
     static mut PyUnicode_Type: ffi::PyTypeObject;
     static mut _PyDict_IndexedValueTombstone: i8;
     fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
@@ -161,8 +163,7 @@ use direct_abi::{
 use direct_function::{
     DirectCallArgPlan, DirectCallArgSource, DirectCallEntryKind, DirectEdgeStats,
     DirectFunctionSpecialization, DirectMethodSpecialization, declare_direct_function,
-    declare_imported_direct_function, direct_call_arg_plan_from_typed,
-    direct_function_specializations_from_typed_guards,
+    declare_imported_direct_function, direct_function_specializations_from_typed_guards,
     direct_method_specialization_from_typed_call, direct_method_specializations_from_typed_guards,
     make_direct_function_signature, record_profiled_direct_call_incompatibility,
     validate_direct_call_compatibility,
@@ -216,13 +217,16 @@ pub(crate) use precompiled_library::{
 };
 pub(crate) use process::{ProcessJitEngine, process_jit_is_currently_compiling};
 use refcount_lowering::RefcountLowering;
-pub(crate) use runtime_context::FunctionRuntimeDataLayout;
 use runtime_context::{
     FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
-    FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
-    PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET, load_function_env_obj,
-    load_py_function_soac_metadata_obj,
+    FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_CODE_OFFSET, PY_FUNCTION_DEFAULTS_OFFSET,
+    PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_FUNCTION_KWDEFAULTS_OFFSET,
+    PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET, PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
+    load_function_env_obj, load_py_function_soac_metadata_obj,
+};
+pub(crate) use runtime_context::{
+    FunctionRuntimeDataLayout, invalidate_py_function_soac_function_id,
 };
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 #[cfg(test)]
@@ -293,15 +297,15 @@ use imports::{
     PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT,
     PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT,
     PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
-    SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
-    SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
-    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
-    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
-    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
-    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT,
-    SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType,
-    predeclare_specialization_type_imports,
+    SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_JIT_RESUME_GENERATOR_IMPORT,
+    SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT,
+    SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
+    SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT, SOAC_RUNTIME_TUPLE_NEW_IMPORT,
+    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType, predeclare_specialization_type_imports,
 };
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
@@ -8926,31 +8930,6 @@ fn emit_callee_function_id_checked(
     }
 
     #[repr(C)]
-    struct PyFunctionObjectSoacPrefix {
-        ob_refcnt: isize,
-        ob_type: *mut ffi::PyTypeObject,
-        func_globals: *mut ffi::PyObject,
-        func_builtins: *mut ffi::PyObject,
-        func_name: *mut ffi::PyObject,
-        func_qualname: *mut ffi::PyObject,
-        func_code: *mut ffi::PyObject,
-        func_defaults: *mut ffi::PyObject,
-        func_kwdefaults: *mut ffi::PyObject,
-        func_closure: *mut ffi::PyObject,
-        func_doc: *mut ffi::PyObject,
-        func_dict: *mut ffi::PyObject,
-        func_weakreflist: *mut ffi::PyObject,
-        func_module: *mut ffi::PyObject,
-        func_annotations: *mut ffi::PyObject,
-        func_annotate: *mut ffi::PyObject,
-        func_typeparams: *mut ffi::PyObject,
-        vectorcall: ffi::vectorcallfunc,
-        func_soac_metadata: *mut std::ffi::c_void,
-        func_soac_metadata_destructor: *mut std::ffi::c_void,
-        func_soac_function_id: u64,
-    }
-
-    #[repr(C)]
     struct PyHeapTypeObjectSoacPrefix {
         ht_type: ffi::PyTypeObject,
         as_async: ffi::PyAsyncMethods,
@@ -8972,8 +8951,6 @@ fn emit_callee_function_id_checked(
 
     const PYOBJECT_OB_TYPE_OFFSET: i32 = offset_of!(ffi::PyObject, ob_type) as i32;
     const PYMETHOD_IM_FUNC_OFFSET: i32 = offset_of!(PyMethodObjectPrefix, im_func) as i32;
-    const PYFUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 =
-        offset_of!(PyFunctionObjectSoacPrefix, func_soac_function_id) as i32;
     const PYTYPE_TP_FLAGS_OFFSET: i32 = offset_of!(ffi::PyTypeObject, tp_flags) as i32;
     const PYHEAPTYPE_SOAC_METADATA_OFFSET: i32 =
         offset_of!(PyHeapTypeObjectSoacPrefix, ht_soac_metadata) as i32;
@@ -9132,7 +9109,7 @@ fn emit_callee_function_id_checked(
         i64_ty,
         ir::MemFlags::trusted(),
         function_value,
-        PYFUNCTION_SOAC_FUNCTION_ID_OFFSET,
+        PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET,
     );
     let id_is_zero = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, packed, 0);
     let id_done_block = fb.create_block();
@@ -9140,6 +9117,78 @@ fn emit_callee_function_id_checked(
         .brif(id_is_zero, miss_block, &[], id_done_block, &[]);
 
     fb.switch_to_block(id_done_block);
+    let metadata = load_py_function_soac_metadata_obj(fb, ptr_ty, function_value);
+    let metadata_is_null = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, metadata, 0);
+    let code_snapshot_block = fb.create_block();
+    fb.ins()
+        .brif(metadata_is_null, miss_block, &[], code_snapshot_block, &[]);
+
+    fb.switch_to_block(code_snapshot_block);
+    let current_code = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        function_value,
+        PY_FUNCTION_CODE_OFFSET,
+    );
+    let registered_code = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        metadata,
+        PY_FUNCTION_JIT_EXTRA_REGISTERED_CODE_OFFSET,
+    );
+    let code_matches = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, current_code, registered_code);
+    let current_defaults = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        function_value,
+        PY_FUNCTION_DEFAULTS_OFFSET,
+    );
+    let registered_defaults = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        metadata,
+        crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_DEFAULTS_OFFSET,
+    );
+    let defaults_match = fb.ins().icmp(
+        ir::condcodes::IntCC::Equal,
+        current_defaults,
+        registered_defaults,
+    );
+    let current_kwdefaults = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        function_value,
+        PY_FUNCTION_KWDEFAULTS_OFFSET,
+    );
+    let registered_kwdefaults = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        metadata,
+        crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_KWDEFAULTS_OFFSET,
+    );
+    let kwdefaults_match = fb.ins().icmp(
+        ir::condcodes::IntCC::Equal,
+        current_kwdefaults,
+        registered_kwdefaults,
+    );
+    // Unlike positional defaults, keyword-only defaults live in a mutable
+    // dictionary. Pointer identity cannot prove that the copied runtime slots
+    // still contain the current values after an in-place update or deletion.
+    // Keep those functions on the vectorcall path, which rereads their
+    // keyword-only defaults before binding.
+    let kwdefaults_are_immutable =
+        fb.ins()
+            .icmp_imm(ir::condcodes::IntCC::Equal, current_kwdefaults, 0);
+    let code_and_defaults_match = fb.ins().band(code_matches, defaults_match);
+    let kwdefaults_are_safe = fb.ins().band(kwdefaults_match, kwdefaults_are_immutable);
+    let snapshots_match = fb.ins().band(code_and_defaults_match, kwdefaults_are_safe);
+    let current_code_block = fb.create_block();
+    fb.ins()
+        .brif(snapshots_match, current_code_block, &[], miss_block, &[]);
+
+    fb.switch_to_block(current_code_block);
     fb.ins().jump(done_block, &[ir::BlockArg::Value(packed)]);
 
     fb.switch_to_block(miss_block);
@@ -13985,6 +14034,9 @@ fn runtime_primitive_import_spec(desc: &DirectCallableDesc) -> &'static ImportSp
         DirectEntry::RuntimeSymbol(direct_abi::SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL) => {
             &SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT
         }
+        DirectEntry::RuntimeSymbol(direct_abi::SOAC_JIT_RESUME_GENERATOR_SYMBOL) => {
+            &SOAC_JIT_RESUME_GENERATOR_IMPORT
+        }
         DirectEntry::RuntimeSymbol(symbol) => {
             panic!("missing ImportSpec for runtime primitive symbol {symbol}")
         }
@@ -16204,15 +16256,6 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
             "typed_generator_instance_codegen_lane",
         );
     }
-    let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
-        fb,
-        call.func.as_ref(),
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-        "typed direct callable",
-    )?;
     let mut arg_refs = Vec::with_capacity(call.args.len());
     for arg in &call.args {
         let CallArgPositional::Positional(arg) = arg else {
@@ -16221,6 +16264,15 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
         arg_refs.push(arg);
     }
     if call.extra.generator_instance_plan().is_some() {
+        let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+            "typed direct generator callable",
+        )?;
         let result = emit_typed_generator_instance_call_result_with_arg_refs(
             fb,
             callable,
@@ -16235,41 +16287,25 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
         return Ok(result);
     }
     let TypedDirectCallableCallGuard::Function(guard) = &call.guard;
-    let target_function =
-        direct_call_target_function(emit_ctx, guard.function_id).ok_or_else(|| {
-            format!(
-                "typed direct callable call target {:?} is unavailable",
-                guard.function_id
-            )
-        })?;
-    emit_record_direct_call_target_sample(
+    let direct_specializations =
+        direct_function_specializations_from_typed_guards(std::slice::from_ref(guard));
+    emit_typed_prepared_direct_callable_specialization_result_with_local_env(
         fb,
-        call.try_semantic_instr_id(),
-        guard.function_id,
-        emit_ctx,
-    );
-    let arg_plan = direct_call_arg_plan_from_typed(&guard.arg_plan);
-    let result = emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
-        fb,
-        callable,
-        callable_is_borrowed,
+        call.func.as_ref(),
         arg_refs.as_slice(),
-        &arg_plan,
-        target_function,
+        call.try_semantic_instr_id(),
+        direct_specializations.as_slice(),
         local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )?;
-    emit_owned_pyobject_result_for_demand_with_codegen_imports(
-        fb,
-        result,
-        PyObjFacts::unknown(),
         emit_ctx,
         demand,
         codegen_env,
         func_imports,
     )
+    .and_then(|result| {
+        result.ok_or_else(|| {
+            "typed direct callable call has no guarded direct or generic emission path".to_string()
+        })
+    })
 }
 
 fn emit_typed_codegen_direct_method_call_result_with_local_env(

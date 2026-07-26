@@ -358,6 +358,7 @@ define_runtime_names! {
     AsyncGenSend => "AsyncGenSend",
     AwaitIterWrapper => "_AwaitIterWrapper",
     DynamicCallee => "__dp_dynamic_callee",
+    MakeGeneratorInstance => "make_generator_instance",
 }
 
 #[derive(

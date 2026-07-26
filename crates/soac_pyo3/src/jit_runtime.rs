@@ -1,18 +1,17 @@
 use crate::lowering_error_to_pyerr;
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyTypeError};
 use pyo3::ffi;
+use pyo3::impl_::pyfunction::{PyFunctionDef, PyMethodDef, WrapPyFunctionArg};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule, PyTuple};
-use soac_core::block_py::{
-    BlockPyFunction, BlockPyModule, FunctionExecutionMode, RuntimeFunctionId,
-};
+use soac_core::block_py::{BlockPyFunction, BlockPyModule};
 use soac_core::pass_tracker::RecordingPassTracker;
 use soac_driver::blockpy_cache::{PythonModuleCacheSource, hash_module_source};
 use soac_driver::{PreOptimizationCacheRequest, SourceToBlockPyOptions, source_to_blockpy};
 use soac_ir_blockpy::BlockPyModuleShape;
-use soac_jit::module_type::{ModuleInfo, SoacExtModule};
+use soac_jit::module_type::{ModuleInfo, SoacExtModule, match_original_code_to_functions};
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -104,9 +103,6 @@ fn install_soac_runtime_bootstrap_globals(
     }
     Ok(SoacRuntimeBootstrapGlobals { helpers })
 }
-
-type OriginalCodeMap = HashMap<RuntimeFunctionId, Py<PyAny>>;
-type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
 
 #[derive(Clone)]
 struct TimedPhase {
@@ -292,79 +288,6 @@ fn compile_original_module_code(py: Python<'_>, source: &str, path: &str) -> PyR
         .getattr("compile")?
         .call1((source, path, "exec"))?;
     Ok(code.unbind())
-}
-
-fn collect_original_code_objects(
-    code: &Bound<'_, PyAny>,
-    code_type: &Bound<'_, PyAny>,
-    by_qualname: &mut OriginalCodeByQualname,
-) -> PyResult<()> {
-    let qualname = code.getattr("co_qualname")?.extract::<String>()?;
-    by_qualname
-        .entry(qualname)
-        .or_default()
-        .push_back(code.clone().unbind());
-
-    let consts = code.getattr("co_consts")?;
-    let const_count = unsafe { ffi::PyTuple_Size(consts.as_ptr()) };
-    if const_count < 0 {
-        return Err(PyErr::fetch(code.py()));
-    }
-    for index in 0..const_count {
-        let item = unsafe { ffi::PyTuple_GetItem(consts.as_ptr(), index) };
-        if item.is_null() {
-            return Err(PyErr::fetch(code.py()));
-        }
-        let item = unsafe { Bound::from_borrowed_ptr(code.py(), item) };
-        if item.is_instance(code_type)? {
-            collect_original_code_objects(&item, code_type, by_qualname)?;
-        }
-    }
-    Ok(())
-}
-
-fn is_synthetic_class_helper(function: &BlockPyFunction<BlockPyModuleShape>) -> bool {
-    function.names.bind_name.starts_with("_dp_class_ns_")
-        || function.names.bind_name.starts_with("_dp_define_class_")
-}
-
-fn original_code_lookup_key(function: &BlockPyFunction<BlockPyModuleShape>) -> Option<&str> {
-    if function.execution_mode() == FunctionExecutionMode::Interpreted {
-        return None;
-    }
-    let qualname = function.names.qualname.as_str();
-    if qualname == "_dp_module_init"
-        || function.names.fn_name == "_dp_resume"
-        || is_synthetic_class_helper(function)
-    {
-        return None;
-    }
-    Some(qualname)
-}
-
-fn match_original_code_to_functions(
-    py: Python<'_>,
-    module_code: &Bound<'_, PyAny>,
-    lowered_module: &BlockPyModule<BlockPyModuleShape>,
-) -> PyResult<OriginalCodeMap> {
-    let code_type = PyModule::import(py, "types")?.getattr("CodeType")?;
-    let mut code_by_qualname = HashMap::new();
-    collect_original_code_objects(module_code, &code_type, &mut code_by_qualname)?;
-
-    let mut code_by_function_id = HashMap::new();
-    for function in &lowered_module.callable_defs {
-        let Some(qualname) = original_code_lookup_key(function) else {
-            continue;
-        };
-        let Some(codes) = code_by_qualname.get_mut(qualname) else {
-            continue;
-        };
-        let Some(code) = codes.pop_front() else {
-            continue;
-        };
-        code_by_function_id.insert(function.function_id, code);
-    }
-    Ok(code_by_function_id)
 }
 
 fn resolve_module_name(module_globals: &Bound<'_, PyAny>, operation: &str) -> PyResult<String> {
@@ -748,6 +671,65 @@ fn resume_generator(
     unsafe { Bound::from_owned_ptr_or_err(py, value) }.map(Bound::unbind)
 }
 
+static RESUME_GENERATOR_FASTCALL: PyFunctionDef = PyFunctionDef::from_method_def(
+    PyMethodDef::fastcall_cfunction_with_keywords(
+        c"resume_generator",
+        resume_generator_fastcall,
+        c"resume_generator($module, handle, owner, preserved_state, send_value, resume_exc)\n--\n\n",
+    ),
+);
+
+unsafe extern "C" fn resume_generator_fastcall(
+    module: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+    kwnames: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let has_keywords = !kwnames.is_null() && unsafe { ffi::PyTuple_GET_SIZE(kwnames) } != 0;
+
+    if nargs < 0 || (args.is_null() && (nargs != 0 || has_keywords)) {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_SystemError,
+                c"generator resume fastcall received an invalid argument array".as_ptr(),
+            );
+        }
+        return std::ptr::null_mut();
+    }
+
+    if nargs == 5 && !has_keywords {
+        return unsafe {
+            soac_jit::soac_jit_resume_generator(
+                *args,
+                *args.add(1),
+                *args.add(2),
+                *args.add(3),
+                *args.add(4),
+            )
+        };
+    }
+
+    if module.is_null() {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_SystemError,
+                c"generator resume fastcall received a null module".as_ptr(),
+            );
+        }
+        return std::ptr::null_mut();
+    }
+
+    let fallback =
+        unsafe { ffi::PyObject_GetAttrString(module, c"_resume_generator_pyo3_fallback".as_ptr()) };
+    if fallback.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let result = unsafe { ffi::PyObject_Vectorcall(fallback, args, nargs as usize, kwnames) };
+    unsafe { ffi::Py_DECREF(fallback) };
+    result
+}
+
 #[pyfunction]
 fn resume_async_generator(
     py: Python<'_>,
@@ -802,7 +784,12 @@ pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(wrap_pyfunction!(force_entry_interpreter_for_tests, module)?)?;
     module.add_function(wrap_pyfunction!(import_, module)?)?;
     module.add_function(wrap_pyfunction!(import_attr, module)?)?;
-    module.add_function(wrap_pyfunction!(resume_generator, module)?)?;
+    // Retain PyO3's exact keyword parsing and argument errors off the hot path.
+    module.add(
+        "_resume_generator_pyo3_fallback",
+        wrap_pyfunction!(resume_generator, module)?,
+    )?;
+    module.add_function(module.wrap_pyfunction(&RESUME_GENERATOR_FASTCALL)?)?;
     module.add_function(wrap_pyfunction!(resume_async_generator, module)?)?;
     module.add_function(wrap_pyfunction!(make_preserved_state, module)?)?;
     module.add_function(wrap_pyfunction!(load_preserved_state, module)?)?;

@@ -32,11 +32,12 @@ use soac_ir_blockpy::is_constructor_entry_function;
 use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
 use soac_ir_typed::plan_v3::{
     DirectCallArgPlan, DirectCallArgSource, DirectCallCallee, DirectCallSpecializationPlan,
-    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
-    ExactListItemSpecializationPlan, FunctionOptimizationPlanV3, FunctionPlanIdentity,
-    IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
-    IndexedGlobalAccessKind, IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3,
-    ModulePlanIdentity, PlanDiagnostic, RegionId,
+    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, EXACT_TUPLE_EXACT_INT_ITEM_SHAPE_TAG,
+    ExactListItemAccessKind, ExactListItemShape, ExactListItemSpecializationPlan,
+    FunctionOptimizationPlanV3, FunctionPlanIdentity, IndexedFieldAccessKind,
+    IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
+    IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic,
+    RegionId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -787,10 +788,17 @@ fn validate_exact_list_item_plan_against_lowered_function(
             planned_function.function.function, plan.access, plan.source, lowered.access
         )));
     }
-    if plan.shape != ExactListItemShape::ExactListExactInt {
+    if !matches!(
+        (plan.shape, plan.access),
+        (ExactListItemShape::ExactListExactInt, _)
+            | (
+                ExactListItemShape::ExactTupleExactInt,
+                ExactListItemAccessKind::Get
+            )
+    ) {
         return Err(MechanicalEmitError::EmissionMismatch(format!(
-            "function {} exact-list item shape {:?} for {}, but codegen only supports ExactListExactInt",
-            planned_function.function.function, plan.shape, plan.source
+            "function {} exact-list item shape {:?} with access {:?} for {}, but codegen only supports exact-list get/set and exact-tuple get",
+            planned_function.function.function, plan.shape, plan.access, plan.source
         )));
     }
     Ok(())
@@ -941,6 +949,18 @@ fn exact_list_item_requests_from_profile_evidence_v3(
                             shape: ExactListItemShape::ExactListExactInt,
                             reason: format!(
                                 "profiled {counter_kind} selected exact-list/exact-int item specialization"
+                            ),
+                        });
+                    }
+                    EXACT_TUPLE_EXACT_INT_ITEM_SHAPE_TAG
+                        if access == ExactListItemAccessKind::Get =>
+                    {
+                        self.requests.push(ExactListItemPlanRequest {
+                            source,
+                            access,
+                            shape: ExactListItemShape::ExactTupleExactInt,
+                            reason: format!(
+                                "profiled {counter_kind} selected exact-tuple/exact-int item specialization"
                             ),
                         });
                     }
@@ -3043,6 +3063,72 @@ mod tests {
         assert_eq!(requests[1].source, set_source);
         assert_eq!(requests[1].access, ExactListItemAccessKind::Set);
         assert_eq!(requests[1].shape, ExactListItemShape::ExactListExactInt);
+    }
+
+    #[test]
+    fn exact_tuple_get_requests_are_derived_from_raw_shape_evidence() {
+        let get_source = InstrId::new(5);
+        let block = Block::new(
+            label(0),
+            vec![
+                InstrBlockPy::GetItem(GetItem::new(local("items", 0), local("index", 1)))
+                    .with_meta(Meta {
+                        instr_id: Some(get_source),
+                        ..Meta::synthetic()
+                    }),
+            ],
+            BlockTerm::jump_term(label(1)),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        let function = function_with_blocks(vec![block]);
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .getitem_specializations
+            .insert(get_source, vec![EXACT_TUPLE_EXACT_INT_ITEM_SHAPE_TAG]);
+
+        let (requests, diagnostics) =
+            exact_list_item_requests_from_profile_evidence_v3(&function, &evidence);
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source, get_source);
+        assert_eq!(requests[0].access, ExactListItemAccessKind::Get);
+        assert_eq!(requests[0].shape, ExactListItemShape::ExactTupleExactInt);
+    }
+
+    #[test]
+    fn exact_tuple_set_shape_is_not_selected_from_profile_evidence() {
+        let set_source = InstrId::new(8);
+        let block = Block::new(
+            label(0),
+            vec![
+                InstrBlockPy::SetItem(SetItem::new(
+                    local("items", 0),
+                    local("index", 1),
+                    local("value", 2),
+                ))
+                .with_meta(Meta {
+                    instr_id: Some(set_source),
+                    ..Meta::synthetic()
+                }),
+            ],
+            BlockTerm::jump_term(label(1)),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        let function = function_with_blocks(vec![block]);
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .setitem_specializations
+            .insert(set_source, vec![EXACT_TUPLE_EXACT_INT_ITEM_SHAPE_TAG]);
+
+        let (requests, diagnostics) =
+            exact_list_item_requests_from_profile_evidence_v3(&function, &evidence);
+
+        assert!(requests.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("setitem_hot_shapes"));
     }
 
     #[test]

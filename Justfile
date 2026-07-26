@@ -1002,6 +1002,69 @@ nqueens-slice slice queen_count loops="1" opt_mode="none" work_dir="": build-tes
 
   "$VENV_DIR/bin/python" -c 'import importlib, os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); module = importlib.import_module("nqueens_slice_" + os.environ["NQUEENS_SLICE"]); raise SystemExit(module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], os.environ["NQUEENS_LOOPS"]]))'
 
+nqueens-slice-release slice queen_count loops="1" opt_mode="none" work_dir="": ensure-shared-python ensure-venv (build-extension "release")
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  SLICE="{{slice}}"
+  QUEEN_COUNT="{{queen_count}}"
+  LOOPS="{{loops}}"
+  OPT_MODE="{{opt_mode}}"
+  COUNTERS_DIR="{{work_dir}}"
+
+  case "$OPT_MODE" in
+    stock|none|profile|verify|apply) ;;
+    *)
+      echo "unknown N-Queens optimization mode: $OPT_MODE" >&2
+      echo "expected one of: stock, none, profile, verify, apply" >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ "$COUNTERS_DIR" == work_dir=* ]]; then
+    echo "nqueens-slice-release: pass the work dir as the fifth positional argument, without a work_dir= prefix" >&2
+    exit 2
+  fi
+
+  if [[ -z "$COUNTERS_DIR" ]]; then
+    COUNTERS_DIR="$REPO_ROOT/work/bench/nqueens-slices/release/$SLICE"
+  elif [[ "$COUNTERS_DIR" != /* ]]; then
+    COUNTERS_DIR="$REPO_ROOT/$COUNTERS_DIR"
+  fi
+
+  export NQUEENS_SLICE="$SLICE"
+  export NQUEENS_QUEEN_COUNT="$QUEEN_COUNT"
+  export NQUEENS_LOOPS="$LOOPS"
+
+  if [[ "$OPT_MODE" == stock ]]; then
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" \
+      "$CPYTHON_BIN" \
+      -c 'import importlib, os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); module = importlib.import_module("nqueens_slice_" + os.environ["NQUEENS_SLICE"]); raise SystemExit(module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], os.environ["NQUEENS_LOOPS"]]))'
+    exit 0
+  fi
+
+  if [[ "$OPT_MODE" == verify || "$OPT_MODE" == apply ]]; then
+    if [[ ! -s "$COUNTERS_DIR/profile.bin" ]]; then
+      echo "N-Queens profile not found at $COUNTERS_DIR/profile.bin; run the same release slice in profile mode first" >&2
+      exit 1
+    fi
+  fi
+
+  mkdir -p "$COUNTERS_DIR"
+  export SOAC_WORK_DIR="$COUNTERS_DIR"
+  export SOAC_OPT_MODE="$OPT_MODE"
+  export SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$BENCHMARK_SOURCE_DIR}"
+  export SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}"
+  export SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}"
+  export SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}"
+  export SOAC_JIT_EMIT_REFCOUNTS=1
+  export SOAC_JIT_BB_MAP=0
+
+  "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" \
+    "$VENV_DIR/bin/python" -c 'import importlib, os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); module = importlib.import_module("nqueens_slice_" + os.environ["NQUEENS_SLICE"]); raise SystemExit(module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], os.environ["NQUEENS_LOOPS"]]))'
+
 nqueens-slice-compile slice queen_count loops="1" opt_mode="apply" work_dir="": build-test-runtime-fast
   #!/usr/bin/env bash
   set -euo pipefail
@@ -1046,6 +1109,288 @@ nqueens-slice-stock slice queen_count loops="1":
     "{{slice}}" \
     "{{queen_count}}" \
     "{{loops}}"
+
+nqueens-slice-perf mode slice queen_count loops="10" work_dir="" output_prefix="": ensure-shared-python ensure-venv (build-extension "release")
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  MODE="{{mode}}"
+  SLICE="{{slice}}"
+  QUEEN_COUNT="{{queen_count}}"
+  LOOPS="{{loops}}"
+  COUNTERS_DIR="{{work_dir}}"
+  OUTPUT_PREFIX="{{output_prefix}}"
+  PERF_FREQUENCY="${PERF_FREQUENCY:-99}"
+  PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,65528}"
+  PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.5}"
+
+  case "$MODE" in
+    stock|apply) ;;
+    soac) MODE=apply ;;
+    *)
+      echo "unknown N-Queens perf mode: $MODE" >&2
+      echo "expected one of: stock, apply, soac" >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ "$COUNTERS_DIR" == work_dir=* ]]; then
+    echo "nqueens-slice-perf: pass the work dir as the fifth positional argument, without a work_dir= prefix" >&2
+    exit 2
+  fi
+
+  if [[ -z "$COUNTERS_DIR" ]]; then
+    COUNTERS_DIR="$REPO_ROOT/work/bench/nqueens-slices/release/$SLICE"
+  elif [[ "$COUNTERS_DIR" != /* ]]; then
+    COUNTERS_DIR="$REPO_ROOT/$COUNTERS_DIR"
+  fi
+
+  if [[ -z "$OUTPUT_PREFIX" ]]; then
+    OUTPUT_PREFIX="$REPO_ROOT/work/logs/nqueens-slices/$SLICE-$MODE"
+  elif [[ "$OUTPUT_PREFIX" != /* ]]; then
+    OUTPUT_PREFIX="$REPO_ROOT/$OUTPUT_PREFIX"
+  fi
+
+  if ! command -v perf >/dev/null 2>&1; then
+    echo "perf is required but was not found on PATH" >&2
+    exit 1
+  fi
+
+  if [[ "$MODE" == apply && ! -s "$COUNTERS_DIR/profile.bin" ]]; then
+    echo "N-Queens profile not found at $COUNTERS_DIR/profile.bin; run the same release slice in profile mode first" >&2
+    exit 1
+  fi
+
+  mkdir -p "$COUNTERS_DIR" "$(dirname "$OUTPUT_PREFIX")"
+  PERF_DATA="$OUTPUT_PREFIX.data"
+  INJECTED_PERF_DATA="$OUTPUT_PREFIX.injected.data"
+  RUN_LOG="$OUTPUT_PREFIX.log"
+  PERF_RECORD_LOG="${OUTPUT_PREFIX}_record.txt"
+  PERF_INJECT_LOG="${OUTPUT_PREFIX}_inject.txt"
+  REPORT_SYMBOLS="${OUTPUT_PREFIX}_report.txt"
+  REPORT_DSO="${OUTPUT_PREFIX}_by_dso.txt"
+  REPORT_DSO_SYMBOLS="${OUTPUT_PREFIX}_by_dso_symbol.txt"
+  REPORT_CALLGRAPH="${OUTPUT_PREFIX}_callgraph.txt"
+
+  mkdir -p "$REPO_ROOT/work/tmp"
+  READY_FILE="$(mktemp "$REPO_ROOT/work/tmp/nqueens_perf_ready.XXXXXX")"
+  WORKLOAD_PID=""
+  PY_PID=""
+  PERF_PID=""
+
+  cleanup() {
+    if [[ -n "$PERF_PID" ]] && kill -0 "$PERF_PID" >/dev/null 2>&1; then
+      kill -INT "$PERF_PID" >/dev/null 2>&1 || true
+      wait "$PERF_PID" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$PY_PID" ]] && kill -0 "$PY_PID" >/dev/null 2>&1; then
+      kill -CONT "$PY_PID" >/dev/null 2>&1 || true
+      kill "$PY_PID" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$WORKLOAD_PID" ]] && kill -0 "$WORKLOAD_PID" >/dev/null 2>&1; then
+      kill "$WORKLOAD_PID" >/dev/null 2>&1 || true
+      wait "$WORKLOAD_PID" >/dev/null 2>&1 || true
+    fi
+    rm -f "$READY_FILE"
+  }
+  trap cleanup EXIT
+
+  export NQUEENS_SLICE="$SLICE"
+  export NQUEENS_QUEEN_COUNT="$QUEEN_COUNT"
+  export NQUEENS_LOOPS="$LOOPS"
+  export NQUEENS_READY_FILE="$READY_FILE"
+
+  if [[ "$MODE" == stock ]]; then
+    workload=(
+      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh"
+      "$CPYTHON_BIN"
+      -c
+      'import importlib, os, pathlib, signal, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); module = importlib.import_module("nqueens_slice_" + os.environ["NQUEENS_SLICE"]); warm_status = module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], "1", "--compile-only"]); warm_status and sys.exit(warm_status); pathlib.Path(os.environ["NQUEENS_READY_FILE"]).write_text(str(os.getpid()) + "\n", encoding="utf-8"); os.kill(os.getpid(), signal.SIGSTOP); raise SystemExit(module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], os.environ["NQUEENS_LOOPS"]]))'
+    )
+  else
+    export SOAC_WORK_DIR="$COUNTERS_DIR"
+    export SOAC_OPT_MODE=apply
+    export SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$BENCHMARK_SOURCE_DIR}"
+    export SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}"
+    export SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}"
+    export SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}"
+    export SOAC_JIT_EMIT_REFCOUNTS=1
+    export SOAC_JIT_BB_MAP=1
+    workload=(
+      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh"
+      "$VENV_DIR/bin/python"
+      -c
+      'import importlib, os, pathlib, signal, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); module = importlib.import_module("nqueens_slice_" + os.environ["NQUEENS_SLICE"]); warm_status = module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], "1", "--compile-only"]); warm_status and sys.exit(warm_status); pathlib.Path(os.environ["NQUEENS_READY_FILE"]).write_text(str(os.getpid()) + "\n", encoding="utf-8"); os.kill(os.getpid(), signal.SIGSTOP); raise SystemExit(module.main([module.__name__ + ".py", os.environ["NQUEENS_QUEEN_COUNT"], os.environ["NQUEENS_LOOPS"]]))'
+    )
+  fi
+
+  echo "N-Queens perf mode: $MODE"
+  echo "N-Queens slice: $SLICE"
+  echo "queen count: $QUEEN_COUNT"
+  echo "loops: $LOOPS"
+  echo "perf event: cpu-clock"
+  echo "perf data: $PERF_DATA"
+
+  "${workload[@]}" >"$RUN_LOG" 2>&1 &
+  WORKLOAD_PID=$!
+
+  for _ in $(seq 1 2400); do
+    if [[ -s "$READY_FILE" ]]; then
+      break
+    fi
+    if ! kill -0 "$WORKLOAD_PID" >/dev/null 2>&1; then
+      if wait "$WORKLOAD_PID"; then
+        WORKLOAD_STATUS=0
+      else
+        WORKLOAD_STATUS=$?
+      fi
+      WORKLOAD_PID=""
+      cat "$RUN_LOG" >&2
+      if [[ "$WORKLOAD_STATUS" -eq 0 ]]; then
+        echo "N-Queens workload exited before warmup readiness" >&2
+        exit 1
+      fi
+      exit "$WORKLOAD_STATUS"
+    fi
+    sleep 0.05
+  done
+
+  if [[ ! -s "$READY_FILE" ]]; then
+    echo "timed out waiting for N-Queens warmup readiness" >&2
+    cat "$RUN_LOG" >&2
+    exit 1
+  fi
+  IFS= read -r PY_PID <"$READY_FILE"
+  if [[ ! "$PY_PID" =~ ^[1-9][0-9]*$ ]]; then
+    echo "N-Queens warmup reported an invalid Python PID: $PY_PID" >&2
+    exit 1
+  fi
+
+  for _ in $(seq 1 200); do
+    PY_STATE="$(ps -o state= -p "$PY_PID" 2>/dev/null | tr -d ' ' || true)"
+    if [[ "$PY_STATE" == T* ]]; then
+      break
+    fi
+    if ! kill -0 "$WORKLOAD_PID" >/dev/null 2>&1 \
+      || ! kill -0 "$PY_PID" >/dev/null 2>&1; then
+      echo "N-Queens workload exited before stopping for perf attach" >&2
+      cat "$RUN_LOG" >&2
+      exit 1
+    fi
+    sleep 0.01
+  done
+  if [[ "$PY_STATE" != T* ]]; then
+    echo "N-Queens Python never entered SIGSTOP for perf attach" >&2
+    exit 1
+  fi
+
+  perf record \
+    --event cpu-clock \
+    --mmap-pages 1024 \
+    --call-graph "$PERF_CALL_GRAPH" \
+    -F "$PERF_FREQUENCY" \
+    -k 1 \
+    -o "$PERF_DATA" \
+    -p "$PY_PID" \
+    >"$PERF_RECORD_LOG" 2>&1 &
+  PERF_PID=$!
+
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$PERF_PID" >/dev/null 2>&1; then
+      if wait "$PERF_PID"; then
+        PERF_STATUS=0
+      else
+        PERF_STATUS=$?
+      fi
+      PERF_PID=""
+      cat "$PERF_RECORD_LOG" >&2
+      echo "perf exited before the warmed N-Queens workload resumed" >&2
+      if [[ "$PERF_STATUS" -eq 0 ]]; then
+        exit 1
+      fi
+      exit "$PERF_STATUS"
+    fi
+    sleep 0.01
+  done
+
+  kill -CONT "$PY_PID"
+  if wait "$WORKLOAD_PID"; then
+    WORKLOAD_STATUS=0
+  else
+    WORKLOAD_STATUS=$?
+  fi
+  WORKLOAD_PID=""
+  PY_PID=""
+
+  if kill -0 "$PERF_PID" >/dev/null 2>&1; then
+    kill -INT "$PERF_PID" >/dev/null 2>&1 || true
+  fi
+  if wait "$PERF_PID"; then
+    PERF_STATUS=0
+  else
+    PERF_STATUS=$?
+  fi
+  PERF_PID=""
+
+  if [[ "$WORKLOAD_STATUS" -ne 0 ]]; then
+    cat "$RUN_LOG" >&2
+    exit "$WORKLOAD_STATUS"
+  fi
+  if [[ "$PERF_STATUS" -ne 0 && "$PERF_STATUS" -ne 130 ]]; then
+    cat "$PERF_RECORD_LOG" >&2
+    exit "$PERF_STATUS"
+  fi
+  if grep -Eiq 'lost[[:space:]]+[1-9][0-9,]*[[:space:]]+(samples?|chunks?)|[1-9][0-9,]*[[:space:]]+(samples?|chunks?)[[:space:]]+lost' "$PERF_RECORD_LOG"; then
+    echo "N-Queens perf lost samples or chunks; see $PERF_RECORD_LOG" >&2
+    cat "$PERF_RECORD_LOG" >&2
+    exit 1
+  fi
+
+  cat "$RUN_LOG"
+  PERF_HEADER="$(perf report --header-only -i "$PERF_DATA")"
+  if [[ "$PERF_HEADER" == *"time of first sample : 0.000000"* ]]; then
+    echo "N-Queens perf captured no samples; see $PERF_RECORD_LOG" >&2
+    exit 1
+  fi
+  REPORT_DATA="$PERF_DATA"
+  if [[ "$MODE" == apply ]]; then
+    if perf inject --jit \
+      -i "$PERF_DATA" \
+      -o "$INJECTED_PERF_DATA" \
+      >"$PERF_INJECT_LOG" 2>&1; then
+      INJECTED_PERF_HEADER="$(perf report --header-only -i "$INJECTED_PERF_DATA" 2>>"$PERF_INJECT_LOG")"
+      if [[ "$INJECTED_PERF_HEADER" == *"time of first sample : 0.000000"* ]]; then
+        echo "JIT injection produced no samples; reporting the original perf data (see $PERF_INJECT_LOG)" >&2
+      else
+        REPORT_DATA="$INJECTED_PERF_DATA"
+        echo "JIT-injected perf data: $INJECTED_PERF_DATA"
+      fi
+    else
+      echo "JIT injection unavailable; reporting the original perf data (see $PERF_INJECT_LOG)" >&2
+    fi
+  fi
+
+  perf report --stdio --percent-limit "$PERF_PERCENT_LIMIT" \
+    --sort overhead,symbol -i "$REPORT_DATA" >"$REPORT_SYMBOLS"
+  if grep -Eq '^#[[:space:]]*Total[[:space:]]+Lost[[:space:]]+Samples:[[:space:]]*[1-9][0-9,]*([[:space:]]|$)' "$REPORT_SYMBOLS"; then
+    echo "N-Queens perf report contains lost samples; see $REPORT_SYMBOLS" >&2
+    exit 1
+  fi
+  perf report --stdio --percent-limit "$PERF_PERCENT_LIMIT" \
+    --sort overhead,dso -i "$REPORT_DATA" >"$REPORT_DSO"
+  perf report --stdio --percent-limit "$PERF_PERCENT_LIMIT" \
+    --sort overhead,dso,symbol -i "$REPORT_DATA" >"$REPORT_DSO_SYMBOLS"
+  perf report --stdio --percent-limit "$PERF_PERCENT_LIMIT" \
+    --sort overhead,symbol --children --call-graph graph,0.5,caller \
+    -i "$REPORT_DATA" >"$REPORT_CALLGRAPH"
+
+  echo "perf record log: $PERF_RECORD_LOG"
+  echo "symbol report: $REPORT_SYMBOLS"
+  echo "DSO report: $REPORT_DSO"
+  echo "DSO and symbol report: $REPORT_DSO_SYMBOLS"
+  echo "callgraph report: $REPORT_CALLGRAPH"
 
 cpython *args='':
   #!/usr/bin/env bash

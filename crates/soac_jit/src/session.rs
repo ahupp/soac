@@ -55,6 +55,13 @@ enum CachedSpecializationMode {
     Apply,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum CachedSharedTypedModulePlanMode {
+    Profile,
+    Verify,
+    Apply,
+}
+
 impl PlannedOptimizationInputsCacheKey {
     pub(crate) fn new(
         module_storage_instance_key: usize,
@@ -76,8 +83,8 @@ impl PlannedOptimizationInputsCacheKey {
 pub(crate) struct SharedTypedModulePlanCacheKey {
     module_storage_instance_key: usize,
     shared_module_registry_epoch: u64,
-    counter_dump_path: PathBuf,
-    specialization_mode: CachedSpecializationMode,
+    counter_dump_path: Option<PathBuf>,
+    specialization_mode: CachedSharedTypedModulePlanMode,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
     guard_miss_deopt: bool,
@@ -87,13 +94,18 @@ impl SharedTypedModulePlanCacheKey {
     pub(crate) fn new(
         module_storage_instance_key: usize,
         shared_module_registry_epoch: u64,
-        counter_dump_path: PathBuf,
+        counter_dump_path: Option<PathBuf>,
         specialization_mode: SpecializationMode,
         behavior_change_indexed_stores: bool,
         profiled_cold_blocks: bool,
         guard_miss_deopt: bool,
     ) -> Option<Self> {
-        let specialization_mode = CachedSpecializationMode::new(specialization_mode)?;
+        let specialization_mode = CachedSharedTypedModulePlanMode::from(specialization_mode);
+        if specialization_mode != CachedSharedTypedModulePlanMode::Profile
+            && counter_dump_path.is_none()
+        {
+            return None;
+        }
         Some(Self {
             module_storage_instance_key,
             shared_module_registry_epoch,
@@ -103,6 +115,16 @@ impl SharedTypedModulePlanCacheKey {
             profiled_cold_blocks,
             guard_miss_deopt,
         })
+    }
+}
+
+impl From<SpecializationMode> for CachedSharedTypedModulePlanMode {
+    fn from(specialization_mode: SpecializationMode) -> Self {
+        match specialization_mode {
+            SpecializationMode::Profile => Self::Profile,
+            SpecializationMode::Verify => Self::Verify,
+            SpecializationMode::Apply => Self::Apply,
+        }
     }
 }
 
@@ -384,10 +406,116 @@ impl fmt::Debug for CompileSession {
 
 #[cfg(test)]
 mod test {
-    use super::{CompileSession, allocate_compile_session_id};
+    use super::{
+        CachedSharedTypedModulePlanMode, CompileSession, PlannedOptimizationInputsCacheKey,
+        SharedTypedModulePlanCacheKey, allocate_compile_session_id,
+    };
+    use soac_config::SpecializationMode;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     static SESSION_ID_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn profile_mode_caches_shared_typed_module_plans_without_counter_evidence() {
+        let key = SharedTypedModulePlanCacheKey::new(
+            1,
+            2,
+            None,
+            SpecializationMode::Profile,
+            false,
+            false,
+            false,
+        )
+        .expect("profile mode should cache a shared typed module plan without counter evidence");
+
+        assert_eq!(
+            key.specialization_mode,
+            CachedSharedTypedModulePlanMode::Profile
+        );
+        assert!(key.counter_dump_path.is_none());
+    }
+
+    #[test]
+    fn profile_mode_does_not_cache_planned_optimization_inputs() {
+        let key = PlannedOptimizationInputsCacheKey::new(
+            1,
+            2,
+            PathBuf::from("profile.bin"),
+            SpecializationMode::Profile,
+        );
+
+        assert!(
+            key.is_none(),
+            "profile mode must not cache replay-only planned optimization inputs",
+        );
+    }
+
+    #[test]
+    fn replay_modes_require_counter_evidence_for_shared_typed_module_plans() {
+        for mode in [SpecializationMode::Verify, SpecializationMode::Apply] {
+            let key = SharedTypedModulePlanCacheKey::new(1, 2, None, mode, false, false, false);
+
+            assert!(
+                key.is_none(),
+                "{mode:?} must not cache a shared typed module plan without counter evidence",
+            );
+        }
+    }
+
+    #[test]
+    fn replay_modes_have_distinct_shared_typed_module_plan_cache_keys() {
+        let counter_dump_path = PathBuf::from("profile.bin");
+        let verify = SharedTypedModulePlanCacheKey::new(
+            1,
+            2,
+            Some(counter_dump_path.clone()),
+            SpecializationMode::Verify,
+            false,
+            false,
+            false,
+        )
+        .expect("verify mode should cache a shared typed module plan with counter evidence");
+        let apply = SharedTypedModulePlanCacheKey::new(
+            1,
+            2,
+            Some(counter_dump_path),
+            SpecializationMode::Apply,
+            false,
+            false,
+            false,
+        )
+        .expect("apply mode should cache a shared typed module plan with counter evidence");
+
+        assert_ne!(
+            verify, apply,
+            "verify and apply must not reuse each other's shared typed module plans",
+        );
+    }
+
+    #[test]
+    fn replay_modes_have_distinct_planned_optimization_input_cache_keys() {
+        let counter_dump_path = PathBuf::from("profile.bin");
+        let verify = PlannedOptimizationInputsCacheKey::new(
+            1,
+            2,
+            counter_dump_path.clone(),
+            SpecializationMode::Verify,
+        )
+        .expect("verify mode should cache replayed optimization inputs");
+        let apply = PlannedOptimizationInputsCacheKey::new(
+            1,
+            2,
+            counter_dump_path,
+            SpecializationMode::Apply,
+        )
+        .expect("apply mode should cache replayed optimization inputs");
+
+        assert_ne!(
+            verify, apply,
+            "verify and apply must not reuse each other's replayed optimization inputs",
+        );
+    }
 
     #[test]
     fn allocated_session_ids_increase_sequentially() {

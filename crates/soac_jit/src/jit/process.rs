@@ -2766,6 +2766,10 @@ impl ProcessJitEngine {
         session: Arc<crate::session::CompileSession>,
         shared_state: Arc<crate::module_type::SharedModuleState>,
     ) -> Result<(), String> {
+        let records_specialization_counters = session
+            .env_config()?
+            .specialization_mode()
+            .is_some_and(|mode| mode.records_counters());
         let batch_functions: Vec<_> = shared_state
             .lowered_module
             .callable_defs
@@ -2773,7 +2777,14 @@ impl ProcessJitEngine {
             .filter(|function| {
                 function.function_id != RuntimeFunctionId::global()
                     && function.execution_mode() == FunctionExecutionMode::Jit
-                    && !keeps_source_generator_vectorcall(&shared_state, function)
+                    && !keeps_source_generator_vectorcall(
+                        function.lowered_kind(),
+                        function.names.display_name.as_str(),
+                        shared_state
+                            .lookup_original_code(function.function_id)
+                            .is_some(),
+                        records_specialization_counters,
+                    )
             })
             .cloned()
             .map(|function| ProcessJitBatchFunction {
@@ -3540,18 +3551,20 @@ impl From<DirectFunctionCompileResult> for DirectFunctionCompileAttempt {
 }
 
 fn keeps_source_generator_vectorcall(
-    shared_state: &crate::module_type::SharedModuleState,
-    function: &BlockPyFunction<BlockPyModuleShape>,
+    function_kind: &FunctionKind,
+    display_name: &str,
+    has_original_runtime_code: bool,
+    records_specialization_counters: bool,
 ) -> bool {
-    function.lowered_kind() == &FunctionKind::Generator
-        && shared_state
-            .lookup_original_code(function.function_id)
-            .is_some()
+    has_original_runtime_code
+        && *function_kind == FunctionKind::Generator
+        && display_name != "<genexpr>"
+        && !records_specialization_counters
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessJitModule, ProcessJitState};
+    use super::{ProcessJitModule, ProcessJitState, keeps_source_generator_vectorcall};
     use crate::jit::RuntimeJitDeoptTable;
     use soac_core::block_py::{
         BlockPyFunction, FunctionKind, FunctionName, ModuleNameGen, Param, ParamKind, ParamSpec,
@@ -3577,6 +3590,54 @@ mod tests {
             storage_layout: None,
             scope: Default::default(),
         }
+    }
+
+    #[test]
+    fn source_named_generators_keep_vectorcall_outside_counter_modes() {
+        assert!(keeps_source_generator_vectorcall(
+            &FunctionKind::Generator,
+            "items",
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn source_named_generators_are_eagerly_compiled_in_counter_modes() {
+        assert!(!keeps_source_generator_vectorcall(
+            &FunctionKind::Generator,
+            "items",
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn source_generator_expressions_are_eagerly_compiled_in_every_mode() {
+        for records_specialization_counters in [false, true] {
+            assert!(!keeps_source_generator_vectorcall(
+                &FunctionKind::Generator,
+                "<genexpr>",
+                true,
+                records_specialization_counters,
+            ));
+        }
+    }
+
+    #[test]
+    fn generated_or_non_generator_functions_remain_eagerly_compiled() {
+        assert!(!keeps_source_generator_vectorcall(
+            &FunctionKind::Generator,
+            "items",
+            false,
+            false,
+        ));
+        assert!(!keeps_source_generator_vectorcall(
+            &FunctionKind::Function,
+            "items",
+            true,
+            false,
+        ));
     }
 
     #[test]

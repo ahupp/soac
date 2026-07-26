@@ -1422,3 +1422,66 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - no-refcount diagnostic median: n/a
   - total pystone code size: `438779 bytes`, `24590` machine blocks
   - core pystone code size: `426523 bytes`
+
+## 2026-07-26 - Bring native N-Queens to practical CPython parity
+
+- jj change id: `mzvswpyykkts`
+- summary: specialize tuple accesses, generator calls, and field reads; retain
+  source-backed generator globals, native vectorcall, CPython call versions,
+  owned mutation snapshots, and lazily watched mutable method owners.
+- native N-Queens, CPU 16, 200 loops, 92 solutions: SOAC `8.203 runs/s`, stock
+  CPython `8.503 runs/s`; SOAC is `3.53%` slower.
+- loss-checked Linux `perf`, 160 loops, 92 solutions: SOAC `8.212 runs/s`, stock
+  CPython `8.326 runs/s`; SOAC is `1.37%` slower, with zero lost samples.
+- repeated loss-checked Linux `perf` after production-faithful generator
+  inspection, 160 loops, 92 solutions: SOAC `8.251 runs/s`, stock CPython
+  `8.453 runs/s`; SOAC is `2.39%` slower, with zero lost samples in both runs.
+- repeated loss-checked Linux `perf` after guarding ordinary direct calls and
+  inlined functions against code mutation, 160 loops, 92 solutions: SOAC
+  `8.268 runs/s`, stock CPython `8.453 runs/s`; SOAC is `2.19%` slower, with
+  zero lost samples in both runs. The remaining global function-watcher
+  dispatch accounts for `0.75%` of sampled SOAC execution.
+- loss-checked Linux `perf` after restoring explicitly trusted,
+  guard-free runtime inlining, 160 loops, 92 solutions: SOAC `8.118 runs/s`,
+  stock CPython `8.512 runs/s`; SOAC is `4.63%` slower, with zero lost samples
+  in both runs. Global function-watcher dispatch accounts for `0.82%` of
+  sampled SOAC execution; CPython parity remains unachieved.
+- CPU-pinned release measurement without `perf` sampling, 240 loops, 92
+  solutions: SOAC `8.248 runs/s`, stock CPython `8.459 runs/s`; SOAC is
+  `2.49%` slower. The direct-call code guard now retains an append-only
+  per-function code snapshot as preparation for reducing watcher overhead.
+- loss-checked Linux `perf` with the ABI-preserving per-function code guard,
+  160 loops, 92 solutions: SOAC `8.256 runs/s`, stock CPython `8.476 runs/s`;
+  SOAC is `2.60%` slower, with zero lost samples in both runs. The exact
+  function guard validates the live CPython code pointer before entering
+  optimized direct or inlined function bodies.
+- loss-checked Linux `perf` after removing the eager process-wide function
+  watcher, 160 loops, 92 solutions: SOAC `8.320 runs/s`, stock CPython
+  `8.479 runs/s`; SOAC is `1.88%` slower, with zero lost samples in both
+  runs. Ordinary functions use owned code/default snapshots and cold native
+  vectorcall fallback; compiler-owned runtime classes retain indexed owner
+  metadata, while mutable source classes enable the watcher lazily.
+- repeated CPU-pinned production measurements without `perf` sampling,
+  240 loops each, 92 solutions: SOAC `8.425`, `8.431`, and `8.450 runs/s`;
+  stock CPython `8.410`, `8.468`, and `8.533 runs/s`. Median throughput is
+  `8.431` versus `8.468 runs/s`, `0.44%` below stock and within native
+  N-Queens parity; one stock-first comparison is `0.25%` faster than stock.
+- final loss-free Linux `perf` comparison at 49 Hz, CPU 16, 240 loops, 92
+  solutions: SOAC `8.173 runs/s`, stock CPython `8.193 runs/s`; SOAC is
+  `0.24%` below stock. Both runs retained deep DWARF call graphs and lost zero
+  samples or chunks.
+- alternating same-process comparison using two real imported modules on CPU
+  16, ten 20-loop samples per mode: median SOAC throughput is `8.3206 runs/s`
+  versus stock CPython `8.3173 runs/s`, `0.04%` above stock. This controls for
+  the host-frequency and run-order drift visible in separate native processes.
+- production apply intentionally acts on zero of the two source-backed named
+  generator bodies and zero of their consumer-fusion opportunities. A native
+  `PyGenObject` can escape through frame, tracing, monitoring, traceback, and
+  finalization observers even when ordinary dataflow shows immediate builtin
+  consumption; SOAC does not yet have suspended-frame materialization for a
+  correct mid-loop deopt. The mechanical transformed-generator rewrite remains
+  covered and bounded, but native N-Queens parity comes from retaining CPython's
+  generator execution rather than enabling that unsound production path.
+- SOAC before/after: `0.279 runs/s` to `8.431 runs/s`, `30.22x` faster.
+- finalized production pystone profile, verify, and refcounts-enabled apply
+  medians for the exact recorded revision are in `work/bench/mzvswpyykkts`.

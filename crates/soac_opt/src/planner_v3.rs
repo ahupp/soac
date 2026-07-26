@@ -327,14 +327,21 @@ fn plan_exact_list_item_specializations_v3(
     let mut seen = HashSet::new();
     let mut plans = Vec::new();
     for request in entries {
+        let guard = match (request.shape, request.access) {
+            (ExactListItemShape::ExactListExactInt, _) => {
+                ExactListItemGuardKind::ExactListExactCompactIntInBounds
+            }
+            (ExactListItemShape::ExactTupleExactInt, ExactListItemAccessKind::Get) => {
+                ExactListItemGuardKind::ExactTupleExactCompactIntInBounds
+            }
+            (ExactListItemShape::ExactTupleExactInt, ExactListItemAccessKind::Set) => continue,
+        };
         if seen.insert((request.source, request.access, request.shape)) {
             plans.push(ExactListItemSpecializationPlan {
                 source: request.source,
                 access: request.access,
                 shape: request.shape,
-                guard: ExactListItemGuardPlan {
-                    kind: ExactListItemGuardKind::ExactListExactCompactIntInBounds,
-                },
+                guard: ExactListItemGuardPlan { kind: guard },
                 fallback: ExactListItemFallbackPlan {
                     kind: ExactListItemFallbackKind::OriginalItemAccess,
                 },
@@ -2511,6 +2518,50 @@ mod tests {
             ExactListItemFallbackKind::OriginalItemAccess
         );
         assert_eq!(items[1].access, ExactListItemAccessKind::Set);
+    }
+
+    #[test]
+    fn plans_exact_tuple_get_and_declines_tuple_set() {
+        let mut request = module_request_regions(Vec::new());
+        let get_source = InstrId::new(9);
+        let set_source = InstrId::new(11);
+        request.functions[0].exact_list_items = vec![
+            ExactListItemPlanRequest {
+                source: get_source,
+                access: ExactListItemAccessKind::Get,
+                shape: ExactListItemShape::ExactTupleExactInt,
+                reason: "profiled exact-tuple getitem".to_string(),
+            },
+            ExactListItemPlanRequest {
+                source: get_source,
+                access: ExactListItemAccessKind::Get,
+                shape: ExactListItemShape::ExactTupleExactInt,
+                reason: "profiled exact-tuple getitem".to_string(),
+            },
+            ExactListItemPlanRequest {
+                source: set_source,
+                access: ExactListItemAccessKind::Set,
+                shape: ExactListItemShape::ExactTupleExactInt,
+                reason: "tuple item stores must remain generic".to_string(),
+            },
+        ];
+
+        let plan = plan_module_optimization_v3(&AlternativeCatalog::default_v3(), request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let items = &plan.functions[0].exact_list_items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, get_source);
+        assert_eq!(items[0].access, ExactListItemAccessKind::Get);
+        assert_eq!(items[0].shape, ExactListItemShape::ExactTupleExactInt);
+        assert_eq!(
+            items[0].guard.kind,
+            ExactListItemGuardKind::ExactTupleExactCompactIntInBounds,
+        );
+        assert_eq!(
+            items[0].fallback.kind,
+            ExactListItemFallbackKind::OriginalItemAccess,
+        );
     }
 
     #[test]

@@ -309,9 +309,14 @@ apply/verify mode:
 - In v3 planning, the optimizer consumes raw
   `module_keys` plus lowered `NameLocation::Global(slot)` load/store sites and
   emits matching indexed-global selections into the v3 plan.
-- In profile/apply modes, the transformed module object creates an
-  indexed unicode dict whose key table matches the lowered module
-  global-name table.
+- In profile and verify modes, and in apply mode for modules without an
+  original source-backed named generator, the transformed module creates an
+  indexed Unicode dictionary whose key table matches the lowered module
+  global-name table. An apply-mode module containing an original source-backed
+  named generator instead retains the ordinary Unicode-key dictionary created
+  by `PyModule_FromDefAndSpec`; SOAC installs only its module metadata. It does
+  not construct or promote an indexed dictionary, and indexed-global
+  selections use their existing guard fallback or deopt path.
 - In verify mode, each global load/store also gets
   `global_indexed_hit` and `global_indexed_fallback` scalar counters.
 
@@ -378,6 +383,10 @@ apply/verify mode:
   attribute is present.
 - In verify mode, each `GetAttr`/`SetAttr` also gets
   `field_indexed_hit` and `field_indexed_fallback` scalar counters.
+- Verify mode preserves profiled indexed field accesses when their counters
+  are active instead of removing them through constructor scalar replacement.
+  Profile mode without selected accesses and apply mode without field counters
+  retain their normal object virtualization.
 
 ### Codegen
 
@@ -505,31 +514,108 @@ their owner/type guard payload is not yet a static mechanical JIT input.
 - When no v3 plan owns the site, the original generic call remains in
   `InstrTyped`, except for the explicit static runtime-name targets described
   above.
+- Runtime `range` resolves to CPython's original `builtins.range`, preserving
+  its exact type, indexing, slicing, comparison, and iterator behavior.
+  Exact CPython range iterators use the existing guarded raw range-iteration
+  path; the internal `IterRange` class remains available for independently
+  selected runtime specializations.
 - The rewrite consumes profiled targets that match the ordinary direct-call /
   typed inliner shape: positional-only-or-normal parameters, no keywords, no
   starred args, and positional inputs that can bind through the direct-entry
   argument plan. Omitted trailing/defaulted parameters are passed as default
   sentinels and resolved by the callee's default-resolving direct entry.
-  Visible generator factories may inline when their only non-stack layout is
-  wrapper-owned preserved activation state; true lexical `freevars` or
-  `cellvars` still keep the callee out of the typed inliner. Generator-instance
+  Ordinary stack-only functions that create and return generator instances may
+  inline. The generator callable's executable blocks are its resume body, not
+  its public factory, so a body with wrapper-owned preserved activation state
+  must not be inlined as an ordinary call; true lexical `freevars` or `cellvars`
+  also keep the callee out of the typed inliner. Generator-instance
   planning recognizes both strict module-global generator names and locally
   proven generator function values such as nested generator helpers carried
-  through local slots. After trusted generator-resume inlining, typed planning
+  through local slots. Source-backed named generators retain CPython's original
+  generator vectorcall in ordinary and apply modes when their original code
+  objects are available. Production compilation and source-backed CLIF/
+  InstrTyped inspection use the same original-code matcher, so native perf
+  annotations reflect this actual generator decision instead of reconstructing
+  an unrelated transformed generator body. Source-backed named generators also
+  receive their source code's CPython `MAKE_FUNCTION` version so native calls
+  specialize and later defaults or closure mutations retain normal CPython
+  invalidation.
+  Both ordinary typed direct calls and inlined Python function bodies retain a
+  typed runtime-function identity guard and a cold generic fallback. The guard
+  also compares the live function code, positional defaults, and keyword
+  defaults against owned snapshots captured in ABI-preserving, append-only JIT
+  metadata fields. Replacing a transformed function's `__code__` rejects its
+  stale direct entry or inline body; its shared vectorcall then restores and
+  invokes the original CPython vectorcall without dropping live JIT metadata
+  owned by active frames. Replacing positional or keyword defaults refreshes
+  the existing function environment on the next call rather than installing a
+  process-wide watcher for ordinary functions. Because `__kwdefaults__` is a
+  mutable dictionary, a function with non-null keyword-only defaults stays on
+  that vectorcall path and rereads its keyword-only default slots before each
+  call; pointer identity alone cannot validate an in-place value replacement or
+  deletion. Compiler-owned runtime classes
+  retain exact-owner specialization metadata without activating that watcher;
+  the watcher is installed lazily only when a mutable source-defined class
+  requires method and type-version invalidation.
+  Direct calls to explicitly resolved compiler runtime names instead receive a
+  trusted-runtime inline decision and retain their guard-free hot path; this
+  exception does not apply to ordinary module-global Python functions.
+  Profile and verify modes use the SOAC generator-factory
+  vectorcall instead, so their resume bodies record the call-target and
+  operation-shape evidence consumed by later typed planning. Generator
+  expressions always keep the transformed factory: their iterator validation,
+  closure bindings, and eager direct entries must not be replaced by the
+  named-generator fast path. Eager scheduling and static generator-instance
+  planning apply the same per-owner source-code and specialization-mode
+  decision. In apply mode, a source-backed named generator retains its normal
+  CPython public call instead of having a transformed wrapper and consumer loop
+  recreated inside its caller. Both source-backed and transformed named
+  generators retain their explicit direct-entry metadata; counter-recording
+  modes, generated generators, and generator expressions remain eligible for
+  their normal typed plans. Apply-mode modules containing source-backed named
+  generators retain the ordinary Unicode-key dictionary created by
+  `PyModule_FromDefAndSpec`; SOAC installs only its module metadata. This
+  lets the native generator specialize global and builtin loads while preserving
+  `function.__globals__ is module.__dict__`, global rebinding and deletion,
+  and the generic fallback of indexed JIT accesses. Profile and verify modes
+  retain their original indexed dictionaries. After trusted
+  generator-resume inlining, typed
+  planning
   can replace a nonescaping generator wrapper with explicit caller locals for
   preserved activation slots, initializing those locals from the original
-  public-call arguments and runtime slot defaults. Public generator factories
-  also install the SOAC generator-factory vectorcall path consistently, so
-  non-inlined named generators use the same preserved activation storage model
-  rather than falling back to CPython's ordinary generator object layout. The
-  first slice only lowers generators whose preserved state has no preserved cell
+  public-call arguments and runtime slot defaults. When a generator requires
+  the transformed factory, it uses the SOAC generator-factory vectorcall path
+  consistently so its preserved activation storage model remains explicit. The
+  transformed factory resolves `make_generator_instance` through the existing
+  module-owned runtime-name cache instead of importing and resolving the
+  runtime helper on every generator creation. Generator, coroutine, and
+  asynchronous-generator wrappers reuse the source function's actual immutable
+  code object when its name, qualified name, and generator-kind flags agree;
+  otherwise the existing synthetic code-template fallback preserves behavior.
+  The first slice only lowers generators whose preserved state has no preserved cell
   slots and whose wrapper has no remaining observable uses after the resume body
   is inlined; synthetic alias/setup temps introduced while inlining trusted
   `next`/`send` paths are consumed with the wrapper.
+  Exact generator-instance evidence also propagates through
+  `iter(generator_function(...))`: the identity-iterator transfer retains the
+  proven generator owner, instance origin, and resume function without
+  promoting ambiguous aliases or ordinary iterator return values.
   The trusted `next(gen)` runtime-protocol inline uses that same erasability
   proof up front. If later observable uses such as `gen.throw(...)` remain, the
   protocol call stays generic instead of exposing wrapper-only fields before
   generator-state lowering can prove the wrapper is erasable.
+  Immediate consumption by `list`, `set`, or `tuple` is not by itself such a
+  proof for a source-backed generator. A native generator's suspended frame and
+  owning `PyGenObject` remain observable through `frame.f_generator`, tracing
+  and monitoring callbacks, `sys._current_frames()`, traceback construction,
+  and close/finalization after an exceptional consumer exit. Those observers
+  can become active after consumption has begun. Because the current runtime
+  cannot materialize an equivalent native generator and suspended frame at a
+  yield or safepoint, production apply mode does not attach generator-instance
+  or consumer-fusion plans to source-backed named generators. The structured
+  scalar-replacement tests exercise transformed generators whose wrapper and
+  activation storage are compiler-owned; they do not establish that a native
+  `PyGenObject` may be removed.
   Calls to builtin `list`, `set`, or `tuple` with a proven nonescaping generator
   instance can also carry an explicit typed builtin-implementation plan. That
   plan keeps the observed callable as the original builtin, but selects the
@@ -544,6 +630,28 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   target stays within the bounded generator-inline budget, so large resume state
   machines keep the ordinary builtin path instead of flattening a
   disproportionate amount of control flow into the caller.
+  Cloned generator-resume state remains owned by its particular inline
+  instance: cloned activation slots and alias evidence cannot be merged across
+  sibling generators, and an ordinary caller must not retain unresolved
+  generator-preserved storage after rewriting.
+  Calls to the resolved compiler-owned `resume_generator` runtime primitive
+  can use its explicit five-borrowed-argument C ABI instead of Python
+  vectorcall. The primitive returns an owned object, propagates the current
+  Python exception on failure, and is never selected for an independently
+  rebound Python name. The Python-facing generator-resume entry also uses
+  CPython's native fastcall ABI for exactly five positional arguments; unusual
+  argument shapes retain the original Python-facing validation and exception
+  behavior.
+  Direct-call and constructor-init inlining use deterministic projected
+  cumulative block and instruction budgets. Generator-resume candidates are
+  prioritized, and continuation cloning consumes the same remaining CFG
+  budget instead of applying an independent limit to each call site. Late
+  builtin consumers are admitted one at a time so the trusted iterator
+  protocol and generator-resume decisions can be refreshed before processing
+  another consumer. Optional late builtin and protocol inlining stops at the
+  measured remaining budget while mandatory generator-resume cleanup
+  continues. Virtual-field join trampolines consume the remaining block
+  budget in deterministic edge order.
   Constructor-entry targets currently require all user arguments to be explicit
   because their type-stored metadata does not yet refresh `__init__` defaults.
 - In apply/verify mode, JIT module planning consumes the cached pre-opt module
@@ -671,27 +779,37 @@ the original materialized object behavior. Ordinary profiled constructor
 virtualization still requires indexed-field access plans before field loads and
 stores are rewritten, but fully trusted static runtime constructors can consume
 their bound constant fields directly in the fully-virtual path. That lets
-compiler-generated runtime wrappers such as `ClosureGenerator` lower their hot
-state to locals before indexed-field replay would otherwise make those fields
-visible.
+  compiler-generated runtime wrappers such as `ClosureGenerator` lower their hot
+  state to locals before indexed-field replay would otherwise make those fields
+  visible.
+
+Field-state planning retains bindings only for constructor instructions that
+actually occur in the typed function. A real constructor can still expose
+scalar fields before an explicit materialization boundary even when its object
+cannot be removed. Once the object escapes through a global or nonlocal store,
+its aliases and field facts are invalidated; subsequent accesses retain their
+observable Python behavior.
 
 ## Operation Specializations
 
 SOAC keeps operation-level specializations in
 `crates/soac_jit/src/jit/operation_specializations.rs` instead of spreading guarded
 fast paths through generic opcode lowering. The first implementations are
-concrete rather than framework-driven: `GetItem` and `SetItem` emit
-exact-list/exact-int arms and share generic fallback paths.
+concrete rather than framework-driven: `GetItem` emits exact-list/exact-int and
+exact-tuple/exact-int arms, `SetItem` emits an exact-list/exact-int arm, and all
+three share generic fallback paths.
 
-Exact-list item sites are selected by the v3 plan. The plan records the lowered
-`GetItem`/`SetItem` source, access kind, exact-list/exact-int shape, explicit
-exact-list/exact-compact-int in-bounds guard, and original item-access fallback.
-The current JIT still uses the existing inline list load/store emitter for the
-selected shape. The emitted exact-list item node is consumed directly; legacy
-replayed item-shape maps are no longer consumed by JIT lowering for this
-family. The generic `dp_jit_pyobject_getitem` and `dp_jit_pyobject_setitem`
-helpers intentionally do not contain an exact-list fast path; unplanned item
-access goes through the CPython item APIs.
+Exact-sequence item sites are selected by the existing v3 exact-list item plan
+family; the family name is retained so typed sidecars, mechanical emission, and
+inlined-site remapping remain shared. Each plan records its lowered
+`GetItem`/`SetItem` source, access kind, exact-list or exact-tuple shape, the
+corresponding exact-sequence/exact-compact-int in-bounds guard, and the original
+item-access fallback. Tuple plans are valid for `GetItem` only. The JIT consumes
+the selected typed item plan directly and emits either the list slot pointer or
+the tuple's inline item array; legacy replayed item-shape maps are not consulted
+by codegen. The generic `dp_jit_pyobject_getitem` and
+`dp_jit_pyobject_setitem` helpers intentionally do not contain sequence fast
+paths; unplanned item access goes through the CPython item APIs.
 
 ### Exact-List `GetItem`
 
@@ -729,7 +847,8 @@ access goes through the CPython item APIs.
 ### Limitations / Soundness / Extensions
 
 - Current limitations:
-  - only the exact-list/exact-int dispatch shape is recorded
+  - exact-list reads select the exact-list/exact-int dispatch shape; exact-tuple
+    reads use a separate shape and guard described below
   - guard misses use the generic fallback path for now; deopt is deliberately
     deferred until operation-specialization sites can guarantee a non-null
     runtime deopt table in all apply/verify entry paths
@@ -744,10 +863,51 @@ access goes through the CPython item APIs.
     indices fall back before direct list memory access
 - Natural extensions:
   - add a separate list-compatible subclass arm guarded by mapping slot identity
-  - add richer operation dispatch tags for tuple, string, dict, and custom slots
+  - add richer operation dispatch tags for string, dict, and custom slots
   - emit borrowed `EmitResult` for typed consumers instead of forcing an owned
     legacy result
-  - add matching tuple/string getitem arms
+  - add a matching exact-string getitem arm
+
+### Exact-Tuple `GetItem`
+
+### Counted Input
+
+- Source input is `getitem_hot_shapes`.
+- Shape tag `2` records an exact `tuple` receiver with an exact `int` index;
+  the exact-list shape remains tag `1`, and zero still means no specialized
+  dispatch shape.
+- The v3 planner represents the tuple read in the existing exact-list item plan
+  family using `ExactTupleExactInt` and the distinct
+  `ExactTupleExactCompactIntInBounds` guard.
+- Verify mode reuses `getitem_specialized_hit` and
+  `getitem_specialized_fallback` counters.
+
+### Codegen
+
+- Exact tuple reads use the same explicit v3-plan annotation, direct and inlined
+  instruction-ID remapping, compact-int unboxing, negative-index normalization,
+  bounds checks, and cold generic fallback as exact-list reads.
+- The receiver is guarded against the relocatable `PyTuple_Type` symbol; tuple
+  subclasses do not enter the direct arm.
+- The pinned CPython `PyTupleObject` contains a cached `ob_hash` between its
+  variable-sized object header and `ob_item`. Codegen uses the corresponding
+  `RawPyTupleObject` layout before directly loading
+  `ob_item[normalized_index]`.
+- A direct hit INCREFs the borrowed tuple element and returns the owned value
+  required by ordinary `GetItem` lowering. When the index is already a proven
+  scalar `i64`, the direct arm avoids materializing an intermediate `PyLong`.
+- A guard miss uses the original `PyObject_GetItem` helper, preserving tuple
+  subclass `__getitem__`, `__index__`, out-of-bounds exceptions, and ownership.
+
+### Limitations / Soundness / Extensions
+
+- Only exact tuples and compact exact-int indices use the direct arm; bools,
+  `int` subclasses, non-compact integers, tuple subclasses, non-integer index
+  objects, and invalid indices retain generic CPython semantics.
+- Tuples are immutable: tuple `SetItem` is never selected as a v3 plan, even
+  when tuple shape evidence occurs at a generic store site.
+- Direct reads return an owned element rather than propagating borrowed result
+  demand; extending borrowed typed consumption remains future work.
 
 ### Exact-List `SetItem`
 

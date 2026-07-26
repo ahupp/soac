@@ -15,6 +15,8 @@ Scope:
   `crates/soac_jit_runtime/src/lib.rs`.
 - `specialized_helpers.rs`: exported helpers and symbols registered by
   `register_specialized_jit_symbols`.
+- `soac_jit`: exported C ABI entrypoints registered directly by the JIT
+  backend.
 - `soac.runtime`: top-level Python callables, runtime classes, methods, and
   intentionally re-exported helper callables in `soac_py/src/soac/runtime.py`.
   Some of these names, such as import helpers, are native `_soac_ext`
@@ -172,8 +174,18 @@ Registered call targets implemented outside `specialized_helpers.rs`:
 ```text
 dp_jit_vectorcall_bind_direct_args
 dp_jit_vectorcall_compile_function_env
+dp_jit_vectorcall_previous_for_changed_code
 dp_jit_direct_compile_function_env
+soac_jit_make_function_with_closure
+soac_jit_resume_generator
 ```
+
+`soac_jit_resume_generator` is the direct five-argument C ABI for the
+compiler-owned `resume_generator` runtime primitive. It borrows its resume
+function, generator owner, preserved state, send value, and exception value;
+it returns an owned Python object or null with the current Python exception
+set. It is selected only for the resolved runtime primitive, not for a
+same-named Python global.
 
 ## Synthetic Inter-Pass Markers
 
@@ -229,6 +241,7 @@ make_preserved_state
 load_preserved_state
 _normalize_throw_exc
 _current_throw_context
+make_generator_instance
 complex_from_parts
 class_lookup_cell
 class_lookup_global
@@ -323,6 +336,7 @@ Runtime aliases and re-exports:
 ```text
 next
 iter
+range
 anext
 isinstance
 getattr

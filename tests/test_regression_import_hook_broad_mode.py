@@ -851,13 +851,11 @@ get_type_function_id = ctypes.pythonapi.PyType_GetSoacFunctionId
 get_type_function_id.argtypes = [ctypes.py_object]
 get_type_function_id.restype = ctypes.c_uint64
 
-assert runtime.range is not range
-assert runtime.range.__module__ == "soac.runtime"
-assert runtime.range.__name__ == "range"
+assert runtime.range is range
+assert runtime.range.__module__ == range.__module__
+assert runtime.range.__name__ == range.__name__
 
 runtime_functions = (
-    runtime.range.__dict__["__init__"],
-    runtime.range.__dict__["__iter__"],
     runtime.IterRange.__dict__["__init__"],
     runtime.IterRange.__dict__["__next__"],
 )
@@ -865,7 +863,6 @@ for function in runtime_functions:
     assert get_function_id(function) != 0
     assert get_function_metadata(function) is not None
 
-assert get_type_function_id(runtime.range) != 0
 assert get_type_function_id(runtime.IterRange) != 0
 assert get_type_function_id(runtime.IterRange) != get_function_id(
     runtime.IterRange.__dict__["__init__"]

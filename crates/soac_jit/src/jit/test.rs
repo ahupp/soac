@@ -5131,6 +5131,51 @@ def build(values):
     }
 
     #[test]
+    fn generator_resume_primitive_recognition_requires_exact_static_runtime_name() {
+        let module = test_module(ModuleNameGen::new(0), vec![test_function()]);
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let args = || {
+            ["handle", "owner", "state", "value", "exception"]
+                .into_iter()
+                .map(|name| CallArgPositional::Positional(name_expr(test_name(name))))
+                .collect::<Vec<_>>()
+        };
+
+        let runtime_call = Call::new(
+            name_expr(test_runtime_name(RuntimeName::ResumeGenerator.name())),
+            args(),
+            vec![],
+        );
+        assert_eq!(
+            static_runtime_primitive_for_call(&runtime_call, &module_constants),
+            Some(RuntimePrimitiveId::ResumeGenerator)
+        );
+
+        let rebound_global_call = Call::new(
+            name_expr(test_global_name(RuntimeName::ResumeGenerator.name())),
+            args(),
+            vec![],
+        );
+        assert_eq!(
+            static_runtime_primitive_for_call(&rebound_global_call, &module_constants),
+            None
+        );
+
+        let mut wrong_arity_args = args();
+        wrong_arity_args.pop();
+        let wrong_arity_call = Call::new(
+            name_expr(test_runtime_name(RuntimeName::ResumeGenerator.name())),
+            wrong_arity_args,
+            vec![],
+        );
+        assert_eq!(
+            static_runtime_primitive_for_call(&wrong_arity_call, &module_constants),
+            None
+        );
+    }
+
+    #[test]
     fn runtime_builtin_i64_demand_accepts_ord_and_i64_constants() {
         let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
         module.module_constants.push(runtime_name_constant("ord"));

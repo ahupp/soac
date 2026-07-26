@@ -3,12 +3,13 @@ use super::codegen_env::{FuncBuildImports, JitCodegenEnv, declare_local_fn};
 use super::imports::{
     DP_JIT_DECREF_IMPORT, DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
     DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT, DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
-    ModuleFuncImports, PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
-    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
+    DP_JIT_VECTORCALL_PREVIOUS_FOR_CHANGED_CODE_IMPORT, ModuleFuncImports,
+    PY_THREAD_STATE_GET_UNCHECKED_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
 };
 use super::runtime_context::{
-    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
-    load_function_env_obj, load_py_function_soac_metadata_obj,
+    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, PY_FUNCTION_CODE_OFFSET,
+    PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, load_function_env_obj,
+    load_py_function_soac_metadata_obj,
 };
 use super::{
     RuntimeFunctionId, SoacEnvConfig, VectorcallEntryFn,
@@ -72,6 +73,11 @@ pub(super) fn define_shared_vectorcall_trampoline(
             &mut fb.func,
             &DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
         );
+        let previous_vectorcall_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_VECTORCALL_PREVIOUS_FOR_CHANGED_CODE_IMPORT,
+        );
         let enter_recursive_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -110,6 +116,48 @@ pub(super) fn define_shared_vectorcall_trampoline(
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(function_extra_ok);
+        let current_code = fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            callable_val,
+            PY_FUNCTION_CODE_OFFSET,
+        );
+        let registered_code = fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            function_extra_val,
+            crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_CODE_OFFSET,
+        );
+        let code_matches =
+            fb.ins()
+                .icmp(ir::condcodes::IntCC::Equal, current_code, registered_code);
+        let unchanged_code_block = fb.create_block();
+        let changed_code_block = fb.create_block();
+        fb.ins().brif(
+            code_matches,
+            unchanged_code_block,
+            &[],
+            changed_code_block,
+            &[],
+        );
+        fb.seal_block(unchanged_code_block);
+        fb.seal_block(changed_code_block);
+
+        fb.switch_to_block(changed_code_block);
+        let fallback_inst = fb.ins().call(
+            previous_vectorcall_ref,
+            &[
+                callable_val,
+                args_val,
+                nargsf_val,
+                kwnames_val,
+                function_extra_val,
+            ],
+        );
+        let fallback_result = fb.inst_results(fallback_inst)[0];
+        fb.ins().return_(&[fallback_result]);
+
+        fb.switch_to_block(unchanged_code_block);
         let function_env_val = fb.ins().load(
             ptr_ty,
             ir::MemFlags::trusted(),

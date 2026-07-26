@@ -555,6 +555,12 @@ explicit ordinary
   `PYPERFORMANCE_TIMEOUT` to `--timeout`, and appends
   `PYPERFORMANCE_INHERIT_ENV_EXTRA` to the `--inherit-environ` list for SOAC
   mode. Document any new pyperformance recipe knobs in README and here.
+- `PERF_FREQUENCY`
+  `just nqueens-slice-perf` defaults to `99` Hz so deep mixed JIT/CPython
+  DWARF stacks do not generate excessive artifacts or lose samples during an
+  N-Queens run. The pystone and pyperformance perf workflows retain their
+  existing `999` Hz default. Set `PERF_FREQUENCY` explicitly when a different
+  sample-density and artifact-size tradeoff is appropriate.
 - `PERF_CALL_GRAPH`
   The perf profiling recipes default to `PERF_CALL_GRAPH=dwarf,65528`
   rather than a shallower stack dump, because the larger DWARF capture

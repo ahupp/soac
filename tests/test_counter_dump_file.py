@@ -40,13 +40,14 @@ def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
     return env
 
 
-def _run_soac_subprocess(script, *, env):
+def _run_soac_subprocess(script, *, env, timeout=None):
     return subprocess.run(
         [sys.executable, "-c", script],
         check=False,
         capture_output=True,
         env=env,
         text=True,
+        timeout=timeout,
     )
 
 
@@ -580,6 +581,199 @@ def run(repeats):
     assert not explicit_codegen_rows
 
 
+def test_apply_eager_compile_preserves_named_generators_and_prewarms_genexpr(tmp_path):
+    module_name = "apply_eager_source_named_generator_case"
+    work_dir = tmp_path / "soac-work"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+def explicit_items(limit):
+    for item in range(limit):
+        yield item + 1
+
+def gen_sum(limit):
+    return sum(item + 1 for item in range(limit))
+
+def run():
+    return sum(explicit_items(8)) + gen_sum(8)
+""",
+        encoding="utf-8",
+    )
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        "assert module.run() == 72",
+    )
+    base_env = _soac_subprocess_env(
+        tmp_path,
+        work_dir=work_dir,
+        extra_env={"SOAC_COMPILE_MODE": "eager"},
+    )
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+
+    summary_path = work_dir / "jit-code-summary.jsonl"
+    profile_codegen_rows = _read_jsonl(summary_path)
+    assert any(
+        row.get("entry_kind") == "direct_function_body"
+        and row.get("function_qualname", "").endswith("explicit_items")
+        for row in profile_codegen_rows
+    ), profile_codegen_rows
+
+    apply_script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        """
+        import dis
+
+        assert module.run() == 72
+        named_items = module.explicit_items
+        expected = tuple(range(1, 9))
+
+        def call_named(value):
+            return named_items(value)
+
+        for _ in range(128):
+            assert tuple(call_named(8)) == expected
+
+        call_opnames = {
+            instruction.opname
+            for instruction in dis.get_instructions(call_named, adaptive=True)
+            if instruction.opname.startswith("CALL")
+        }
+        assert "CALL_PY_EXACT_ARGS" in call_opnames, call_opnames
+
+        named_items.__defaults__ = (8,)
+        for _ in range(128):
+            assert tuple(call_named(8)) == expected
+
+        call_opnames = {
+            instruction.opname
+            for instruction in dis.get_instructions(call_named, adaptive=True)
+            if instruction.opname.startswith("CALL")
+        }
+        assert not any(
+            opname.startswith("CALL_PY_") for opname in call_opnames
+        ), call_opnames
+        """,
+    )
+    apply_result = _run_soac_subprocess(
+        apply_script,
+        env={**base_env, "SOAC_OPT_MODE": "apply"},
+    )
+    _assert_subprocess_ok(apply_result)
+    apply_codegen_rows = _read_jsonl(summary_path)[len(profile_codegen_rows) :]
+
+    assert apply_codegen_rows
+    assert not any(
+        row.get("entry_kind") == "direct_function_body"
+        and row.get("function_qualname", "").endswith("explicit_items")
+        for row in apply_codegen_rows
+    ), apply_codegen_rows
+    assert any(
+        row.get("entry_kind") == "direct_function_body"
+        and row.get("function_qualname", "").endswith("<genexpr>")
+        for row in apply_codegen_rows
+    ), apply_codegen_rows
+
+
+def test_apply_promoted_generator_globals_preserve_indexed_global_fallbacks(tmp_path):
+    module_name = "apply_promoted_generator_globals_case"
+    work_dir = tmp_path / "soac-work"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+VALUE = 3
+
+class Reader:
+    def current(self):
+        return VALUE
+
+def named_items(limit):
+    for item in range(limit):
+        yield VALUE + item
+
+def named_lengths(values):
+    yield len(values)
+
+def bump_value(delta):
+    global VALUE
+    VALUE += delta
+    return VALUE
+
+def shadow_and_restore_len(values):
+    global len
+    original = next(named_lengths(values))
+    len = lambda ignored: 19
+    shadowed = next(named_lengths(values))
+    del len
+    return original, shadowed, next(named_lengths(values))
+
+def run():
+    before = tuple(named_items(2))
+    updated = bump_value(4)
+    after = tuple(named_items(2))
+    class_value = Reader().current()
+    lengths = shadow_and_restore_len((1, 2, 3))
+    return before, updated, after, class_value, lengths
+""",
+        encoding="utf-8",
+    )
+    profile_script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        """
+        assert module.named_items.__globals__ is module.__dict__
+        assert module.named_lengths.__globals__ is module.__dict__
+        assert tuple(module.named_items(2)) == (3, 4)
+        assert tuple(module.named_lengths((1, 2, 3))) == (3,)
+        assert module.bump_value(4) == 7
+        assert module.Reader().current() == 7
+        assert tuple(module.named_items(2)) == (7, 8)
+        assert tuple(module.named_lengths((1, 2, 3))) == (3,)
+        assert module.VALUE == 7
+        assert "len" not in module.__dict__
+        """,
+    )
+    apply_script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        """
+        assert module.named_items.__globals__ is module.__dict__
+        assert module.named_lengths.__globals__ is module.__dict__
+        assert module.run() == ((3, 4), 7, (7, 8), 7, (3, 19, 3))
+        assert module.VALUE == 7
+        assert tuple(module.named_items(2)) == (7, 8)
+        assert "len" not in module.__dict__
+        assert not any(
+            key.startswith("__soac_source_named_generator_globals_promotion__")
+            for key in module.__dict__
+        )
+        """,
+    )
+    base_env = _soac_subprocess_env(
+        tmp_path,
+        work_dir=work_dir,
+        extra_env={"SOAC_COMPILE_MODE": "eager"},
+    )
+    profile_result = _run_soac_subprocess(
+        profile_script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+        timeout=30,
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+
+    apply_result = _run_soac_subprocess(
+        apply_script,
+        env={**base_env, "SOAC_OPT_MODE": "apply"},
+        timeout=30,
+    )
+    _assert_subprocess_ok(apply_result)
+
+
 def test_apply_eager_compile_prewarms_nested_genexpr_direct_entries(tmp_path):
     module_name = "eager_nested_genexpr_precompile_case"
     work_dir = tmp_path / "soac-work"
@@ -702,6 +896,138 @@ def test_apply_mode_lazy_diagonal_slice_runner_preserves_expected_result_binding
     _assert_subprocess_ok(apply_result)
 
 
+def test_specialized_nested_generator_identity_iter_preserves_generator_state(tmp_path):
+    module_name = "nested_generator_identity_iter_case"
+    work_dir = tmp_path / "soac-work"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+def values(start, count):
+    for offset in range(count):
+        yield start + offset
+
+
+def nested_identity_iterator(start):
+    iterator = iter(values(start, 3))
+    return next(iterator), next(iterator), next(iterator)
+
+
+def observable_identity_iterator(start):
+    generator = values(start, 3)
+    iterator = iter(generator)
+    return iterator is generator, next(iterator), next(generator), next(iterator)
+
+
+def nested_generator_loop(start):
+    total = 0
+    for value in values(start, 3):
+        total += value
+    return total
+
+
+def independent_nested_iterators():
+    left = iter(values(3, 2))
+    right = iter(values(9, 2))
+    return next(left), next(right), next(left), next(right)
+
+
+def resume_generator(first, second, third, fourth, fifth):
+    return first + second + third + fourth + fifth
+
+
+def independently_rebound_resume_generator():
+    return resume_generator(1, 2, 3, 4, 5)
+
+
+def run():
+    return (
+        nested_identity_iterator(3),
+        observable_identity_iterator(3),
+        nested_generator_loop(3),
+        independent_nested_iterators(),
+        independently_rebound_resume_generator(),
+    )
+""",
+        encoding="utf-8",
+    )
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        "assert module.run() == ((3, 4, 5), (True, 3, 4, 5), 12, (3, 9, 4, 10), 15)",
+    )
+    base_env = _soac_subprocess_env(
+        tmp_path,
+        work_dir=work_dir,
+        extra_env={"SOAC_COMPILE_MODE": "eager"},
+    )
+
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+        timeout=60,
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+
+    for opt_mode in ("verify", "apply"):
+        specialized_result = _run_soac_subprocess(
+            script,
+            env={**base_env, "SOAC_OPT_MODE": opt_mode},
+            timeout=60,
+        )
+        _assert_subprocess_ok(specialized_result)
+
+
+def test_specialized_full_nqueens_slice_preserves_generator_state(tmp_path):
+    bench_dir = Path(__file__).resolve().parents[1] / "bench"
+    work_dir = tmp_path / "soac-work"
+    script = _import_and_run_script(
+        bench_dir,
+        "import nqueens_slice_full_nqueens_list_consumer as module",
+        'assert module.main(["nqueens_slice_full_nqueens_list_consumer.py", "4", "1"]) == 0',
+    )
+    base_env = _soac_subprocess_env(
+        bench_dir,
+        work_dir=work_dir,
+        extra_env={"SOAC_COMPILE_MODE": "eager"},
+    )
+
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+        timeout=60,
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+
+    profile = _inspect_counter_dump_json(work_dir / "profile.bin")
+    nqueens_record = next(
+        record
+        for record in profile["records"]
+        if record["module_name"] == "nqueens_slice_full_nqueens_list_consumer"
+    )
+    for function_qualname in ("permutations", "n_queens"):
+        assert any(
+            row["function_qualname"] == function_qualname
+            and row["kind"] == "call_hot_targets"
+            and row["value"] > 0
+            for row in nqueens_record["rows"]
+        ), (function_qualname, profile)
+    assert any(
+        row["kind"] == "getitem_hot_shapes"
+        and row["observed_value"] == 2
+        and row["value"] > 0
+        for row in nqueens_record["rows"]
+    ), profile
+
+    for opt_mode in ("verify", "apply"):
+        specialized_result = _run_soac_subprocess(
+            script,
+            env={**base_env, "SOAC_OPT_MODE": opt_mode},
+            timeout=60,
+        )
+        _assert_subprocess_ok(specialized_result)
+
+
 def test_apply_mode_callback_pair_inline_preserves_genexpr_argument_binding(tmp_path):
     support_module_name = "callback_pair_inline_support_case"
     module_name = "callback_pair_inline_genexpr_binding_case"
@@ -777,10 +1103,11 @@ def test_profile_eager_runtime_import_does_not_compile_runtime_entries(tmp_path)
     result = _run_soac_subprocess(
         "\n".join(
             [
+                "import builtins",
                 "from soac.import_hook import install",
                 "install()",
                 "import soac.runtime as runtime",
-                'assert runtime.range.__module__ == "soac.runtime"',
+                "assert runtime.range is builtins.range",
                 "",
             ]
         ),
@@ -1245,7 +1572,7 @@ def run():
     base_env = _soac_subprocess_env(
         tmp_path,
         work_dir=work_dir,
-        extra_env={"SOAC_COMPILE_MODE": "eager"},
+        extra_env={"SOAC_COMPILE_MODE": "lazy", "SOAC_BACKGROUND_JIT": "0"},
     )
 
     profile_result = _run_soac_subprocess(
