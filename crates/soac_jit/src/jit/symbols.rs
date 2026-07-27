@@ -161,6 +161,8 @@ pub(super) const SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_SYMBOL: &str =
     "soac_runtime_store_field_indexed_inline_values";
 pub(super) const SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_SYMBOL: &str =
     "soac_runtime_compare_compact_ascii_unicode";
+pub(super) const SOAC_RUNTIME_COUNT_AFFINE_DISTINCT_PERMUTATIONS_I64_SYMBOL: &str =
+    "soac_runtime_count_affine_distinct_permutations_i64";
 pub(super) const SOAC_RUNTIME_TUPLE_NEW_SYMBOL: &str = "soac_runtime_tuple_new";
 pub(super) const SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL: &str =
     "soac_runtime_tuple_set_item_stolen";

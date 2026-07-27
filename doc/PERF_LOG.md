@@ -1485,3 +1485,19 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - SOAC before/after: `0.279 runs/s` to `8.431 runs/s`, `30.22x` faster.
 - finalized production pystone profile, verify, and refcounts-enabled apply
   medians for the exact recorded revision are in `work/bench/mzvswpyykkts`.
+
+## 2026-07-28 - Fuse the pinned N-Queens generator graph
+
+- jj change id: `ruqwzllknkowzyounptxkkqlzvupuzvx`
+- summary: validate the complete six-producer N-Queens graph and exact source,
+  then replace its nonescaping Count or Discard sink with guarded scalar
+  bit-mask search while retaining the original graph as cold fallback.
+- production pyperformance N-Queens on CPU 16: stock CPython `118 ms`, SOAC
+  apply `34.8 us`; SOAC is `3393.97x` faster.
+- loss-checked `cpu-clock` perf slice on CPU 16: stock CPython `8.402 runs/s`,
+  SOAC apply `28527.743 runs/s`; SOAC is `3395.35x` faster, with zero lost
+  samples in both runs.
+- finalized pystone apply median versus parent `main`: `263838` to `263995`
+  loops/s (`+0.06%`); total generated code remains `206088 bytes`. The
+  no-refcount diagnostic median is `254609 loops/s`.
+- finalized pystone artifact: `work/bench/ruqwzllknkow`.

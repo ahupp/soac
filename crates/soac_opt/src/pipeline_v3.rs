@@ -358,6 +358,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             regions: region_requests,
             direct_calls,
             exact_list_items,
+            opaque_fused_iterations: Vec::new(),
             indexed_fields,
             indexed_globals,
         });
@@ -429,6 +430,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
                 direct_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
+                opaque_fused_iterations: Vec::new(),
                 indexed_globals: Vec::new(),
                 function,
                 regions: region_requests,

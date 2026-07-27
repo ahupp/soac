@@ -1464,6 +1464,60 @@ pub struct TypedGeneratorResumePlan {
     pub candidate_origins: Vec<InstrId>,
 }
 
+/// A resolved operand for an opaque fused-iteration entry guard.
+///
+/// The distinction is intentional: entry guards must not run ordinary Python
+/// lookup code before deciding whether to execute the untouched fallback.
+/// Locals are already evaluated values, indexed globals use a non-raising
+/// probe, and runtime names are compiler-owned module constants.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedOpaqueFusedGuardOperand {
+    Local(ResolvedName),
+    IndexedGlobal { name: String, expected_index: u32 },
+    RuntimeName(RuntimeName),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedOpaqueFusedGuardExpectation {
+    FunctionIdentity {
+        function_id: RuntimeFunctionId,
+    },
+    FunctionPositionalDefaultIdentity {
+        function_id: RuntimeFunctionId,
+        default_index: u32,
+        expected_defaults_len: u32,
+        expected: RuntimeName,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedOpaqueFusedEntryGuard {
+    pub operand: TypedOpaqueFusedGuardOperand,
+    pub expectation: TypedOpaqueFusedGuardExpectation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedOpaqueFusedResult {
+    Count,
+    Discard,
+}
+
+/// JIT-facing, fully resolved form of an opaque fused-iteration decision.
+///
+/// The plan is attached to the original root expression. Codegen emits the
+/// guarded scalar fast path and clones that same expression, with this
+/// sidecar cleared, for the cold fallback. Keeping the fallback in the typed
+/// program avoids reconstructing or partially resuming generator state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedOpaqueFusedIterationPlan {
+    pub source: InstrId,
+    pub result: TypedOpaqueFusedResult,
+    pub width_input: ResolvedName,
+    pub minimum_width: i64,
+    pub maximum_width: i64,
+    pub entry_guards: Vec<TypedOpaqueFusedEntryGuard>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
@@ -1479,6 +1533,7 @@ pub struct TypedInstrExtra {
     pub builtin_implementation: Option<TypedBuiltinImplementationPlan>,
     pub generator_instance: Option<TypedGeneratorInstancePlan>,
     pub generator_resume: Option<TypedGeneratorResumePlan>,
+    pub opaque_fused_iteration: Option<TypedOpaqueFusedIterationPlan>,
     pub guard_miss_deopt: bool,
 }
 
@@ -1722,6 +1777,22 @@ impl TypedInstrExtra {
         self.generator_resume.take().is_some()
     }
 
+    pub fn opaque_fused_iteration_plan(&self) -> Option<&TypedOpaqueFusedIterationPlan> {
+        self.opaque_fused_iteration.as_ref()
+    }
+
+    pub fn set_opaque_fused_iteration_plan(&mut self, plan: TypedOpaqueFusedIterationPlan) -> bool {
+        if self.opaque_fused_iteration.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.opaque_fused_iteration = Some(plan);
+        true
+    }
+
+    pub fn clear_opaque_fused_iteration_plan(&mut self) -> bool {
+        self.opaque_fused_iteration.take().is_some()
+    }
+
     pub fn guard_miss_deopt_enabled(&self) -> bool {
         self.guard_miss_deopt
     }
@@ -1819,6 +1890,11 @@ impl InstrTyped {
             .and_then(TypedInstrExtra::generator_resume_plan)
     }
 
+    pub fn opaque_fused_iteration_plan(&self) -> Option<&TypedOpaqueFusedIterationPlan> {
+        self.typed_extra()
+            .and_then(TypedInstrExtra::opaque_fused_iteration_plan)
+    }
+
     pub fn guard_miss_deopt_enabled(&self) -> bool {
         self.typed_extra()
             .is_some_and(TypedInstrExtra::guard_miss_deopt_enabled)
@@ -1892,4 +1968,49 @@ impl ModuleShape for TypedBlockPyModuleShape {
     type Instr = InstrTyped;
     type ModuleConstant = ConstantExpr;
     type BlockExtra = TypedBlockExtra;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_fused_iteration_sidecar_set_replace_and_clear_are_structural() {
+        let width_input = ResolvedName {
+            id: "n".into(),
+            location: block_py::NameLocation::local(0),
+        };
+        let plan = TypedOpaqueFusedIterationPlan {
+            source: InstrId::new(17),
+            result: TypedOpaqueFusedResult::Count,
+            width_input,
+            minimum_width: 0,
+            maximum_width: 8,
+            entry_guards: vec![TypedOpaqueFusedEntryGuard {
+                operand: TypedOpaqueFusedGuardOperand::IndexedGlobal {
+                    name: "permutations".to_string(),
+                    expected_index: 3,
+                },
+                expectation: TypedOpaqueFusedGuardExpectation::FunctionPositionalDefaultIdentity {
+                    function_id: RuntimeFunctionId::from_raw_parts(1, 2),
+                    default_index: 0,
+                    expected_defaults_len: 1,
+                    expected: RuntimeName::None,
+                },
+            }],
+        };
+        let mut extra = TypedInstrExtra::default();
+
+        assert!(extra.set_opaque_fused_iteration_plan(plan.clone()));
+        assert!(!extra.set_opaque_fused_iteration_plan(plan.clone()));
+        assert_eq!(extra.opaque_fused_iteration_plan(), Some(&plan));
+
+        let mut replacement = plan;
+        replacement.maximum_width = 7;
+        assert!(extra.set_opaque_fused_iteration_plan(replacement.clone()));
+        assert_eq!(extra.opaque_fused_iteration_plan(), Some(&replacement));
+        assert!(extra.clear_opaque_fused_iteration_plan());
+        assert!(!extra.clear_opaque_fused_iteration_plan());
+        assert_eq!(extra.opaque_fused_iteration_plan(), None);
+    }
 }

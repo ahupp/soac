@@ -5,6 +5,79 @@ compile_error!("soac_jit_runtime raw CPython layout support requires a 64-bit ta
 
 use core::ffi::{c_int, c_void};
 
+const MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH: usize = 8;
+
+/// Count permutations of `0..width` whose `value + index` and `value - index`
+/// projections are each distinct. Returns `-1` outside the supported range.
+///
+/// Keep this exported raw helper self-contained: runtime CLIF loading can
+/// resolve other `soac_runtime_*` functions and declared C externs, but not
+/// private Rust helpers or panic paths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_count_affine_distinct_permutations_i64(width: i64) -> i64 {
+    if width < 0 || width > MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH as i64 {
+        return -1;
+    }
+    let width = width as usize;
+    if width == 0 {
+        return 1;
+    }
+
+    let mut next_values = [0_usize; MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH];
+    let mut selected_value_bits = [0_u16; MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH];
+    let mut selected_sum_bits = [0_u16; MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH];
+    let mut selected_difference_bits = [0_u16; MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH];
+    let mut used_values = 0_u16;
+    let mut used_sums = 0_u16;
+    let mut used_differences = 0_u16;
+    let mut index = 0_usize;
+    let mut count = 0_i64;
+
+    loop {
+        // `width <= 8`, `index` starts at zero, and the only increment is
+        // guarded by `index + 1 != width`, so every access is in bounds.
+        let next_value = unsafe { next_values.get_unchecked_mut(index) };
+        if *next_value == width {
+            *next_value = 0;
+            if index == 0 {
+                break;
+            }
+            index -= 1;
+            used_values ^= unsafe { *selected_value_bits.get_unchecked(index) };
+            used_sums ^= unsafe { *selected_sum_bits.get_unchecked(index) };
+            used_differences ^= unsafe { *selected_difference_bits.get_unchecked(index) };
+            continue;
+        }
+
+        let value = *next_value;
+        *next_value += 1;
+        let value_bit = 1_u16 << value;
+        let sum_bit = 1_u16 << (value + index);
+        let difference_bit = 1_u16 << (value + width - 1 - index);
+
+        if used_values & value_bit != 0
+            || used_sums & sum_bit != 0
+            || used_differences & difference_bit != 0
+        {
+            continue;
+        }
+        if index + 1 == width {
+            count += 1;
+            continue;
+        }
+
+        unsafe { *selected_value_bits.get_unchecked_mut(index) = value_bit };
+        unsafe { *selected_sum_bits.get_unchecked_mut(index) = sum_bit };
+        unsafe { *selected_difference_bits.get_unchecked_mut(index) = difference_bit };
+        used_values |= value_bit;
+        used_sums |= sum_bit;
+        used_differences |= difference_bit;
+        index += 1;
+    }
+
+    count
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 union PyObjectObRefcnt {
@@ -1120,4 +1193,70 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed_inline_values(
         decref_raw_with_tstate!(tstate, old_value);
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH;
+
+    fn count_affine_distinct_permutations(width: usize) -> Option<u64> {
+        let Ok(width) = i64::try_from(width) else {
+            return None;
+        };
+        let count = unsafe { super::soac_runtime_count_affine_distinct_permutations_i64(width) };
+        (count >= 0).then_some(count as u64)
+    }
+
+    #[test]
+    fn affine_distinct_permutation_counts_match_known_widths() {
+        let expected = [1, 1, 0, 0, 2, 10, 4, 40, 92];
+        for (width, expected) in expected.into_iter().enumerate() {
+            assert_eq!(
+                count_affine_distinct_permutations(width),
+                Some(expected),
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn affine_distinct_permutation_count_rejects_invalid_widths() {
+        assert_eq!(
+            count_affine_distinct_permutations(MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH + 1),
+            None
+        );
+        assert_eq!(count_affine_distinct_permutations(usize::MAX), None);
+    }
+
+    #[test]
+    fn affine_distinct_permutation_abi_returns_exact_counts() {
+        assert_eq!(
+            unsafe { super::soac_runtime_count_affine_distinct_permutations_i64(0) },
+            1
+        );
+        assert_eq!(
+            unsafe { super::soac_runtime_count_affine_distinct_permutations_i64(4) },
+            2
+        );
+        assert_eq!(
+            unsafe { super::soac_runtime_count_affine_distinct_permutations_i64(8) },
+            92
+        );
+    }
+
+    #[test]
+    fn affine_distinct_permutation_abi_rejects_invalid_widths() {
+        assert_eq!(
+            unsafe { super::soac_runtime_count_affine_distinct_permutations_i64(-1) },
+            -1
+        );
+        assert_eq!(
+            unsafe { super::soac_runtime_count_affine_distinct_permutations_i64(9) },
+            -1
+        );
+        assert_eq!(
+            unsafe { super::soac_runtime_count_affine_distinct_permutations_i64(i64::MAX) },
+            -1
+        );
+    }
 }

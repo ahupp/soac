@@ -1,13 +1,22 @@
 use crate::plan_v3::{
-    CallBodyPlan, ConversionKind, DeoptPointId, DirectCallArgPlan, DirectCallSpecializationPlan,
-    ExactListItemAccessKind, ExactListItemFallbackPlan, ExactListItemGuardPlan, ExactListItemShape,
-    ExactListItemSpecializationPlan, FailureMode, GuardFailure, GuardKind, IndexedFieldAccessKind,
-    IndexedFieldFallbackPlan, IndexedFieldGuardKind, IndexedFieldOwnerType,
-    IndexedFieldReceiverSource, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
-    IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
-    MaterializeKind, ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind,
+    CallBodyPlan, ConversionKind, Cost, DeoptPointId, DirectCallArgPlan,
+    DirectCallSpecializationPlan, ExactListItemAccessKind, ExactListItemFallbackPlan,
+    ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
+    GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldFallbackPlan,
+    IndexedFieldGuardKind, IndexedFieldOwnerType, IndexedFieldReceiverSource,
+    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackPlan,
+    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
+    ModuleOptimizationPlanV3, OpaqueFusedAlgorithmPlan, OpaqueFusedCompatibilityMode,
+    OpaqueFusedEntryGuardPlan, OpaqueFusedFallbackPlan, OpaqueFusedProducerStagePlan,
+    OpaqueFusedSinkPlan, OpaqueFusedStageId, OperationNode, PlanNodeId, PlanNodeKind,
     PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget,
     RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp, validate_module_plan_v3,
+};
+#[cfg(test)]
+use crate::plan_v3::{
+    OpaqueFusedCompletionPlan, OpaqueFusedExceptionPlan, OpaqueFusedGuardExpectation,
+    OpaqueFusedGuardInput, OpaqueFusedSite, OpaqueFusedSiteOwner, OpaqueFusedYieldEdgePlan,
+    OpaqueFusedYieldTarget,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::collections::{HashMap, HashSet};
@@ -24,6 +33,7 @@ pub struct MechanicalFunctionEmission {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
     pub direct_calls: Vec<MechanicalDirectCallEmission>,
+    pub opaque_fused_iterations: Vec<MechanicalOpaqueFusedIterationEmission>,
     pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
     pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
@@ -77,6 +87,20 @@ pub struct MechanicalDirectCallEmission {
     pub callee: crate::plan_v3::DirectCallCallee,
     pub arg_plan: DirectCallArgPlan,
     pub body: CallBodyPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct MechanicalOpaqueFusedIterationEmission {
+    pub source: InstrId,
+    pub algorithm: OpaqueFusedAlgorithmPlan,
+    pub compatibility: OpaqueFusedCompatibilityMode,
+    pub entry_stage: OpaqueFusedStageId,
+    pub stages: Vec<OpaqueFusedProducerStagePlan>,
+    pub sink: OpaqueFusedSinkPlan,
+    pub entry_guards: Vec<OpaqueFusedEntryGuardPlan>,
+    pub fallback: OpaqueFusedFallbackPlan,
+    pub cost: Cost,
     pub reason: String,
 }
 
@@ -859,6 +883,11 @@ fn emit_function(
         function: function.function.function,
         debug_name: function.function.debug_name.clone(),
         direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
+        opaque_fused_iterations: function
+            .opaque_fused_iterations
+            .iter()
+            .map(emit_opaque_fused_iteration)
+            .collect(),
         exact_list_items: function
             .exact_list_items
             .iter()
@@ -1615,6 +1644,23 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
     }
 }
 
+fn emit_opaque_fused_iteration(
+    plan: &crate::plan_v3::OpaqueFusedIterationPlan,
+) -> MechanicalOpaqueFusedIterationEmission {
+    MechanicalOpaqueFusedIterationEmission {
+        source: plan.source,
+        algorithm: plan.algorithm.clone(),
+        compatibility: plan.compatibility,
+        entry_stage: plan.entry_stage,
+        stages: plan.stages.clone(),
+        sink: plan.sink.clone(),
+        entry_guards: plan.entry_guards.clone(),
+        fallback: plan.fallback.clone(),
+        cost: plan.cost,
+        reason: plan.reason.clone(),
+    }
+}
+
 fn emit_exact_list_item(item: &ExactListItemSpecializationPlan) -> MechanicalExactListItemEmission {
     MechanicalExactListItemEmission {
         source: item.source,
@@ -1883,6 +1929,7 @@ mod tests {
                     },
                 ],
                 direct_calls: Vec::new(),
+                opaque_fused_iterations: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -1891,6 +1938,94 @@ mod tests {
                 diagnostics: Vec::new(),
             }],
         }
+    }
+
+    fn add_test_opaque_fused_iteration(plan: &mut ModuleOptimizationPlanV3) {
+        let source = InstrId::new(50);
+        let entry_stage = OpaqueFusedStageId(0);
+        let width_input = OpaqueFusedGuardInput::FunctionParam { index: 0 };
+        plan.functions[0]
+            .opaque_fused_iterations
+            .push(crate::plan_v3::OpaqueFusedIterationPlan {
+                source,
+                algorithm: OpaqueFusedAlgorithmPlan::AffineDistinctPermutationCount {
+                    width_input: width_input.clone(),
+                    maximum_width: 16,
+                },
+                compatibility: OpaqueFusedCompatibilityMode::OpaqueNoGeneratorMaterialization,
+                entry_stage,
+                stages: vec![OpaqueFusedProducerStagePlan {
+                    id: entry_stage,
+                    function: SerializedFunctionId::new(
+                        SerializedModuleId::new(0),
+                        LocalFunctionId::new(2),
+                    ),
+                    origin: OpaqueFusedSite {
+                        owner: OpaqueFusedSiteOwner::Root,
+                        source: InstrId::new(51),
+                    },
+                    arg_plan: DirectCallArgPlan {
+                        sources: vec![DirectCallArgSource::Provided(0)],
+                    },
+                    positional_defaults: Vec::new(),
+                    yield_edges: vec![OpaqueFusedYieldEdgePlan {
+                        source: InstrId::new(52),
+                        target: OpaqueFusedYieldTarget::Sink,
+                    }],
+                    completion: OpaqueFusedCompletionPlan::FinishConsumer,
+                    exception: OpaqueFusedExceptionPlan::Propagate,
+                }],
+                sink: OpaqueFusedSinkPlan::Count {
+                    consume_source: InstrId::new(53),
+                    result_source: source,
+                },
+                entry_guards: vec![OpaqueFusedEntryGuardPlan {
+                    input: width_input,
+                    expectation: OpaqueFusedGuardExpectation::ExactCompactIntRange {
+                        min: 0,
+                        max: 16,
+                    },
+                    reason: "test admitted width".to_string(),
+                }],
+                fallback: OpaqueFusedFallbackPlan {
+                    original_source: source,
+                },
+                cost: Cost::default(),
+                reason: "test opaque fused iteration".to_string(),
+            });
+    }
+
+    #[test]
+    fn emits_and_validates_opaque_fused_iteration_mechanically() {
+        let mut plan = test_plan(true);
+        add_test_opaque_fused_iteration(&mut plan);
+
+        let mut emission = emit_mechanical_plan_v3(&plan).unwrap();
+
+        let fused = &emission.functions[0].opaque_fused_iterations[0];
+        assert_eq!(fused.source, InstrId::new(50));
+        assert!(matches!(
+            &fused.algorithm,
+            OpaqueFusedAlgorithmPlan::AffineDistinctPermutationCount {
+                maximum_width: 16,
+                ..
+            }
+        ));
+        assert_eq!(
+            fused.compatibility,
+            OpaqueFusedCompatibilityMode::OpaqueNoGeneratorMaterialization
+        );
+
+        emission.functions[0].opaque_fused_iterations[0].reason = "mutated emission".to_string();
+        let err = validate_mechanical_emission_matches_plan_v3(&plan, &emission).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MechanicalEmitError::EmissionMismatch(ref message)
+                    if message.contains("does not match the selected plan")
+            ),
+            "{err}"
+        );
     }
 
     #[test]

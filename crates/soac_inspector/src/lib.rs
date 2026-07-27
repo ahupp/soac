@@ -543,6 +543,7 @@ fn build_source_backed_runtime_render_state(
         module_name,
         module_package_name(module_name),
         source_hash,
+        Some(source.as_str()),
         original_code_by_function_id,
     )
     .map_err(|err| err.to_string())

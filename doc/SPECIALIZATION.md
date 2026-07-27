@@ -700,6 +700,163 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   - richer support for more Python callable shapes that still map to a
     transformed function body
 
+## Opaque Fused Iteration
+
+Opaque fused iteration is an intentional compatibility-relaxed specialization
+for a complete, synchronously consumed generator graph. It applies only when
+the producer instances are proven not to escape and every yield is consumed by
+the selected graph. Separately returned or otherwise observable instances of
+the same generator functions keep the ordinary CPython generator path.
+
+This specialization records and consumes no profiling counters. Profile and
+verify modes keep the original generator graph. Admission occurs only during
+typed planning in apply mode, from independently pinned exact source bytes
+together with a complete typed producer/consumer graph and static
+target/argument proof; ordinary hot-target or shape evidence cannot select it.
+Verify is deliberately excluded because its counter-vectorcall installation
+invalidates CPython's function version, so the same entry guards would always
+take the fallback.
+
+The optimization is represented as one validated typed producer/consumer plan,
+not as recursive inlining of `iter`, `next`, `send`, resume helpers, and
+consumer implementations. Each producer body is represented once in the plan. A producer
+`yield` is an edge into its consumer, and the consumer continuation is an edge
+back to the producer's shared continuation. Completion, Python exception, and
+cleanup exits remain distinct. Activation state that would otherwise live in a
+generator frame or preserved-state object is held in scalar helper stack locals.
+
+The first emitted algorithm is deliberately narrow. It requires byte-for-byte
+equality between the candidate module source and one of two independently
+pinned N-Queens sources, plus a validated six-producer graph: the `n_queens`
+and `permutations` generators, four generator expressions, five immediate
+aggregate consumers, and one direct `for` consumer. The tracked slice ends in
+`return len(list(n_queens(...)))` and selects a Count sink. The installed
+pyperformance benchmark ends in the effect-only statement
+`list(n_queens(...))` and selects a Discard sink; its ordinary implicit return
+value remains `None`. The reference bytes are carried independently from the
+candidate module and are not derived from that module or from profile
+evidence. Exact-source matching is temporary soundness scaffolding; similarly
+named or graph-shaped functions are not enough to select the algorithm. A
+follow-up must derive the scalar computation from general producer semantics
+before this source gate can be removed.
+
+For an exact compact integer width in `0..=8`, codegen replaces that complete
+graph with one allocation-free iterative depth-first search. Stack-local arrays
+hold the next candidate and selected bits at each depth; three `u16` masks
+represent used columns, ascending diagonals, and descending diagonals. Invalid
+prefixes are rejected immediately, so the hot path does not enumerate all
+permutations or materialize ranges, iterators, generator objects, frames,
+indices/cycles lists, slices, tuples, projection integers, sets, or the outer
+result list. The Count sink boxes the final count. The Discard sink ignores the
+helper's count and produces the canonical `None` result without boxing it.
+This is aggregate scalarization as well as generator fusion, and therefore
+takes the broader compatibility relaxations listed below.
+
+### Eligibility and guards
+
+- The complete selected producer/consumer graph must be nonescaping. There may
+  be no remaining Python use that can observe the selected generator through
+  `send`, `throw`, `close`, iteration outside the graph, identity, or an
+  unknown Python/C call.
+- The complete module source bytes must exactly match one of the two tracked
+  sources, and discovery must reproduce its exact Count or Discard sink and
+  six-producer ownership graph.
+- The selected `n_queens` and `permutations` globals are loaded from their
+  expected indexed global slots and guarded as exact `PyFunction` objects with
+  the expected SOAC function IDs. Each function's nonzero CPython
+  `func_version` must still equal its code object's `co_version`, which rejects
+  replacement vectorcalls and other function mutation. The `permutations`
+  positional-default guard also requires the exact defaults-tuple length and
+  the expected right-aligned `r is None` item. A miss takes the untouched
+  original expression before any selected generator is activated.
+- Transformed instances of the two exact pinned modules retain SOAC's indexed
+  module-dictionary layout so those global probes are constant-time and cannot
+  invoke Python. Other source-backed named-generator modules continue to use an
+  ordinary module dictionary. If an external mutation converts the pinned
+  module dictionary away from the expected indexed layout, the probe misses
+  and the untouched generator graph runs.
+- Every skipped canonical runtime builtin is present in the validated plan.
+  These names are statically pinned by SOAC's existing runtime-builtin name
+  binding; they are structural dependencies, not dynamic Python-global guards.
+- The width must be an exact compact integer in `0..=8`. Negative values,
+  larger integers, integer subclasses, and non-integers use the ordinary path.
+- The initial implementation rejects `yield from`, source `finally`/`with`
+  cleanup, externally aliased closure cells, and exception regions whose
+  cleanup cannot be represented by the fused plan.
+- Once a hot fused activation starts, it does not deopt to a partially
+  reconstructed generator. The bounded scalar helper has no Python safepoint
+  inside its search; it cannot observe dependency changes after entry.
+- The caller emits a fixed guard sequence and one helper call, so graph depth
+  does not recursively clone producer or consumer CFGs into machine code.
+
+### Preserved Python behavior
+
+- For the Count sink, exact integer widths `0..=8` return the same solution
+  count. Unit coverage fixes the complete sequence to
+  `1, 1, 0, 0, 2, 10, 4, 40, 92`.
+- For the Discard sink, the same widths exhaust the equivalent search and the
+  benchmark callable returns `None`, without materializing or retaining its
+  list of solutions.
+- Exact-type, exact-source, graph, function-identity, or code/default guard
+  misses execute the original SOAC Python call graph.
+- All inputs for which the scalar algorithm is not proven, including widths
+  outside the admitted range, retain ordinary exception and allocation
+  behavior through that fallback.
+- Other uses of the generator functions and generator expressions are not
+  rewritten; only the proven nonescaping instances rooted at the selected
+  Count or Discard expression are opaque.
+
+### Intentional CPython divergences
+
+For the selected nonescaping instances only:
+
+- SOAC does not allocate a `PyGenObject` or suspended
+  `_PyInterpreterFrame`. `gi_frame`, `gi_running`, `gi_yieldfrom`,
+  `frame.f_generator`, writable frame locals, `sys._current_frames()`, GC heap
+  discovery, PEP 523 frame hooks, and C frame-inspection APIs cannot observe the
+  eliminated activations.
+- The two pinned transformed modules use SOAC's indexed `PyDictObject` key
+  layout rather than stock CPython's ordinary module-dictionary layout. Normal
+  Python mapping operations retain their intended behavior, but C extensions,
+  private CPython APIs, dictionary watchers, or debugging tools that inspect
+  dictionary storage/layout details can distinguish it. Conversion away from
+  that layout disables the fused hot path rather than rebuilding indexed
+  storage.
+- Trace, profile, debugger, coverage, and `sys.monitoring` callbacks do not
+  receive faithful call/resume/yield/return, line, or opcode events for the
+  eliminated work. Having an observer active does not disable this
+  specialization. Observers may still see surrounding caller or instrumented
+  call-site events, but they see neither a Python frame for the SOAC direct
+  entry nor frames for the eliminated generators. The direct native helper
+  call is not a Python-visible call boundary.
+- Python tracebacks may omit the eliminated generator and generator-expression
+  frames and their exact suspended instruction positions.
+- Eliminated Python calls and generator resumes also eliminate their CPython
+  recursion-accounting checks. With an unusually low recursion limit, fused
+  execution may succeed where stock Python raises `RecursionError`, and
+  observable recursion depth may differ.
+- The skipped generator/frame, range/iterator, list, slice, tuple, set, and
+  intermediate integer allocations are not reproduced for observability.
+  Allocation-specific `MemoryError` points, `tracemalloc` records, allocator
+  hooks, allocated-block counts, refcount/destruction timing, cyclic-GC trigger
+  timing, GC callbacks, and unrelated finalizer timing may differ.
+- Pending calls, signal delivery, asynchronous exceptions, and thread
+  hand-off can be delayed until the bounded helper returns; former yield and
+  Python-loop boundaries are not safepoints. Entry-guarded function, default,
+  and global identities therefore act as an activation snapshot for the
+  duration of the helper.
+- As in the ordinary transformed path used by this benchmark, `range`, `len`,
+  `list`, `tuple`, `reversed`, and `set` are bound to SOAC's canonical runtime
+  builtins. Assigning same-named globals after import is not observed as stock
+  Python would observe it. Opaque fusion validates that the complete expected
+  builtin dependency set is present, but does not add a dynamic shadowing
+  fallback.
+- Resource-exhaustion behavior differs: the scalar search uses fixed stack
+  storage and can succeed where CPython would fail while allocating one of the
+  eliminated objects. For the Count sink, failure to allocate the final boxed
+  count is reported in the surrounding caller rather than from a generator
+  frame; the Discard sink performs no corresponding result allocation.
+
 
 ## Direct Method Calls
 

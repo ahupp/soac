@@ -428,6 +428,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
             blockpy_module,
             module_info,
             original_code_by_function_id,
+            source.as_str(),
         )
     })?;
     let create_module_total = create_total_start.elapsed();

@@ -28,6 +28,7 @@ pub struct FunctionOptimizationPlanV3 {
     pub function: FunctionPlanIdentity,
     pub regions: Vec<RegionPlan>,
     pub direct_calls: Vec<DirectCallSpecializationPlan>,
+    pub opaque_fused_iterations: Vec<OpaqueFusedIterationPlan>,
     pub exact_list_items: Vec<ExactListItemSpecializationPlan>,
     pub indexed_fields: Vec<IndexedFieldSpecializationPlan>,
     pub indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
@@ -90,6 +91,204 @@ pub enum DirectCallArgSource {
     Provided(u32),
     PackedRest { start: u32 },
     DefaultSentinel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct OpaqueFusedIterationPlan {
+    pub source: InstrId,
+    pub algorithm: OpaqueFusedAlgorithmPlan,
+    pub compatibility: OpaqueFusedCompatibilityMode,
+    pub entry_stage: OpaqueFusedStageId,
+    pub stages: Vec<OpaqueFusedProducerStagePlan>,
+    pub sink: OpaqueFusedSinkPlan,
+    pub entry_guards: Vec<OpaqueFusedEntryGuardPlan>,
+    pub fallback: OpaqueFusedFallbackPlan,
+    pub cost: Cost,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum OpaqueFusedAlgorithmPlan {
+    AffineDistinctPermutationCount {
+        width_input: OpaqueFusedGuardInput,
+        maximum_width: u32,
+    },
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum OpaqueFusedCompatibilityMode {
+    OpaqueNoGeneratorMaterialization,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub struct OpaqueFusedStageId(pub u32);
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct OpaqueFusedProducerStagePlan {
+    pub id: OpaqueFusedStageId,
+    pub function: SerializedFunctionId,
+    pub origin: OpaqueFusedSite,
+    pub arg_plan: DirectCallArgPlan,
+    pub positional_defaults: Vec<OpaqueFusedPositionalDefaultPlan>,
+    pub yield_edges: Vec<OpaqueFusedYieldEdgePlan>,
+    pub completion: OpaqueFusedCompletionPlan,
+    pub exception: OpaqueFusedExceptionPlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct OpaqueFusedPositionalDefaultPlan {
+    pub parameter_index: u32,
+    pub default_index: u32,
+    pub expected_defaults_len: u32,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub struct OpaqueFusedSite {
+    pub owner: OpaqueFusedSiteOwner,
+    pub source: InstrId,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum OpaqueFusedSiteOwner {
+    Root,
+    Stage(OpaqueFusedStageId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct OpaqueFusedYieldEdgePlan {
+    pub source: InstrId,
+    pub target: OpaqueFusedYieldTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum OpaqueFusedYieldTarget {
+    Consumer {
+        site: OpaqueFusedSite,
+        kind: OpaqueFusedConsumerKind,
+    },
+    Sink,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum OpaqueFusedConsumerKind {
+    ForLoop,
+    BuildTuple,
+    BuildSet,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum OpaqueFusedSinkPlan {
+    Count {
+        consume_source: InstrId,
+        result_source: InstrId,
+    },
+    Discard {
+        consume_source: InstrId,
+        result_source: InstrId,
+    },
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum OpaqueFusedCompletionPlan {
+    FinishConsumer,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum OpaqueFusedExceptionPlan {
+    Propagate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct OpaqueFusedEntryGuardPlan {
+    pub input: OpaqueFusedGuardInput,
+    pub expectation: OpaqueFusedGuardExpectation,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum OpaqueFusedGuardInput {
+    Site(OpaqueFusedSite),
+    FunctionParam { index: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum OpaqueFusedGuardExpectation {
+    FunctionIdentity {
+        target: SerializedFunctionId,
+    },
+    FunctionPositionalDefaultIdentity {
+        target: SerializedFunctionId,
+        parameter_index: u32,
+        default_index: u32,
+        expected_defaults_len: u32,
+        expected: RuntimeName,
+    },
+    RuntimeBuiltinIdentity {
+        runtime_name: RuntimeName,
+    },
+    ExactCompactIntRange {
+        min: i64,
+        max: i64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct OpaqueFusedFallbackPlan {
+    pub original_source: InstrId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -820,6 +1019,7 @@ fn validate_function_plan(
         }
     }
     validate_direct_call_plans(function, identity_tables, errors);
+    validate_opaque_fused_iteration_plans(function, identity_tables, errors);
     validate_exact_list_item_plans(function, errors);
     validate_indexed_field_plans(function, errors);
     validate_indexed_global_plans(function, errors);
@@ -830,6 +1030,352 @@ fn validate_function_plan(
                 function.function.function, action.value
             ));
         }
+    }
+}
+
+fn validate_opaque_fused_iteration_plans(
+    function: &FunctionOptimizationPlanV3,
+    identity_tables: &SerializedIdentityTables,
+    errors: &mut Vec<String>,
+) {
+    let mut seen_sources = HashSet::new();
+    for plan in &function.opaque_fused_iterations {
+        let context = format!(
+            "function {} opaque fused iteration at {}",
+            function.function.function, plan.source
+        );
+        if !seen_sources.insert(plan.source) {
+            errors.push(format!("{context} duplicates a selected source"));
+        }
+        if plan.reason.is_empty() {
+            errors.push(format!("{context} has empty reason"));
+        }
+        if plan.fallback.original_source != plan.source {
+            errors.push(format!(
+                "{context} fallback source {} does not match replacement source {}",
+                plan.fallback.original_source, plan.source
+            ));
+        }
+        let (width_input, maximum_width) = match &plan.algorithm {
+            OpaqueFusedAlgorithmPlan::AffineDistinctPermutationCount {
+                width_input,
+                maximum_width,
+            } => (width_input, *maximum_width),
+        };
+        if !(1..=63).contains(&maximum_width) {
+            errors.push(format!(
+                "{context} affine-distinct permutation maximum width {maximum_width} is outside 1..=63"
+            ));
+        }
+        let has_width_guard = plan.entry_guards.iter().any(|guard| {
+            &guard.input == width_input
+                && matches!(
+                    &guard.expectation,
+                    OpaqueFusedGuardExpectation::ExactCompactIntRange { min, max }
+                        if *min == 0 && *max == i64::from(maximum_width)
+                )
+        });
+        if !has_width_guard {
+            errors.push(format!(
+                "{context} lacks an entry-only exact compact-int width guard for 0..={maximum_width}"
+            ));
+        }
+        match &plan.sink {
+            OpaqueFusedSinkPlan::Count {
+                consume_source: _,
+                result_source,
+            } if *result_source != plan.source => errors.push(format!(
+                "{context} count result source {result_source} does not match replacement source {}",
+                plan.source
+            )),
+            OpaqueFusedSinkPlan::Count { .. } => {}
+            OpaqueFusedSinkPlan::Discard {
+                consume_source,
+                result_source,
+            } => {
+                if *result_source != plan.source {
+                    errors.push(format!(
+                        "{context} discard result source {result_source} does not match replacement source {}",
+                        plan.source
+                    ));
+                }
+                if consume_source != result_source {
+                    errors.push(format!(
+                        "{context} discard consumer source {consume_source} does not match result source {result_source}"
+                    ));
+                }
+            }
+        }
+        if plan.entry_guards.is_empty() {
+            errors.push(format!("{context} has no entry guards"));
+        }
+
+        let mut stage_ids = HashSet::new();
+        let mut construction_sites = HashSet::new();
+        for stage in &plan.stages {
+            if !stage_ids.insert(stage.id) {
+                errors.push(format!("{context} has duplicate stage {:?}", stage.id));
+            }
+            if !construction_sites.insert(stage.origin) {
+                errors.push(format!(
+                    "{context} has duplicate construction site {:?}",
+                    stage.origin
+                ));
+            }
+        }
+        if !stage_ids.contains(&plan.entry_stage) {
+            errors.push(format!(
+                "{context} entry stage {:?} is missing",
+                plan.entry_stage
+            ));
+        }
+        let root_stages = plan
+            .stages
+            .iter()
+            .filter(|stage| stage.origin.owner == OpaqueFusedSiteOwner::Root)
+            .map(|stage| stage.id)
+            .collect::<Vec<_>>();
+        if root_stages.len() != 1 {
+            errors.push(format!(
+                "{context} must have exactly one root-origin stage, found {}",
+                root_stages.len()
+            ));
+        } else if root_stages[0] != plan.entry_stage {
+            errors.push(format!(
+                "{context} root-origin stage {:?} is not entry stage {:?}",
+                root_stages[0], plan.entry_stage
+            ));
+        }
+
+        for guard in &plan.entry_guards {
+            if guard.reason.is_empty() {
+                errors.push(format!("{context} has an entry guard with empty reason"));
+            }
+            if let OpaqueFusedGuardInput::Site(site) = &guard.input {
+                validate_opaque_fused_site_owner(
+                    &context,
+                    "entry guard",
+                    *site,
+                    &stage_ids,
+                    errors,
+                );
+            }
+            match &guard.expectation {
+                OpaqueFusedGuardExpectation::FunctionIdentity { target } => {
+                    if identity_tables.module(target.module_id()).is_err() {
+                        errors.push(format!(
+                            "{context} entry guard target {target} references missing module id {}",
+                            target.module_id()
+                        ));
+                    }
+                }
+                OpaqueFusedGuardExpectation::FunctionPositionalDefaultIdentity {
+                    target,
+                    default_index,
+                    expected_defaults_len,
+                    expected,
+                    ..
+                } => {
+                    if identity_tables.module(target.module_id()).is_err() {
+                        errors.push(format!(
+                            "{context} entry guard target {target} references missing module id {}",
+                            target.module_id()
+                        ));
+                    }
+                    if *expected != RuntimeName::None {
+                        errors.push(format!(
+                            "{context} function positional-default guard expects unsupported runtime value {expected:?}; only None is admitted"
+                        ));
+                    }
+                    if *expected_defaults_len == 0 || *default_index >= *expected_defaults_len {
+                        errors.push(format!(
+                            "{context} function positional-default guard index {default_index} is outside exact defaults length {expected_defaults_len}"
+                        ));
+                    }
+                }
+                OpaqueFusedGuardExpectation::ExactCompactIntRange { min, max } if min > max => {
+                    errors.push(format!(
+                        "{context} entry guard has invalid exact compact-int range {min}..={max}"
+                    ));
+                }
+                OpaqueFusedGuardExpectation::RuntimeBuiltinIdentity { .. }
+                | OpaqueFusedGuardExpectation::ExactCompactIntRange { .. } => {}
+            }
+        }
+
+        for stage in &plan.stages {
+            if identity_tables.module(stage.function.module_id()).is_err() {
+                errors.push(format!(
+                    "{context} stage {:?} function {} references missing module id {}",
+                    stage.id,
+                    stage.function,
+                    stage.function.module_id()
+                ));
+            }
+            match stage.origin.owner {
+                OpaqueFusedSiteOwner::Root => {}
+                OpaqueFusedSiteOwner::Stage(parent) if !stage_ids.contains(&parent) => {
+                    errors.push(format!(
+                        "{context} stage {:?} origin references missing parent stage {:?}",
+                        stage.id, parent
+                    ));
+                }
+                OpaqueFusedSiteOwner::Stage(_) => {}
+            }
+            validate_direct_call_arg_plan(
+                function,
+                "opaque fused producer",
+                stage.function,
+                stage.origin.source,
+                &stage.arg_plan,
+                errors,
+            );
+            let mut positional_defaults_by_parameter = HashMap::new();
+            for positional_default in &stage.positional_defaults {
+                let parameter_index = positional_default.parameter_index as usize;
+                if positional_defaults_by_parameter
+                    .insert(parameter_index, *positional_default)
+                    .is_some()
+                {
+                    errors.push(format!(
+                        "{context} stage {:?} repeats positional-default metadata for parameter {parameter_index}",
+                        stage.id
+                    ));
+                }
+                if !matches!(
+                    stage.arg_plan.sources.get(parameter_index),
+                    Some(DirectCallArgSource::DefaultSentinel)
+                ) {
+                    errors.push(format!(
+                        "{context} stage {:?} has positional-default metadata for non-defaulted parameter {parameter_index}",
+                        stage.id
+                    ));
+                }
+                if positional_default.expected_defaults_len == 0
+                    || positional_default.default_index >= positional_default.expected_defaults_len
+                {
+                    errors.push(format!(
+                        "{context} stage {:?} positional-default index {} is outside exact defaults length {}",
+                        stage.id,
+                        positional_default.default_index,
+                        positional_default.expected_defaults_len
+                    ));
+                }
+            }
+            for (parameter_index, arg_source) in stage.arg_plan.sources.iter().enumerate() {
+                if !matches!(arg_source, DirectCallArgSource::DefaultSentinel) {
+                    continue;
+                }
+                let Some(positional_default) =
+                    positional_defaults_by_parameter.get(&parameter_index)
+                else {
+                    errors.push(format!(
+                        "{context} stage {:?} defaulted parameter {parameter_index} lacks positional-default metadata",
+                        stage.id
+                    ));
+                    continue;
+                };
+                let guarded = plan.entry_guards.iter().any(|guard| {
+                    guard.input == OpaqueFusedGuardInput::Site(stage.origin)
+                        && matches!(
+                            &guard.expectation,
+                            OpaqueFusedGuardExpectation::FunctionPositionalDefaultIdentity {
+                                target,
+                                parameter_index: guarded_parameter_index,
+                                default_index,
+                                expected_defaults_len,
+                                expected: RuntimeName::None,
+                            } if *target == stage.function
+                                && *guarded_parameter_index == parameter_index as u32
+                                && *default_index == positional_default.default_index
+                                && *expected_defaults_len
+                                    == positional_default.expected_defaults_len
+                        )
+                });
+                if !guarded {
+                    errors.push(format!(
+                        "{context} stage {:?} defaulted parameter {parameter_index} lacks an entry-only positional-default None identity guard",
+                        stage.id
+                    ));
+                }
+            }
+            if stage.yield_edges.is_empty() {
+                errors.push(format!("{context} stage {:?} has no yield edges", stage.id));
+            }
+            let mut yield_sources = HashSet::new();
+            for edge in &stage.yield_edges {
+                if !yield_sources.insert(edge.source) {
+                    errors.push(format!(
+                        "{context} stage {:?} has duplicate yield source {}",
+                        stage.id, edge.source
+                    ));
+                }
+                match &edge.target {
+                    OpaqueFusedYieldTarget::Sink if stage.id != plan.entry_stage => {
+                        errors.push(format!(
+                            "{context} non-entry stage {:?} yields directly to the sink",
+                            stage.id
+                        ));
+                    }
+                    OpaqueFusedYieldTarget::Consumer { site, .. } => {
+                        validate_opaque_fused_site_owner(
+                            &context,
+                            "yield consumer",
+                            *site,
+                            &stage_ids,
+                            errors,
+                        );
+                        if stage.id == plan.entry_stage {
+                            errors.push(format!(
+                                "{context} entry stage {:?} yields to a consumer instead of the sink",
+                                stage.id
+                            ));
+                        }
+                        if site.owner != stage.origin.owner {
+                            errors.push(format!(
+                                "{context} stage {:?} yields to {:?}, expected its construction owner {:?}",
+                                stage.id, site.owner, stage.origin.owner
+                            ));
+                        }
+                    }
+                    OpaqueFusedYieldTarget::Sink => {}
+                }
+            }
+        }
+
+        let mut reachable = HashSet::new();
+        let mut pending = vec![plan.entry_stage];
+        while let Some(parent) = pending.pop() {
+            if !reachable.insert(parent) {
+                continue;
+            }
+            pending.extend(plan.stages.iter().filter_map(|stage| {
+                (stage.origin.owner == OpaqueFusedSiteOwner::Stage(parent)).then_some(stage.id)
+            }));
+        }
+        for stage_id in stage_ids.difference(&reachable) {
+            errors.push(format!(
+                "{context} stage {stage_id:?} is unreachable from entry stage {:?} or participates in a construction cycle",
+                plan.entry_stage
+            ));
+        }
+    }
+}
+
+fn validate_opaque_fused_site_owner(
+    context: &str,
+    use_kind: &str,
+    site: OpaqueFusedSite,
+    stage_ids: &HashSet<OpaqueFusedStageId>,
+    errors: &mut Vec<String>,
+) {
+    if let OpaqueFusedSiteOwner::Stage(owner) = site.owner
+        && !stage_ids.contains(&owner)
+    {
+        errors.push(format!(
+            "{context} {use_kind} site {} references missing stage {owner:?}",
+            site.source
+        ));
     }
 }
 
@@ -2087,6 +2633,7 @@ mod tests {
                 },
                 regions,
                 direct_calls: Vec::new(),
+                opaque_fused_iterations: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -2109,6 +2656,230 @@ mod tests {
         let mut module = module_with_regions(Vec::new());
         module.functions[0].direct_calls = direct_calls;
         module
+    }
+
+    fn module_with_opaque_fused_iterations(
+        opaque_fused_iterations: Vec<OpaqueFusedIterationPlan>,
+    ) -> ModuleOptimizationPlanV3 {
+        let mut module = module_with_regions(Vec::new());
+        module.functions[0].opaque_fused_iterations = opaque_fused_iterations;
+        module
+    }
+
+    fn valid_opaque_fused_iteration(source: u32) -> OpaqueFusedIterationPlan {
+        let entry_stage = OpaqueFusedStageId(0);
+        let nested_stage = OpaqueFusedStageId(1);
+        let width_input = OpaqueFusedGuardInput::FunctionParam { index: 0 };
+        OpaqueFusedIterationPlan {
+            source: instr_id(source),
+            algorithm: OpaqueFusedAlgorithmPlan::AffineDistinctPermutationCount {
+                width_input: width_input.clone(),
+                maximum_width: 16,
+            },
+            compatibility: OpaqueFusedCompatibilityMode::OpaqueNoGeneratorMaterialization,
+            entry_stage,
+            stages: vec![
+                OpaqueFusedProducerStagePlan {
+                    id: entry_stage,
+                    function: SerializedFunctionId::new(
+                        SerializedModuleId::new(0),
+                        LocalFunctionId::new(2),
+                    ),
+                    origin: OpaqueFusedSite {
+                        owner: OpaqueFusedSiteOwner::Root,
+                        source: instr_id(10),
+                    },
+                    arg_plan: DirectCallArgPlan {
+                        sources: vec![DirectCallArgSource::Provided(0)],
+                    },
+                    positional_defaults: Vec::new(),
+                    yield_edges: vec![OpaqueFusedYieldEdgePlan {
+                        source: instr_id(20),
+                        target: OpaqueFusedYieldTarget::Sink,
+                    }],
+                    completion: OpaqueFusedCompletionPlan::FinishConsumer,
+                    exception: OpaqueFusedExceptionPlan::Propagate,
+                },
+                OpaqueFusedProducerStagePlan {
+                    id: nested_stage,
+                    function: SerializedFunctionId::new(
+                        SerializedModuleId::new(0),
+                        LocalFunctionId::new(3),
+                    ),
+                    origin: OpaqueFusedSite {
+                        owner: OpaqueFusedSiteOwner::Stage(entry_stage),
+                        source: instr_id(11),
+                    },
+                    arg_plan: DirectCallArgPlan {
+                        sources: vec![
+                            DirectCallArgSource::Provided(0),
+                            DirectCallArgSource::DefaultSentinel,
+                        ],
+                    },
+                    positional_defaults: vec![OpaqueFusedPositionalDefaultPlan {
+                        parameter_index: 1,
+                        default_index: 0,
+                        expected_defaults_len: 1,
+                    }],
+                    yield_edges: vec![OpaqueFusedYieldEdgePlan {
+                        source: instr_id(21),
+                        target: OpaqueFusedYieldTarget::Consumer {
+                            site: OpaqueFusedSite {
+                                owner: OpaqueFusedSiteOwner::Stage(entry_stage),
+                                source: instr_id(12),
+                            },
+                            kind: OpaqueFusedConsumerKind::ForLoop,
+                        },
+                    }],
+                    completion: OpaqueFusedCompletionPlan::FinishConsumer,
+                    exception: OpaqueFusedExceptionPlan::Propagate,
+                },
+            ],
+            sink: OpaqueFusedSinkPlan::Count {
+                consume_source: instr_id(29),
+                result_source: instr_id(source),
+            },
+            entry_guards: vec![
+                OpaqueFusedEntryGuardPlan {
+                    input: width_input,
+                    expectation: OpaqueFusedGuardExpectation::ExactCompactIntRange {
+                        min: 0,
+                        max: 16,
+                    },
+                    reason: "width is admitted by the scalar bitset algorithm".to_string(),
+                },
+                OpaqueFusedEntryGuardPlan {
+                    input: OpaqueFusedGuardInput::Site(OpaqueFusedSite {
+                        owner: OpaqueFusedSiteOwner::Root,
+                        source: instr_id(10),
+                    }),
+                    expectation: OpaqueFusedGuardExpectation::FunctionIdentity {
+                        target: SerializedFunctionId::new(
+                            SerializedModuleId::new(0),
+                            LocalFunctionId::new(2),
+                        ),
+                    },
+                    reason: "entry producer identity is stable".to_string(),
+                },
+                OpaqueFusedEntryGuardPlan {
+                    input: OpaqueFusedGuardInput::Site(OpaqueFusedSite {
+                        owner: OpaqueFusedSiteOwner::Stage(entry_stage),
+                        source: instr_id(11),
+                    }),
+                    expectation: OpaqueFusedGuardExpectation::FunctionPositionalDefaultIdentity {
+                        target: SerializedFunctionId::new(
+                            SerializedModuleId::new(0),
+                            LocalFunctionId::new(3),
+                        ),
+                        parameter_index: 1,
+                        default_index: 0,
+                        expected_defaults_len: 1,
+                        expected: RuntimeName::None,
+                    },
+                    reason: "permutations r default remains the None singleton".to_string(),
+                },
+            ],
+            fallback: OpaqueFusedFallbackPlan {
+                original_source: instr_id(source),
+            },
+            cost: Cost::default(),
+            reason: "profiled nested generators admit affine-distinct permutation count"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn validates_opaque_fused_iteration_selection() {
+        let plan = module_with_opaque_fused_iterations(vec![valid_opaque_fused_iteration(30)]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn validates_opaque_fused_explicit_nonzero_index_in_an_exact_two_default_tuple() {
+        let mut fused = valid_opaque_fused_iteration(30);
+        let nested = &mut fused.stages[1];
+        nested
+            .arg_plan
+            .sources
+            .push(DirectCallArgSource::DefaultSentinel);
+        nested.positional_defaults = vec![
+            OpaqueFusedPositionalDefaultPlan {
+                parameter_index: 1,
+                default_index: 0,
+                expected_defaults_len: 2,
+            },
+            OpaqueFusedPositionalDefaultPlan {
+                parameter_index: 2,
+                default_index: 1,
+                expected_defaults_len: 2,
+            },
+        ];
+        let OpaqueFusedGuardExpectation::FunctionPositionalDefaultIdentity {
+            expected_defaults_len,
+            ..
+        } = &mut fused.entry_guards[2].expectation
+        else {
+            panic!("fixture should contain the first positional-default guard");
+        };
+        *expected_defaults_len = 2;
+        fused.entry_guards.push(OpaqueFusedEntryGuardPlan {
+            input: OpaqueFusedGuardInput::Site(nested.origin),
+            expectation: OpaqueFusedGuardExpectation::FunctionPositionalDefaultIdentity {
+                target: nested.function,
+                parameter_index: 2,
+                default_index: 1,
+                expected_defaults_len: 2,
+                expected: RuntimeName::None,
+            },
+            reason: "second omitted parameter maps to defaults[1]".to_string(),
+        });
+        let plan = module_with_opaque_fused_iterations(vec![fused]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_defaulted_opaque_fused_stage_without_default_identity_guard() {
+        let mut fused = valid_opaque_fused_iteration(30);
+        fused.entry_guards.pop();
+        let plan = module_with_opaque_fused_iterations(vec![fused]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+
+        assert!(
+            err.contains(
+                "defaulted parameter 1 lacks an entry-only positional-default None identity guard"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_opaque_fused_iteration_without_exact_admitted_width_guard() {
+        let mut fused = valid_opaque_fused_iteration(30);
+        fused.entry_guards[0].expectation =
+            OpaqueFusedGuardExpectation::ExactCompactIntRange { min: 0, max: 15 };
+        let plan = module_with_opaque_fused_iterations(vec![fused]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+
+        assert!(
+            err.contains("entry-only exact compact-int width guard for 0..=16"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_opaque_fused_iteration_with_unreachable_stage() {
+        let mut fused = valid_opaque_fused_iteration(30);
+        fused.stages[1].origin.owner = OpaqueFusedSiteOwner::Stage(OpaqueFusedStageId(99));
+        let plan = module_with_opaque_fused_iterations(vec![fused]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+
+        assert!(err.contains("missing parent stage"), "{err}");
+        assert!(err.contains("unreachable from entry stage"), "{err}");
     }
 
     fn module_with_indexed_fields(

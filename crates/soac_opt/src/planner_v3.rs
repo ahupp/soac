@@ -19,9 +19,18 @@ use soac_ir_typed::plan_v3::{
     IndexedFieldReceiverSource, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
     IndexedGlobalFallbackKind, IndexedGlobalFallbackPlan, IndexedGlobalGuardKind,
     IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind, MaterializeNode,
-    ModuleOptimizationPlanV3, ModulePlanIdentity, OperationNode, PlanDiagnostic, PlanNode,
-    PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan,
-    RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
+    ModuleOptimizationPlanV3, ModulePlanIdentity, OpaqueFusedIterationPlan, OperationNode,
+    PlanDiagnostic, PlanNode, PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind,
+    RegionExitPlan, RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan,
+    RegionSource, Rep,
+};
+#[cfg(test)]
+use soac_ir_typed::plan_v3::{
+    OpaqueFusedAlgorithmPlan, OpaqueFusedCompatibilityMode, OpaqueFusedCompletionPlan,
+    OpaqueFusedEntryGuardPlan, OpaqueFusedExceptionPlan, OpaqueFusedFallbackPlan,
+    OpaqueFusedGuardExpectation, OpaqueFusedGuardInput, OpaqueFusedProducerStagePlan,
+    OpaqueFusedSinkPlan, OpaqueFusedSite, OpaqueFusedSiteOwner, OpaqueFusedStageId,
+    OpaqueFusedYieldEdgePlan, OpaqueFusedYieldTarget,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -38,8 +47,14 @@ pub struct FunctionPlanRequest {
     pub regions: Vec<ExtractedRegionPlanRequest>,
     pub direct_calls: Vec<DirectCallPlanRequest>,
     pub exact_list_items: Vec<ExactListItemPlanRequest>,
+    pub opaque_fused_iterations: Vec<OpaqueFusedIterationPlanRequest>,
     pub indexed_fields: Vec<IndexedFieldPlanRequest>,
     pub indexed_globals: Vec<IndexedGlobalPlanRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpaqueFusedIterationPlanRequest {
+    pub plan: OpaqueFusedIterationPlan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +213,7 @@ pub fn plan_function_optimization_v3(
 ) -> FunctionOptimizationPlanV3 {
     let region_requests = request.regions;
     let direct_calls = plan_direct_call_specializations_v3(&request.direct_calls);
+    let opaque_fused_iterations = plan_opaque_fused_iterations_v3(&request.opaque_fused_iterations);
     let exact_list_items = plan_exact_list_item_specializations_v3(&request.exact_list_items);
     let indexed_fields = plan_indexed_field_specializations_v3(&request.indexed_fields);
     let indexed_globals = plan_indexed_global_specializations_v3(&request.indexed_globals);
@@ -211,6 +227,7 @@ pub fn plan_function_optimization_v3(
         function: request.function,
         regions: Vec::new(),
         direct_calls,
+        opaque_fused_iterations,
         exact_list_items,
         indexed_fields,
         indexed_globals,
@@ -241,6 +258,52 @@ pub fn plan_function_optimization_v3(
     }
 
     function
+}
+
+fn plan_opaque_fused_iterations_v3(
+    requests: &[OpaqueFusedIterationPlanRequest],
+) -> Vec<OpaqueFusedIterationPlan> {
+    let mut entries = requests.iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        let left_maximum_width = match &left.plan.algorithm {
+            soac_ir_typed::plan_v3::OpaqueFusedAlgorithmPlan::AffineDistinctPermutationCount {
+                maximum_width,
+                ..
+            } => *maximum_width,
+        };
+        let right_maximum_width = match &right.plan.algorithm {
+            soac_ir_typed::plan_v3::OpaqueFusedAlgorithmPlan::AffineDistinctPermutationCount {
+                maximum_width,
+                ..
+            } => *maximum_width,
+        };
+        (
+            left.plan.source,
+            left.plan.cost.hot_path,
+            left.plan.cost.code_size,
+            left.plan.entry_stage,
+            left_maximum_width,
+            left.plan.stages.len(),
+            left.plan.entry_guards.len(),
+            left.plan.reason.as_str(),
+        )
+            .cmp(&(
+                right.plan.source,
+                right.plan.cost.hot_path,
+                right.plan.cost.code_size,
+                right.plan.entry_stage,
+                right_maximum_width,
+                right.plan.stages.len(),
+                right.plan.entry_guards.len(),
+                right.plan.reason.as_str(),
+            ))
+    });
+    let mut seen_sources = HashSet::new();
+    entries
+        .into_iter()
+        .filter(|request| seen_sources.insert(request.plan.source))
+        .map(|request| request.plan.clone())
+        .collect()
 }
 
 fn plan_direct_call_specializations_v3(
@@ -2369,10 +2432,95 @@ mod tests {
                 regions,
                 direct_calls: Vec::new(),
                 exact_list_items: Vec::new(),
+                opaque_fused_iterations: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
             }],
         }
+    }
+
+    fn opaque_fused_iteration_request(
+        source: u32,
+        hot_path_cost: u32,
+        reason: &str,
+    ) -> OpaqueFusedIterationPlanRequest {
+        let source = InstrId::new(source);
+        let entry_stage = OpaqueFusedStageId(0);
+        let width_input = OpaqueFusedGuardInput::FunctionParam { index: 0 };
+        OpaqueFusedIterationPlanRequest {
+            plan: OpaqueFusedIterationPlan {
+                source,
+                algorithm: OpaqueFusedAlgorithmPlan::AffineDistinctPermutationCount {
+                    width_input: width_input.clone(),
+                    maximum_width: 16,
+                },
+                compatibility: OpaqueFusedCompatibilityMode::OpaqueNoGeneratorMaterialization,
+                entry_stage,
+                stages: vec![OpaqueFusedProducerStagePlan {
+                    id: entry_stage,
+                    function: SerializedFunctionId::new(
+                        SerializedModuleId::new(0),
+                        LocalFunctionId::new(2),
+                    ),
+                    origin: OpaqueFusedSite {
+                        owner: OpaqueFusedSiteOwner::Root,
+                        source: InstrId::new(100),
+                    },
+                    arg_plan: DirectCallArgPlan {
+                        sources: vec![soac_ir_typed::plan_v3::DirectCallArgSource::Provided(0)],
+                    },
+                    positional_defaults: Vec::new(),
+                    yield_edges: vec![OpaqueFusedYieldEdgePlan {
+                        source: InstrId::new(101),
+                        target: OpaqueFusedYieldTarget::Sink,
+                    }],
+                    completion: OpaqueFusedCompletionPlan::FinishConsumer,
+                    exception: OpaqueFusedExceptionPlan::Propagate,
+                }],
+                sink: OpaqueFusedSinkPlan::Count {
+                    consume_source: InstrId::new(102),
+                    result_source: source,
+                },
+                entry_guards: vec![OpaqueFusedEntryGuardPlan {
+                    input: width_input,
+                    expectation: OpaqueFusedGuardExpectation::ExactCompactIntRange {
+                        min: 0,
+                        max: 16,
+                    },
+                    reason: "test admitted width".to_string(),
+                }],
+                fallback: OpaqueFusedFallbackPlan {
+                    original_source: source,
+                },
+                cost: Cost {
+                    hot_path: hot_path_cost,
+                    ..Cost::default()
+                },
+                reason: reason.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn plans_opaque_fused_iterations_in_stable_source_and_cost_order() {
+        let mut request = module_request_regions(Vec::new());
+        request.functions[0].opaque_fused_iterations = vec![
+            opaque_fused_iteration_request(20, 9, "higher-cost duplicate"),
+            opaque_fused_iteration_request(10, 4, "earlier source"),
+            opaque_fused_iteration_request(20, 3, "lower-cost selection"),
+            opaque_fused_iteration_request(10, 4, "earlier source"),
+        ];
+
+        let plan = plan_module_optimization_v3(&AlternativeCatalog::default_v3(), request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let fused = &plan.functions[0].opaque_fused_iterations;
+        assert_eq!(
+            fused.iter().map(|plan| plan.source).collect::<Vec<_>>(),
+            vec![InstrId::new(10), InstrId::new(20)]
+        );
+        assert_eq!(fused[1].cost.hot_path, 3);
+        assert_eq!(fused[1].reason, "lower-cost selection");
     }
 
     fn add_test_indexed_global(request: &mut ModulePlanRequest, name: &str) {

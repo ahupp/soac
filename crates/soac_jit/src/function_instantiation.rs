@@ -1,4 +1,7 @@
-use crate::jit::{ModuleJitContext, ModuleRuntimeContext};
+use crate::jit::{
+    FIRST_VALID_CPYTHON_FUNCTION_VERSION, ModuleJitContext, ModuleRuntimeContext,
+    raw_py_code_version,
+};
 use crate::module_type::SharedModuleState;
 use crate::{
     CompileSession, FunctionInstantiationTemplate, clone_module_runtime_context,
@@ -14,7 +17,7 @@ use soac_core::block_py::{
     BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
-use std::ffi::{CString, c_int, c_void};
+use std::ffi::{CString, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,31 +26,6 @@ use tracing::{info, trace};
 pub(crate) const SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL: &str =
     "soac_jit_make_function_with_closure";
 const MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS: usize = 17;
-const FIRST_VALID_CPYTHON_FUNCTION_VERSION: u32 = 2;
-
-// The pinned CPython's `_PyCode_DEF` places `co_version` after this prefix.
-// Keep the layout local to the ABI boundary used to restore MAKE_FUNCTION
-// semantics for source-backed generators that retain CPython vectorcall.
-#[repr(C)]
-struct RawPyCodeVersionPrefix {
-    ob_base: ffi::PyVarObject,
-    co_consts: *mut ffi::PyObject,
-    co_names: *mut ffi::PyObject,
-    co_exceptiontable: *mut ffi::PyObject,
-    co_flags: c_int,
-    co_argcount: c_int,
-    co_posonlyargcount: c_int,
-    co_kwonlyargcount: c_int,
-    co_stacksize: c_int,
-    co_firstlineno: c_int,
-    co_nlocalsplus: c_int,
-    co_framesize: c_int,
-    co_nlocals: c_int,
-    co_ncellvars: c_int,
-    co_nfreevars: c_int,
-    co_version: u32,
-}
-
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
@@ -730,7 +708,7 @@ fn restore_source_generator_cpython_function_version(
     if code.is_null() {
         return Err(PyErr::fetch(py));
     }
-    let version = unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_version };
+    let version = unsafe { raw_py_code_version(code) };
     if version >= FIRST_VALID_CPYTHON_FUNCTION_VERSION {
         unsafe { _PyFunction_SetVersion(func.as_ptr().cast::<ffi::PyFunctionObject>(), version) };
     }

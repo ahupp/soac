@@ -29,6 +29,9 @@ title: "Completed"
  * Implement `doc/todo/typed_local_values.md`: make typed codegen carry explicit
    SOAC value representations through locals so exact-int scalar locals do not
    need PyObject materialization or cleanup-root traffic until a Python boundary.
+ * Replace the initial N-Queens affine-distinct producer/consumer recognizer with
+   a semantic opaque-fused-iteration planner that derives scalar loop operations
+   from the validated producer graph instead of matching that one graph shape.
 
 
 ## Perf-to-investigate

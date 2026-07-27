@@ -11,7 +11,7 @@ use soac_core::block_py::{
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 use std::ptr;
 use std::sync::Arc;
@@ -85,6 +85,27 @@ struct RawPyFunctionObjectSoacMetadataPrefix {
     func_soac_metadata: *mut c_void,
     func_soac_metadata_destructor: *mut c_void,
     func_soac_function_id: u64,
+    func_version: u32,
+}
+
+#[repr(C)]
+struct RawPyCodeVersionPrefix {
+    ob_base: ffi::PyVarObject,
+    co_consts: *mut ffi::PyObject,
+    co_names: *mut ffi::PyObject,
+    co_exceptiontable: *mut ffi::PyObject,
+    co_flags: c_int,
+    co_argcount: c_int,
+    co_posonlyargcount: c_int,
+    co_kwonlyargcount: c_int,
+    co_stacksize: c_int,
+    co_firstlineno: c_int,
+    co_nlocalsplus: c_int,
+    co_framesize: c_int,
+    co_nlocals: c_int,
+    co_ncellvars: c_int,
+    co_nfreevars: c_int,
+    co_version: u32,
 }
 
 pub struct ModuleRuntimeContext {
@@ -127,6 +148,10 @@ pub const PY_FUNCTION_KWDEFAULTS_OFFSET: i32 =
     offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_kwdefaults) as i32;
 pub const PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 =
     offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_soac_function_id) as i32;
+pub const PY_FUNCTION_VERSION_OFFSET: i32 =
+    offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_version) as i32;
+pub const PY_CODE_VERSION_OFFSET: i32 = offset_of!(RawPyCodeVersionPrefix, co_version) as i32;
+pub const FIRST_VALID_CPYTHON_FUNCTION_VERSION: u32 = 2;
 pub const PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET: i32 =
     offset_of!(PyThreadStateCurrentExceptionPrefix, current_exception) as i32;
 
@@ -156,6 +181,10 @@ pub(super) fn load_py_function_soac_metadata_obj(
 pub(crate) unsafe fn invalidate_py_function_soac_function_id(function: *mut ffi::PyFunctionObject) {
     let raw_function = function.cast::<RawPyFunctionObjectSoacMetadataPrefix>();
     unsafe { (*raw_function).func_soac_function_id = 0 };
+}
+
+pub(crate) unsafe fn raw_py_code_version(code: *mut ffi::PyObject) -> u32 {
+    unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_version }
 }
 
 #[derive(Clone, Debug)]

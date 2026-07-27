@@ -273,6 +273,7 @@ mod tests {
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    opaque_fused_iterations: Vec::new(),
                 }],
             },
         )

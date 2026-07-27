@@ -977,7 +977,7 @@ def run():
         _assert_subprocess_ok(specialized_result)
 
 
-def test_specialized_full_nqueens_slice_preserves_generator_state(tmp_path):
+def test_specialized_full_nqueens_slice_preserves_results_and_guarded_fallbacks(tmp_path):
     bench_dir = Path(__file__).resolve().parents[1] / "bench"
     work_dir = tmp_path / "soac-work"
     script = _import_and_run_script(
@@ -1026,6 +1026,234 @@ def test_specialized_full_nqueens_slice_preserves_generator_state(tmp_path):
             timeout=60,
         )
         _assert_subprocess_ok(specialized_result)
+
+    apply_bodies = [
+        """
+        expected_counts = [1, 1, 0, 0, 2, 10, 4, 40, 92]
+        assert [
+            module.full_nqueens_list_consumer(width)
+            for width in range(len(expected_counts))
+        ] == expected_counts
+        assert module.full_nqueens_list_consumer(9) == 352
+        assert module.full_nqueens_list_consumer(-1) == 0
+
+        class IntSubclass(int):
+            equality_calls = 0
+
+            def __eq__(self, other):
+                type(self).equality_calls += 1
+                return False
+
+        assert module.full_nqueens_list_consumer(IntSubclass(4)) == 0
+        assert IntSubclass.equality_calls > 0
+        """,
+        """
+        import sys
+
+        frame_events = []
+
+        def trace(frame, event, _arg):
+            if event in ("call", "line") and frame.f_code.co_name in {
+                "n_queens",
+                "permutations",
+            }:
+                frame_events.append((frame.f_code.co_name, event))
+            return trace
+
+        sys.settrace(trace)
+        try:
+            assert list(module.n_queens(1)) == [(0,)]
+            assert frame_events, "direct generator consumption must exercise the tracer"
+            frame_events.clear()
+            assert module.full_nqueens_list_consumer(4) == 2
+        finally:
+            sys.settrace(None)
+        assert frame_events == [], frame_events
+        """,
+        """
+        original_n_queens = module.n_queens
+
+        def rebound_n_queens(_queen_count):
+            yield "first"
+            yield "second"
+            yield "third"
+
+        module.n_queens = rebound_n_queens
+        try:
+            assert module.full_nqueens_list_consumer(4) == 3
+        finally:
+            module.n_queens = original_n_queens
+        assert module.full_nqueens_list_consumer(4) == 2
+        """,
+        """
+        original_permutations = module.permutations
+
+        def rebound_permutations(_iterable, r=None):
+            yield (1, 3, 0, 2)
+
+        module.permutations = rebound_permutations
+        try:
+            assert module.full_nqueens_list_consumer(4) == 1
+        finally:
+            module.permutations = original_permutations
+        assert module.full_nqueens_list_consumer(4) == 2
+        """,
+        """
+        original_defaults = module.permutations.__defaults__
+        module.permutations.__defaults__ = (1,)
+        try:
+            try:
+                module.full_nqueens_list_consumer(4)
+            except IndexError:
+                pass
+            else:
+                raise AssertionError("mutated omitted-r default did not take effect")
+        finally:
+            module.permutations.__defaults__ = original_defaults
+        assert module.full_nqueens_list_consumer(4) == 2
+        """,
+        """
+        original_defaults = module.permutations.__defaults__
+        module.permutations.__defaults__ = (None, 1)
+        try:
+            try:
+                module.full_nqueens_list_consumer(4)
+            except IndexError:
+                pass
+            else:
+                raise AssertionError("right-aligned mutated omitted-r default did not take effect")
+        finally:
+            module.permutations.__defaults__ = original_defaults
+        assert module.full_nqueens_list_consumer(4) == 2
+        """,
+        """
+        import ctypes
+
+        get_vectorcall = ctypes.pythonapi.PyVectorcall_Function
+        get_vectorcall.argtypes = [ctypes.py_object]
+        get_vectorcall.restype = ctypes.c_void_p
+        set_vectorcall = ctypes.pythonapi.PyFunction_SetVectorcall
+        set_vectorcall.argtypes = [ctypes.py_object, ctypes.c_void_p]
+        set_vectorcall.restype = None
+
+        original_vectorcall = get_vectorcall(module.n_queens)
+        assert original_vectorcall
+        set_vectorcall(module.n_queens, None)
+        try:
+            try:
+                module.full_nqueens_list_consumer(4)
+            except TypeError:
+                pass
+            else:
+                raise AssertionError("cleared n_queens vectorcall did not reach fallback")
+        finally:
+            set_vectorcall(module.n_queens, original_vectorcall)
+        assert module.full_nqueens_list_consumer(4) == 2
+        """,
+    ]
+    for body in apply_bodies:
+        apply_script = _import_and_run_script(
+            bench_dir,
+            "import nqueens_slice_full_nqueens_list_consumer as module",
+            body,
+        )
+        apply_result = _run_soac_subprocess(
+            apply_script,
+            env={**base_env, "SOAC_OPT_MODE": "apply"},
+            timeout=60,
+        )
+        _assert_subprocess_ok(apply_result)
+
+
+def test_specialized_pyperformance_nqueens_discard_executes_hot_and_fallback_paths(
+    tmp_path,
+):
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / "crates"
+        / "soac_jit"
+        / "src"
+        / "jit"
+        / "fixtures"
+        / "opaque_fused_pyperformance_nqueens_v1.py"
+    )
+    benchmark_root = tmp_path / "benchmarks" / "bm_nqueens"
+    benchmark_root.mkdir(parents=True)
+    benchmark_path = benchmark_root / "run_benchmark.py"
+    benchmark_path.write_bytes(fixture.read_bytes())
+    profile_script = _import_and_run_script(
+        benchmark_root,
+        "import run_benchmark as module",
+        "assert module.bench_n_queens(8) is None",
+    )
+    apply_script = _import_and_run_script(
+        benchmark_root,
+        "import run_benchmark as module",
+        """
+        frame_events = []
+
+        def trace(frame, event, _arg):
+            if event in ("call", "line") and frame.f_code.co_name in {
+                "n_queens",
+                "permutations",
+            }:
+                frame_events.append((frame.f_code.co_name, event))
+            return trace
+
+        sys.settrace(trace)
+        try:
+            assert list(module.n_queens(1)) == [(0,)]
+            assert frame_events, "direct generator consumption must exercise the tracer"
+            frame_events.clear()
+            assert module.bench_n_queens(8) is None
+        finally:
+            sys.settrace(None)
+        assert frame_events == [], frame_events
+
+        original_n_queens = module.n_queens
+        fallback_calls = []
+
+        def rebound_n_queens(width):
+            fallback_calls.append(width)
+            yield (0, 1, 2, 3)
+
+        module.n_queens = rebound_n_queens
+        try:
+            assert module.bench_n_queens(8) is None
+        finally:
+            module.n_queens = original_n_queens
+        assert fallback_calls == [8]
+        """,
+    )
+    work_dir = tmp_path / "soac-work"
+    base_env = _soac_subprocess_env(
+        benchmark_root,
+        work_dir=work_dir,
+        extra_env={
+            "SOAC_COMPILE_MODE": "eager",
+            "SOAC_BACKGROUND_JIT": "0",
+        },
+    )
+    profile_result = _run_soac_subprocess(
+        profile_script,
+        env={
+            **base_env,
+            "SOAC_OPT_MODE": "profile",
+        },
+        timeout=60,
+    )
+    _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").exists()
+
+    apply_result = _run_soac_subprocess(
+        apply_script,
+        env={
+            **base_env,
+            "SOAC_OPT_MODE": "apply",
+        },
+        timeout=60,
+    )
+    _assert_subprocess_ok(apply_result)
 
 
 def test_apply_mode_callback_pair_inline_preserves_genexpr_argument_binding(tmp_path):

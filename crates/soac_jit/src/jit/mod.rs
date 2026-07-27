@@ -42,7 +42,8 @@ use soac_ir_typed::{
     TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectMethodCall,
     TypedExactIntBranchPlan, TypedExactIntReturnPlan, TypedGetAttr, TypedGuardedCallableCall,
     TypedGuardedMethodCall, TypedIndexedFieldCounterSource, TypedIndexedFieldGuard,
-    TypedIndexedFieldPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
+    TypedIndexedFieldPlanSource, TypedOpaqueFusedGuardExpectation, TypedOpaqueFusedGuardOperand,
+    TypedOpaqueFusedResult, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
     ValueFacts, lower_blockpy_function_to_typed,
 };
 #[cfg(test)]
@@ -82,6 +83,13 @@ unsafe extern "C" {
     fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
 }
 
+#[repr(C)]
+struct RawPyTupleObjectForOpaqueFusedGuard {
+    ob_base: ffi::PyVarObject,
+    ob_hash: isize,
+    ob_item: [*mut ffi::PyObject; 1],
+}
+
 mod backend;
 mod codegen_env;
 mod compiled;
@@ -101,7 +109,12 @@ mod inspection;
 mod intrinsics;
 mod jitdump;
 mod module_data;
+mod opaque_fused_iteration;
 mod operation_specializations;
+
+pub(crate) fn opaque_fused_nqueens_source_matches(source: &str) -> bool {
+    opaque_fused_iteration::tracked_nqueens_source_matches(source)
+}
 mod planning;
 mod precompile;
 mod precompiled_library;
@@ -217,16 +230,18 @@ pub(crate) use precompiled_library::{
 };
 pub(crate) use process::{ProcessJitEngine, process_jit_is_currently_compiling};
 use refcount_lowering::RefcountLowering;
+pub(crate) use runtime_context::{
+    FIRST_VALID_CPYTHON_FUNCTION_VERSION, FunctionRuntimeDataLayout,
+    invalidate_py_function_soac_function_id, raw_py_code_version,
+};
 use runtime_context::{
     FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
     FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
-    FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_CODE_OFFSET, PY_FUNCTION_DEFAULTS_OFFSET,
-    PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_FUNCTION_KWDEFAULTS_OFFSET,
-    PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET, PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
-    load_function_env_obj, load_py_function_soac_metadata_obj,
-};
-pub(crate) use runtime_context::{
-    FunctionRuntimeDataLayout, invalidate_py_function_soac_function_id,
+    FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_CODE_VERSION_OFFSET, PY_FUNCTION_CODE_OFFSET,
+    PY_FUNCTION_DEFAULTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
+    PY_FUNCTION_KWDEFAULTS_OFFSET, PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET, PY_FUNCTION_VERSION_OFFSET,
+    PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET, load_function_env_obj,
+    load_py_function_soac_metadata_obj,
 };
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 #[cfg(test)]
@@ -300,7 +315,8 @@ use imports::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_JIT_RESUME_GENERATOR_IMPORT,
     SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT,
     SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
-    SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
+    SOAC_RUNTIME_COUNT_AFFINE_DISTINCT_PERMUTATIONS_I64_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
     SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
     SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
     SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
@@ -926,6 +942,44 @@ fn emit_borrowed_planned_indexed_global_load(
 
     fb.switch_to_block(result_block);
     emit_optional_counter_increment_for_kind(fb, ctx, ctx.global_indexed_hit_counter_ids, instr_id);
+    fb.block_params(result_block)[0]
+}
+
+/// Probe an already-resolved global guard operand without invoking Python
+/// lookup or changing specialization counters. A miss must reach the original
+/// expression before any generator in the fused region has been activated.
+fn emit_borrowed_opaque_fused_indexed_global_load(
+    fb: &mut FunctionBuilder<'_>,
+    name: &str,
+    expected_index: u32,
+    fallback_block: ir::Block,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let name_obj = emit_owned_module_constant(
+        fb,
+        ctx.module_constants.require_unicode_constant_id(name),
+        ctx,
+    );
+    let slot_index = fb.ins().iconst(ir::types::I64, i64::from(expected_index));
+    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, ctx.consts.ptr_ty);
+
+    let probe = fb.ins().call(
+        ctx.probe_global_indexed_ref,
+        &[ctx.consts.block_const, name_obj, slot_index],
+    );
+    let value = fb.inst_results(probe)[0];
+    let missing = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+    fb.ins().brif(
+        missing,
+        fallback_block,
+        &[],
+        result_block,
+        &[ir::BlockArg::Value(value)],
+    );
+
+    fb.switch_to_block(result_block);
     fb.block_params(result_block)[0]
 }
 
@@ -8914,6 +8968,211 @@ fn emit_exact_function_id_match_bool01(
         fb.block_params(done_block)[0],
         IntFacts::i32_bool01(),
     ))
+}
+
+fn emit_exact_unmodified_function_id_match_bool01(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    expected_function_id: RuntimeFunctionId,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+) -> Result<SoacValue, String> {
+    let identity =
+        emit_exact_function_id_match_bool01(fb, callable, expected_function_id, ctx, codegen_env)?
+            .expect_i32_bool01("opaque fused function identity guard");
+    let zero = fb.ins().iconst(ctx.consts.i32_ty, 0);
+    let inspect_type_block = fb.create_block();
+    let inspect_state_block = fb.create_block();
+    let inspect_code_block = fb.create_block();
+    let done_block = fb.create_block();
+    fb.append_block_param(done_block, ctx.consts.i32_ty);
+    fb.ins().brif(
+        identity,
+        inspect_type_block,
+        &[],
+        done_block,
+        &[ir::BlockArg::Value(zero)],
+    );
+
+    fb.switch_to_block(inspect_type_block);
+    let function_type = emit_type_ptr_value_for_ref(
+        fb,
+        codegen_env,
+        ctx,
+        &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Function),
+    )?
+    .ok_or_else(|| "opaque fused guard could not bind PyFunction_Type".to_string())?;
+    let actual_type = fb.ins().load(
+        ctx.consts.ptr_ty,
+        ir::MemFlags::trusted(),
+        callable,
+        offset_of!(ffi::PyObject, ob_type) as i32,
+    );
+    let exact_function = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, actual_type, function_type);
+    fb.ins().brif(
+        exact_function,
+        inspect_state_block,
+        &[],
+        done_block,
+        &[ir::BlockArg::Value(zero)],
+    );
+
+    fb.switch_to_block(inspect_state_block);
+    let code = fb.ins().load(
+        ctx.consts.ptr_ty,
+        ir::MemFlags::trusted(),
+        callable,
+        PY_FUNCTION_CODE_OFFSET,
+    );
+    let code_present = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, code, 0);
+    fb.ins().brif(
+        code_present,
+        inspect_code_block,
+        &[],
+        done_block,
+        &[ir::BlockArg::Value(zero)],
+    );
+
+    fb.switch_to_block(inspect_code_block);
+    let function_version = fb.ins().load(
+        ir::types::I32,
+        ir::MemFlags::trusted(),
+        callable,
+        PY_FUNCTION_VERSION_OFFSET,
+    );
+    let code_version = fb.ins().load(
+        ir::types::I32,
+        ir::MemFlags::trusted(),
+        code,
+        PY_CODE_VERSION_OFFSET,
+    );
+    let valid_version = fb.ins().icmp_imm(
+        ir::condcodes::IntCC::UnsignedGreaterThanOrEqual,
+        function_version,
+        i64::from(FIRST_VALID_CPYTHON_FUNCTION_VERSION),
+    );
+    let same_version = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, function_version, code_version);
+    let unmodified = fb.ins().band(valid_version, same_version);
+    let unmodified = emit_i32_bool01_from_cond(fb, unmodified, ctx)
+        .expect_i32_bool01("opaque fused unmodified-function guard");
+    fb.ins()
+        .jump(done_block, &[ir::BlockArg::Value(unmodified)]);
+
+    fb.switch_to_block(done_block);
+    Ok(SoacValue::i32(
+        fb.block_params(done_block)[0],
+        IntFacts::i32_bool01(),
+    ))
+}
+
+fn emit_exact_function_positional_default_match_bool01(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    expected_function_id: RuntimeFunctionId,
+    default_index: u32,
+    expected_defaults_len: u32,
+    expected: RuntimeName,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+) -> Result<ir::Value, String> {
+    let expected_default_id = ctx
+        .module_constants
+        .runtime_name_constant_id(expected)
+        .ok_or_else(|| {
+            format!(
+                "opaque fused guard is missing runtime constant for positional default {expected:?}"
+            )
+        })?;
+    let expected_default = emit_owned_module_constant(fb, expected_default_id, ctx);
+    let identity = emit_exact_unmodified_function_id_match_bool01(
+        fb,
+        callable,
+        expected_function_id,
+        ctx,
+        codegen_env,
+    )?
+    .expect_i32_bool01("opaque fused function-default identity guard");
+    let zero = fb.ins().iconst(ctx.consts.i32_ty, 0);
+    let inspect_defaults_block = fb.create_block();
+    let inspect_size_block = fb.create_block();
+    let inspect_item_block = fb.create_block();
+    let done_block = fb.create_block();
+    fb.append_block_param(done_block, ctx.consts.i32_ty);
+    fb.ins().brif(
+        identity,
+        inspect_defaults_block,
+        &[],
+        done_block,
+        &[ir::BlockArg::Value(zero)],
+    );
+
+    fb.switch_to_block(inspect_defaults_block);
+    let defaults = fb.ins().load(
+        ctx.consts.ptr_ty,
+        ir::MemFlags::trusted(),
+        callable,
+        PY_FUNCTION_DEFAULTS_OFFSET,
+    );
+    let defaults_present = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, defaults, 0);
+    fb.ins().brif(
+        defaults_present,
+        inspect_size_block,
+        &[],
+        done_block,
+        &[ir::BlockArg::Value(zero)],
+    );
+
+    fb.switch_to_block(inspect_size_block);
+    let default_count = fb.ins().load(
+        ctx.consts.i64_ty,
+        ir::MemFlags::trusted(),
+        defaults,
+        offset_of!(ffi::PyVarObject, ob_size) as i32,
+    );
+    let exact_default_count = fb.ins().icmp_imm(
+        ir::condcodes::IntCC::Equal,
+        default_count,
+        i64::from(expected_defaults_len),
+    );
+    fb.ins().brif(
+        exact_default_count,
+        inspect_item_block,
+        &[],
+        done_block,
+        &[ir::BlockArg::Value(zero)],
+    );
+
+    fb.switch_to_block(inspect_item_block);
+    let items = fb.ins().iadd_imm(
+        defaults,
+        i64::try_from(offset_of!(RawPyTupleObjectForOpaqueFusedGuard, ob_item))
+            .expect("raw tuple item offset should fit in i64"),
+    );
+    let item_offset = fb.ins().iconst(
+        ctx.consts.i64_ty,
+        i64::from(default_index)
+            * i64::try_from(std::mem::size_of::<*mut ffi::PyObject>())
+                .expect("pointer size should fit in i64"),
+    );
+    let item_address = fb.ins().iadd(items, item_offset);
+    let item = fb
+        .ins()
+        .load(ctx.consts.ptr_ty, ir::MemFlags::trusted(), item_address, 0);
+    let matches = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, item, expected_default);
+    let matches = emit_i32_bool01_from_cond(fb, matches, ctx)
+        .expect_i32_bool01("opaque fused positional-default guard result");
+    fb.ins().jump(done_block, &[ir::BlockArg::Value(matches)]);
+
+    fb.switch_to_block(done_block);
+    Ok(fb.block_params(done_block)[0])
 }
 
 fn emit_callee_function_id_checked(
@@ -16961,6 +17220,24 @@ fn emit_typed_codegen_stmt_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    if expr.opaque_fused_iteration_plan().is_some() {
+        let value = emit_typed_opaque_fused_iteration_return_pyobject(
+            fb,
+            expr,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?
+        .ok_or_else(|| "opaque fused statement sidecar disappeared before codegen".to_string())?;
+        return Ok(emit_owned_pyobject_result_for_demand(
+            fb,
+            value,
+            PyObjFacts::unknown(),
+            emit_ctx,
+            demand,
+        ));
+    }
     if let Some(result) =
         emit_typed_local_load_result_with_local_env(fb, expr, local_env, emit_ctx, demand)
     {
@@ -17612,6 +17889,243 @@ fn emit_typed_exact_int_return_pyobject(
         func_imports,
     )
     .map(|result| Some(result.value))
+}
+
+fn emit_typed_opaque_fused_guard_operand(
+    fb: &mut FunctionBuilder<'_>,
+    operand: &TypedOpaqueFusedGuardOperand,
+    fallback_block: ir::Block,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<ir::Value, String> {
+    match operand {
+        TypedOpaqueFusedGuardOperand::Local(name) => {
+            if !matches!(name.location, NameLocation::Local(_)) {
+                return Err(format!(
+                    "opaque fused local guard operand is not an ordinary local: {name:?}"
+                ));
+            }
+            if local_env.scalar_i64_value_for_load(name).is_some()
+                || local_env.scalar_i32_bool01_value_for_load(name).is_some()
+            {
+                return Err(format!(
+                    "opaque fused callable guard operand is scalarized: {name:?}"
+                ));
+            }
+            Ok(emit_resolved_name_load_with_local_env(
+                fb, name, None, local_env, emit_ctx, true,
+            ))
+        }
+        TypedOpaqueFusedGuardOperand::IndexedGlobal {
+            name,
+            expected_index,
+        } => Ok(emit_borrowed_opaque_fused_indexed_global_load(
+            fb,
+            name,
+            *expected_index,
+            fallback_block,
+            emit_ctx,
+        )),
+        TypedOpaqueFusedGuardOperand::RuntimeName(runtime_name) => {
+            let constant_id = emit_ctx
+                .module_constants
+                .runtime_name_constant_id(*runtime_name)
+                .ok_or_else(|| {
+                    format!("opaque fused guard is missing runtime constant for {runtime_name:?}")
+                })?;
+            Ok(emit_owned_module_constant(fb, constant_id, emit_ctx))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_opaque_fused_iteration_return_pyobject(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<ir::Value>, String> {
+    let Some(plan) = expr.opaque_fused_iteration_plan().cloned() else {
+        return Ok(None);
+    };
+    if expr.try_semantic_instr_id() != Some(plan.source) {
+        return Err(format!(
+            "opaque fused sidecar source {} does not match host expression source {:?}",
+            plan.source,
+            expr.try_semantic_instr_id()
+        ));
+    }
+    if plan.minimum_width > plan.maximum_width {
+        return Err(format!(
+            "opaque fused width range is invalid: {}..={}",
+            plan.minimum_width, plan.maximum_width
+        ));
+    }
+    if !matches!(plan.width_input.location, NameLocation::Local(_)) {
+        return Err(format!(
+            "opaque fused width input is not an ordinary local: {:?}",
+            plan.width_input
+        ));
+    }
+
+    let fallback_block = fb.create_block();
+    fb.set_cold_block(fallback_block);
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.ptr_ty);
+
+    for guard in &plan.entry_guards {
+        let operand = emit_typed_opaque_fused_guard_operand(
+            fb,
+            &guard.operand,
+            fallback_block,
+            local_env,
+            emit_ctx,
+        )?;
+        let matches = match &guard.expectation {
+            TypedOpaqueFusedGuardExpectation::FunctionIdentity { function_id } => {
+                emit_exact_unmodified_function_id_match_bool01(
+                    fb,
+                    operand,
+                    *function_id,
+                    emit_ctx,
+                    codegen_env,
+                )?
+                .expect_i32_bool01("opaque fused function identity guard")
+            }
+            TypedOpaqueFusedGuardExpectation::FunctionPositionalDefaultIdentity {
+                function_id,
+                default_index,
+                expected_defaults_len,
+                expected,
+            } => emit_exact_function_positional_default_match_bool01(
+                fb,
+                operand,
+                *function_id,
+                *default_index,
+                *expected_defaults_len,
+                *expected,
+                emit_ctx,
+                codegen_env,
+            )?,
+        };
+        let matched_block = fb.create_block();
+        fb.ins()
+            .brif(matches, matched_block, &[], fallback_block, &[]);
+        fb.switch_to_block(matched_block);
+    }
+
+    let width = if let Some((width, _)) = local_env.scalar_i64_value_for_load(&plan.width_input) {
+        width
+    } else {
+        let width_obj = emit_resolved_name_load_with_local_env(
+            fb,
+            &plan.width_input,
+            None,
+            local_env,
+            emit_ctx,
+            true,
+        );
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            codegen_env,
+            func_imports,
+            owned_transfer_temp_load: None,
+        };
+        intrinsics::emit_v3_guarded_compact_long_i64(
+            &mut intrinsic_state,
+            width_obj,
+            fallback_block,
+        )
+    };
+    let below_minimum = fb.ins().icmp_imm(
+        ir::condcodes::IntCC::SignedLessThan,
+        width,
+        plan.minimum_width,
+    );
+    let above_maximum = fb.ins().icmp_imm(
+        ir::condcodes::IntCC::SignedGreaterThan,
+        width,
+        plan.maximum_width,
+    );
+    let width_out_of_range = fb.ins().bor(below_minimum, above_maximum);
+    let hot_block = fb.create_block();
+    fb.ins()
+        .brif(width_out_of_range, fallback_block, &[], hot_block, &[]);
+
+    fb.switch_to_block(hot_block);
+    let count_ref = func_imports.get(
+        codegen_env,
+        &mut fb.func,
+        &SOAC_RUNTIME_COUNT_AFFINE_DISTINCT_PERMUTATIONS_I64_IMPORT,
+    )?;
+    let count_call = fb.ins().call(count_ref, &[width]);
+    let count = fb.inst_results(count_call)[0];
+    let count_supported =
+        fb.ins()
+            .icmp_imm(ir::condcodes::IntCC::SignedGreaterThanOrEqual, count, 0);
+    let produce_result_block = fb.create_block();
+    fb.ins().brif(
+        count_supported,
+        produce_result_block,
+        &[],
+        fallback_block,
+        &[],
+    );
+
+    fb.switch_to_block(produce_result_block);
+    let fused_result = match plan.result {
+        TypedOpaqueFusedResult::Count => emit_checked_owned_pyobject_call_with_cleanup(
+            fb,
+            emit_ctx,
+            emit_ctx.py_long_from_i64_ref,
+            &[count],
+            &[],
+        ),
+        TypedOpaqueFusedResult::Discard => emit_none_const(fb, emit_ctx),
+    };
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(fused_result)]);
+
+    fb.switch_to_block(fallback_block);
+    let mut fallback_expr = expr.clone();
+    let fallback_extra = fallback_expr.typed_extra_mut().ok_or_else(|| {
+        "opaque fused host expression does not expose typed metadata for fallback".to_string()
+    })?;
+    if !fallback_extra.clear_opaque_fused_iteration_plan() {
+        return Err("opaque fused fallback clone did not contain its sidecar".to_string());
+    }
+    let fallback_result = emit_typed_codegen_stmt_result_with_local_env(
+        fb,
+        &fallback_expr,
+        local_env,
+        emit_ctx,
+        ResultDemand::PYOBJECT_OWNED,
+        codegen_env,
+        func_imports,
+    )?;
+    let (fallback_value, fallback_ownership, fallback_facts) =
+        fallback_result.expect_pyobject("opaque fused cold fallback");
+    let (fallback_value, fallback_ownership) = emit_promote_pyobject_to_owned_boundary(
+        fb,
+        fallback_value,
+        fallback_ownership,
+        fallback_facts,
+        emit_ctx,
+    );
+    if !fallback_ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
+        return Err(format!(
+            "opaque fused fallback produced {fallback_ownership:?}, but return requires owned PyObject"
+        ));
+    }
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+
+    fb.switch_to_block(result_block);
+    Ok(Some(fb.block_params(result_block)[0]))
 }
 
 fn exact_int_deopt_resume_point(
@@ -20921,6 +21435,23 @@ fn emit_typed_codegen_term(
             .unwrap_or(ResultDemand::PYOBJECT_BORROWED_OK);
         let result = match demand {
             ResultDemand::PyObject { .. } => {
+                if let Some(ret_value) = emit_typed_opaque_fused_iteration_return_pyobject(
+                    fb,
+                    value,
+                    local_env,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                )? {
+                    return emit_codegen_return_pyobject(
+                        fb,
+                        source_label,
+                        ret_value,
+                        local_env,
+                        emit_ctx,
+                        current_exception_name,
+                    );
+                }
                 if let Some(ret_value) = emit_typed_exact_int_return_pyobject(
                     fb,
                     value,

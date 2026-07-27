@@ -1729,6 +1729,7 @@ mod tests {
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
+                opaque_fused_iterations: Vec::new(),
                 deopt_points: Vec::new(),
                 ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                 diagnostics: Vec::new(),
