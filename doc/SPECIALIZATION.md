@@ -717,13 +717,17 @@ Verify is deliberately excluded because its counter-vectorcall installation
 invalidates CPython's function version, so the same entry guards would always
 take the fallback.
 
-The optimization is represented as one validated typed producer/consumer plan,
-not as recursive inlining of `iter`, `next`, `send`, resume helpers, and
-consumer implementations. Each producer body is represented once in the plan. A producer
-`yield` is an edge into its consumer, and the consumer continuation is an edge
-back to the producer's shared continuation. Completion, Python exception, and
-cleanup exits remain distinct. Activation state that would otherwise live in a
-generator frame or preserved-state object is held in scalar helper stack locals.
+The optimization is selected through one validated typed producer/consumer
+plan, not through recursive inlining of `iter`, `next`, `send`, resume helpers,
+and consumer implementations. The serialized plan currently records each
+producer stage once by function identity, argument/default binding, ownership
+topology, yield-site ids, and completion/exception policy. It does **not** yet
+contain the producer bodies' operations or a general resumable control-flow
+graph. The JIT-facing sidecar reduces the admitted graph to the width input,
+guard range, Count or Discard result, and entry guards; codegen calls the one
+N-Queens scalar helper. The helper's stack locals hold the activation and search
+state that the admitted source would otherwise keep in generator frames and
+intermediate containers.
 
 The first emitted algorithm is deliberately narrow. It requires byte-for-byte
 equality between the candidate module source and one of two independently
@@ -751,6 +755,34 @@ result list. The Count sink boxes the final count. The Discard sink ignores the
 helper's count and produces the canonical `None` result without boxing it.
 This is aggregate scalarization as well as generator fusion, and therefore
 takes the broader compatibility relaxations listed below.
+
+### Generality gap
+
+Removing the exact-source check would be unsound. Another graph can have the
+same functions, yields, and consumers while computing different values,
+performing different Python-visible effects, or requiring different exception
+and cleanup behavior. Generalization has two separately useful stages:
+
+1. **General synchronous generator fusion** must translate each admitted
+   producer body into a typed fused state machine. That IR needs explicit
+   activation locals and cells, operations and evaluation order, branch and
+   loop edges, yielded values, consumer continuations, completion, exceptions,
+   and cleanup. Codegen can then erase frames while preserving the original
+   stream and Python operations.
+2. **Aggregate and algorithm scalarization** can subsequently prove stronger
+   rewrites over that state machine. N-Queens additionally replaces permutation
+   enumeration, tuple/set construction, and equality/length checks with a
+   pruned bit-mask search. That requires collection/loop algebra and an
+   equivalence proof; it is not a consequence of generator-frame elimination.
+
+The first stage also needs complete escape, alias, effect, and dependency
+analysis; guards for every mutable function, default, closure, global, builtin,
+type, and protocol dependency; general per-activation argument/state binding;
+mechanical lowering for supported consumers and sinks; and an explicit policy
+for unknown calls, `send`/`throw`/`close`, `yield from`, cleanup, cancellation,
+unbounded execution, and safepoints. Unsupported graphs must retain the
+original path. “General” therefore means a documented closed, nonescaping,
+synchronous subset, not unconditional elimination of every Python generator.
 
 ### Eligibility and guards
 

@@ -29,9 +29,33 @@ title: "Completed"
  * Implement `doc/todo/typed_local_values.md`: make typed codegen carry explicit
    SOAC value representations through locals so exact-int scalar locals do not
    need PyObject materialization or cleanup-root traffic until a Python boundary.
- * Replace the initial N-Queens affine-distinct producer/consumer recognizer with
-   a semantic opaque-fused-iteration planner that derives scalar loop operations
-   from the validated producer graph instead of matching that one graph shape.
+ * Generalize opaque fused iteration beyond the two pinned N-Queens sources in
+   two separately useful stages:
+   * Add a typed fused-state-machine IR for general synchronous generator-frame
+     elimination. Represent each producer body once with activation locals and
+     cells, operations, yielded values, branches/backedges, consumer
+     continuations, completion, exceptions, and cleanup; lower it mechanically
+     rather than calling an algorithm-specific helper.
+   * Extend graph discovery with per-activation argument and closure state,
+     escape/alias/effect analysis, and complete entry guards for mutable
+     functions, defaults, closures, globals, builtins, types, and protocol
+     methods. Reject dependencies that can change inside the opaque region when
+     they cannot be proven stable or revalidated without partial deopt.
+   * Add explicit supported consumer and sink semantics beyond direct `for`,
+     tuple/set construction, Count, and Discard, including ordering,
+     short-circuiting, allocation, hashing/equality, exceptions, and result
+     materialization.
+   * Define the supported semantic boundary for repeated activations, unknown
+     calls, `send`/`throw`/`close`, `yield from`, source cleanup, cancellation,
+     unbounded execution, and safepoints; unsupported graphs must keep the
+     original generator path.
+   * Separately add aggregate/collection algebra that can prove algorithmic
+     scalarization such as N-Queens permutation plus distinct-affine predicates
+     into bit-mask search. Do not treat graph topology alone as proof of that
+     stronger rewrite.
+   * Remove exact-source admission only after structured tests prove equivalent
+     unpinned programs admit, semantic mutations reject or fall back, and typed
+     codegen consumes the general operation plan without rediscovering it.
 
 
 ## Perf-to-investigate
