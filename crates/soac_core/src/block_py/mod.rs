@@ -133,6 +133,9 @@ macro_rules! define_runtime_names {
 }
 
 define_runtime_names! {
+    Pep479Exception => "pep_479_exception",
+    SoacFilterIterator => "__soac_filter_iterator",
+    SoacMapIterator => "__soac_map_iterator",
     NoDefault => "NO_DEFAULT",
     Ellipsis => "ELLIPSIS",
     True => "TRUE",

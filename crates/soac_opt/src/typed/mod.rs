@@ -7588,12 +7588,14 @@ pub fn lower_typed_generator_state_to_locals_with_plan(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &mut Vec<ConstantExpr>,
     callee_module: &BlockPyModule<TypedBlockPyModuleShape>,
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
     plans: &[TypedGeneratorStateLoweringPlan],
 ) -> TypedGeneratorStateLoweringStats {
     lower_typed_generator_state_to_locals_with_plan_and_collect_preserved_locals(
         function,
         module_constants,
         callee_module,
+        external_callees,
         plans,
     )
     .stats
@@ -7603,6 +7605,7 @@ pub fn lower_typed_generator_state_to_locals_with_plan_and_collect_preserved_loc
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &mut Vec<ConstantExpr>,
     callee_module: &BlockPyModule<TypedBlockPyModuleShape>,
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
     plans: &[TypedGeneratorStateLoweringPlan],
 ) -> TypedGeneratorStateLoweringOutcome {
     let mut outcome = TypedGeneratorStateLoweringOutcome::default();
@@ -7611,6 +7614,7 @@ pub fn lower_typed_generator_state_to_locals_with_plan_and_collect_preserved_loc
             function,
             module_constants,
             callee_module,
+            external_callees,
             plan,
         ) else {
             continue;
@@ -7759,19 +7763,22 @@ fn lower_typed_generator_state_origin_to_locals(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &mut Vec<ConstantExpr>,
     callee_module: &BlockPyModule<TypedBlockPyModuleShape>,
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
     plan: &TypedGeneratorStateLoweringPlan,
 ) -> Option<(
     TypedGeneratorStateLoweringStats,
     HashMap<PreservedLocation, ResolvedName>,
 )> {
-    let callee = callee_module
-        .callable_defs
-        .iter()
-        .find(|callee| callee.function_id == plan.function_id)
-        .or_else(|| {
-            trace_typed_generator_state_lowering_skip(function, plan, "missing_callee");
-            None
-        })?;
+    let callee = typed_inline_callee(
+        callee_module,
+        TypedInlineExternalCallees::Contextual(external_callees),
+        plan.function_id,
+    )
+    .map(|callee| callee.function)
+    .or_else(|| {
+        trace_typed_generator_state_lowering_skip(function, plan, "missing_callee");
+        None
+    })?;
     let public_layout = callee.public_storage_layout().or_else(|| {
         trace_typed_generator_state_lowering_skip(function, plan, "missing_public_layout");
         None
@@ -10285,6 +10292,20 @@ fn typed_block_term_is_stop_iteration_raise(
         return false;
     };
     typed_expr_is_runtime_name_load(exc, RuntimeName::StopIteration, module_constants)
+        || typed_expr_is_zero_arg_runtime_call(exc, RuntimeName::StopIteration, module_constants)
+}
+
+fn typed_expr_is_zero_arg_runtime_call(
+    expr: &InstrTyped,
+    runtime_name: RuntimeName,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    let Some((func, args, keywords)) = typed_callable_call_parts(expr) else {
+        return false;
+    };
+    args.is_empty()
+        && keywords.is_empty()
+        && typed_expr_is_runtime_name_load(func, runtime_name, module_constants)
 }
 
 fn stop_iteration_handler_jump_edge_for_raise(
@@ -10378,6 +10399,7 @@ fn typed_callable_call_parts<'a>(
         InstrTyped::GuardedCallableCallTyped(call) => {
             Some((call.func.as_ref(), &call.args, &call.keywords))
         }
+        InstrTyped::DirectCallableCallTyped(call) => Some((call.func.as_ref(), &call.args, &[])),
         _ => None,
     }
 }
@@ -11618,6 +11640,7 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
                 &mut callable_defs[caller_index],
                 module_constants,
                 &callee_module,
+                &HashMap::new(),
                 &[TypedGeneratorStateLoweringPlan {
                     generator_origin: origin,
                     function_id: values_id,
@@ -12301,6 +12324,7 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
                 &mut callable_defs[caller_index],
                 module_constants,
                 &callee_module,
+                &HashMap::new(),
                 &[TypedGeneratorStateLoweringPlan {
                     generator_origin: origin,
                     function_id: values_id,
@@ -16904,6 +16928,92 @@ def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n
             1
         );
         assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 0);
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_rewrite_accepts_direct_exception_match() {
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration\n        return self.current\n\n\\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        );
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let exception_matches_id = typed_runtime_name_call_instr_ids(
+            caller,
+            RuntimeName::ExceptionMatches,
+            &module_constants,
+        )
+        .into_iter()
+        .next()
+        .expect("inlined try handler should call exception_matches");
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                exception_matches_id,
+                TypedCallEmissionPlan::DirectCallable {
+                    function_guard: TypedDirectFunctionCallGuard {
+                        function_id: RuntimeFunctionId::from_raw_parts(0, 1),
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                    },
+                },
+            )]),
+        };
+        assert_eq!(
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("exception_matches direct-call emission should lower"),
+            1
+        );
+
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+            1
+        );
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 0);
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_rewrite_accepts_zero_arg_constructor() {
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration()\n        return self.current\n\n\\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        );
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+            1
+        );
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 0);
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_rewrite_keeps_value_constructor() {
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration(41)\n        return self.current\n\n\\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        );
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+            0,
+            "a value-bearing StopIteration constructor may evaluate observable arguments",
+        );
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .any(|block| matches!(block.term, BlockTerm::Raise(_))),
+            "the value-bearing raise should remain in the CFG",
+        );
     }
 
     #[test]

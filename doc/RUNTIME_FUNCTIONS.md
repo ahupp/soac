@@ -227,6 +227,10 @@ IterRange
 tuple_from_iter
 list_from_iter
 set_from_iter
+map_from_iter
+__soac_map_iterator
+filter_from_iter
+__soac_filter_iterator
 constructor_call
 __deepcopy__
 templatelib_Template
@@ -264,6 +268,7 @@ exc_info_from_exception
 _get_awaitable_iter
 await_iter
 raise_from
+pep_479_exception
 _call_exception_class
 import_
 import_attr
@@ -279,6 +284,28 @@ asynccontextmanager_aenter
 asynccontextmanager_get_aexit
 asynccontextmanager_exit
 ```
+
+Iterator-pipeline helper roles:
+
+- `list_from_iter` and `tuple_from_iter` are the production inline bodies for
+  exact builtin `list` and `tuple` consumers when typed planning proves a
+  single-use closed generator-expression pipeline. The resulting collection
+  remains a real Python object.
+- `map_from_iter` and `filter_from_iter` eagerly acquire the source iterator and
+  return the compiler-owned `__soac_map_iterator` and
+  `__soac_filter_iterator` workers. Production may inline those workers and
+  their generator-expression producer into a selected list/tuple materializer
+  region.
+- `set_from_iter` is a callable runtime helper with ordinary Python behavior,
+  but it is not registered as a production builtin-implementation body. Exact
+  builtin `set` consumers remain on CPython's native path because expanding
+  the Python-level `result.add(item)` loop is not compact or profitable. A
+  future fused set materializer should use checked direct `PySet_Add`-shaped
+  IR/runtime support instead.
+
+Eliminated generator-expression and map/filter activations also eliminate
+their generator objects and suspended frames; the intentional introspection
+compatibility boundary is documented in `doc/SPECIALIZATION.md`.
 
 Runtime classes and methods:
 

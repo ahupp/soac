@@ -112,6 +112,47 @@ def set_from_iter(value):
         result.add(item)
 
 
+def map_from_iter(function, iterable):
+    return __soac_map_iterator(function, iter(iterable))
+
+
+def __soac_map_iterator(function, iterator):
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        try:
+            mapped = function(item)
+        except StopIteration:
+            return
+        yield mapped
+
+
+def filter_from_iter(function, iterable):
+    return __soac_filter_iterator(function, iter(iterable))
+
+
+def __soac_filter_iterator(function, iterator):
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        if function is None:
+            predicate = item
+        else:
+            try:
+                predicate = function(item)
+            except StopIteration:
+                return
+        try:
+            if predicate:
+                yield item
+        except StopIteration:
+            return
+
+
 def constructor_call(cls, /, *args, **kwargs):
     return cls(*args, **kwargs)
 
@@ -578,6 +619,8 @@ def raise_from(exc, cause):
             raise TypeError("exceptions must derive from BaseException")
     elif not isinstance(exc, BaseException):
         raise TypeError("exceptions must derive from BaseException")
+    if cause is NO_DEFAULT:
+        return exc
     if cause is None:
         exc.__cause__ = None
         exc.__suppress_context__ = True
@@ -594,6 +637,20 @@ def raise_from(exc, cause):
         exc.__cause__ = cause
         exc.__suppress_context__ = True
     return exc
+
+
+def pep_479_exception(kind, cause):
+    if not isinstance(cause, StopIteration):
+        return cause
+    if kind == 0:
+        message = "generator raised StopIteration"
+    else:
+        message = "coroutine raised StopIteration"
+    error = RuntimeError(message)
+    error.__cause__ = cause
+    error.__context__ = cause
+    error.__suppress_context__ = True
+    return error
 
 
 def _call_exception_class(exc_type):

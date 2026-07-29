@@ -21245,13 +21245,11 @@ fn emit_codegen_raise_exception_from_function(
     let thread_state_value = emit_ctx.consts.thread_state_value;
     let decref_ref = emit_ctx.decref_ref;
 
-    let cause_value = emit_none_const(fb, emit_ctx);
-    emit_ctx.emit_incref_for_family(
-        fb,
-        cause_value,
-        Some(PyObjFacts::none_singleton()),
-        RefcountFamily::ConstantClone,
-    );
+    // A bare `raise exc` normalizes the exception but must not overwrite an
+    // explicit cause already attached by a nested `raise_from(exc, cause)`
+    // expression. `NO_DEFAULT` distinguishes that operation from source
+    // `raise exc from None`, whose nested helper call passes the real `None`.
+    let cause_value = emit_checked_runtime_name_object(fb, RuntimeName::NoDefault, emit_ctx);
     let raise_call_inst = fb.ins().call(
         emit_ctx.py_call_positional_three_ref,
         &[

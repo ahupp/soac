@@ -688,6 +688,42 @@ fn completion_raise(
     }
 }
 
+fn push_terminal_exception_blocks(state: &mut ResumeLoweringState) {
+    let terminal_exception_name = state.fresh_temp("terminal_exc");
+    let terminal_params = vec![BlockParam {
+        name: terminal_exception_name.clone(),
+        role: BlockParamRole::Exception,
+    }];
+    let terminal_exception = match state.kind {
+        FunctionKind::Generator => core_call(
+            "pep_479_exception",
+            vec![
+                core_literal_int(0),
+                core_name(terminal_exception_name.as_str()),
+            ],
+        ),
+        FunctionKind::Coroutine => core_call(
+            "pep_479_exception",
+            vec![
+                core_literal_int(1),
+                core_name(terminal_exception_name.as_str()),
+            ],
+        ),
+        FunctionKind::AsyncGenerator => core_name(terminal_exception_name.as_str()),
+        FunctionKind::Function => unreachable!(),
+    };
+    state.push_terminal_block(LinearCoreBlock {
+        label: state.terminal_exception_label.clone(),
+        body: state.terminal_cleanup_stmts(),
+        term: BlockTerm::Raise(TermRaise {
+            exc: Some(terminal_exception),
+        }),
+        params: terminal_params,
+        exc_edge: None,
+        extra: Default::default(),
+    });
+}
+
 fn push_completion_raise_block(
     state: &mut ResumeLoweringState,
     label: BlockLabel,
@@ -1692,22 +1728,8 @@ fn lower_resume_blocks(
         extra: Default::default(),
     }];
     blocks.append(&mut dispatch_wrappers);
-    blocks.append(&mut state.blocks);
-    let terminal_exception_name = state.fresh_temp("terminal_exc");
-    blocks.push(LinearCoreBlock {
-        label: state.terminal_exception_label.clone(),
-        body: state.terminal_cleanup_stmts(),
-        term: BlockTerm::Raise(TermRaise {
-            exc: Some(core_name(terminal_exception_name.as_str())),
-        }),
-        params: vec![BlockParam {
-            name: terminal_exception_name,
-            role: BlockParamRole::Exception,
-        }],
-        exc_edge: None,
-        extra: Default::default(),
-    });
-    blocks.push(LinearCoreBlock {
+    push_terminal_exception_blocks(&mut state);
+    state.push_terminal_block(LinearCoreBlock {
         label: state.exhausted_label.clone(),
         body: Vec::new(),
         term: completion_raise(state.kind, None),
@@ -1715,13 +1737,8 @@ fn lower_resume_blocks(
         exc_edge: None,
         extra: Default::default(),
     });
+    blocks.append(&mut state.blocks);
     state.exception_edges.insert(dispatch_label.clone(), None);
-    state
-        .exception_edges
-        .insert(state.terminal_exception_label.clone(), None);
-    state
-        .exception_edges
-        .insert(state.exhausted_label.clone(), None);
     (
         attach_exception_edges_to_blocks(blocks, &state.exception_edges),
         state.exception_edges,

@@ -120,6 +120,24 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-07-29 - Generalize closed iterator-pipeline fusion
+
+- jj change id: `wszrsrsw`
+- summary: exact `list` and `tuple` sinks can now fuse single-use generator
+  expressions through canonical single-input `map` and `filter` stages while
+  preserving ordered materialization and callback exception semantics.
+- throughput: `+1.54%` specialized pystone median versus the parent N-Queens
+  change; the exact opaque N-Queens count path runs at `28530.838 loops/s`
+  versus stock CPython's `8.457 loops/s`. The generalized ordered-list path is
+  correct but remains below parity at `0.779 loops/s` versus stock's
+  `7.885 loops/s`.
+- pre-change benchmark: `work/bench/ruqwzllknkow`
+  - apply, refcounts enabled, median: `263995 loops/s`
+- post-change benchmark: `work/bench/wszrsrswkttr`
+  - apply, refcounts enabled, median: `268052 loops/s`
+  - no-refcount diagnostic median: `282615 loops/s`
+  - total pystone code size: `206816 bytes`, `12251` machine blocks
+
 ## 2026-05-12 - Inline builtin list consumers for generators
 
 - jj change id: `qtrtxpvp`

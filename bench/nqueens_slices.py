@@ -9,6 +9,7 @@ SLICE_MODULES = {
     "diagonal_set_consumers": "nqueens_slice_diagonal_set_consumers",
     "nqueens_composed_consumers": "nqueens_slice_nqueens_composed_consumers",
     "full_nqueens_list_consumer": "nqueens_slice_full_nqueens_list_consumer",
+    "ordered_closed_pipeline": "nqueens_slice_ordered_closed_pipeline",
 }
 
 

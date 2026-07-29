@@ -19174,6 +19174,384 @@ def f(x, y):
     }
 
     #[test]
+    fn runtime_typed_v3_fuses_closed_map_filter_genexpr_across_runtime_module() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_fuses_closed_map_filter_genexpr_across_runtime_module",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let env_config =
+                typed_v3_env_config().with_specialization_mode(Some(SpecializationMode::Verify));
+            let runtime_source = r#"
+def list_from_iter(value):
+    result = []
+    iterator = iter(value)
+    while True:
+        try:
+            item = next(iterator)
+            result.append(item)
+        except StopIteration:
+            return result
+
+def tuple_from_iter(value):
+    result = []
+    iterator = iter(value)
+    while True:
+        try:
+            item = next(iterator)
+            result.append(item)
+        except StopIteration:
+            return tuple(result)
+
+def map_from_iter(function, iterable):
+    return __soac_map_iterator(function, iter(iterable))
+
+def __soac_map_iterator(function, iterator):
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        try:
+            mapped = function(item)
+        except StopIteration:
+            return
+        yield mapped
+
+def filter_from_iter(function, iterable):
+    return __soac_filter_iterator(function, iter(iterable))
+
+def __soac_filter_iterator(function, iterator):
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        if function is None:
+            predicate = item
+        else:
+            try:
+                predicate = function(item)
+            except StopIteration:
+                return
+        try:
+            if predicate:
+                yield item
+        except StopIteration:
+            return
+
+NO_DEFAULT = object()
+
+def _is_generator_closed(owner):
+    return bool(load_preserved_state(owner._preserved_values, owner._closed_slot))
+
+def _reraise_control_flow(exc):
+    raise exc
+
+class ClosureGenerator:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.send(None)
+
+    def send(self, value):
+        if _is_generator_closed(self):
+            raise StopIteration
+        try:
+            return resume_generator(
+                self._resume_function,
+                self,
+                self._preserved_values,
+                value,
+                NO_DEFAULT,
+            )
+        except BaseException as exc:
+            _reraise_control_flow(exc)
+"#;
+            let user_source = r#"
+def convert(value):
+    return value * 3 + 1
+
+def keep(value):
+    return value % 2 == 0
+
+def collect(count):
+    mapped = list(map(convert, (value for value in range(count))))
+    filtered = tuple(filter(keep, (value for value in range(count))))
+    return mapped, filtered
+"#;
+
+            let runtime_lowered = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
+                runtime_source,
+                ModuleNameGen::new(41),
+                soac_core::pass_tracker::RecordingPassTracker::new(),
+                soac_lowering::LoweringOptions {
+                    runtime_names_as_globals: true,
+                },
+            )
+            .expect("closed-pipeline runtime source should lower")
+            .blockpy_module;
+            let user_lowered = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
+                user_source,
+                ModuleNameGen::new(42),
+                soac_core::pass_tracker::RecordingPassTracker::new(),
+                soac_lowering::LoweringOptions {
+                    runtime_names_as_globals: false,
+                },
+            )
+            .expect("closed-pipeline user source should lower")
+            .blockpy_module;
+            let collect_id = user_lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "collect")
+                .map(|function| function.function_id)
+                .expect("user source should define collect");
+            let forbidden_runtime_qualnames = HashSet::from([
+                "map_from_iter",
+                "filter_from_iter",
+                "__soac_map_iterator",
+                "__soac_filter_iterator",
+                "ClosureGenerator.__iter__",
+                "ClosureGenerator.__next__",
+                "ClosureGenerator.send",
+            ]);
+            let mut forbidden_direct_targets = runtime_lowered
+                .callable_defs
+                .iter()
+                .filter(|function| {
+                    forbidden_runtime_qualnames.contains(function.names.qualname.as_str())
+                })
+                .map(|function| function.function_id)
+                .collect::<HashSet<_>>();
+            forbidden_direct_targets.extend(
+                runtime_lowered
+                    .callable_defs
+                    .iter()
+                    .chain(user_lowered.callable_defs.iter())
+                    .filter(|function| function.lowered_kind() == &FunctionKind::Generator)
+                    .map(|function| function.function_id),
+            );
+
+            let runtime_shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                runtime_lowered,
+                "soac.runtime",
+                "soac",
+            )
+            .expect("closed-pipeline runtime shared state should build");
+            let user_module_name = "runtime_typed_v3_closed_iterator_pipeline_user";
+            let user_shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                user_lowered,
+                user_module_name,
+                "",
+            )
+            .expect("closed-pipeline user shared state should build");
+            let compile_session = crate::session::CompileSession::new();
+            compile_session
+                .retain_shared_module_state_for_inspection(runtime_shared_state)
+                .expect("runtime module should be retained for closed-pipeline planning");
+            compile_session
+                .retain_shared_module_state_for_inspection(user_shared_state.clone())
+                .expect("user module should be retained for closed-pipeline planning");
+
+            let profile = SpecializationProfile {
+                module_name: Some(user_module_name),
+                counter_dump_path: None,
+                direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+                opt_v3_emitted_direct_calls: HashMap::new(),
+                opt_v3_emitted_exact_list_items: HashMap::new(),
+                opt_v3_emitted_indexed_fields: HashMap::new(),
+                opt_v3_emitted_indexed_globals: HashMap::new(),
+                opt_v3_exact_int_branch_artifacts: HashMap::new(),
+                behavior_change_indexed_stores: false,
+                profiled_cold_blocks: false,
+                guard_miss_deopt: false,
+            };
+            let module_plan = optimize_blockpy_for_shared_state(
+                user_shared_state.as_ref(),
+                Some(&compile_session),
+                Some(&profile),
+                &env_config,
+            )
+            .expect("closed map/filter/genexpr pipeline should fuse across the runtime module");
+            let planned_collect = module_plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == collect_id)
+                .expect("planned user module should include collect");
+
+            struct ClosedPipelineResiduals<'a> {
+                forbidden_direct_targets: &'a HashSet<RuntimeFunctionId>,
+                module_constants: &'a [ConstantExpr],
+                forbidden_calls: Vec<String>,
+                generator_instance_plans: usize,
+                generator_resume_plans: usize,
+                generator_closures: usize,
+                preserved_references: usize,
+                final_tuple_calls: usize,
+            }
+
+            impl ClosedPipelineResiduals<'_> {
+                fn record_callable(&mut self, callable: &InstrTyped) {
+                    let InstrTyped::Load(load) = callable else {
+                        return;
+                    };
+                    let runtime_name = load.name.runtime_name_id().or_else(|| {
+                        let index = load.name.location.as_constant()?;
+                        match self.module_constants.get(index as usize) {
+                            Some(ConstantExpr::RuntimeName(runtime_name)) => Some(*runtime_name),
+                            _ => None,
+                        }
+                    });
+                    let Some(runtime_name) = runtime_name else {
+                        return;
+                    };
+                    if matches!(
+                        runtime_name,
+                        RuntimeName::Map
+                            | RuntimeName::Filter
+                            | RuntimeName::SoacMapIterator
+                            | RuntimeName::SoacFilterIterator
+                            | RuntimeName::ResumeGenerator
+                    ) {
+                        self.forbidden_calls.push(runtime_name.name().to_string());
+                    }
+                    if runtime_name == RuntimeName::Tuple {
+                        self.final_tuple_calls += 1;
+                    }
+                }
+
+                fn record_name(&mut self, name: &ResolvedName) {
+                    if name.preserved_location().is_some()
+                        || name.cell_location().is_some_and(CellLocation::is_preserved)
+                    {
+                        self.preserved_references += 1;
+                    }
+                }
+            }
+
+            impl Visit<InstrTyped> for ClosedPipelineResiduals<'_> {
+                fn visit_instr(&mut self, expr: &InstrTyped) {
+                    self.generator_instance_plans +=
+                        usize::from(expr.generator_instance_plan().is_some());
+                    self.generator_resume_plans +=
+                        usize::from(expr.generator_resume_plan().is_some());
+                    if expr.builtin_implementation_plan().is_some_and(|plan| {
+                        matches!(plan.source, RuntimeName::Map | RuntimeName::Filter)
+                    }) {
+                        self.forbidden_calls
+                            .push("map/filter builtin implementation sidecar".to_string());
+                    }
+                    match expr {
+                        InstrTyped::CallTyped(call) => self.record_callable(call.func.as_ref()),
+                        InstrTyped::GuardedCallableCallTyped(call) => {
+                            self.record_callable(call.func.as_ref());
+                        }
+                        InstrTyped::DirectCallableCallTyped(call) => {
+                            self.record_callable(call.func.as_ref());
+                        }
+                        InstrTyped::CallDirect(call) => {
+                            self.record_callable(call.callable.as_ref());
+                            if self.forbidden_direct_targets.contains(&call.function_id) {
+                                self.forbidden_calls
+                                    .push(format!("direct target {:?}", call.function_id));
+                            }
+                        }
+                        InstrTyped::GuardedMethodCallTyped(call)
+                            if matches!(
+                                call.method_name.as_str(),
+                                "__iter__" | "__next__" | "send"
+                            ) =>
+                        {
+                            self.forbidden_calls
+                                .push(format!("guarded method {}", call.method_name));
+                        }
+                        InstrTyped::DirectMethodCallTyped(call)
+                            if matches!(
+                                call.method_name.as_str(),
+                                "__iter__" | "__next__" | "send"
+                            ) =>
+                        {
+                            self.forbidden_calls
+                                .push(format!("direct method {}", call.method_name));
+                        }
+                        InstrTyped::MakeFunctionWithClosure(make_function)
+                            if make_function.kind == FunctionKind::Generator =>
+                        {
+                            self.generator_closures += 1;
+                        }
+                        InstrTyped::Load(load) => self.record_name(&load.name),
+                        InstrTyped::Store(store) => self.record_name(&store.name),
+                        InstrTyped::Del(del) => self.record_name(&del.name),
+                        InstrTyped::CellRef(cell_ref) if cell_ref.location.is_preserved() => {
+                            self.preserved_references += 1;
+                        }
+                        _ => {}
+                    }
+                    expr.visit_children(self);
+                }
+            }
+
+            let mut residuals = ClosedPipelineResiduals {
+                forbidden_direct_targets: &forbidden_direct_targets,
+                module_constants: &module_plan.module.module_constants,
+                forbidden_calls: Vec::new(),
+                generator_instance_plans: 0,
+                generator_resume_plans: 0,
+                generator_closures: 0,
+                preserved_references: 0,
+                final_tuple_calls: 0,
+            };
+            residuals.visit_fn(planned_collect);
+            assert!(
+                residuals.forbidden_calls.is_empty(),
+                "closed pipelines with {} blocks should not retain map/filter helpers, generator-worker, protocol-shell, or resume calls: {:?}",
+                planned_collect.blocks.len(),
+                residuals.forbidden_calls,
+            );
+            assert_eq!(
+                residuals.generator_instance_plans, 0,
+                "closed pipeline should not retain generator-instance sidecars",
+            );
+            assert_eq!(
+                residuals.generator_resume_plans, 0,
+                "closed pipeline should not retain generator-resume sidecars",
+            );
+            assert_eq!(
+                residuals.generator_closures, 0,
+                "closed pipeline should not materialize generator function closures",
+            );
+            assert_eq!(
+                residuals.preserved_references, 0,
+                "closed pipeline should lower all imported generator state to ordinary caller locals",
+            );
+            for layout in planned_collect
+                .storage_layout
+                .iter()
+                .chain(planned_collect.public_storage_layout.iter())
+            {
+                assert!(
+                    layout.preserved_slots.is_empty(),
+                    "closed pipeline should not retain preserved storage slots: {:?}",
+                    layout.preserved_slots,
+                );
+            }
+            assert_eq!(
+                residuals.final_tuple_calls, 1,
+                "the two fused roots should retain only the tuple root's final materialization call",
+            );
+        });
+    }
+
+    #[test]
     fn runtime_typed_v3_pipeline_inlines_static_runtime_range_calls() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),

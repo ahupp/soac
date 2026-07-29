@@ -1353,6 +1353,45 @@ fn trusted_escaping_object_origins_in_expr(
             {
                 return;
             }
+            if expr
+                .builtin_implementation_plan()
+                .is_some_and(|plan| matches!(plan.source, RuntimeName::Map | RuntimeName::Filter))
+            {
+                match expr {
+                    InstrTyped::CallTyped(call) => {
+                        self.visit_instr(call.func.as_ref());
+                        for arg in call.args.iter().take(1) {
+                            self.visit_call_arg(arg);
+                        }
+                        for keyword in &call.keywords {
+                            match keyword {
+                                CallArgKeyword::Named { value, .. }
+                                | CallArgKeyword::Starred(value) => self.visit_instr(value),
+                            }
+                        }
+                    }
+                    InstrTyped::GuardedCallableCallTyped(call) => {
+                        self.visit_instr(call.func.as_ref());
+                        for arg in call.args.iter().take(1) {
+                            self.visit_call_arg(arg);
+                        }
+                        for keyword in &call.keywords {
+                            match keyword {
+                                CallArgKeyword::Named { value, .. }
+                                | CallArgKeyword::Starred(value) => self.visit_instr(value),
+                            }
+                        }
+                    }
+                    InstrTyped::DirectCallableCallTyped(call) => {
+                        self.visit_instr(call.func.as_ref());
+                        for arg in call.args.iter().take(1) {
+                            self.visit_call_arg(arg);
+                        }
+                    }
+                    _ => unreachable!("builtin iterator stage must be a call expression"),
+                }
+                return;
+            }
             if trusted_generator_resume_lookup_recognizes_call(
                 expr,
                 self.state,

@@ -569,8 +569,12 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   planning apply the same per-owner source-code and specialization-mode
   decision. In apply mode, a source-backed named generator retains its normal
   CPython public call instead of having a transformed wrapper and consumer loop
-  recreated inside its caller. Both source-backed and transformed named
-  generators retain their explicit direct-entry metadata; counter-recording
+  recreated inside its caller. General closed-pipeline fusion does not attach
+  executable generator-instance metadata to those calls: the current sidecar
+  changes factory codegen and is not a guard. The separately guarded exact
+  opaque specialization below is the only apply-mode exception. Both
+  source-backed and transformed named generators retain their explicit
+  direct-entry metadata; counter-recording
   modes, generated generators, and generator expressions remain eligible for
   their normal typed plans. Apply-mode modules containing source-backed named
   generators retain the ordinary Unicode-key dictionary created by
@@ -604,28 +608,33 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   proof up front. If later observable uses such as `gen.throw(...)` remain, the
   protocol call stays generic instead of exposing wrapper-only fields before
   generator-state lowering can prove the wrapper is erasable.
-  Immediate consumption by `list`, `set`, or `tuple` is not by itself such a
-  proof for a source-backed generator. A native generator's suspended frame and
-  owning `PyGenObject` remain observable through `frame.f_generator`, tracing
-  and monitoring callbacks, `sys._current_frames()`, traceback construction,
-  and close/finalization after an exceptional consumer exit. Those observers
-  can become active after consumption has begun. Because the current runtime
-  cannot materialize an equivalent native generator and suspended frame at a
-  yield or safepoint, production apply mode does not attach generator-instance
-  or consumer-fusion plans to source-backed named generators. The structured
-  scalar-replacement tests exercise transformed generators whose wrapper and
-  activation storage are compiler-owned; they do not establish that a native
-  `PyGenObject` may be removed.
-  Calls to builtin `list`, `set`, or `tuple` with a proven nonescaping generator
+  Immediate consumption by `list`, `set`, or `tuple` is not by itself proof that
+  a source-backed named-generator activation may be erased. Its native
+  `PyGenObject` and suspended frame are observable through `frame.f_generator`,
+  tracing and monitoring, `sys._current_frames()`, traceback construction, and
+  exceptional cleanup. Source-backed generator function objects and escaping,
+  aliased, or immediately materialized calls therefore retain CPython's public
+  vectorcall in the generalized path. Admitting one safely will require a
+  pre-activation guard over the exact function binding, code, defaults, and
+  closure dependencies, with guard failure resuming the untouched original
+  expression. It must also reject the activation before rewriting when
+  argument/state binding or the whole ownership graph cannot be lowered.
+  Calls to builtin `list` or `tuple` with a proven nonescaping generator
   instance can also carry an explicit typed builtin-implementation plan. That
   plan keeps the observed callable as the original builtin, but selects the
-  visible `soac.runtime.list_from_iter`, `soac.runtime.set_from_iter`, or
+  visible `soac.runtime.list_from_iter` or
   `soac.runtime.tuple_from_iter` helper as a fallback-free inline body so the
   generator consumer loop can be exposed to later typed rewrites without
   pretending that the builtin object itself is the helper target. The tuple
   helper keeps its own visible `iter`/`next` loop around a list accumulator before
   final tuple materialization, so tuple(genexpr) can reuse the same
   generator-consumer lowering rather than falling back to CPython iteration.
+  `soac.runtime.set_from_iter` remains a callable runtime helper, but production
+  planning deliberately leaves exact builtin `set` construction on CPython's
+  native path. Inlining the current Python helper expands `result.add(item)`
+  into too much method-call and exception control flow to be compact or
+  profitable; a future fused set sink should lower directly to checked
+  `PySet_Add`-shaped IR/runtime support.
   The current slice only selects that body when the paired generator resume
   target stays within the bounded generator-inline budget, so large resume state
   machines keep the ordinary builtin path instead of flattening a
@@ -700,6 +709,88 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   - richer support for more Python callable shapes that still map to a
     transformed function body
 
+## Closed Iterator-Pipeline Fusion
+
+Closed iterator-pipeline fusion removes proven generator, `map`, and `filter`
+intermediates when a single-use chain is consumed immediately by an exact
+builtin `list` or `tuple`. Eligible producers include compiler-owned
+generator expressions and the compiler-owned `map`/`filter` workers created by
+the selected stages. Source-backed named generators stay native in this
+generalized pass. The sink remains a real Python collection and may escape.
+This is distinct from opaque fused iteration below: it executes the original
+stage algorithm and materializes the exact sink from the values that reach it.
+
+The specialization records no new profiling counters. Typed planning derives a
+single-use def/use chain from the verify/apply typed module plus exact static
+targets.
+Each `map` or `filter` stage must be the canonical builtin with exactly two
+positional arguments, and its iterable input must have one of those proven
+generator identities. The chain must terminate at an exact `list` or `tuple`
+consumer. A callback or predicate remains an ordinary fallible
+per-element call; it does not receive the iterator, so only the iterable edge
+is treated as internal, nonescaping consumption.
+
+Planning stages the visible runtime implementations
+`map_from_iter`/`filter_from_iter` and
+`list_from_iter`/`tuple_from_iter` one source at a time. After
+each rewrite, the typed inline fixpoint refreshes owner evidence, exposes the
+next wrapper, inlines eligible worker or producer resumes, and scalar-replaces
+their preserved activation slots with caller locals. External runtime callees
+use the same public generator layout as local callees during state lowering.
+Codegen therefore receives ordinary typed loops, callback calls, and collection
+operations; it does not rediscover the pipeline or emit a pipeline-specific
+runtime patch.
+
+The fused order remains source-next, map callback, filter callback or truth
+test, then sink insertion for each item. Construction and argument evaluation
+order, eager outer `iter()` acquisition, and list and tuple encounter order
+remain visible. `StopIteration` from a map callback, filter callback, or filter
+truth test terminates that stage and returns the partial sink, matching the
+builtin iterators. Other callback exceptions propagate once. `StopIteration`
+raised inside the fused generator-expression producer still follows PEP 479.
+Exact builtin `set` consumers remain native, including their hashing, equality,
+insertion-error, and length-hint behavior.
+
+Current eligibility deliberately excludes aliases or multiple uses of an
+intermediate, escaping iterator results, keyword or starred arguments,
+multi-input `map`, arbitrary source iterators, exact builtin `set` and other
+sinks, and source-backed named-generator activations. A source name that does
+not resolve to SOAC's canonical runtime builtin also prevents selection.
+Excluded cases retain their ordinary unfused path; in apply mode a
+source-backed named generator retains its native CPython call, while generated
+or transformed iterators retain SOAC's ordinary wrapper path. Supporting
+source-backed producers requires a guarded whole-graph fallback; closed
+ownership alone cannot protect against decorators, global or `__code__`
+rebinding, and positional or keyword-default mutation.
+
+Individual resume targets are currently limited to 64 blocks and 512
+recursively counted typed instructions. Optional inline admission stops near a
+cumulative caller cap of 384 blocks and 4096 typed body instructions; consumer
+admission reserves its immediate resume/protocol follow-up and admits at most
+one builtin-implementation source per fixpoint pass. These are typed CFG growth
+limits, not native code-size limits. A stage that is too large remains unfused,
+but an already-started rewrite may require resume/state cleanup beyond the
+optional cap; the current process is not a whole-graph transaction. Deep nested
+graphs can therefore be only partially fused and grow substantial exception,
+ownership, and protocol control flow. N-Queens reaches this boundary, so the
+generalized pass is not used as a replacement for the fixed-size opaque
+N-Queens specialization below.
+
+Fully fused intermediates intentionally relax CPython compatibility for
+back-door generator and frame introspection. Their generator-expression and
+`map`/`filter` objects, suspended frames, and frame ancestry do not exist:
+`gi_frame`, `frame.f_generator`, `sys._current_frames()`, tracing, profiling,
+monitoring, GC inspection, and equivalent object/frame observation cannot see
+those eliminated activations. Their allocation, reference-count,
+destruction/finalizer, recursion-check, and eval-breaker timing can
+consequently differ. The materializer helpers grow a list by append, and
+`tuple_from_iter` uses that list before constructing the final tuple, so peak
+memory, allocation/`MemoryError`, and cleanup timing can differ from CPython's
+builtin length-hint paths. Pipeline admission does not treat callbacks as
+iterator escapes or erase their effects. Callback calls preserve ordinary
+result and exception semantics and may be independently specialized under the
+direct-call policy above.
+
 ## Opaque Fused Iteration
 
 Opaque fused iteration is an intentional compatibility-relaxed specialization
@@ -756,6 +847,13 @@ helper's count and produces the canonical `None` result without boxing it.
 This is aggregate scalarization as well as generator fusion, and therefore
 takes the broader compatibility relaxations listed below.
 
+The preceding generalized pass implements a bounded linear subset by cloning
+existing typed wrapper and resume CFGs into the caller. It retains the exact
+materialized collection, scales caller CFG with the admitted stages, has no
+serialized arbitrary producer/consumer graph, and proves no collection
+algebra. It therefore neither removes this specialization's exact-source gate
+nor substitutes for the fixed guard sequence and scalar helper emitted here.
+
 ### Generality gap
 
 Removing the exact-source check would be unsound. Another graph can have the
@@ -763,8 +861,8 @@ same functions, yields, and consumers while computing different values,
 performing different Python-visible effects, or requiring different exception
 and cleanup behavior. Generalization has two separately useful stages:
 
-1. **General synchronous generator fusion** must translate each admitted
-   producer body into a typed fused state machine. That IR needs explicit
+1. **Fully general synchronous generator-graph fusion** would translate each
+   admitted producer body into a typed fused state machine. That IR needs explicit
    activation locals and cells, operations and evaluation order, branch and
    loop edges, yielded values, consumer continuations, completion, exceptions,
    and cleanup. Codegen can then erase frames while preserving the original
