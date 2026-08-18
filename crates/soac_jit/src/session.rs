@@ -206,6 +206,17 @@ impl CompileSession {
         Arc::clone(PROCESS_COMPILE_SESSION.get_or_init(|| Arc::new(Self::new())))
     }
 
+    pub fn flush_counter_dump_outputs(&self) -> Result<(), String> {
+        let Some(path) = crate::module_type::counter_dump_file_from_env() else {
+            return Ok(());
+        };
+        let shared_states = self.shared_module_states_snapshot()?;
+        for shared_state in shared_states {
+            shared_state.flush_counter_dump_file_once(path.as_path())?;
+        }
+        Ok(())
+    }
+
     pub fn id(&self) -> CompileSessionId {
         self.id
     }

@@ -102,6 +102,13 @@ fn inspect_counter_dump_json(path: &str) -> PyResult<String> {
     })
 }
 
+#[pyfunction]
+fn flush_counter_dump_outputs() -> PyResult<()> {
+    soac_jit::CompileSession::process()
+        .flush_counter_dump_outputs()
+        .map_err(PyRuntimeError::new_err)
+}
+
 #[pymodule]
 fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     soac_config::init_logging().map_err(PyRuntimeError::new_err)?;
@@ -113,5 +120,7 @@ fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     module.add_function(wrap_pyfunction!(inspect_counter_dump_json, module)?)?;
     jit_runtime::add_module_functions(module)?;
+    let flush_callback = wrap_pyfunction!(flush_counter_dump_outputs, module)?;
+    PyModule::import(py, "atexit")?.call_method1("register", (flush_callback,))?;
     Ok(())
 }

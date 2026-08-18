@@ -24,7 +24,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -68,8 +68,21 @@ pub struct SharedModuleState {
     counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
     top_value_counters: Box<[GilTopValueCounter]>,
+    counter_dump_flush_tracker: Mutex<CounterDumpFlushTracker>,
     pub(crate) precompiled_module_runtime:
         OnceLock<Result<Arc<crate::jit::PrecompiledModuleRuntime>, String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CounterDumpFlushStatus {
+    InProgress,
+    Complete,
+}
+
+#[derive(Default)]
+struct CounterDumpFlushTracker {
+    paths: HashMap<PathBuf, CounterDumpFlushStatus>,
+    module_cleared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -709,6 +722,46 @@ impl SharedModuleState {
         file.write_all(bytes.as_slice())
             .map_err(|err| format!("failed to write {}: {err}", path.display()))
     }
+
+    pub(crate) fn flush_counter_dump_file_once(&self, path: &Path) -> Result<(), String> {
+        {
+            let mut tracker = self
+                .counter_dump_flush_tracker
+                .lock()
+                .map_err(|_| "counter dump flush tracker lock poisoned".to_string())?;
+            if tracker.module_cleared || tracker.paths.contains_key(path) {
+                return Ok(());
+            }
+            tracker
+                .paths
+                .insert(path.to_path_buf(), CounterDumpFlushStatus::InProgress);
+        }
+
+        // Capturing type layouts can invoke Python attribute callbacks, so neither the
+        // per-module tracker nor the session registry may remain locked during serialization.
+        let result = self.append_counter_dump_file(path);
+        let mut tracker = self
+            .counter_dump_flush_tracker
+            .lock()
+            .map_err(|_| "counter dump flush tracker lock poisoned".to_string())?;
+        if result.is_ok() {
+            tracker
+                .paths
+                .insert(path.to_path_buf(), CounterDumpFlushStatus::Complete);
+        } else {
+            tracker.paths.remove(path);
+        }
+        result
+    }
+
+    fn mark_counter_dump_module_cleared(&self) -> Result<(), String> {
+        let mut tracker = self
+            .counter_dump_flush_tracker
+            .lock()
+            .map_err(|_| "counter dump flush tracker lock poisoned".to_string())?;
+        tracker.module_cleared = true;
+        Ok(())
+    }
 }
 
 static NEXT_SHARED_MODULE_STATE_STORAGE_KEY: AtomicUsize = AtomicUsize::new(1);
@@ -1011,6 +1064,7 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         counter_slots_by_id,
         counter_values,
         top_value_counters,
+        counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
         precompiled_module_runtime: OnceLock::new(),
     }))
 }
@@ -1048,6 +1102,7 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
         counter_slots_by_id,
         counter_values,
         top_value_counters,
+        counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
         precompiled_module_runtime: OnceLock::new(),
     }))
 }
@@ -1121,6 +1176,7 @@ pub fn build_shared_state_for_inspection_with_original_code_and_source_hash(
         counter_slots_by_id,
         counter_values,
         top_value_counters,
+        counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
         precompiled_module_runtime: OnceLock::new(),
     }))
 }
@@ -1204,6 +1260,7 @@ impl SoacExtModuleState {
             counter_slots_by_id,
             counter_values,
             top_value_counters,
+            counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
             precompiled_module_runtime: OnceLock::new(),
         });
         compile_session
@@ -1220,13 +1277,18 @@ impl SoacExtModuleState {
         }
         let shared_state = unsafe { self.shared_state.assume_init_ref().as_ref() };
         shared_state.append_specialization_runtime_log();
+        let mut flushed = true;
         if let Some(path) = counter_dump_file_from_env() {
-            if let Err(err) = shared_state.append_counter_dump_file(path.as_path()) {
+            if let Err(err) = shared_state.flush_counter_dump_file_once(path.as_path()) {
+                flushed = false;
                 eprintln!(
                     "[soac counters] failed to append counter dump to {}: {err}",
                     path.display()
                 );
             }
+        }
+        if flushed && let Err(err) = shared_state.mark_counter_dump_module_cleared() {
+            eprintln!("[soac counters] failed to mark cleared module: {err}");
         }
         unsafe { ptr::drop_in_place(self.shared_state.as_mut_ptr()) };
         self.initialized = false;
@@ -1432,7 +1494,7 @@ fn snapshot_type_key_layout_events_bound(
     Ok((out, type_table))
 }
 
-fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
+pub(crate) fn counter_dump_file_from_env() -> Option<PathBuf> {
     let path = match SoacEnvConfig::from_env().map(|config| config.counter_dump_output_path()) {
         Ok(Some(path)) => path,
         Ok(None) => return None,
@@ -1915,7 +1977,7 @@ impl SoacExtModule {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soac_core::profile::COUNTER_DUMP_MAGIC;
+    use soac_core::profile::{COUNTER_DUMP_MAGIC, parse_counter_dump_records};
     use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
     use soac_ir_typed::lower_blockpy_module_to_typed;
     use soac_lowering::lower_python_to_blockpy_for_testing;
@@ -2090,6 +2152,7 @@ def f():
             module_name: "counter_test".to_string(),
             package_name: String::new(),
             original_code_by_function_id: HashMap::new(),
+            counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
             precompiled_module_runtime: OnceLock::new(),
         };
 
@@ -2165,6 +2228,7 @@ def f(x):
             module_name: "counter_test".to_string(),
             package_name: String::new(),
             original_code_by_function_id: HashMap::new(),
+            counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
             precompiled_module_runtime: OnceLock::new(),
         };
 
@@ -2372,6 +2436,7 @@ def f():
             module_name: "counter_test".to_string(),
             package_name: "pkg".to_string(),
             original_code_by_function_id: HashMap::new(),
+            counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
             precompiled_module_runtime: OnceLock::new(),
         };
 
@@ -2396,5 +2461,108 @@ def f():
         assert!(!bytes.is_empty());
 
         fs::remove_file(&path).expect("temp file should be removable");
+    }
+
+    #[test]
+    fn counter_dump_flush_is_path_aware_reentrant_and_retries_failed_writes() {
+        let mut lowered = lower_python_to_blockpy_for_testing(
+            r#"
+VALUE = 1
+
+def f():
+    return VALUE
+"#,
+        )
+        .expect("transform should succeed")
+        .blockpy_module;
+        define_module_block_entry_counters(&mut lowered);
+
+        let shared_state = SharedModuleState {
+            function_index_by_id: build_function_index_by_id(&lowered)
+                .expect("function index should build"),
+            codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
+            source_hash: 0,
+            storage_instance_key: allocate_shared_module_state_storage_key(),
+            function_templates: Mutex::new(HashMap::new()),
+            module_constant_objs: Vec::new(),
+            runtime_name_cache: build_runtime_name_cache(),
+            counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0), CounterRuntimeSlot::Scalar(1)]
+                .into_boxed_slice(),
+            counter_values: vec![5, 8].into_boxed_slice(),
+            top_value_counters: Vec::new().into_boxed_slice(),
+            lowered_module: lowered,
+            module_name: "counter_flush_test".to_string(),
+            package_name: "pkg".to_string(),
+            original_code_by_function_id: HashMap::new(),
+            counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
+            precompiled_module_runtime: OnceLock::new(),
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "soac_counter_dump_flush_{unique}_{}",
+            std::process::id()
+        ));
+        let profile_path = dir.join("profile.bin");
+        assert!(
+            shared_state
+                .flush_counter_dump_file_once(profile_path.as_path())
+                .is_err(),
+            "a missing output directory should leave the flush eligible for retry",
+        );
+
+        fs::create_dir_all(&dir).expect("counter dump output directory should be creatable");
+        shared_state
+            .flush_counter_dump_file_once(profile_path.as_path())
+            .expect("failed counter dump write should be retryable");
+        shared_state
+            .flush_counter_dump_file_once(profile_path.as_path())
+            .expect("completed profile dump should not be appended twice");
+        let profile = fs::read(&profile_path).expect("profile dump should be readable");
+        assert_eq!(
+            parse_counter_dump_records(profile.as_slice())
+                .expect("profile dump should decode")
+                .len(),
+            1,
+            "a completed output path must contain exactly one module record",
+        );
+
+        let verify_path = dir.join("verify.bin");
+        shared_state
+            .flush_counter_dump_file_once(verify_path.as_path())
+            .expect("a distinct verification path should receive its own record");
+        let verify = fs::read(&verify_path).expect("verification dump should be readable");
+        assert_eq!(
+            parse_counter_dump_records(verify.as_slice())
+                .expect("verification dump should decode")
+                .len(),
+            1,
+        );
+
+        let reentrant_path = dir.join("reentrant.bin");
+        shared_state
+            .counter_dump_flush_tracker
+            .lock()
+            .expect("flush tracker should lock")
+            .paths
+            .insert(reentrant_path.clone(), CounterDumpFlushStatus::InProgress);
+        shared_state
+            .flush_counter_dump_file_once(reentrant_path.as_path())
+            .expect("a reentrant flush of the same path should be skipped");
+        assert!(!reentrant_path.exists());
+
+        shared_state
+            .mark_counter_dump_module_cleared()
+            .expect("cleared module marker should be writable");
+        let stale_path = dir.join("stale.bin");
+        shared_state
+            .flush_counter_dump_file_once(stale_path.as_path())
+            .expect("a cleared module should not enter a later output path");
+        assert!(!stale_path.exists());
+
+        fs::remove_dir_all(&dir).expect("counter dump test directory should be removable");
     }
 }

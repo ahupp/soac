@@ -161,6 +161,31 @@ preserve logical and storage names for owned cells, closure freevars, and
 preserved slots. Preserved-cell unbound errors use the actual Python variable
 name rather than an internal codegen label.
 
+Profile evidence must include every counter-producing transformed module in
+the process, not only modules whose CPython `m_clear` callback happens to run
+before interpreter shutdown. The process `CompileSession` retains transformed
+`SharedModuleState` objects for cross-module planning; a live compiler-owned
+`soac.runtime` module can therefore remain un-cleared even when a benchmark
+main module has already appended its own profile frame. Omitting that runtime
+frame makes valid strict cross-module apply targets appear absent.
+
+The shutdown contract is an early-registered private extension `atexit`
+callback that snapshots the retained compile-session states and flushes each
+active module's final counters. The explicit public Rust
+`CompileSession::flush_counter_dump_outputs` API coordinates that pass;
+existing module-clear flushing remains available for earlier cleanup. Each
+module-state/output-path pair must be serialized at most once across both
+paths, including reentrant callbacks, without holding a registry or state
+mutex while building a counter record that may invoke Python. Preserve
+`profile.bin` versus `verify.bin` mode separation, skip dumps in apply/none
+modes, retain strict source-hash and target validation, and do not expose a
+new public Python callback or module-global cache. Registering the shutdown
+callback during `_soac_ext` initialization lets later user `atexit` work run
+first and observers registered before importing SOAC inspect the completed
+dump afterward. Exact-once is process-local: if ten independent benchmark
+worker subprocesses append to one shared profile path, one main frame plus
+one runtime frame from each process correctly produces twenty total frames.
+
 The hot streams consumed by the current replay path are:
 
 - `call_hot_targets`
