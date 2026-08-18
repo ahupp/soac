@@ -539,6 +539,73 @@ fn collect_code_purpose_provenance(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn jit_artifact_records_are_complete_single_write_jsonl_lines() {
+        let path = Path::new("jit-code-summary.jsonl");
+        let first = serde_json::json!({
+            "process_id": 17,
+            "function_qualname": "Record.method",
+            "purpose_names": ["ordinary", "refcount"],
+            "block_role_purpose_bytes": [[1, 2], [3, 4]],
+            "details": {"unicode": "λ", "enabled": true},
+        });
+        let second = serde_json::json!({
+            "process_id": 23,
+            "function_qualname": "Record.other",
+            "purpose_names": [],
+        });
+        let mut writer = CountingWriter::default();
+
+        write_jit_artifact_record(&mut writer, path, &first)
+            .expect("first artifact record should serialize and write");
+        assert_eq!(
+            writer.writes.len(),
+            1,
+            "one JSONL record must use exactly one underlying write"
+        );
+        assert_eq!(writer.writes[0].last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&writer.writes[0])
+                .expect("newline-terminated artifact should parse as JSON"),
+            first
+        );
+
+        write_jit_artifact_record(&mut writer, path, &second)
+            .expect("second artifact record should serialize and write");
+        assert_eq!(
+            writer.writes.len(),
+            2,
+            "appending another JSONL record must use one additional write"
+        );
+        let records = writer
+            .writes
+            .concat()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                serde_json::from_slice::<serde_json::Value>(line)
+                    .expect("each appended artifact line should remain valid JSON")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records, vec![first, second]);
+    }
+
     #[test]
     fn code_purpose_provenance_splits_machine_blocks_by_srcloc_spans() {
         let refcount = cranelift_codegen::MachSrcLoc::<cranelift_codegen::Final> {
@@ -1041,16 +1108,24 @@ fn append_jit_artifact_record(
             .append(true)
             .open(path)
             .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-        use std::io::Write;
-        serde_json::to_writer(&mut file, record)
-            .map_err(|err| format!("failed to serialize {}: {err}", path.display()))?;
-        file.write_all(b"\n")
-            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
-        Ok(())
+        write_jit_artifact_record(&mut file, path, record)
     })();
     if let Err(err) = result {
         eprintln!("[soac {artifact_kind}] {err}");
     }
+}
+
+fn write_jit_artifact_record(
+    writer: &mut impl std::io::Write,
+    path: &Path,
+    record: &serde_json::Value,
+) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(record)
+        .map_err(|err| format!("failed to serialize {}: {err}", path.display()))?;
+    bytes.push(b'\n');
+    writer
+        .write_all(&bytes)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 pub(super) fn record_jit_code_summary(
