@@ -156,13 +156,62 @@ planner lives in `soac-opt`.
 
 # Setup
 
-```
-$ cargo install --locked just
-$ just setup-dev-env
+## Ubuntu 24.04 prerequisites
+
+Install the C compiler and build tools, the libraries needed by the vendored
+CPython build, Git, `just`, Rust's toolchain manager, and `gdb` for test-hang
+diagnostics:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential curl gdb git just pkg-config rustup \
+  libbz2-dev libffi-dev libgdbm-compat-dev libgdbm-dev \
+  liblzma-dev libncurses-dev libnss3-dev libreadline-dev \
+  libsqlite3-dev libssl-dev libzstd-dev tk-dev uuid-dev zlib1g-dev
+
+rustup default stable
+
+curl -LsSf https://astral.sh/uv/install.sh -o /tmp/soac-uv-install.sh
+sh /tmp/soac-uv-install.sh
+. "$HOME/.local/bin/env"
 ```
 
-The workflows in `AGENTS.md` depend on using `jj-vcs` for version control and may not work well with codex 
-with a regular git repo.
+The `rustup` Ubuntu package provides the `cargo` and `rustc` commands.
+`just setup-dev-env` installs the additional nightly Rust toolchain and its
+Cranelift codegen component automatically.
+
+## Initialize and build the checkout
+
+The vendored CPython submodule must be initialized and built before
+`just setup-dev-env`; the setup recipe expects an existing shared interpreter
+at `vendor/cpython/python`:
+
+```bash
+git submodule update --init --recursive vendor/cpython
+just build-python
+just setup-dev-env
+just test-all
+```
+
+CPython must be built on a **case-sensitive filesystem** because its `Python/`
+source directory and `python` executable must coexist. A macOS checkout shared
+into a Linux VM over virtiofs usually remains case-insensitive. For that setup,
+bind-mount a guest-local ext4 directory over the submodule path before
+initializing or building it:
+
+```bash
+mkdir -p "$HOME/.local/share/soac/cpython" vendor/cpython
+sudo mount --bind "$HOME/.local/share/soac/cpython" vendor/cpython
+git submodule update --init --recursive vendor/cpython
+just build-python
+just setup-dev-env
+```
+
+Add the bind mount to the guest's `/etc/fstab` if it should survive VM
+restarts. The workflows in `AGENTS.md` also require Jujutsu for version-control
+operations; install it with `cargo install --locked jj-cli` if `jj` is not
+already available on the machine where those operations run.
 
 `setup-dev-env` reuses an already-installed nightly Rust toolchain and Cranelift
 codegen component rather than upgrading them on every run, because a nightly
