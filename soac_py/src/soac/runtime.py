@@ -541,7 +541,7 @@ def create_class(
                     )
             else:
                 raise TypeError("__classcell__ must be a cell")
-        _soac_ext.profile_watch_type_key_layout(cls)
+        _soac_ext.profile_watch_type_key_layout(cls, namespace_fn)
 
     return cls
 

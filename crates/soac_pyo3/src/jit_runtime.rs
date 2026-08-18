@@ -614,11 +614,31 @@ fn exec_module_inner(
 }
 
 #[pyfunction]
-fn profile_watch_type_key_layout(type_obj: &Bound<'_, PyAny>) -> PyResult<()> {
-    unsafe { soac_jit::module_type::watch_split_keys_for_type(type_obj.as_ptr()) }.map_err(|_| {
+fn profile_watch_type_key_layout(
+    type_obj: &Bound<'_, PyAny>,
+    namespace_function: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    unsafe { soac_jit::module_type::watch_split_keys_for_type(type_obj.as_ptr()) }.map_err(
+        |_| {
+            Python::attach(|py| {
+                if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                    PyRuntimeError::new_err("failed to watch type split-key layout")
+                } else {
+                    PyErr::fetch(py)
+                }
+            })
+        },
+    )?;
+    unsafe {
+        soac_jit::register_created_owner_type_from_namespace(
+            type_obj.as_ptr(),
+            namespace_function.as_ptr(),
+        )
+    }
+    .map_err(|_| {
         Python::attach(|py| {
             if unsafe { ffi::PyErr_Occurred() }.is_null() {
-                PyRuntimeError::new_err("failed to watch type split-key layout")
+                PyRuntimeError::new_err("failed to register the created class owner type")
             } else {
                 PyErr::fetch(py)
             }

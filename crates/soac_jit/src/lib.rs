@@ -1614,6 +1614,106 @@ unsafe fn register_function_owner_types_for_globals(
     Ok(())
 }
 
+unsafe fn owner_type_supports_early_registration(
+    owner_type: *mut ffi::PyTypeObject,
+    visited_types: &mut HashSet<usize>,
+) -> bool {
+    if !visited_types.insert(owner_type as usize) {
+        return true;
+    }
+    if !owner_type_supports_direct_constructor_entry(owner_type) {
+        return false;
+    }
+
+    let owner_dict = (*owner_type).tp_dict;
+    if owner_dict.is_null() {
+        return false;
+    }
+    let owner_module = ffi::PyDict_GetItemString(owner_dict, c"__module__".as_ptr());
+    if owner_module.is_null() || ffi::PyUnicode_CheckExact(owner_module) == 0 {
+        return false;
+    }
+
+    let mut position: ffi::Py_ssize_t = 0;
+    let mut key = ptr::null_mut();
+    let mut value = ptr::null_mut();
+    while ffi::PyDict_Next(owner_dict, &mut position, &mut key, &mut value) != 0 {
+        if ffi::PyType_Check(value) != 0
+            && !owner_type_supports_early_registration(
+                value.cast::<ffi::PyTypeObject>(),
+                visited_types,
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub unsafe fn register_created_owner_type_from_namespace(
+    owner_type: *mut ffi::PyObject,
+    namespace_function: *mut ffi::PyObject,
+) -> Result<(), ()> {
+    if owner_type.is_null()
+        || ffi::PyType_Check(owner_type) == 0
+        || namespace_function.is_null()
+        || ffi::PyFunction_Check(namespace_function) == 0
+    {
+        return Ok(());
+    }
+
+    let owner_type = owner_type.cast::<ffi::PyTypeObject>();
+    if !owner_type_supports_early_registration(owner_type, &mut HashSet::new()) {
+        return Ok(());
+    }
+
+    let metadata = PyFunction_GetSoacMetadata(namespace_function);
+    if metadata.is_null() {
+        return Ok(());
+    }
+
+    let (shared_state, compile_session, globals) = {
+        let namespace_data = &*(metadata as *const PyFunctionJitExtra);
+        let globals = namespace_data.function_env.globals_obj();
+        if globals.is_null() {
+            return set_runtime_error("class namespace function has no module globals");
+        }
+        ffi::Py_INCREF(globals);
+        (
+            Arc::clone(&namespace_data.module_state),
+            Arc::clone(&namespace_data.compile_session),
+            globals,
+        )
+    };
+    let module_runtime = ModuleRuntimeContext {
+        mod_ctx: jit::ModuleJitContext {
+            shared_module_state: Arc::as_ptr(&shared_state),
+            globals_obj: globals.cast::<c_void>(),
+        },
+        compile_session,
+        shared_module_state_owner: Arc::clone(&shared_state),
+    };
+
+    let module_name = ffi::PyDict_GetItemString(globals, c"__name__".as_ptr());
+    if module_name.is_null() {
+        if ffi::PyErr_Occurred().is_null() {
+            return set_runtime_error("class namespace module globals have no module name");
+        }
+        return Err(());
+    }
+    if ffi::PyUnicode_CheckExact(module_name) == 0 {
+        return Ok(());
+    }
+
+    register_owner_types_from_type(
+        owner_type,
+        module_name,
+        &mut HashSet::new(),
+        Some(shared_state.as_ref()),
+        Some(&module_runtime),
+    )
+}
+
 pub unsafe fn register_function_owner_types_for_module(
     module: *mut ffi::PyObject,
 ) -> Result<(), ()> {

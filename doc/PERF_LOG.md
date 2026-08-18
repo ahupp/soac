@@ -1532,3 +1532,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 - newly completed exploratory runs: `richards` `381.46 ms` versus stock
   `22.10 ms` (`17.26x` slower); `deltablue` `484.26 ms` versus stock `1.47 ms`
   (`328.69x` slower).
+
+## 2026-08-18 - Register constructor targets during class creation
+
+- jj change id: `ntkwxnmn`
+- summary: register safe transformed classes before returning from class
+  creation so profile evidence selects existing guarded constructor calls.
+- pyperformance SOAC apply medians: `chaos` `100.61 ms` to `95.83 ms`
+  (`1.050x`), `deltablue` `4.69 ms` to `4.58 ms` (`1.024x`), and `richards`
+  `43.20 ms` to `44.06 ms` (`0.981x`); mixed-workload geometric improvement
+  `1.018x`. The candidate remains `0.357x` stock CPython across that subset.

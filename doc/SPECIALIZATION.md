@@ -48,9 +48,12 @@ one module-init binding with no later in-module stores or deletes are treated as
 static function targets under SOAC's strict-module assumption. Runtime
 constructors such as `IterRange(...)` and compiler-generated
 `ClosureGenerator(...)` calls can therefore lower as unconditional direct
-callable calls; user-module constructors remain generic for now because their
-type metadata is not guaranteed to be available while module initialization is
-still running. The optimization currently assumes, but does not yet
+callable calls. User-module constructors additionally need their synthetic
+constructor identity registered immediately after their class is created:
+module-level calls can run before the final owner-type registration sweep.
+Early registration is only eligibility evidence, not proof that eager apply
+planning has selected or emitted a direct constructor edge. The optimization
+currently assumes, but does not yet
 runtime-enforce, the strict-module rule that outside code cannot later replace
 those final globals. The static path is apply/verify-only; profile mode keeps the
 original call graph so nested protocol sites still collect ordinary evidence
@@ -907,6 +910,52 @@ and `dp_jit_finish_constructor_init`. The per-call allocation-shape check is not
 in the synthetic target; registration checks the realized `PyTypeObject` once
 and does not attach constructor metadata for custom `__new__`, metaclasses,
 abstract classes, or non-generic allocation.
+
+For source-defined classes, constructor identity must become available at
+class creation, not only after the entire transformed module finishes
+initializing. The existing `soac.runtime.create_class` callback already sees
+the realized class and its trusted transformed namespace function; that
+function can supply the owning module's SOAC context to the existing
+owner-type registration path. Registering the safe synthetic constructor
+identity before returning the class lets profile-mode module-level calls
+record that identity in `call_hot_targets`.
+`_soac_ext.profile_watch_type_key_layout(cls, namespace_fn)` first retains the
+existing split-key watcher and then calls
+the public `soac_jit::register_created_owner_type_from_namespace` API, which
+reads trusted SOAC namespace-function metadata and reuses ordinary owner-type
+registration. Untransformed namespace functions remain a no-op. The final
+module-wide registration sweep and owner-mutation invalidation remain
+necessary and are preserved.
+
+The early path must reject custom metaclasses and unsupported allocation
+shapes using raw CPython type slots before inspecting `__module__` or calling
+any Python-visible operation. A metaclass can override `__getattribute__`,
+and an early `owner.__module__` lookup would otherwise run user code before
+the class name is assigned in its containing module. Same-module eligibility
+must also avoid exotic descriptor or equality callbacks. Eligibility must
+cover the complete recursively visited owner-type graph: a safe outer class
+can contain a nested class with a custom metaclass, and recursively
+registering that nested type would expose the same premature lookup. A
+cycle-safe `owner_type_supports_early_registration` preflight traverses raw
+type dictionaries and verifies heap type, exact built-in metaclass, generic
+allocation, `object.__new__`, and exact-Unicode module identity before any
+Python callback. It defers the entire unsafe graph to the unchanged late
+registration sweep after class assignment.
+
+An eager apply compiler may plan lowered functions before the module body has
+created the actual Python class. The synthetic constructor function and its
+persistent ID can still be known from the lowered module, but the heap-type
+identity and constructor metadata are only available later at execution.
+Thus early registration alone does not prove that apply selected a direct
+edge: require structured planning or actual `soac_jit_direct_edges` evidence
+before claiming constructor specialization. The focused profile-to-apply
+integration verifies a real eager-mode direct edge for a safe source-defined
+class, and a `chaos` apply run independently observes new direct edges in
+`GVector.linear_combination`, `GVector.__mul__`, and `GVector.__add__`.
+Generated-code growth and steady-state throughput must still be evaluated
+separately. Unsupported top-level or nested class shapes retain
+zero constructor metadata and their original Python `__new__`, metaclass
+`__call__`, `__init__`, evaluation order, side effects, and exceptions.
 
 Constructor initializer inlining is represented in `InstrTyped` metadata, not
 rediscovered by codegen. After a constructor-entry direct call is inlined, the
