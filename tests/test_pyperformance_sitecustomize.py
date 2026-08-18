@@ -277,3 +277,56 @@ def test_pyperformance_measured_value_hook_pauses_once_before_values(
         ("compute", False, False, 0),
         ("compute", False, False, 0),
     ]
+
+
+def test_pyperformance_worker_timing_records_exact_pyperf_benchmark_name(
+    monkeypatch,
+    tmp_path,
+):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    script = (
+        tmp_path
+        / "pyperformance"
+        / "data-files"
+        / "benchmarks"
+        / "bm_async_tree"
+        / "run_benchmark.py"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text("# benchmark placeholder\n")
+    work_dir = tmp_path / "work"
+    flush_callbacks = []
+
+    class FakeWorkerTask:
+        name = "async_tree_cpu_io_mixed_tg"
+
+        def _compute_values(
+            self,
+            values,
+            nvalue,
+            is_warmup=False,
+            calibrate_loops=False,
+            start=0,
+        ):
+            return values
+
+    monkeypatch.setattr(sitecustomize.sys, "argv", [str(script), "--worker"])
+    monkeypatch.setenv("SOAC_PYPERFORMANCE_ENABLE", "1")
+    monkeypatch.setenv("SOAC_OPT_MODE", "apply")
+    monkeypatch.setenv("SOAC_WORK_DIR", str(work_dir))
+    monkeypatch.setenv(sitecustomize._WORKER_START_ENV, "60")
+    monkeypatch.setattr(sitecustomize.atexit, "register", flush_callbacks.append)
+
+    sitecustomize._install_measured_value_pause_hook(FakeWorkerTask)
+    FakeWorkerTask()._compute_values([], 1)
+
+    assert len(flush_callbacks) == 1
+    flush_callbacks[0]()
+    timing_path = work_dir / "pyperformance-worker-timing.jsonl"
+    records = [json.loads(line) for line in timing_path.read_text().splitlines()]
+
+    assert len(records) == 1
+    assert records[0]["record_type"] == "pyperformance_worker_timing_v1"
+    assert records[0]["benchmark_name"] == "bm_async_tree"
+    assert records[0]["pyperf_benchmark_name"] == "async_tree_cpu_io_mixed_tg"
+    assert records[0]["opt_mode"] == "apply"

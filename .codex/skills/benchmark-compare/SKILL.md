@@ -20,21 +20,33 @@ work/bench/{change_id}_{commit_id}/
 This commit-qualified layout is for one-off comparison runs. Finalized
 benchmarks for changes being merged to `main` use `work/bench/{change_id}` instead.
 
-Important files:
+An ordinary `just benchmark` result contains:
 
 - `benchmark.txt`: textual report with profile, verify, and specialized
   apply-pass timings.
+- `summary.txt` and `summary.json`: specialized throughput and emitted-code
+  size summaries.
 - `counters/profile.bin`: counters collected by the profile pass.
-- `counters/modules/**/mod.opt`: optimization decisions generated from the
-  profile counters and cached BlockPy modules.
 - `counters/verify.bin`: verify-mode counters collected while applying
   planned specializations.
+- `counters/events.jsonl` and `counters/jit-code-summary.jsonl`: runtime events
+  and compact generated-code summaries.
+- `counters/modules/**/mod.blockpy`: cached pre-optimization BlockPy modules;
+  apply and verify consume these together with `profile.bin` to make typed v3
+  decisions during JIT planning, without a serialized optimization plan.
+
+Only `just benchmark-deep-profile` or
+`just benchmark-deep-profile-from-profile <result-dir>` adds:
+
 - `profile_counters.txt` and `verify_counters.txt`: textual counter dumps.
 - `profile_specializations.txt` and `verify_specializations.txt`:
   specialization summaries.
 - `clif/functions.tsv`, `clif/fn_<function_id>_<qualname>.clif`, and
   `clif/fn_<function_id>_<qualname>.vcode`: lowered pystone functions plus the
   rendered post-opt CLIF and VCode for each one.
+- `perf.data`, `perf.injected.data`, and
+  `clif/fn_<function_id>_<qualname>.annotated.vcode`: native profiling and
+  JIT-block attribution.
 
 ## Create The Current Result
 
@@ -74,12 +86,14 @@ that revision and create the exact directory for the current commit id. The
 benchmark recipe always records the current `@` revision, so switch the
 workspace to the revision you want before running it.
 
-A result is complete enough for comparison when it has `benchmark.txt`,
-`counters/profile.bin`, `counters/verify.bin`, `verify_counters.txt`,
-`profile_specializations.txt`, and `verify_specializations.txt`. Prefer results
-that also have `clif/functions.tsv`, `clif/*.clif`, and `clif/*.vcode`. If the
-exact result exists but lacks these generated inspection artifacts, say so and
-re-run `just benchmark` for that side only if the missing detail is needed.
+A result is complete enough for throughput and generated-code-size comparison
+when it has `benchmark.txt`, `summary.json`, `counters/profile.bin`, and
+`counters/verify.bin`. Textual counter summaries, specialization summaries,
+CLIF/VCode, and perf artifacts are optional deep-profile diagnostics, not
+ordinary benchmark outputs. When those details are needed for an existing
+result, run `just benchmark-deep-profile-from-profile <result-dir>` to reuse
+its existing profile evidence; do not rerun `just benchmark` expecting it to
+create deep-profile artifacts.
 
 ## Create A Missing Result For Another Rev
 
@@ -119,17 +133,19 @@ Compare in this order:
 2. Extract specialized apply-pass loops/sec from `benchmark.txt`; use the
    median as the headline result.
 3. Compare profile-pass loops/sec only as overhead context.
-4. Confirm `profile_specializations.txt` and `verify_specializations.txt`
-   match inside each result or explain any difference.
-5. Compare A vs B `profile_specializations.txt`; changed specialization sets can
-   dominate benchmark throughput.
-6. Compare `verify_counters.txt` hit/fallback totals for direct calls, globals,
-   fields, operators, and other expected fast paths.
-7. Compare the relevant `clif/fn_*_*.clif` and `clif/fn_*_*.vcode` files for
-   functions whose specialization sets or verify hits moved materially.
-8. If the benchmark delta still needs explanation, run a separate perf pass for
-   the side(s) of interest and switch to the `analyze-pystone-perf` workflow.
+4. Compare generated-code bytes and machine-block counts in each `summary.json`.
+5. When deep-profile diagnostics are requested, generate them for the relevant
+   side(s), then compare `profile_specializations.txt` with
+   `verify_specializations.txt` inside each result and across revisions.
+6. If available, compare `verify_counters.txt` hit/fallback totals for direct
+   calls, globals, fields, operators, and other expected fast paths.
+7. If available, compare the relevant `clif/fn_*_*.clif` and
+   `clif/fn_*_*.vcode` files for functions whose specialization sets or verify
+   hits moved materially.
+8. If the benchmark delta still needs explanation, inspect the separately
+   collected perf artifacts and switch to the `analyze-pystone-perf` workflow.
 
 When reporting, include the two result directories, median specialized
-throughput, relative delta, specialization-set delta, verify hit/fallback
-summary, and any rendered-CLIF paths inspected.
+throughput, relative delta, and emitted-code-size delta. Include
+specialization-set deltas, verify hit/fallback summaries, and rendered-CLIF
+paths only when their deep-profile diagnostics were actually generated.

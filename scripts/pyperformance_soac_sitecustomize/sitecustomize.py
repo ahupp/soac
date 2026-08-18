@@ -249,6 +249,7 @@ def _install_measured_value_pause_hook(worker_task_cls=None) -> None:
     paused = False
     first_measured_start_ns: int | None = None
     last_measured_end_ns: int | None = None
+    pyperf_benchmark_name: str | None = None
     measured_batches = 0
     measured_wall_ns = 0
 
@@ -263,10 +264,13 @@ def _install_measured_value_pause_hook(worker_task_cls=None) -> None:
         nonlocal paused
         nonlocal first_measured_start_ns
         nonlocal last_measured_end_ns
+        nonlocal pyperf_benchmark_name
         nonlocal measured_batches
         nonlocal measured_wall_ns
 
         measured = not is_warmup and not calibrate_loops
+        if measured and pyperf_benchmark_name is None:
+            pyperf_benchmark_name = getattr(self, "name", None)
         if not paused and measured and ready_file:
             paused = True
             _pause_before_measured_values(ready_file)
@@ -310,6 +314,7 @@ def _install_measured_value_pause_hook(worker_task_cls=None) -> None:
         record.update(
             {
                 "record_type": "pyperformance_worker_timing_v1",
+                "pyperf_benchmark_name": pyperf_benchmark_name,
                 "pid": os.getpid(),
                 "setup_wall_ns": max(0, first_measured_start_ns - worker_start_ns),
                 "measured_batches": measured_batches,

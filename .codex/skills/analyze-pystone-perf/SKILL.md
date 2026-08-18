@@ -28,22 +28,23 @@ or verify pass, as the transformed benchmark headline. The recipe prints
 `benchmark result: <result-dir>`. Use that directory for the rest of the
 workflow.
 
-2. **Collect perf for the specialized apply run**
+2. **Add specialized inspection and native perf artifacts**
 
 ```bash
-SOAC_WORK_DIR="<result-dir>/counters" \
-SOAC_OPT_MODE=apply \
-PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.2}" \
-just perf-pystone-jit-warm 10000000 "<result-dir>/perf"
-cargo run -q -p soac_inspector --bin annotate_cranelift_perf -- "<result-dir>" \
-  > "<result-dir>/perf_cranelift_blocks.tsv"
+just benchmark-deep-profile-from-profile "<result-dir>"
 ```
+
+This reuses the existing profile evidence, reruns verify, exports textual
+counter/specialization summaries and CLIF/VCode, then separately profiles the
+specialized apply path. It also writes `perf.data`, `perf.injected.data`,
+perf-annotated VCode, and block-attribution rows in `deep_profile.txt`.
+The profiled replay enables `SOAC_JIT_BB_MAP=1`; the earlier unprofiled apply
+pass remains the headline throughput measurement.
 
 3. **Sanity-check that expected specializations are still reached**
 
-`just benchmark` already runs a verify-mode pass and writes
-`<result-dir>/counters/verify.bin`,
-`<result-dir>/profile_specializations.txt`, and
+`just benchmark` writes `<result-dir>/counters/verify.bin`. The separate
+deep-profile step writes `<result-dir>/profile_specializations.txt` and
 `<result-dir>/verify_specializations.txt`.
 
 Compare profile and verify at the **site / target level**, not by raw counter
@@ -60,15 +61,18 @@ Do this before trusting perf conclusions:
 
 4. **Read the perf artifacts**
 
-For prefix `<result-dir>/perf`, inspect:
+The deep-profile recipe uses prefix
+`<result-dir>/<result-directory-basename>_perf`. Inspect:
 
 - `<prefix>.log`: measured loops/sec during the profiled run.
 - `<prefix>_by_dso.txt`: split between CPython, SOAC runtime/extension, and `[JIT]`.
 - `<prefix>_by_dso_symbol.txt`: top self-time symbols.
 - `<prefix>_callgraph.txt`: cumulative stacks and helper-call parents.
 - `<prefix>_report.txt`: full report if the condensed reports are ambiguous.
-- `<result-dir>/perf_cranelift_blocks.tsv`: JIT samples attributed to generated
+- `<result-dir>/deep_profile.txt`: JIT samples attributed to generated
   Cranelift basic blocks.
+- `<result-dir>/clif/fn_<function_id>_<qualname>.annotated.vcode`: generated
+  VCode annotated with JIT-block samples.
 
 Look for SOAC-specific boundaries first: specialized runtime helpers, generic
 CPython hooks reached from helpers, fallback vectorcall / eval-frame stacks,
@@ -78,7 +82,7 @@ and refcount / deallocation clusters.
 
 5. **Read the counters and specializations**
 
-`just benchmark` writes textual dumps beside the binary counter files:
+The deep-profile step writes textual dumps beside the binary counter files:
 
 - `<result-dir>/profile_counters.txt`
 - `<result-dir>/verify_counters.txt`
@@ -87,7 +91,7 @@ and refcount / deallocation clusters.
 - `<result-dir>/clif/functions.tsv`
 - `<result-dir>/clif/fn_<function_id>_<qualname>.clif`
 - `<result-dir>/clif/fn_<function_id>_<qualname>.vcode`
-- `<result-dir>/perf_cranelift_blocks.tsv`
+- `<result-dir>/deep_profile.txt`
 
 6. **Read rendered specialized CLIF for hot functions**
 
@@ -97,9 +101,10 @@ rg -n 'soac_runtime_|dp_jit_|PyObject_|PyNumber_|call_indirect' \
   <result-dir>/clif/fn_*_*.clif
 ```
 
-`just benchmark` renders one post-opt CLIF file per lowered pystone function,
-plus raw VCode. Start with functions that appear as `[JIT]
-py:d:<name>` in perf, then add callees whose helpers dominate the callgraph.
+The deep-profile step renders one post-opt CLIF file per lowered pystone
+function, plus raw and perf-annotated VCode. Start with functions that appear
+as `[JIT] py:d:<name>` in perf, then add callees whose helpers dominate the
+callgraph.
 For pystone this is usually `Proc0`, `Proc1`, `Proc8`, `Func2`, and the
 procs/functions reached from `Proc0`.
 
@@ -116,8 +121,8 @@ rg -n 'dp_jit_py_vectorcall|call_indirect|dp_jit_direct_code_ptr|dp_jit_pyobject
 When reporting a candidate, cite the full chain:
 
 - Perf self/cumulative cost and the owning helper stack.
-- Cranelift block sample count from `perf_cranelift_blocks.tsv`, when the cost
-  is in generated JIT code.
+- Cranelift block sample count from `deep_profile.txt` or annotated VCode, when
+  the cost is in generated JIT code.
 - The CLIF helper calls / fallback blocks that explain that cost.
 - The Python source shape if it matters.
 - The missing specialization or codegen decision that would remove the cost.

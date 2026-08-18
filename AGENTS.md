@@ -13,6 +13,10 @@ because it should affect engineering decisions:
 * Optimization priorities should favor long-running or batch workloads
   over changes that only improve cold-start behavior.
 
+* Read `OPT_GOAL.md` before optimizer, specialization, or benchmarking work.
+  It defines the pyperformance acceptance target, measurement and JIT-coverage
+  requirements, optimization architecture, and compatibility guardrails.
+
 * Prefer an explicit end-to-end pipeline from parsing through lowering
   and code generation, rather than hiding behavior in ad hoc runtime
   patches.
@@ -209,18 +213,30 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 12. Record finalized performance changes.
 
 When a change is expected to affect performance, validate it with a before/after
-benchmark before treating it as complete. Use the repo benchmark comparison
-workflow unless there is a specific reason to use a narrower measurement, and
-report both headline throughput and relative delta.
+benchmark before treating it as complete. `OPT_GOAL.md` is authoritative: the
+goal is a pyperformance geometric-mean speedup of at least 10% over the same
+stock CPython, and retained optimizations must also improve or preserve SOAC
+relative to the prior revision. Use `just pyperformance-compare` for the
+stock/SOAC comparison and pass a previous-SOAC result when available. For fast
+iteration, use the independently runnable mixed `chaos` pyperformance
+workload; if it is unavailable or cannot exercise the relevant transformed hot
+path, use pystone as the regression guardrail. Investigate substantial
+`chaos` or pystone regressions, but never treat an improvement on either as
+proof of full-suite pyperformance progress. Report both the stock comparison
+and the before/after SOAC delta.
 
 When a performance change is complete enough that you intend to keep it,
-rebase the finished change onto `main`, run `$soac-profile-benchmark`, write the
-finalized benchmark result to `work/bench/{change_id}`, and
-append an entry to `doc/PERF_LOG.md` in the same logical change.
+rebase the finished change onto `main`, run the applicable pyperformance
+comparison, and append an entry to `doc/PERF_LOG.md` in the same logical change.
+If the existing pystone sanity-check workflow is useful for that change, run
+`$soac-profile-benchmark` as a secondary regression check and write its finalized
+result to `work/bench/{change_id}`. Keep pyperformance comparison artifacts
+under `work/pyperformance/`.
 Use `work/bench/{change_id}_{commit_id}` only for one-off test benchmarks while
 iterating. Keep log entries succinct: include the jj change id, a short summary
-of the optimization, the benchmarked throughput delta, and the before/after
-headline numbers. Do not paste validation checklists, full command lines, or
+of the optimization, the pyperformance stock and previous-SOAC deltas, and the
+before/after headline numbers; include pystone only when it provides relevant
+guardrail evidence. Do not paste validation checklists, full command lines, or
 long run logs.
 
 The benchmark recipes record and print the actual current `@` revision; they do
@@ -396,13 +412,15 @@ so a later turn can resume without rediscovering context.
 - `just run-cpython-tests ...`
   Use for vendored CPython regrtest runs.
 - `$soac-profile-benchmark`
-  Default skill for performance benchmark requests. This uses the
-  default pystone workflow: profile, verify, and specialized apply benchmark.
+  Fast pystone regression/sanity-check workflow, not the authoritative
+  pyperformance acceptance benchmark. This uses the default pystone workflow:
+  profile, diagnostic verify, and specialized apply benchmark.
   Tracked benchmark sources live under `bench/`; generated benchmark result
   artifacts live under ignored `work/bench/`.
-  One-off test benchmarks write `work/bench/{change_id}_{commit_id}`. Finalized
-  benchmarks for changes that are being merged to `main` must run after rebasing
-  onto `main` and write `work/bench/{change_id}`. Use `just benchmark-deep-profile`
+  One-off test benchmarks write `work/bench/{change_id}_{commit_id}`. When
+  recording a finalized pystone sanity check for a change being merged to
+  `main`, run it after rebasing onto `main` and write
+  `work/bench/{change_id}`. Use `just benchmark-deep-profile`
   when the user explicitly wants inspector/CLIF artifacts or perf capture, and
   use `just benchmark-deep-profile-from-profile <result-dir>` to extend an
   existing `counters/profile.bin` result without rerunning the profile pass.
@@ -420,6 +438,17 @@ another revision's cache.
   apply pass after the default refcounts-enabled pass. Keep the default
   refcounts-enabled median as the headline; if the diagnostic fails, report the
   failure without treating it as a failed production benchmark.
+- `just pyperformance-compare [benchmarks=chaos] [rounds=3] [baseline] [extra args...]`
+  Authoritative repeatable pyperformance comparison workflow. Runs the same
+  vendored stock CPython and profile-trained SOAC apply mode in independent,
+  order-alternating rounds; it defaults to the mixed `chaos` workload and
+  three rounds. Use the full pyperformance target set and at least three rounds
+  for a final suite-wide performance claim. Pass a prior comparison directory
+  or SOAC result JSON as `baseline` to also compare the changed SOAC revision
+  against its previous revision. Results live under `work/pyperformance/`.
+  Inspect transformed-module and JIT evidence separately: completed benchmarks
+  do not show that their standard-library or third-party hot paths were
+  transformed. See `OPT_GOAL.md` for acceptance and compatibility policy.
 - `just pyperformance [stock|soac|soac-single] [output] [benchmarks] [extra pyperformance run args...]`
   Runs the pyperformance suite using the repo-local pyperformance install and
   the vendored CPython executable. `stock` runs plain CPython. The default

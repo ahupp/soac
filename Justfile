@@ -1845,6 +1845,102 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
   fi
   run_pyperformance_once "$OUTPUT" "apply" "apply" "${pyperformance_apply_args[@]}"
 
+pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure-cpython ensure-shared-python
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  BENCHMARKS="{{benchmarks}}"
+  ROUNDS="{{rounds}}"
+  BASELINE="{{baseline}}"
+  set -- {{args}}
+
+  if ! [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "pyperformance comparison rounds must be a positive integer: $ROUNDS" >&2
+    exit 2
+  fi
+
+  if [[ "$BENCHMARKS" == all || "$BENCHMARKS" == full ]]; then
+    BENCHMARK_SELECTOR=""
+  else
+    BENCHMARK_SELECTOR="$BENCHMARKS"
+  fi
+
+  BASELINE_JSON=""
+  if [[ -n "$BASELINE" ]]; then
+    if [[ "$BASELINE" != /* ]]; then
+      BASELINE="$REPO_ROOT/$BASELINE"
+    fi
+    if [[ -d "$BASELINE" ]]; then
+      BASELINE_JSON="$BASELINE/soac.json"
+    else
+      BASELINE_JSON="$BASELINE"
+    fi
+    if [[ ! -f "$BASELINE_JSON" ]]; then
+      echo "previous SOAC benchmark result not found: $BASELINE_JSON" >&2
+      exit 2
+    fi
+  fi
+
+  just update-venv-offline
+  mkdir -p "$PYPERFORMANCE_RESULTS_DIR"
+  RESULT_DIR="$(mktemp -d "$PYPERFORMANCE_RESULTS_DIR/comparison-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+  printf '%s\n' "${BENCHMARK_SELECTOR:-all}" > "$RESULT_DIR/benchmark-selector.txt"
+
+  list_args=(list "--python=$CPYTHON_BIN")
+  if [[ -n "$BENCHMARK_SELECTOR" ]]; then
+    list_args+=("--benchmarks=$BENCHMARK_SELECTOR")
+  fi
+  "$VENV_DIR/bin/pyperformance" "${list_args[@]}" > "$RESULT_DIR/requested-benchmarks.txt"
+  printf 'round\torder\tmode\toutput\n' > "$RESULT_DIR/run-order.tsv"
+
+  echo "pyperformance comparison directory: $RESULT_DIR"
+  echo "pyperformance benchmark selector: ${BENCHMARK_SELECTOR:-all}"
+  echo "independent paired rounds: $ROUNDS"
+  if [[ -n "$BASELINE_JSON" ]]; then
+    echo "previous SOAC benchmark result: $BASELINE_JSON"
+  fi
+
+  for ((round = 1; round <= ROUNDS; round++)); do
+    printf -v round_label '%02d' "$round"
+    if ((round % 2 == 1)); then
+      run_modes=(stock soac)
+    else
+      run_modes=(soac stock)
+    fi
+
+    for order in "${!run_modes[@]}"; do
+      mode="${run_modes[$order]}"
+      output="$RESULT_DIR/round-$round_label-$mode.json"
+      printf '%s\t%s\t%s\t%s\n' \
+        "$round_label" "$((order + 1))" "$mode" "$output" \
+        >> "$RESULT_DIR/run-order.tsv"
+      env -u SOAC_WORK_DIR -u SOAC_OPT_MODE \
+        just pyperformance "$mode" "$output" "$BENCHMARK_SELECTOR" "$@"
+    done
+  done
+
+  summary_args=("$RESULT_DIR" --json-out "$RESULT_DIR/summary.json")
+  if [[ -n "$BASELINE_JSON" ]]; then
+    summary_args+=(--baseline "$BASELINE")
+  fi
+  "$VENV_DIR/bin/python" \
+    "$REPO_ROOT/scripts/summarize_pyperformance_comparison.py" \
+    "${summary_args[@]}" | tee "$RESULT_DIR/summary.txt"
+
+  "$VENV_DIR/bin/pyperformance" compare \
+    "$RESULT_DIR/stock.json" "$RESULT_DIR/soac.json" -O table \
+    | tee "$RESULT_DIR/stock-vs-soac.txt"
+
+  if [[ -n "$BASELINE_JSON" ]]; then
+    "$VENV_DIR/bin/python" -m pyperf compare_to --table \
+      "$BASELINE_JSON" "$RESULT_DIR/soac.json" \
+      | tee "$RESULT_DIR/previous-soac-vs-soac.txt"
+  fi
+
+  echo "pyperformance comparison summary: $RESULT_DIR/summary.json"
+
 pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail

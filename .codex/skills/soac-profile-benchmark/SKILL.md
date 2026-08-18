@@ -73,7 +73,13 @@ directory, especially:
 - `counters/profile.bin`
 - `counters/verify.bin`
 - `counters/events.jsonl`
-- `counters/modules/**/mod.opt`
+- `counters/jit-code-summary.jsonl`
+- `counters/modules/**/mod.blockpy`
+
+The cached `mod.blockpy` files contain pre-optimization BlockPy. Verify and
+apply consume those modules together with `profile.bin` and construct typed v3
+optimization decisions during JIT planning; there is no serialized
+optimization-plan artifact.
 
 If the deep-profile recipe was used, also read:
 

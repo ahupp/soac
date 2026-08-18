@@ -1,14 +1,16 @@
 # Optimization goal
 
 The primary measurable goal of this line of work is to improve SOAC's
-performance on the pyperformance suite and to beat the same stock CPython by
-as large a margin as possible. The primary suite-wide score is the geometric
-mean of per-benchmark speedups: `stock elapsed time / SOAC apply elapsed time`,
-or equivalently `SOAC apply throughput / stock throughput`. Comparisons must
-use a target benchmark set fixed before the comparison. A full-suite aggregate
-is incomplete when any comparable result is missing or failed; an intersection
-aggregate may be shown only when explicitly labeled. Coverage and every
-per-benchmark ratio must be reported alongside the aggregate.
+performance on the pyperformance suite. The current success target is to beat
+the same stock CPython by at least 10% on the geometric mean of a benchmark set
+fixed before the comparison. Define the score as
+`stock elapsed time / SOAC apply elapsed time`, or equivalently
+`SOAC apply throughput / stock throughput`; the target score is at least
+`1.10`. A full-suite aggregate is incomplete when any comparable result is
+missing or failed; an intersection aggregate may be shown only when explicitly
+labeled. Report every per-benchmark ratio, execution coverage, and whether the
+benchmark's meaningful hot code was actually transformed alongside the
+aggregate.
 
 Pyperformance is a proxy for progress on long-running Python programs. Direct,
 representative server measurements are difficult at this phase, so the suite
@@ -17,38 +19,65 @@ real programs, not benchmark recognition. Optimizations should therefore be
 expressed as reusable semantic facts and local transformations whenever
 possible.
 
-Optimization and compilation may be expensive when that cost can be amortized
-by a long-running process, but they are not free. Results must report planning
-and compilation time, peak optimizer memory, generated-code size, and a
-break-even estimate in addition to steady-state throughput.
+The full pyperformance suite is the acceptance criterion, but it is too slow
+for every edit. Use its independently runnable `chaos` workload as the fast
+mixed-workload sanity check: its pure-Python fractal/spline implementation
+exercises custom classes, mutable objects, attribute access, method calls,
+nested loops, lists, branches, and integer/floating-point operations. If
+`chaos` is unavailable or cannot exercise the relevant transformed hot path,
+use the existing pystone benchmark instead.
+Investigate and fix substantial `chaos` or pystone regressions, but an
+improvement on either fast workload does not establish progress toward the
+full-suite pyperformance goal. Monitor typed-IR growth and generated
+native-code size; investigate material growth even when peak memory is
+acceptable. Optimizer peak-memory measurements, detailed planning-time
+accounting, and calculated break-even points are not currently required.
 
 ## Measurement model
 
-Headline performance is the specialized apply pass compared with the same
-vendored stock CPython, using identical inputs, affinity, clock policy, and
-benchmark variants. Profile and verify passes supply optimization and
-runtime-path evidence; differential tests establish correctness. Their
-throughput is not the headline result.
+Headline performance is the normally trained specialized `SOAC_OPT_MODE=apply`
+pass, measured without an attached native profiler and compared with the same
+vendored stock CPython. Compare the changed SOAC revision against both stock
+CPython and the previous SOAC revision. Use identical inputs, affinity, clock
+policy, benchmark variants, and module-selection policy, and generate fresh
+profile evidence independently for each SOAC revision. A profile pass supplies
+the optimization evidence required by apply. A verify pass is optional
+diagnostic evidence for checking whether expected paths, guards, and fallback
+counters were actually exercised; profile, verify, and unspecialized throughput
+are never the headline result.
 
-Use unprofiled pyperformance runs for headline throughput and separate native
-`perf` captures, including JIT-symbol attribution, to find and explain hot
-paths. Pyperformance measures the outcome; `perf`, generated-IR inspection,
-and JIT code summaries explain it. Final performance claims should use
-pyperformance's statistical comparison across at least three independently
-started, order-alternated comparisons. A delta within measured noise is
-inconclusive rather than a win or regression.
+Use separate native `perf` captures, including JIT-symbol attribution, to find
+and explain hot paths. Pyperformance measures the outcome; `perf`,
+generated-IR inspection, and JIT code summaries explain it. Run
+`just pyperformance-compare` for repeatable stock-versus-SOAC measurements and
+comparison against an available prior SOAC result; it defaults to the
+`chaos` fast workload, so pass the full target benchmark set when claiming
+the overall goal. Final performance claims should use pyperformance's
+statistical comparison across at least three independently started,
+order-alternated comparisons. A delta within measured noise is inconclusive
+rather than a win or regression.
 
 For each retained performance change, report at least:
 
-- per-benchmark SOAC/stock performance and the suite aggregate;
-- benchmark coverage, failures, and material regressions;
-- profile, planning, and compilation wall time;
-- peak optimizer memory;
-- typed instruction and block growth;
-- emitted native bytes and machine-block growth;
-- steady-state savings per invocation; and
-- the estimated number of invocations or wall time needed to amortize the
-  additional optimization cost.
+- per-benchmark changed-SOAC/stock and changed-SOAC/previous-SOAC performance;
+- the fixed benchmark set, geometric-mean aggregate, and whether it meets the
+  current 10% target;
+- completed, missing, and failed benchmarks and material regressions;
+- actual transformed hot-path coverage, including whether benchmark code,
+  standard-library modules, and third-party dependencies were transformed or
+  remained on stock CPython;
+- material startup or compilation overhead when it explains a regression; and
+- available typed-IR instruction/block counts and emitted native-code size,
+  highlighting material growth or stating when instrumentation is unavailable.
+
+Benchmark completion does not demonstrate meaningful JIT coverage. A benchmark
+whose work occurs in an untransformed standard-library or third-party module is
+not evidence that SOAC optimized that work; conversely, transforming a large
+standard-library import graph can increase startup time without helping the
+measured loop. Keep module-selection policy explicit and inspect hot-path and
+generated-code evidence before drawing either conclusion. For example, the
+default `chaos` configuration transforms its benchmark classes and functions
+while imported standard-library `math` and `random` remain on stock CPython.
 
 ## Profile and apply phases
 
@@ -60,14 +89,27 @@ the apply process starts or loads a function, and optimized code may contain
 entry guards, fallbacks, and supported deoptimization paths.
 
 Profile evidence selects and prioritizes candidates; it does not prove Python
-semantics. Apply must validate that evidence against the relevant module,
-function, code, typed IR, and compiler revision. Stale or inconsistent evidence
-disables the affected optimization.
+semantics. Apply must validate evidence against the relevant module, source,
+function, and typed-IR assumptions that the evidence format can actually
+identify. Stale or inconsistent evidence disables the affected optimization.
+Counter dumps currently identify module/source content but do not record a
+compiler revision or build identity, so automatic rejection of profiles from a
+different SOAC compiler is not an existing guarantee. The Python source can
+remain identical while a compiler change changes instruction identities or
+optimization-site meaning. Generate independent profile evidence for each
+revision instead of reusing profiles across compiler changes;
+compiler-identity validation would require a future evidence-format and reader
+change.
 
 ## Optimization structure
 
 Analyses, decisions, and transformations should be independent components with
-explicit inputs and outputs:
+explicit inputs and outputs. The pipeline below describes an architectural
+direction, not a claim that every fact cache, speculative overlay,
+transactional commit, or prioritized worklist already exists. Improve the
+current production path in the smallest sound, measurable step; do not rewrite
+the optimizer merely to implement aspirational infrastructure before a concrete
+optimization needs it:
 
 ```text
 profile evidence + static program facts
@@ -141,8 +183,11 @@ a validated narrower change summary, but a missing or rejected summary
 invalidates the enclosing region or function.
 
 Analyses are observationally pure: they may populate fact caches, diagnostics,
-and metrics, but must not mutate typed IR or optimization decisions. Query
-order cannot change compiler behavior.
+and metrics, but must not mutate typed IR or optimization decisions. Query or
+candidate order may affect which profitable optimizations fit a resource
+budget, but must not affect Python-visible semantics or the soundness of facts
+consumed by a selected optimization; identical optimization decisions and
+generated code are not required.
 
 Fact dependency cycles are solved to a sound fixed point within the smallest
 relevant analysis family or region. Fixed-point analyses publish only sound
@@ -183,6 +228,15 @@ Commit also requires proof that every required runtime guard can be emitted,
 dominates all effects that rely on its assumption, and reaches the untouched
 fallback on failure. At runtime, successful guards select the optimized bundle;
 failed guards select the fallback before dependent visible effects.
+
+Each guarded assumption must state how long it remains valid. Entry guards are
+insufficient when a Python callback, C extension, reentrant operation, monkey
+patch, concurrency boundary, or other mutation can invalidate the assumption
+after entry. The optimization must prove stability for the entire dependent
+interval, invalidate optimized code, or revalidate before each unsafe use. If
+invalidation occurs after visible effects begin, fallback is permitted only
+when the exact semantic continuation can be reconstructed without replaying or
+dropping those effects; otherwise the optimization must be rejected.
 
 Whether an object is observable is an analysis fact, not a property hard-coded
 into a particular optimization. Returning or yielding it, storing it into
@@ -299,8 +353,10 @@ behavior changes when they plausibly unlock material performance. Do not
 self-censor a useful proposal merely because it is incompatible.
 
 Rarity and monorepo evidence inform a proposal's value, but do not by themselves
-authorize it. A new compatibility category must be explicitly approved and
-documented before the optimizer relies on it. A proposal should state:
+authorize it. Only explicit user approval authorizes a new production-visible
+compatibility change. A new category must be approved and documented before
+the optimizer relies on it; unapproved experiments must remain disabled by
+default and excluded from headline results. A proposal should state:
 
 - the blocked optimization and expected benefit;
 - discovered and eligible opportunity counts, or an explicit statement that
@@ -319,9 +375,11 @@ guard-miss behavior, and differential tests.
 ### Candidate enforced contracts
 
 The following contracts are optimization directions, not facts that are true
-today merely because they appear in this document. An optimization may propose
-and implement them when useful; it may rely on them only after enforcement and
-failure semantics have been approved and validated.
+today merely because they appear in this document. An agent may propose a
+contract or build an experiment that is disabled by default, but may not enable
+or rely on production-visible compatibility changes until the user explicitly
+approves their enforcement and failure semantics and focused tests validate
+them.
 
 #### Runtime-enforced type annotations
 
@@ -358,11 +416,20 @@ requires proof or a guard.
 
 ### Approved activation-introspection relaxation
 
-SOAC may omit activation machinery eliminated by optimization. Generator and
-frame objects, frame ancestry, frame locals, traceback frames, tracing,
-profiling, monitoring, debugger and coverage events, and GC discovery may be
-missing or incomplete for eliminated activations. SOAC is not required to
-materialize those activations solely for back-door observation.
+SOAC may omit activation machinery eliminated by optimization and is not
+required to materialize eliminated generator/frame objects, frame ancestry,
+frame locals, traceback frames, or GC-discoverable activations solely for
+back-door observation. An attempt to inspect unsupported activation state must
+fail explicitly or select a compatible fallback; it must never silently return
+incorrect or incomplete data as though the operation succeeded.
+
+Tracing, profiling, `sys.monitoring`, debugger, and coverage support may likewise
+be unsupported for eliminated activations, but attempts to enable or use those
+features must fail explicitly, decline the optimization, or fall back to
+compatible execution. SOAC must not silently omit callbacks or events that an
+enabled feature is entitled to receive. Once callbacks can run, their count,
+order, state mutations, exceptions, and other visible effects retain ordinary
+CPython semantics.
 
 This relaxation does not permit changes to ordinary computed values,
 evaluation or callback order, exception propagation, cleanup, collection

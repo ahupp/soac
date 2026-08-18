@@ -181,6 +181,42 @@ The `rustup` Ubuntu package provides the `cargo` and `rustc` commands.
 `just setup-dev-env` installs the additional nightly Rust toolchain and its
 Cranelift codegen component automatically.
 
+`ripgrep` is optional but useful for searching the repository:
+
+```bash
+sudo apt-get install -y ripgrep
+```
+
+### Enable profiling and debugger access in a trusted development VM
+
+Native `perf` profiling, JIT-symbol attribution, and attaching `gdb` to test
+processes require less restrictive kernel settings than a fresh Ubuntu image
+usually provides. Install the `perf` tools for the running guest kernel:
+
+```bash
+sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)"
+perf --version
+```
+
+`just setup-dev-env` also installs Inferno's `inferno-collapse-perf` tool for
+the deep-profile recipes. Configure the required kernel settings persistently
+inside the Ubuntu guest:
+
+```bash
+sudo tee /etc/sysctl.d/99-soac-profiling.conf >/dev/null <<'EOF'
+kernel.perf_event_paranoid = -1
+kernel.yama.ptrace_scope = 0
+kernel.kptr_restrict = 0
+EOF
+sudo sysctl --system
+sysctl kernel.perf_event_paranoid kernel.yama.ptrace_scope kernel.kptr_restrict
+```
+
+These settings apply to the entire guest: they allow unprivileged performance
+monitoring, permit ordinary same-user debugger attachment, and expose kernel
+pointer information. Use them only in a trusted, isolated development VM; do
+not apply them to a shared machine or production system.
+
 ## Initialize and build the checkout
 
 The vendored CPython submodule must be initialized and built before
@@ -211,7 +247,10 @@ just setup-dev-env
 Add the bind mount to the guest's `/etc/fstab` if it should survive VM
 restarts. The workflows in `AGENTS.md` also require Jujutsu for version-control
 operations; install it with `cargo install --locked jj-cli` if `jj` is not
-already available on the machine where those operations run.
+already available on the machine where those operations run. The pystone
+`just benchmark` recipe itself runs `jj status` and `jj log`, so running that
+benchmark inside the Ubuntu guest requires `jj` to be installed in the guest,
+even when Jujutsu is already installed on the macOS host.
 
 `setup-dev-env` reuses an already-installed nightly Rust toolchain and Cranelift
 codegen component rather than upgrading them on every run, because a nightly
@@ -581,9 +620,13 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `output` is omitted, final results are written to
   `work/pyperformance/{stock,soac}-<timestamp>.json`, and pyperformance's own
   benchmark virtual environments are created under `work/pyperformance/venv/`.
+  The first run may install benchmark-specific dependencies from PyPI while
+  creating those virtual environments, even though SOAC's own venv refresh runs
+  offline; allow network access for this initial bootstrap or populate the
+  benchmark environments in advance.
   When `benchmarks` is omitted, pyperformance uses its default suite selection;
   pass a comma-separated pyperformance benchmark list such as
-  `json_dumps,richards` for a narrower run. Stock runs, `soac-single`, and the
+  `json_dumps,chaos` for a narrower run. Stock runs, `soac-single`, and the
   SOAC apply pass default pyperf sampling to `--fast --min-time=0.05` so
   comparison runs collect multiple values without paying the full default
   pyperf runtime. The SOAC profile pass instead defaults to
@@ -611,6 +654,35 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   SOAC pass, the recipe prints a compact rollup of setup time before pyperf's
   measured-value collection, measured-value collection wall time, and total
   worker lifetime.
+
+- `just pyperformance-compare [benchmarks=chaos] [rounds=3] [baseline] [extra args...]`
+  Compare stock CPython with separately profiled SOAC apply runs using
+  independently started, alternating measurements. The default `chaos`
+  benchmark is a quick mixed Python workload that exercises custom classes,
+  mutable attributes, operators, calls, nested loops, lists, arithmetic,
+  branches, and standard-library functions.
+
+  ```bash
+  just pyperformance-compare
+  just pyperformance-compare all 3 '' --rigorous
+  just pyperformance-compare chaos 3 work/pyperformance/<previous-comparison>
+  just pyperformance-compare chaos 1 '' --debug-single-value
+  ```
+
+  The examples run the default comparison, the full suite, a comparison
+  against a previous SOAC result, and a quick single-round smoke test,
+  respectively; replace `<previous-comparison>` with an existing comparison
+  directory. Each generated `summary.txt` and `summary.json` reports
+  benchmark-result-specific transformed project/dependency and standard-library
+  module coverage, compiled functions, pre-optimization serialized BlockPy
+  bytes, optimized typed-IR final basic-block counts, and apply-mode emitted
+  native-code bytes and machine-block counts.
+  Use the full fixed pyperformance benchmark selection for authoritative
+  optimization claims and compare against both stock CPython and the previous
+  SOAC revision. If `chaos` fails on an unsupported compiler/runtime shape,
+  report the failure and use the existing pystone benchmark as a fast regression
+  sanity check. A large pystone slowdown requires investigation, but a pystone
+  improvement does not establish a pyperformance improvement.
 
 - `just pyperformance-deep-profile-from-profile <result.json> <benchmark> [worker=<worker-dir>] [loops=<count>]`
   Replay one measured pyperformance worker directly from a prior SOAC
