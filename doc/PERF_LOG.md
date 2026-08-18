@@ -115,10 +115,11 @@ changes:
 
 # Codex Optimization Log
 
-Chronological log of finalized performance changes and not-landed
-optimization attempts made by Codex agents. Keep entries succinct: what
-changed or was tried, which jj change id carried it when landed, the
-benchmarked throughput delta, and the headline pre/post numbers.
+Chronological log of finalized performance changes made by Codex agents.
+Keep new entries succinct: what changed, which jj change id carried it, the
+benchmarked throughput delta, and the headline pre/post numbers. Historical
+entries may include abandoned experiments; record new positive, negative,
+and inconclusive strategy history in `doc/optimization-attempts/` instead.
 
 ## 2026-07-29 - Generalize closed iterator-pipeline fusion
 
@@ -1519,3 +1520,15 @@ benchmarked throughput delta, and the headline pre/post numbers.
   loops/s (`+0.06%`); total generated code remains `206088 bytes`. The
   no-refcount diagnostic median is `254609 loops/s`.
 - finalized pystone artifact: `work/bench/ruqwzllknkow`.
+
+## 2026-08-18 - Preserve scalar-region indexed-field guard dependencies
+
+- jj change id: `tmtwnonn`
+- summary: discard exact scalar-region plans when their borrowed indexed-field
+  input lacks a matching surviving typed owner/layout guard; `richards` and
+  `deltablue` now complete specialized apply instead of failing.
+- `chaos` SOAC apply: `215.22 ms` to `192.72 ms` (`1.117x` faster, exploratory
+  previous baseline); candidate stock CPython: `29.54 ms`, or `0.153x` stock.
+- newly completed exploratory runs: `richards` `381.46 ms` versus stock
+  `22.10 ms` (`17.26x` slower); `deltablue` `484.26 ms` versus stock `1.47 ms`
+  (`328.69x` slower).

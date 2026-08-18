@@ -5605,6 +5605,104 @@ fn remap_virtualized_exact_int_inputs_to_scalar_locals(
     remapper.count
 }
 
+fn invalidate_unguarded_exact_int_selections(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+) -> usize {
+    let indexed_field_guards = super::typed_indexed_field_guards_by_instr(function);
+
+    struct Validator<'a> {
+        indexed_field_guards: &'a HashMap<InstrId, Vec<soac_ir_typed::TypedIndexedFieldGuard>>,
+        missing_field_sources: HashSet<InstrId>,
+        invalidated_branch_regions: usize,
+        invalidated_return_regions: usize,
+    }
+
+    impl Validator<'_> {
+        fn region_has_live_indexed_field_guards(&mut self, region: &RegionPlan) -> bool {
+            let mut valid = true;
+            for input in &region.inputs {
+                if input.value.rep != soac_ir_typed::plan_v3::Rep::PyObjectBorrowed {
+                    continue;
+                }
+                let RegionInputSource::IndexedField {
+                    source,
+                    owner_type,
+                    expected_index,
+                    ..
+                } = &input.source
+                else {
+                    continue;
+                };
+                let has_matching_guard =
+                    self.indexed_field_guards.get(source).is_some_and(|guards| {
+                        guards.iter().any(|guard| {
+                            guard.expected_index == *expected_index
+                                && matches!(
+                                    &guard.owner_type_ref,
+                                    TypedAttrOwnerRef::TypeKey {
+                                        module_name,
+                                        qualname,
+                                    } if module_name == &owner_type.module_name
+                                        && qualname == &owner_type.qualname
+                                )
+                        })
+                    });
+                if !has_matching_guard {
+                    self.missing_field_sources.insert(*source);
+                    valid = false;
+                }
+            }
+            valid
+        }
+
+        fn validate_expr(&mut self, expr: &mut InstrTyped) {
+            let Some(extra) = expr.typed_extra_mut() else {
+                return;
+            };
+            if let Some(plan) = extra.exact_int_branch_plan()
+                && (!self.region_has_live_indexed_field_guards(&plan.hot_plan)
+                    || !self.region_has_live_indexed_field_guards(&plan.fallback_plan))
+            {
+                self.invalidated_branch_regions += usize::from(extra.clear_exact_int_branch_plan());
+            }
+            if let Some(plan) = extra.exact_int_return_plan()
+                && (!self.region_has_live_indexed_field_guards(&plan.hot_plan)
+                    || !self.region_has_live_indexed_field_guards(&plan.fallback_plan))
+            {
+                self.invalidated_return_regions += usize::from(extra.clear_exact_int_return_plan());
+            }
+        }
+    }
+
+    impl VisitMut<InstrTyped> for Validator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            self.validate_expr(expr);
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut validator = Validator {
+        indexed_field_guards: &indexed_field_guards,
+        missing_field_sources: HashSet::new(),
+        invalidated_branch_regions: 0,
+        invalidated_return_regions: 0,
+    };
+    validator.visit_fn_mut(function);
+    let invalidated = validator.invalidated_branch_regions + validator.invalidated_return_regions;
+    if invalidated != 0 {
+        tracing::info!(
+            target: "soac_jit_codegen",
+            function_id = ?function.function_id,
+            function_qualname = %function.names.qualname,
+            invalidated_branch_regions = validator.invalidated_branch_regions,
+            invalidated_return_regions = validator.invalidated_return_regions,
+            missing_field_sources = ?validator.missing_field_sources,
+            "typed_scalar_regions_invalidated_without_live_indexed_field_guards",
+        );
+    }
+    invalidated
+}
+
 fn retain_live_typed_profile_sidecars(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     remapped_call_emissions: &mut RemappedTypedCallEmissions,
@@ -9306,6 +9404,7 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
     apply_profile_access_and_scalar_plans_to_typed_function(
         function, profile, None, None, None, None, None, None,
     )?;
+    invalidate_unguarded_exact_int_selections(function);
     apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     Ok(())
@@ -11922,6 +12021,7 @@ fn apply_typed_v3_module_rewrites(
             );
         }
         assign_missing_typed_function_instr_ids(function);
+        invalidate_unguarded_exact_int_selections(function);
         refresh_typed_function_value_facts(function);
         trace_typed_preserved_name_count(
             function,
@@ -21720,5 +21820,219 @@ def large(x):\n{large_body}"
                 name: Some(scalar.id_str().to_string()),
             }
         );
+    }
+
+    fn indexed_field_exact_int_sidecar_fixture(
+        indexed_guard: bool,
+    ) -> (BlockPyFunction<TypedBlockPyModuleShape>, InstrId, InstrId) {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def branch(record):\n    if record.value < 10:\n        return 1\n    return 0\n",
+        )
+        .expect("indexed-field branch fixture should lower")
+        .blockpy_module;
+        let typed = lower_blockpy_module_to_typed(lowered);
+        let mut function = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "branch")
+            .cloned()
+            .expect("indexed-field branch fixture should contain branch function");
+        assign_missing_typed_function_instr_ids(&mut function);
+
+        struct GuardAnnotator {
+            indexed_guard: bool,
+            field_source: Option<InstrId>,
+        }
+
+        impl VisitMut<InstrTyped> for GuardAnnotator {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::GetAttrTyped(op) = expr {
+                    self.field_source = Some(op.semantic_instr_id());
+                    if self.indexed_guard {
+                        op.access = TypedAttrAccessPlan::IndexedField {
+                            source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
+                            counter_source: None,
+                            guards: vec![soac_ir_typed::TypedIndexedFieldGuard {
+                                expected_index: 0,
+                                owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                                    module_name: "fixture".to_string(),
+                                    qualname: "Record".to_string(),
+                                },
+                                type_version: 1,
+                            }],
+                        };
+                    }
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        let mut annotator = GuardAnnotator {
+            indexed_guard,
+            field_source: None,
+        };
+        annotator.visit_fn_mut(&mut function);
+        let field_source = annotator
+            .field_source
+            .expect("indexed-field branch fixture should contain an attribute load");
+        let branch = function
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                BlockTerm::IfTerm(if_term) => Some(&mut if_term.test),
+                _ => None,
+            })
+            .expect("indexed-field branch fixture should contain a conditional");
+        let branch_source = branch
+            .try_semantic_instr_id()
+            .expect("indexed-field branch fixture should have a semantic instruction ID");
+        let hot_plan = RegionPlan {
+            id: soac_ir_typed::plan_v3::RegionId(0),
+            source: RegionSource::Instr {
+                instr_id: branch_source,
+            },
+            inputs: vec![soac_ir_typed::plan_v3::RegionInput {
+                value: soac_ir_typed::plan_v3::PlanValue::new(
+                    1,
+                    soac_ir_typed::plan_v3::Rep::PyObjectBorrowed,
+                ),
+                source: RegionInputSource::IndexedField {
+                    source: field_source,
+                    receiver: IndexedFieldReceiverSource::LocalName {
+                        name: "record".to_string(),
+                    },
+                    owner_type: soac_ir_typed::plan_v3::IndexedFieldOwnerType {
+                        module_name: "fixture".to_string(),
+                        qualname: "Record".to_string(),
+                    },
+                    attr_name: "value".to_string(),
+                    expected_index: 0,
+                },
+            }],
+            nodes: Vec::new(),
+            exits: Vec::new(),
+        };
+        let mut fallback_plan = hot_plan.clone();
+        fallback_plan.id = soac_ir_typed::plan_v3::RegionId(1);
+        fallback_plan.inputs[0].value.rep = soac_ir_typed::plan_v3::Rep::PyObjectOwned;
+        let hot_region = MechanicalRegionEmission {
+            region: hot_plan.id,
+            steps: Vec::new(),
+            exits: Vec::new(),
+        };
+        let fallback_region = MechanicalRegionEmission {
+            region: fallback_plan.id,
+            steps: Vec::new(),
+            exits: Vec::new(),
+        };
+        let extra = branch
+            .typed_extra_mut()
+            .expect("indexed-field branch should support exact-int sidecars");
+        extra.set_exact_int_branch_plan(TypedExactIntBranchPlan {
+            source: TypedExactIntPlanSource::OptimizationPlanV3,
+            instr_id: branch_source,
+            hot_plan: hot_plan.clone(),
+            hot_region: hot_region.clone(),
+            fallback_plan: fallback_plan.clone(),
+            fallback_region: fallback_region.clone(),
+        });
+        extra.set_exact_int_return_plan(TypedExactIntReturnPlan {
+            source: TypedExactIntPlanSource::OptimizationPlanV3,
+            instr_id: branch_source,
+            hot_plan,
+            hot_region,
+            fallback_plan,
+            fallback_region,
+        });
+
+        (function, branch_source, field_source)
+    }
+
+    fn exact_int_sidecars_for_branch(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        branch_source: InstrId,
+    ) -> (bool, bool) {
+        let branch = function
+            .blocks
+            .iter()
+            .find_map(|block| match &block.term {
+                BlockTerm::IfTerm(if_term)
+                    if if_term.test.try_semantic_instr_id() == Some(branch_source) =>
+                {
+                    Some(&if_term.test)
+                }
+                _ => None,
+            })
+            .expect("indexed-field branch should survive sidecar validation");
+        let extra = branch
+            .typed_extra()
+            .expect("indexed-field branch should retain typed metadata");
+        (
+            extra.exact_int_branch_plan().is_some(),
+            extra.exact_int_return_plan().is_some(),
+        )
+    }
+
+    #[test]
+    fn exact_int_indexed_field_sidecars_preserve_live_typed_guards() {
+        let (mut function, branch_source, _) = indexed_field_exact_int_sidecar_fixture(true);
+
+        assert_eq!(invalidate_unguarded_exact_int_selections(&mut function), 0);
+        assert_eq!(
+            exact_int_sidecars_for_branch(&function, branch_source),
+            (true, true),
+            "a surviving indexed-field guard should preserve both exact-int specializations",
+        );
+    }
+
+    #[test]
+    fn exact_int_indexed_field_sidecars_reject_missing_typed_guards() {
+        let (mut function, branch_source, _) = indexed_field_exact_int_sidecar_fixture(false);
+
+        assert_eq!(invalidate_unguarded_exact_int_selections(&mut function), 2);
+        assert_eq!(
+            exact_int_sidecars_for_branch(&function, branch_source),
+            (false, false),
+            "a generic or removed field load must invalidate dependent exact-int sidecars",
+        );
+    }
+
+    #[test]
+    fn exact_int_indexed_field_sidecars_reject_mismatched_typed_guards() {
+        struct GuardMismatch {
+            expected_index: u32,
+            owner_qualname: &'static str,
+        }
+
+        impl VisitMut<InstrTyped> for GuardMismatch {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::GetAttrTyped(op) = expr
+                    && let TypedAttrAccessPlan::IndexedField { guards, .. } = &mut op.access
+                {
+                    guards[0].expected_index = self.expected_index;
+                    guards[0].owner_type_ref = TypedAttrOwnerRef::TypeKey {
+                        module_name: "fixture".to_string(),
+                        qualname: self.owner_qualname.to_string(),
+                    };
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        for (expected_index, owner_qualname) in [(1, "Record"), (0, "OtherRecord")] {
+            let (mut function, branch_source, _) = indexed_field_exact_int_sidecar_fixture(true);
+            GuardMismatch {
+                expected_index,
+                owner_qualname,
+            }
+            .visit_fn_mut(&mut function);
+
+            assert_eq!(invalidate_unguarded_exact_int_selections(&mut function), 2);
+            assert_eq!(
+                exact_int_sidecars_for_branch(&function, branch_source),
+                (false, false),
+                "field index and owner identity must both match the dependent scalar region",
+            );
+        }
     }
 }

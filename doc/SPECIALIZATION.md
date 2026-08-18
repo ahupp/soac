@@ -416,6 +416,13 @@ apply/verify mode:
   borrowed field value and jumps to the region's local generic fallback on a
   guard or inline-values miss. Return/store expression regions intentionally do
   not consume indexed-field loads as region inputs yet.
+- A region that borrows an indexed-field value remains eligible only while its
+  referenced attribute instruction still exists in the final typed function
+  with a usable owner/type-version/index guard. Typed rewrites can remove,
+  replace, or fail to attach that guarded `GetAttrTyped` instruction even when
+  the enclosing comparison survives. Planning must then discard the dependent
+  exact-int or exact-string sidecar and preserve the original generic operation;
+  codegen must not recreate a missing guard or dereference an unguarded field.
 - After that guard, loads check the object's CPython inline-values block for
   the expected key at the recorded index and return an owned reference to the
   value slot.

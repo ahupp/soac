@@ -3,9 +3,12 @@ title: "OPTIMIZATION"
 ---
 
 
-Your job is to make the benchmark (run via "just benchmark") as fast
-as possible. Use the $analyze-pystone-perf skill to run the benchmark,
-using a combination of:
+The authoritative performance objective is defined in `OPT_GOAL.md`: improve
+the full pyperformance suite against stock CPython and the previous SOAC
+revision. Use `just pyperformance-compare` for comparisons, its `chaos`
+workload for fast iteration, and `just benchmark` as a pystone fallback or
+secondary guardrail when useful. The `$analyze-pystone-perf` skill supports
+investigations specific to that secondary workload. Use a combination of:
 
 * perf profiles
 * verification mode counters, to see if expected optimizations are
@@ -26,7 +29,7 @@ things.
 
 2. Changes should not be overly specific to the benchmark itself. The
    optimization should apply to general-purpose code. An outside
-   observer who's never seen the pystone benchmark should be able to
+   observer who's never seen the selected benchmark should be able to
    look at the change and say, "yes, that is a sensible thing to do".
 
 3. Measure the specialized/apply pass as the transformed benchmark
@@ -43,13 +46,14 @@ For each optimization attempt:
    input policy, and same benchmark-stability knobs. Report absolute
    specialized throughput, stock CPython throughput, and relative change.
 
-2. Run verify mode before trusting perf conclusions. Expected hot
-   specialization sites from the profile run should either appear in the
-   verify run or have an understood reason for disappearing.
+2. Use verify mode when diagnostic evidence is needed before trusting perf
+   conclusions. Expected hot specialization sites from the profile run should
+   either appear in the verify run or have an understood reason for
+   disappearing.
 
-3. Collect perf for the specialized/apply pass, not the profiling pass.
-   Keep benchmark, verify, perf, counter-summary, and rendered-CLIF
-   artifacts in work/logs/.
+3. Collect perf separately for the specialized/apply pass, not the profiling
+   pass or headline throughput measurement. Keep generated benchmark, verify,
+   perf, counter-summary, and rendered-CLIF artifacts under ignored `work/`.
 
 4. Render specialized CLIF for the hot JIT functions. Before coding,
    connect the proposed optimization all the way through: perf hotspot,
@@ -65,15 +69,16 @@ For each optimization attempt:
    change, and whether the relevant verify counters / CLIF shape changed
    as expected.
 
-7. Update `doc/PERF_LOG.md` before moving on. Log landed changes,
-   benchmark-negative attempts, and inconclusive attempts that consumed
-   meaningful investigation time. Keep entries concise: candidate
-   summary, landed jj change id if any, specialized-throughput
-   before/after, relative change, and the reason a candidate was
-   abandoned.
+7. Create or update one tracked file per optimization strategy under
+   `doc/optimization-attempts/` before moving on. Record every implementation
+   attempt in that strategy's existing file, including negative, rejected,
+   failed, and inconclusive outcomes; include the hypothesis, compatibility
+   analysis, baseline/candidate measurements, transformed coverage, IR/native
+   size, verdict, and why any candidate was abandoned. Keep
+   `doc/PERF_LOG.md` for concise summaries of finalized retained changes.
 
-8. For an abandoned candidate, also record the transferable lesson in
-   this file before picking the next candidate. Include why the original
+8. For an abandoned candidate, also record the transferable lesson in its
+   strategy file before picking the next candidate. Include why the original
    hypothesis was incomplete: for example, the hotspot was split across
    several parents, the generated fast path expanded too much CLIF, the
    optimized helper was below the benchmark's noise floor, or the change

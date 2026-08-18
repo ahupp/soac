@@ -203,12 +203,12 @@ the deep-profile recipes. Configure the required kernel settings persistently
 inside the Ubuntu guest:
 
 ```bash
-sudo tee /etc/sysctl.d/99-soac-profiling.conf >/dev/null <<'EOF'
+sudo tee -a /etc/sysctl.d/openai.conf >/dev/null <<'EOF'
 kernel.perf_event_paranoid = -1
 kernel.yama.ptrace_scope = 0
 kernel.kptr_restrict = 0
 EOF
-sudo sysctl --system
+sudo sysctl -p /etc/sysctl.d/openai.conf
 sysctl kernel.perf_event_paranoid kernel.yama.ptrace_scope kernel.kptr_restrict
 ```
 

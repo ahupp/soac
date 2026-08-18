@@ -79,6 +79,38 @@ generated-code evidence before drawing either conclusion. For example, the
 default `chaos` configuration transforms its benchmark classes and functions
 while imported standard-library `math` and `random` remain on stock CPython.
 
+## Record every optimization strategy
+
+Maintain one tracked Markdown file per attempted optimization strategy under
+`doc/optimization-attempts/`, using the Pacific-date filename convention and
+template documented there. Create the file when a strategy is selected and
+update that same file across baseline collection, implementation experiments,
+repeated measurements, and the final decision. Do not create a new file for
+each benchmark run or discard the record when experimental code is reverted.
+
+Each strategy file must record:
+
+- the hypothesis, expected general-purpose benefit, and hotspot or structural
+  evidence motivating the strategy;
+- what implementation was attempted, what changed between iterations, and the
+  relevant CPython-compatibility assumptions, guards, fallback, and tests;
+- the fixed benchmark selection, measurement protocol, baseline revision or
+  result, stock CPython result, previous-SOAC result when available, and each
+  measured candidate result or explicit reason a value is unavailable;
+- benchmark completion and actual transformed project, dependency, and
+  standard-library coverage, including failures and unoptimized hot paths;
+- available optimized typed-IR counts, pre-optimization BlockPy size, native
+  code bytes, machine-block counts, and material startup or compilation costs;
+- every negative, rejected, failed, or inconclusive attempt, its quantitative
+  evidence where available, and the technical reason it was not retained; and
+- the current status, final verdict, transferable lesson, and next action.
+
+Keep bulky generated artifacts under ignored `work/`; copy the essential
+measurements and conclusions into the tracked strategy file so rejected work
+remains understandable after artifacts disappear. `doc/PERF_LOG.md` remains a
+concise summary of finalized retained performance changes; it does not replace
+per-strategy attempt history.
+
 ## Profile and apply phases
 
 Optimization selection must not adapt dynamically from observations made by

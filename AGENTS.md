@@ -225,9 +225,22 @@ path, use pystone as the regression guardrail. Investigate substantial
 proof of full-suite pyperformance progress. Report both the stock comparison
 and the before/after SOAC delta.
 
+For every attempted optimization strategy, create or update exactly one
+tracked Markdown file under `doc/optimization-attempts/`, following that
+directory's README and template. Keep all iterations of the same strategy in
+its existing file; do not create one file per benchmark run. Record the
+hypothesis, implementation and compatibility analysis, fixed benchmark and
+transformation coverage, stock/previous-SOAC/candidate measurements, available
+typed-IR and native-code sizes, verdict, and transferable lessons. Preserve
+negative, rejected, failed, and inconclusive outcomes even when their code is
+reverted; mark unavailable or pending measurements explicitly instead of
+inventing them. Keep generated benchmark artifacts under ignored `work/`, but
+copy the essential evidence into the tracked strategy file.
+
 When a performance change is complete enough that you intend to keep it,
 rebase the finished change onto `main`, run the applicable pyperformance
-comparison, and append an entry to `doc/PERF_LOG.md` in the same logical change.
+comparison, update its strategy file, and append a concise finalized-change
+entry to `doc/PERF_LOG.md` in the same logical change.
 If the existing pystone sanity-check workflow is useful for that change, run
 `$soac-profile-benchmark` as a secondary regression check and write its finalized
 result to `work/bench/{change_id}`. Keep pyperformance comparison artifacts
