@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use soac_core::block_py::literal::{Literal, NumberLiteralValue};
 use soac_core::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    ChildVisitable, ConstantExpr, NameLike, ParamDefaultSource, RuntimeName,
+    ChildVisitable, ConstantExpr, NameLike, ParamDefaultSource, RuntimeName, StorageLayout,
 };
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
@@ -412,8 +412,28 @@ impl ModuleConstantCollector {
         }
     }
 
+    fn collect_closure_storage_names(&mut self, storage_layout: &StorageLayout) {
+        for slot in storage_layout
+            .freevars
+            .iter()
+            .chain(storage_layout.cellvars.iter())
+        {
+            self.constants
+                .intern_unicode_bytes(slot.logical_name.as_bytes());
+            self.constants
+                .intern_unicode_bytes(slot.storage_name.as_bytes());
+        }
+        for slot in &storage_layout.preserved_slots {
+            self.constants
+                .intern_unicode_bytes(slot.logical_name.as_bytes());
+            self.constants
+                .intern_unicode_bytes(slot.storage_name.as_bytes());
+        }
+    }
+
     fn collect_function(&mut self, function: &BlockPyFunction<BlockPyModuleShape>) {
         if let Some(storage_layout) = function.storage_layout() {
+            self.collect_closure_storage_names(storage_layout);
             for name in storage_layout.stack_slots() {
                 if should_include_in_locals_snapshot(name) {
                     self.constants.intern_unicode_bytes(name.as_bytes());
@@ -450,6 +470,7 @@ impl ModuleConstantCollector {
 
     fn collect_typed_function(&mut self, function: &BlockPyFunction<TypedBlockPyModuleShape>) {
         if let Some(storage_layout) = function.storage_layout() {
+            self.collect_closure_storage_names(storage_layout);
             for name in storage_layout.stack_slots() {
                 if should_include_in_locals_snapshot(name) {
                     self.constants.intern_unicode_bytes(name.as_bytes());
@@ -800,5 +821,74 @@ fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
         AbruptKind::Exception => 2,
         AbruptKind::Break => 3,
         AbruptKind::Continue => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModuleCodegenConstants, ModuleConstantValue};
+    use soac_core::block_py::{
+        ClosureInit, ClosureSlot, PreservedSlot, PreservedSlotStorage, StorageLayout,
+    };
+    use soac_ir_typed::lower_blockpy_module_to_typed;
+
+    #[test]
+    fn closure_and_preserved_storage_names_are_available_to_unbound_codegen() {
+        let mut module =
+            soac_lowering::lower_python_to_blockpy_for_testing("def run():\n    return 1\n")
+                .expect("closure-storage constant fixture should lower")
+                .blockpy_module;
+        let function = module
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "run")
+            .expect("closure-storage fixture should contain run");
+        function.storage_layout = Some(StorageLayout {
+            freevars: vec![ClosureSlot {
+                logical_name: "captured_value".to_string(),
+                storage_name: "_dp_free_captured_value".to_string(),
+                init: ClosureInit::InheritedCapture,
+            }],
+            cellvars: vec![ClosureSlot {
+                logical_name: "pool".to_string(),
+                storage_name: "_dp_cell_pool".to_string(),
+                init: ClosureInit::EmptyCell,
+            }],
+            preserved_slots: vec![PreservedSlot {
+                logical_name: "suspended_value".to_string(),
+                storage_name: "_dp_preserved_suspended_value".to_string(),
+                init: ClosureInit::Deferred,
+                storage: PreservedSlotStorage::PyCellObject,
+            }],
+            stack_slots: Vec::new(),
+        });
+
+        let typed_module = lower_blockpy_module_to_typed(module.clone());
+        for (kind, constants) in [
+            (
+                "BlockPy",
+                ModuleCodegenConstants::collect_from_module(&module),
+            ),
+            (
+                "typed BlockPy",
+                ModuleCodegenConstants::collect_from_typed_module(&typed_module),
+            ),
+        ] {
+            for name in [
+                "captured_value",
+                "_dp_free_captured_value",
+                "pool",
+                "_dp_cell_pool",
+                "suspended_value",
+                "_dp_preserved_suspended_value",
+            ] {
+                assert!(
+                    constants
+                        .lookup_id(&ModuleConstantValue::Unicode(name.as_bytes().to_vec()))
+                        .is_some(),
+                    "{kind} module constants must include closure/preserved storage name {name:?}"
+                );
+            }
+        }
     }
 }

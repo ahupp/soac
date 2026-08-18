@@ -79,6 +79,14 @@ the field specialization remains owned by the attribute access site,
 the v3 planner emits hot checked-`i64` or exact-unicode operation regions plus
 local generic Python fallback regions, materializes Python object results explicitly, and
 `emit_mechanical_plan_v3` refuses invalid plans before emitting steps.
+Exact-int region inputs must also remain available in the final typed source
+function after rewrite and cleanup. Ordinary typed local liveness includes
+the `RegionInputSource::FunctionParam` named locals and `IndexedField`
+`LocalName` receivers embedded in both hot and fallback regions of selected
+exact-int branch and return sidecars. These are real semantic reads even when
+they do not appear as ordinary expression loads; preserving and transporting
+them across CFG edges keeps selected optimized regions valid without pruning
+the optimization, fabricating values, or changing Python behavior.
 
 Do not expand a legacy family as the primary implementation path unless there is
 a specific reason; add the v3 catalog alternative, fact bridge, planner rule,
@@ -126,6 +134,30 @@ Current migration surface:
 The counter dump contains hot specialization input, cold key-layout
 metadata, and optional verify counters for indexed storage fast paths
 and applied refcount operations.
+
+Profile-mode evidence is keyed to the original lowered source function and
+semantic `InstrId`. Counter definitions are established before typed JIT
+planning, so the `profile` pass must preserve those original instruction IDs
+and its original call graph: typed optimization rewrites, direct-call
+inlining, and hot-continuation cloning are reserved for `verify`/`apply`
+replay. In particular, cloning a continuation during profiling would
+renumber its hot instructions without moving their source-keyed counter
+definitions, leaving executed operators, calls, attributes, item accesses,
+and branches incorrectly unobserved.
+
+Skipping optimization rewrites in profile mode does not skip the ordinary
+typed runtime preparation, counter instrumentation, ownership/value analysis,
+generator and closure handling, or generic JIT planning. Verify and apply
+still consume the collected source-keyed evidence and run their existing
+validated typed rewrites, guards, and fallbacks. The mode boundary is based
+on explicit `SOAC_OPT_MODE=profile`, not merely on whether a counter dump
+exists.
+Because profile mode retains original generator `CellRef` operations and
+preserved-cell state, typed and untyped module constant collection also
+preserve logical and storage names for owned cells, closure freevars, and
+preserved slots. Preserved-cell unbound errors use the actual Python variable
+name rather than an internal codegen label.
+
 The hot streams consumed by the current replay path are:
 
 - `call_hot_targets`

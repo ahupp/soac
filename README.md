@@ -718,9 +718,13 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `<worker-dir>/worker_perf*`. The replay worker pauses through
   `SOAC_PYPERFORMANCE_MEASURE_READY_FILE` immediately before pyperf starts its
   measured values, so the attached profile excludes benchmark-module import and
-  any pyperf warmups. It also enables `SOAC_JIT_BB_MAP=1` for detailed JIT block
-  maps. Use this when pyperformance says a benchmark is slow and you need
-  measured-worker attribution instead of profiling the pyperformance harness.
+  any pyperf warmups. The recipe reuses a fresh release runtime and records the
+  portable `cpu-clock` event with a 1024-page buffer; captures with missing or
+  lost samples fail. Detailed JIT block maps default to `SOAC_JIT_BB_MAP=1`.
+  Set `SOAC_JIT_BB_MAP=0` for symbol-level profiling when per-block map writes
+  are prohibitively slow, such as on a VM-mounted checkout. Use this when
+  pyperformance says a benchmark is slow and you need measured-worker
+  attribution instead of profiling the pyperformance harness.
 
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompile a counter-referenced set of cached BlockPy modules into

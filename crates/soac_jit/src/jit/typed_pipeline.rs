@@ -9693,7 +9693,12 @@ fn optimize_blockpy_with_external_inline_callees(
                         })
                 })
                 .transpose()?;
-            if let Some(profile) = profile {
+            // Counter definitions and storage are fixed before typed rewrites.
+            // Profiling must execute the original semantic instruction IDs;
+            // cloned hot continuations would otherwise bypass their counters.
+            if let Some(profile) = profile
+                && env_config.specialization_mode() != Some(SpecializationMode::Profile)
+            {
                 let mut static_direct_calls =
                     static_direct_calls_for_module(typed_module, &static_targets);
                 static_direct_calls.extend(static_direct_calls_for_external_callees(
@@ -12583,6 +12588,157 @@ mod tests {
         lower_typed_function_call_access_plan_instrs, merge_trusted_owner_states,
         remap_trusted_owner_state_for_edge, trusted_owner_block_predecessor_edges,
     };
+
+    #[test]
+    fn profile_mode_preserves_countered_hot_loop_ids_while_apply_can_split() {
+        let source = r#"
+class Box:
+    def __init__(self):
+        self.value = 0
+
+def advance(value):
+    return value + 1
+
+def run(values):
+    box = Box()
+    alias = None
+    if values:
+        alias = box
+    else:
+        alias = box
+
+    total = 0
+    for index in range(len(values)):
+        alias.value = advance(values[index])
+        values[index] = alias.value + index
+        if index & 1:
+            total += values[index]
+        else:
+            total += alias.value
+    return total, values, alias.value
+"#;
+        let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("countered hot-loop source should lower")
+            .blockpy_module;
+        let profile_config =
+            SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Profile));
+        let mut counter_module = lower_blockpy_module_to_typed(lowered.clone());
+        soac_instrument::define_typed_module_counter_defs(
+            &mut counter_module,
+            &soac_instrument::InstrumentationConfig::from_env_config(&profile_config),
+        )
+        .expect("profile counters should be defined against original semantic IDs");
+        lowered.counter_defs = counter_module.counter_defs;
+
+        let original_run = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "run")
+            .expect("hot-loop source should retain run");
+        let run_function_id = original_run.function_id;
+        let original_block_count = original_run.blocks.len();
+        let countered_instr_ids = lowered
+            .counter_defs
+            .iter()
+            .filter_map(|counter| match counter.site {
+                CounterSite::Runtime {
+                    function_id: Some(function_id),
+                    instr_id: Some(instr_id),
+                } if function_id == run_function_id => Some(instr_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert!(
+            !countered_instr_ids.is_empty(),
+            "joined hot-loop fixture must contain original counter-bearing sites"
+        );
+        for kind in [
+            "call_hot_targets",
+            "operator_hot_shapes",
+            "getitem_hot_shapes",
+            "setitem_hot_shapes",
+            "field_access",
+            "branch_outcomes",
+        ] {
+            assert!(
+                lowered.counter_defs.iter().any(|counter| {
+                    counter.kind == kind
+                        && matches!(
+                            counter.site,
+                            CounterSite::Runtime {
+                                function_id: Some(function_id),
+                                ..
+                            } if function_id == run_function_id
+                        )
+                }),
+                "joined hot-loop fixture should define {kind} counters"
+            );
+        }
+
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let profile_plan = optimize_blockpy_with_external_inline_callees(
+            &lowered,
+            Some(&profile),
+            &profile_config,
+            HashMap::new(),
+            StaticDirectCallTargets::default(),
+            false,
+        )
+        .expect("profile-mode hot loop should plan without replacing its original CFG");
+        let profiled_run = profile_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == run_function_id)
+            .expect("profile plan should retain the countered hot-loop function");
+        assert_eq!(
+            profiled_run.blocks.len(),
+            original_block_count,
+            "profile-mode continuation splitting must not bypass original counter sites"
+        );
+        let profiled_instr_ids = collect_typed_semantic_instr_ids(profiled_run);
+        assert!(
+            countered_instr_ids.is_subset(&profiled_instr_ids),
+            "profile mode must retain every original counter-bearing semantic ID: missing={:?}",
+            countered_instr_ids
+                .difference(&profiled_instr_ids)
+                .collect::<Vec<_>>()
+        );
+
+        let apply_config =
+            SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Apply));
+        let apply_plan = optimize_blockpy_with_external_inline_callees(
+            &lowered,
+            Some(&profile),
+            &apply_config,
+            HashMap::new(),
+            StaticDirectCallTargets::default(),
+            false,
+        )
+        .expect("apply-mode hot loop should retain ordinary continuation optimizations");
+        let applied_run = apply_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == run_function_id)
+            .expect("apply plan should retain the hot-loop function");
+        assert!(
+            applied_run.blocks.len() > original_block_count,
+            "apply mode should continue cloning the joined hot-loop continuation"
+        );
+    }
 
     #[test]
     fn pinned_pyperformance_nqueens_discard_reaches_full_typed_pipeline() {

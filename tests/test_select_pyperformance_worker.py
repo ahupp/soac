@@ -36,13 +36,16 @@ def worker_record(tmp_path: Path, name: str, *, stable_args, opt_mode="profile")
     }
 
 
-def test_select_worker_prefers_measured_profile_record(monkeypatch, tmp_path):
+@pytest.mark.parametrize("calibration_flag", ["calibrate_loops", "--calibrate-loops"])
+def test_select_worker_prefers_measured_profile_record(
+    monkeypatch, tmp_path, calibration_flag
+):
     module = load_select_pyperformance_worker()
     measured = worker_record(tmp_path, "measured", stable_args=["--worker-task=0"])
     calibration = worker_record(
         tmp_path,
         "calibration",
-        stable_args=["calibrate_loops", "--worker-task=0"],
+        stable_args=[calibration_flag, "--worker-task=0"],
     )
     apply = worker_record(
         tmp_path,

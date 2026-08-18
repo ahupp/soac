@@ -1999,7 +1999,7 @@ pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure
 
   echo "pyperformance comparison summary: $RESULT_DIR/summary.json"
 
-pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpython (update-venv-offline) (build-extension "release")
+pyperformance-deep-profile-from-profile result benchmark *args='': (build-runtime-fast "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -2107,6 +2107,7 @@ pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpytho
   echo "benchmark script: $WORKER_BENCHMARK_SCRIPT"
   echo "stable args: ${WORKER_STABLE_ARGS[*]}"
   echo "profile loops: $LOOPS"
+  echo "JIT basic-block maps: ${SOAC_JIT_BB_MAP:-1}"
   echo "perf data: $PERF_DATA"
   echo "run log: $RUN_LOG"
   echo "report by dso/symbol: $REPORT_DSO_SYMBOLS"
@@ -2119,7 +2120,7 @@ pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpytho
     SOAC_PYPERFORMANCE_MEASURE_READY_FILE="$READY_FILE" \
     SOAC_WORK_DIR="$WORKER_WORK_DIR" \
     SOAC_OPT_MODE=apply \
-    SOAC_JIT_BB_MAP=1 \
+    SOAC_JIT_BB_MAP="${SOAC_JIT_BB_MAP:-1}" \
     SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}" \
     SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}" \
     SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}" \
@@ -2174,6 +2175,8 @@ pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpytho
   fi
 
   perf record \
+    --event cpu-clock \
+    --mmap-pages 1024 \
     --call-graph "$PERF_CALL_GRAPH" \
     -F "$PERF_FREQUENCY" \
     -k 1 \
@@ -2214,6 +2217,17 @@ pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpytho
     cat "$PERF_RECORD_LOG" >&2
     exit "$perf_status"
   fi
+  if grep -Eiq 'lost[[:space:]]+[1-9][0-9,]*[[:space:]]+(samples?|chunks?)|[1-9][0-9,]*[[:space:]]+(samples?|chunks?)[[:space:]]+lost' "$PERF_RECORD_LOG"; then
+    echo "pyperformance perf lost samples or chunks; see $PERF_RECORD_LOG" >&2
+    cat "$PERF_RECORD_LOG" >&2
+    exit 1
+  fi
+
+  PERF_HEADER="$(perf report --header-only -i "$PERF_DATA")"
+  if [[ "$PERF_HEADER" == *"time of first sample : 0.000000"* ]]; then
+    echo "pyperformance perf captured no samples; see $PERF_RECORD_LOG" >&2
+    exit 1
+  fi
 
   perf report \
     --stdio \
@@ -2221,6 +2235,10 @@ pyperformance-deep-profile-from-profile result benchmark *args='': ensure-cpytho
     --sort overhead,symbol \
     -i "$PERF_DATA" \
     >"$REPORT_SYMBOLS"
+  if grep -Eq '^#[[:space:]]*Total[[:space:]]+Lost[[:space:]]+Samples:[[:space:]]*[1-9][0-9,]*([[:space:]]|$)' "$REPORT_SYMBOLS"; then
+    echo "pyperformance perf report contains lost samples; see $REPORT_SYMBOLS" >&2
+    exit 1
+  fi
 
   perf report \
     --stdio \

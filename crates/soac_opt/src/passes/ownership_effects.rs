@@ -12,6 +12,7 @@ use soac_core::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
     ChildVisitable, HasSemanticInstrId, InstrKey, LocalLocation, RuntimeFunctionId, Visit,
 };
+use soac_ir_typed::plan_v3::{IndexedFieldReceiverSource, RegionInputSource, RegionPlan};
 use soac_ir_typed::{
     FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockPyModuleShape,
     TypedPyObjectOwnershipPlan, ValueFacts,
@@ -3187,11 +3188,42 @@ fn collect_typed_local_reads(
         uses: &'a mut HashSet<LocalLocation>,
     }
 
+    impl LocalReadCollector<'_> {
+        fn mark_exact_int_region_input_reads(&mut self, regions: [&RegionPlan; 2]) {
+            for region in regions {
+                for input in &region.inputs {
+                    let name = match &input.source {
+                        RegionInputSource::FunctionParam {
+                            name: Some(name), ..
+                        }
+                        | RegionInputSource::IndexedField {
+                            receiver: IndexedFieldReceiverSource::LocalName { name },
+                            ..
+                        } => name,
+                        _ => continue,
+                    };
+                    if let Some(location) = self.location_by_name.get(name) {
+                        mark_local_use(*location, self.defs, self.uses);
+                    }
+                }
+            }
+        }
+    }
+
     impl Visit<InstrTyped> for LocalReadCollector<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped)
         where
             InstrTyped: ChildVisitable<InstrTyped>,
         {
+            if let Some(extra) = expr.typed_extra() {
+                if let Some(plan) = extra.exact_int_branch_plan() {
+                    self.mark_exact_int_region_input_reads([&plan.hot_plan, &plan.fallback_plan]);
+                }
+                if let Some(plan) = extra.exact_int_return_plan() {
+                    self.mark_exact_int_region_input_reads([&plan.hot_plan, &plan.fallback_plan]);
+                }
+            }
+
             match expr {
                 InstrTyped::Load(op) => {
                     if let Some(location) = op.name.local_location() {
@@ -3537,14 +3569,24 @@ fn expected_release_actions(
 mod tests {
     use super::{
         LocalRefState, RefcountActionKind, RefcountReleaseReason, compute_function_local_live_ins,
-        compute_function_local_must_bound_ins,
+        compute_function_local_must_bound_ins, compute_typed_function_local_live_ins,
         compute_typed_function_precise_immortal_local_entry_states, forwarded_locations,
         plan_ownership_effects, plan_typed_ownership_effects, validate_ownership_effects,
         validate_typed_ownership_effects,
     };
     use crate::passes::{LocalRefKind, infer_module_value_facts, plan_typed_local_env_module};
-    use soac_core::block_py::{BlockArg, BlockLabel, BlockPyFunction, BlockTerm, LocalLocation};
-    use soac_ir_typed::{InstrTyped, TypedPlannedResult, lower_blockpy_module_to_typed};
+    use soac_core::block_py::{
+        BlockArg, BlockLabel, BlockPyFunction, BlockTerm, HasSemanticInstrId, LocalLocation,
+    };
+    use soac_ir_typed::emit_v3::MechanicalRegionEmission;
+    use soac_ir_typed::plan_v3::{
+        IndexedFieldOwnerType, IndexedFieldReceiverSource, PlanValue, RegionId, RegionInput,
+        RegionInputSource, RegionPlan, RegionSource, Rep,
+    };
+    use soac_ir_typed::{
+        InstrTyped, TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
+        TypedPlannedResult, lower_blockpy_module_to_typed,
+    };
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::collections::{HashMap, HashSet};
 
@@ -3844,6 +3886,163 @@ def outer():
             HashSet::from([LocalLocation(10), LocalLocation(3)]),
             "explicit edge args should preserve the source local location rather than the tail target param name",
         );
+    }
+
+    #[test]
+    fn typed_exact_int_region_inputs_keep_hidden_locals_live_at_their_block() {
+        for (return_plan, fallback_region, indexed_receiver) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let lowered = lower_python_to_blockpy_for_testing(
+                r#"
+def f(h, flag):
+    if flag:
+        value = 1
+    else:
+        value = 2
+    if value:
+        return 1
+    return 0
+"#,
+            )
+            .expect("hidden region-local fixture should lower")
+            .blockpy_module;
+            let mut typed = lower_blockpy_module_to_typed(lowered);
+            let function = typed
+                .callable_defs
+                .iter_mut()
+                .find(|function| function.names.qualname == "f")
+                .expect("hidden region-local fixture should contain f");
+            assert!(
+                function.body_params().iter().any(|param| param.name == "h"),
+                "h must be a real function parameter, not a fabricated local",
+            );
+            let h_location = function
+                .storage_layout()
+                .as_ref()
+                .expect("typed function should have storage")
+                .stack_slots()
+                .iter()
+                .position(|name| name == "h")
+                .map(|slot| LocalLocation(u32::try_from(slot).expect("slot should fit in u32")))
+                .expect("h should have a declared local slot");
+            let entry_label = function.entry_block().label;
+            let target_label = function
+                .blocks
+                .iter()
+                .find(|block| {
+                    block.label != entry_label
+                        && matches!(block.term, BlockTerm::IfTerm(_))
+                        && !block.param_names().any(|name| name == "h")
+                })
+                .map(|block| block.label)
+                .expect("fixture should contain a non-entry conditional without an h block param");
+            assert!(
+                !compute_typed_function_local_live_ins(function)
+                    .get(&target_label)
+                    .is_some_and(|live| live.contains(&h_location)),
+                "h should be dead until the exact-int sidecar introduces its hidden read",
+            );
+
+            let branch = function
+                .blocks
+                .iter_mut()
+                .find_map(|block| match &mut block.term {
+                    BlockTerm::IfTerm(if_term) if block.label == target_label => {
+                        Some(&mut if_term.test)
+                    }
+                    _ => None,
+                })
+                .expect("target conditional should survive fixture setup");
+            let source = branch
+                .try_semantic_instr_id()
+                .expect("target conditional should have a semantic instruction ID");
+            let input = RegionInput {
+                value: PlanValue::new(1, Rep::PyObjectBorrowed),
+                source: if indexed_receiver {
+                    RegionInputSource::IndexedField {
+                        source,
+                        receiver: IndexedFieldReceiverSource::LocalName {
+                            name: "h".to_string(),
+                        },
+                        owner_type: IndexedFieldOwnerType {
+                            module_name: "fixture".to_string(),
+                            qualname: "Record".to_string(),
+                        },
+                        attr_name: "value".to_string(),
+                        expected_index: 0,
+                    }
+                } else {
+                    RegionInputSource::FunctionParam {
+                        index: 0,
+                        name: Some("h".to_string()),
+                    }
+                },
+            };
+            let mut hot_plan = RegionPlan {
+                id: RegionId(0),
+                source: RegionSource::Instr { instr_id: source },
+                inputs: Vec::new(),
+                nodes: Vec::new(),
+                exits: Vec::new(),
+            };
+            let mut fallback_plan = hot_plan.clone();
+            fallback_plan.id = RegionId(1);
+            if fallback_region {
+                fallback_plan.inputs.push(input);
+            } else {
+                hot_plan.inputs.push(input);
+            }
+            let hot_region = MechanicalRegionEmission {
+                region: hot_plan.id,
+                steps: Vec::new(),
+                exits: Vec::new(),
+            };
+            let fallback_emission = MechanicalRegionEmission {
+                region: fallback_plan.id,
+                steps: Vec::new(),
+                exits: Vec::new(),
+            };
+            let extra = branch
+                .typed_extra_mut()
+                .expect("target conditional should support exact-int plans");
+            if return_plan {
+                extra.set_exact_int_return_plan(TypedExactIntReturnPlan {
+                    source: TypedExactIntPlanSource::OptimizationPlanV3,
+                    instr_id: source,
+                    hot_plan,
+                    hot_region,
+                    fallback_plan,
+                    fallback_region: fallback_emission,
+                });
+            } else {
+                extra.set_exact_int_branch_plan(TypedExactIntBranchPlan {
+                    source: TypedExactIntPlanSource::OptimizationPlanV3,
+                    instr_id: source,
+                    hot_plan,
+                    hot_region,
+                    fallback_plan,
+                    fallback_region: fallback_emission,
+                });
+            }
+
+            assert!(
+                compute_typed_function_local_live_ins(function)
+                    .get(&target_label)
+                    .is_some_and(|live| live.contains(&h_location)),
+                "exact-int {kind} {region} {input} must keep declared parameter h live in its actual block",
+                kind = if return_plan { "return" } else { "branch" },
+                region = if fallback_region { "fallback" } else { "hot" },
+                input = if indexed_receiver {
+                    "indexed-field receiver"
+                } else {
+                    "named local input"
+                },
+            );
+        }
     }
 
     #[test]

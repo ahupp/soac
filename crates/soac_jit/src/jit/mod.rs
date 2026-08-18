@@ -6981,9 +6981,15 @@ fn emit_raw_cell_object_for_location_with_local_env(
             );
             match preserved_slot_storage_for_location(ctx, location) {
                 PreservedSlotStorage::PyCellObject | PreservedSlotStorage::PyObjectOrNull => {
+                    let logical_name = ctx
+                        .storage_layout
+                        .as_ref()
+                        .and_then(|layout| layout.preserved_slot(slot))
+                        .map(|preserved_slot| preserved_slot.logical_name.as_str())
+                        .expect("preserved raw cell should have a storage-layout slot");
                     emit_checked_local_value_or_unbound(
                         fb,
-                        debug_name,
+                        logical_name,
                         value,
                         LocalRefKind::Borrowed,
                         ctx,

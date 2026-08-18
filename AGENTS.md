@@ -537,8 +537,13 @@ another revision's cache.
   multiple measured workers. During replay it sets
   `SOAC_PYPERFORMANCE_MEASURE_READY_FILE`, which makes the generic pyperf worker
   hook pause immediately before measured values so `perf` can attach after
-  benchmark import and any pyperf warmups. Use this instead of manually
-  reconstructing worker commands when profiling one pyperformance benchmark.
+  benchmark import and any pyperf warmups. It reuses a fresh release runtime,
+  records portable `cpu-clock` samples with a 1024-page buffer, and rejects
+  missing or lost samples. Detailed JIT block maps are enabled by default;
+  set `SOAC_JIT_BB_MAP=0` for symbol-level profiles when block-map writes on
+  a mounted checkout make worker startup prohibitively slow. Use this instead
+  of manually reconstructing worker commands when profiling one pyperformance
+  benchmark.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,

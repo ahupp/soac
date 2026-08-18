@@ -30,7 +30,7 @@ def _is_calibration_record(record: dict[str, Any]) -> bool:
     stable_args = record.get("stable_args", [])
     return any(
         isinstance(arg, str)
-        and (arg == "calibrate_loops" or arg.startswith("calibrate_"))
+        and arg.lstrip("-").replace("-", "_").startswith("calibrate_")
         for arg in stable_args
     )
 
