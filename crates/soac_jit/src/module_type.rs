@@ -55,7 +55,6 @@ pub struct SharedModuleState {
     pub module_name: String,
     pub package_name: String,
     pub source_hash: u64,
-    opaque_fused_nqueens_source_matches: bool,
     pub codegen_constants: ModuleCodegenConstants,
     storage_instance_key: usize,
     function_index_by_id: HashMap<RuntimeFunctionId, usize>,
@@ -150,10 +149,6 @@ impl SharedModuleState {
 
     pub fn source_hash(&self) -> u64 {
         self.source_hash
-    }
-
-    pub(crate) fn opaque_fused_nqueens_source_matches(&self) -> bool {
-        self.opaque_fused_nqueens_source_matches
     }
 
     pub fn lookup_function(
@@ -1006,7 +1001,6 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash: 0,
-        opaque_fused_nqueens_source_matches: false,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -1044,7 +1038,6 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash,
-        opaque_fused_nqueens_source_matches: false,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -1100,7 +1093,7 @@ pub fn build_shared_state_for_inspection_with_original_code_and_source_hash(
     module_name: &str,
     package_name: &str,
     source_hash: u64,
-    source: Option<&str>,
+    _source: Option<&str>,
     original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
 ) -> PyResult<Arc<SharedModuleState>> {
     let function_index_by_id = build_function_index_by_id(&lowered_module)?;
@@ -1118,8 +1111,6 @@ pub fn build_shared_state_for_inspection_with_original_code_and_source_hash(
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash,
-        opaque_fused_nqueens_source_matches: source
-            .is_some_and(crate::jit::opaque_fused_nqueens_source_matches),
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -1178,7 +1169,6 @@ impl SoacExtModuleState {
         module_name: String,
         package_name: String,
         source_hash: u64,
-        opaque_fused_nqueens_source_matches: bool,
     ) -> PyResult<()> {
         if self.initialized {
             return Err(PyRuntimeError::new_err(
@@ -1204,7 +1194,6 @@ impl SoacExtModuleState {
             module_name,
             package_name,
             source_hash,
-            opaque_fused_nqueens_source_matches,
             codegen_constants,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_index_by_id,
@@ -1851,13 +1840,11 @@ impl SoacExtModule {
         mut lowered_module: BlockPyModule<BlockPyModuleShape>,
         mut module_info: ModuleInfo,
         original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
-        source: &str,
+        _source: &str,
     ) -> PyResult<Py<PyAny>> {
         ensure_module_dict_metadata_names(&mut lowered_module.global_names);
         module_info.indexed_module_keys = lowered_module.global_names.clone();
         let source_hash = module_info.hash;
-        let opaque_fused_nqueens_source_matches =
-            crate::jit::opaque_fused_nqueens_source_matches(source);
         let module_name = spec
             .getattr("name")?
             .extract::<String>()
@@ -1870,16 +1857,10 @@ impl SoacExtModule {
             .env_config()
             .map_err(PyRuntimeError::new_err)?
             .specialization_mode();
-        // Source-backed named generators normally keep an ordinary globals
-        // dictionary because their native CPython frames own global lookup on
-        // the fallback path.  The exact opaque-fusion sources are the narrow
-        // exception: their entry guard must be able to probe the indexed slots
-        // without executing Python, and the unchanged source generators still
-        // handle an indexed dict correctly if any guard falls back.  An
-        // external mutation that converts the dict layout simply makes that
-        // indexed probe miss and reaches the original generator graph.
-        let use_ordinary_source_named_generator_globals = !opaque_fused_nqueens_source_matches
-            && lowered_module.callable_defs.iter().any(|function| {
+        // Source-backed named generator frames own their CPython global lookup,
+        // so they always require the same ordinary globals dictionary.
+        let use_ordinary_source_named_generator_globals =
+            lowered_module.callable_defs.iter().any(|function| {
                 source_named_generator_globals_require_ordinary_dict(
                     module_name.as_str(),
                     specialization_mode,
@@ -1912,7 +1893,6 @@ impl SoacExtModule {
                 module_name,
                 package_name,
                 source_hash,
-                opaque_fused_nqueens_source_matches,
             )?
         };
         Ok(module.unbind())
@@ -2099,7 +2079,6 @@ def f():
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
-            opaque_fused_nqueens_source_matches: false,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_templates: Mutex::new(HashMap::new()),
             module_constant_objs: Vec::new(),
@@ -2175,7 +2154,6 @@ def f(x):
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
-            opaque_fused_nqueens_source_matches: false,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_templates: Mutex::new(HashMap::new()),
             module_constant_objs: Vec::new(),
@@ -2382,7 +2360,6 @@ def f():
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
-            opaque_fused_nqueens_source_matches: false,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_templates: Mutex::new(HashMap::new()),
             module_constant_objs: Vec::new(),

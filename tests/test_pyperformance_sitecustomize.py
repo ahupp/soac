@@ -6,23 +6,6 @@ from types import SimpleNamespace
 from pathlib import Path
 
 
-def test_pinned_nqueens_source_matches_installed_pyperformance_benchmark():
-    spec = importlib.util.find_spec("benchmarks.bm_nqueens.run_benchmark")
-    assert spec is not None and spec.origin is not None
-    installed = Path(spec.origin)
-    pinned = (
-        Path(__file__).resolve().parents[1]
-        / "crates"
-        / "soac_jit"
-        / "src"
-        / "jit"
-        / "fixtures"
-        / "opaque_fused_pyperformance_nqueens_v1.py"
-    )
-
-    assert installed.read_bytes() == pinned.read_bytes()
-
-
 def load_pyperformance_sitecustomize(monkeypatch):
     monkeypatch.delenv("SOAC_PYPERFORMANCE_ENABLE", raising=False)
     path = (

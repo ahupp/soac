@@ -9533,7 +9533,6 @@ pub(super) fn optimize_blockpy(
         env_config,
         HashMap::new(),
         StaticDirectCallTargets::default(),
-        false,
     )
 }
 
@@ -9617,7 +9616,6 @@ fn build_shared_state_jit_module_plan(
         env_config,
         external_callees,
         static_targets,
-        shared_state.opaque_fused_nqueens_source_matches(),
     )?;
     let optimize_elapsed = optimize_start.elapsed();
     tracing::info!(
@@ -9641,7 +9639,6 @@ fn optimize_blockpy_with_external_inline_callees(
     env_config: &SoacEnvConfig,
     external_callees: HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
     static_targets: StaticDirectCallTargets,
-    opaque_fused_nqueens_source_matches: bool,
 ) -> Result<Arc<JitModulePlan>, String> {
     let total_start = Instant::now();
     let inline_plan_start = Instant::now();
@@ -9663,36 +9660,6 @@ fn optimize_blockpy_with_external_inline_callees(
                     static_generator_instances.get(&function.function_id),
                 )?;
             }
-            // Verify installs counter-recording vectorcalls on named source
-            // generators, intentionally invalidating their CPython function
-            // versions. The opaque entry guard therefore cannot activate in
-            // that mode; admission is an Apply-only terminal specialization.
-            let opaque_fused_admission =
-                if env_config.specialization_mode() == Some(SpecializationMode::Apply) {
-                    prepare_opaque_fused_count_admission(
-                        typed_module,
-                        &static_targets,
-                        opaque_fused_nqueens_source_matches,
-                    )?
-                } else {
-                    None
-                };
-            let opaque_fused_root_snapshot = opaque_fused_admission
-                .as_ref()
-                .map(|admission| {
-                    typed_module
-                        .callable_defs
-                        .iter()
-                        .find(|function| function.function_id == admission.root_function_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            format!(
-                                "opaque fused root {:?} disappeared before the rewrite snapshot",
-                                admission.root_function_id
-                            )
-                        })
-                })
-                .transpose()?;
             // Counter definitions and storage are fixed before typed rewrites.
             // Profiling must execute the original semantic instruction IDs;
             // cloned hot continuations would otherwise bypass their counters.
@@ -9712,29 +9679,6 @@ fn optimize_blockpy_with_external_inline_callees(
                     &external_callees,
                     &static_targets,
                     &static_direct_calls,
-                )?;
-            }
-            if let (Some(admission), Some(root_snapshot)) =
-                (&opaque_fused_admission, opaque_fused_root_snapshot)
-            {
-                let root = typed_module
-                    .callable_defs
-                    .iter_mut()
-                    .find(|function| function.function_id == admission.root_function_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "opaque fused root {:?} disappeared during ordinary rewrites",
-                            admission.root_function_id
-                        )
-                    })?;
-                *root = root_snapshot;
-                super::opaque_fused_iteration::attach_admitted_opaque_fused_count(
-                    typed_module,
-                    admission,
-                )?;
-                super::opaque_fused_iteration::validate_attached_opaque_fused_count_is_atomic(
-                    typed_module,
-                    admission,
                 )?;
             }
             Ok(())
@@ -10151,31 +10095,6 @@ fn prepare_trusted_typed_inline_work_for_function(
             builtin_plan,
         },
     })
-}
-
-/// Prepare exact-source opaque fusion without mutating the production module.
-/// Source-backed generators remain suppressed on the ordinary inline path;
-/// only this discovery clone exposes the complete graph for transactional
-/// semantic admission and typed-sidecar resolution.
-fn prepare_opaque_fused_count_admission(
-    module: &BlockPyModule<TypedBlockPyModuleShape>,
-    static_targets: &StaticDirectCallTargets,
-    exact_source_match: bool,
-) -> Result<Option<super::opaque_fused_iteration::AdmittedOpaqueFusedCount>, String> {
-    let mut discovery_module = module.clone();
-    for function in &mut discovery_module.callable_defs {
-        assign_missing_typed_function_instr_ids(function);
-    }
-    let mut discovery_targets = static_targets.clone();
-    discovery_targets.suppressed_source_generators.clear();
-    let plans = static_generator_instance_plans_for_module(&discovery_module, &discovery_targets);
-    for function in &mut discovery_module.callable_defs {
-        annotate_typed_generator_instance_plans(function, plans.get(&function.function_id))?;
-    }
-    super::opaque_fused_iteration::admit_tracked_nqueens_count(
-        &discovery_module,
-        exact_source_match,
-    )
 }
 
 fn apply_typed_v3_module_rewrites(
@@ -12694,7 +12613,6 @@ def run(values):
             &profile_config,
             HashMap::new(),
             StaticDirectCallTargets::default(),
-            false,
         )
         .expect("profile-mode hot loop should plan without replacing its original CFG");
         let profiled_run = profile_plan
@@ -12725,7 +12643,6 @@ def run(values):
             &apply_config,
             HashMap::new(),
             StaticDirectCallTargets::default(),
-            false,
         )
         .expect("apply-mode hot loop should retain ordinary continuation optimizations");
         let applied_run = apply_plan
@@ -12741,53 +12658,52 @@ def run(values):
     }
 
     #[test]
-    fn pinned_pyperformance_nqueens_discard_reaches_full_typed_pipeline() {
-        let source = include_str!("fixtures/opaque_fused_pyperformance_nqueens_v1.py");
-        let exact_source_match =
-            crate::jit::opaque_fused_iteration::tracked_nqueens_source_matches(source);
-        assert!(exact_source_match);
-        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
-            .expect("pinned pyperformance N-Queens should lower")
-            .blockpy_module;
-        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
-        let generator_targets = strict_module_global_generator_targets_for_module(&lowered);
-        assert_eq!(
-            generator_targets
-                .keys()
-                .map(String::as_str)
-                .collect::<HashSet<_>>(),
-            HashSet::from(["permutations", "n_queens"])
-        );
-        let static_targets = StaticDirectCallTargets {
-            module_global_generators: HashMap::from([(module_id, generator_targets)]),
-            ..StaticDirectCallTargets::default()
-        };
-        let plan = optimize_blockpy_with_external_inline_callees(
-            &lowered,
-            None,
-            &SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Apply)),
-            HashMap::new(),
-            static_targets,
-            exact_source_match,
-        )
-        .expect("pinned pyperformance N-Queens should admit opaque fusion");
-        let root = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.names.qualname == "bench_n_queens")
-            .expect("typed plan should retain bench_n_queens");
-        let fused = root
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(InstrTyped::opaque_fused_iteration_plan)
-            .collect::<Vec<_>>();
-        let [fused] = fused.as_slice() else {
-            panic!("expected exactly one body-hosted fused plan, got {fused:#?}");
-        };
-        assert_eq!(fused.result, soac_ir_typed::TypedOpaqueFusedResult::Discard);
-        assert_eq!((fused.minimum_width, fused.maximum_width), (0, 8));
+    fn source_backed_generator_consumers_do_not_receive_opaque_substitutions() {
+        const SOURCE: &str = "def values(limit):\n    for value in range(limit):\n        yield value\n\ndef consume(limit):\n    list(values(limit))\n";
+        let variants = [
+            SOURCE.to_string(),
+            format!("{SOURCE}\n# Source comments cannot change optimization eligibility.\n"),
+        ];
+        let mut previous_consumer_block_count = None;
+
+        for source in variants {
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("source-backed generator consumer should lower")
+                .blockpy_module;
+            let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+            let generator_targets = strict_module_global_generator_targets_for_module(&lowered);
+            assert!(generator_targets.contains_key("values"));
+            let static_targets = StaticDirectCallTargets {
+                module_global_generators: HashMap::from([(module_id, generator_targets)]),
+                ..StaticDirectCallTargets::default()
+            };
+            let plan = optimize_blockpy_with_external_inline_callees(
+                &lowered,
+                None,
+                &SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Apply)),
+                HashMap::new(),
+                static_targets,
+            )
+            .expect("source-backed generator consumer should use the ordinary typed pipeline");
+            let consumer = plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "consume")
+                .expect("typed plan should retain the source-backed generator consumer");
+            assert!(
+                consumer
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.body.iter())
+                    .all(|instr| instr.opaque_fused_iteration_plan().is_none()),
+                "ordinary source-backed generator consumption must remain observable"
+            );
+            if let Some(previous) = previous_consumer_block_count {
+                assert_eq!(consumer.blocks.len(), previous);
+            }
+            previous_consumer_block_count = Some(consumer.blocks.len());
+        }
     }
 
     fn assert_no_dead_synthetic_generator_materializations(

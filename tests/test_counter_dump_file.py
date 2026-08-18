@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import importlib.util
 import json
 import os
 import subprocess
@@ -977,7 +978,7 @@ def run():
         _assert_subprocess_ok(specialized_result)
 
 
-def test_specialized_full_nqueens_slice_preserves_results_and_guarded_fallbacks(tmp_path):
+def test_profiled_full_nqueens_slice_preserves_results_tracing_and_mutations(tmp_path):
     bench_dir = Path(__file__).resolve().parents[1] / "bench"
     work_dir = tmp_path / "soac-work"
     script = _import_and_run_script(
@@ -1068,7 +1069,12 @@ def test_specialized_full_nqueens_slice_preserves_results_and_guarded_fallbacks(
             assert module.full_nqueens_list_consumer(4) == 2
         finally:
             sys.settrace(None)
-        assert frame_events == [], frame_events
+        assert {"n_queens", "permutations"}.issubset(
+            {function_name for function_name, _event in frame_events}
+        ), frame_events
+        assert {"call", "line"}.issubset(
+            {event for _function_name, event in frame_events}
+        ), frame_events
         """,
         """
         original_n_queens = module.n_queens
@@ -1165,22 +1171,16 @@ def test_specialized_full_nqueens_slice_preserves_results_and_guarded_fallbacks(
         _assert_subprocess_ok(apply_result)
 
 
-def test_specialized_pyperformance_nqueens_discard_executes_hot_and_fallback_paths(
+def test_profiled_pyperformance_nqueens_preserves_generator_tracing_and_rebinding(
     tmp_path,
 ):
-    fixture = (
-        Path(__file__).resolve().parents[1]
-        / "crates"
-        / "soac_jit"
-        / "src"
-        / "jit"
-        / "fixtures"
-        / "opaque_fused_pyperformance_nqueens_v1.py"
-    )
+    spec = importlib.util.find_spec("benchmarks.bm_nqueens.run_benchmark")
+    assert spec is not None and spec.origin is not None
+    benchmark_source = Path(spec.origin)
     benchmark_root = tmp_path / "benchmarks" / "bm_nqueens"
     benchmark_root.mkdir(parents=True)
     benchmark_path = benchmark_root / "run_benchmark.py"
-    benchmark_path.write_bytes(fixture.read_bytes())
+    benchmark_path.write_bytes(benchmark_source.read_bytes())
     profile_script = _import_and_run_script(
         benchmark_root,
         "import run_benchmark as module",
@@ -1205,10 +1205,15 @@ def test_specialized_pyperformance_nqueens_discard_executes_hot_and_fallback_pat
             assert list(module.n_queens(1)) == [(0,)]
             assert frame_events, "direct generator consumption must exercise the tracer"
             frame_events.clear()
-            assert module.bench_n_queens(8) is None
+            assert module.bench_n_queens(4) is None
         finally:
             sys.settrace(None)
-        assert frame_events == [], frame_events
+        assert {"n_queens", "permutations"}.issubset(
+            {function_name for function_name, _event in frame_events}
+        ), frame_events
+        assert {"call", "line"}.issubset(
+            {event for _function_name, event in frame_events}
+        ), frame_events
 
         original_n_queens = module.n_queens
         fallback_calls = []
