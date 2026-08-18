@@ -121,7 +121,7 @@ def {func:id}({param:id}):
 while True:
     try:
         {target_tmp:id} = await __soac__.anext({iter_name:id})
-    except StopAsyncIteration:
+    except __soac__.StopAsyncIteration:
         break
     {target:expr} = {target_tmp:id}
     {body:stmt}
@@ -152,7 +152,7 @@ async for {target:expr} in {iter:expr}:
 while True:
     try:
         {target_tmp:id} = __soac__.next({iter_name:id})
-    except StopIteration:
+    except __soac__.StopIteration:
         break
     {target:expr} = {target_tmp:id}
     {body:stmt}

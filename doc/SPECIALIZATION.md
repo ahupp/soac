@@ -1311,6 +1311,24 @@ paths; unplanned item access goes through the CPython item APIs.
     encode directly
 
 
+## Compiler-Owned Iterator Exhaustion Exceptions
+
+Compiler-generated synchronous and asynchronous iteration handlers bind their
+exception types to the private runtime names `__soac__.StopIteration` and
+`__soac__.StopAsyncIteration`. This covers both synthetic comprehension
+rewrites and ordinary `for` / `async for` lowering. Compiler-owned iteration
+must not accidentally resolve a user module's lexical `StopIteration` or
+`StopAsyncIteration` binding: replacing either name must not change loop
+termination.
+
+The rule applies only to synthetic handlers. User-authored
+`except StopIteration:` and `except StopAsyncIteration:` continue to resolve
+ordinary lexical globals and therefore retain their existing Python-visible
+shadowing behavior. Lowered runtime-name provenance also remains explicit
+for downstream planning; this change does not add a new helper, alter
+optimizer direct-call selection, or bypass mutable runtime-helper globals.
+
+
 ## Static Runtime Builtin Primitives
 
 ### Counted Input

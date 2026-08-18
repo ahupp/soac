@@ -276,7 +276,7 @@ fn stop_iteration_handler_with_body(
                 r#"
 try:
     pass
-except StopIteration:
+except __soac__.StopIteration:
     pass
 "#
             ) else {
@@ -289,7 +289,7 @@ except StopIteration:
                 r#"
 try:
     pass
-except StopAsyncIteration:
+except __soac__.StopAsyncIteration:
     pass
 "#
             ) else {
@@ -892,4 +892,25 @@ where
         targets,
         lower_region,
     )
+}
+
+#[cfg(test)]
+mod stop_iteration_handler_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_iteration_handlers_use_compiler_owned_runtime_exceptions() {
+        for exception_name in ["StopIteration", "StopAsyncIteration"] {
+            let ast::ExceptHandler::ExceptHandler(handler) =
+                stop_iteration_handler_with_body(exception_name, Vec::new());
+            let Some(ast::Expr::Attribute(exception)) = handler.type_.as_deref() else {
+                panic!("synthetic {exception_name} handler must use a runtime attribute");
+            };
+            assert_eq!(exception.attr.as_str(), exception_name);
+            let ast::Expr::Name(runtime) = exception.value.as_ref() else {
+                panic!("synthetic {exception_name} handler must load the runtime namespace");
+            };
+            assert_eq!(runtime.id.as_str(), "__soac__");
+        }
+    }
 }
