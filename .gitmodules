@@ -1,4 +1,4 @@
 [submodule "vendor/cpython"]
 	path = vendor/cpython
-	url = https://github.com/ahupp/cpython.git
+	url = https://github.com/adamh-oai/cpython.git
 	branch = soac
