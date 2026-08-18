@@ -258,7 +258,9 @@ refresh forces rebuilds. It also installs the `ruff` command with uv. The repo
 keeps uv and XDG state under the working tree (`.uv-cache`, `.uv/`, `.xdg/`,
 and `work/tmp/`) and puts the repo-local uv tool bin directory on `PATH`, so
 later test and benchmark recipes can run uv in offline mode instead of fetching
-through the sandbox. Cargo uses the caller's normal `CARGO_HOME`.
+through the sandbox. The Python dependency lockfile is `soac_py/uv.lock`;
+freshness checks also honor a root `uv.lock` when one exists. Cargo uses the
+caller's normal `CARGO_HOME`.
 
 For jj worktrees, `just setup-dev-env` infers the parent checkout from a
 file-backed `.jj/repo` when possible. Set
@@ -609,21 +611,39 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 
 - `just pyperformance [stock|soac|soac-single] [output] [benchmarks] [extra pyperformance run args...]`
   Run the pyperformance suite against the vendored CPython executable. The
-  `stock` mode runs plain CPython. The default `soac` mode builds the release
-  SOAC extension, runs pyperformance once with `SOAC_OPT_MODE=profile`, then
-  runs it again with `SOAC_OPT_MODE=apply`; the requested `output` is the
-  apply result, and the profile pyperf result is written beside it with a
-  `.profile.json` suffix. Use `soac-single` for one-pass debugging; it honors
-  the caller's `SOAC_OPT_MODE` and defaults to `none`.
+  `stock` mode runs plain CPython and only prepares the Python environment; it
+  does not build or stage the SOAC extension. The default `soac` mode prepares
+  the release SOAC extension, runs pyperformance once with
+  `SOAC_OPT_MODE=profile`, then runs it again with `SOAC_OPT_MODE=apply`; the
+  requested `output` is the apply result, and the profile pyperf result is
+  written beside it with a `.profile.json` suffix. Use `soac-single` for
+  one-pass debugging; it honors the caller's `SOAC_OPT_MODE` and defaults to
+  `none`.
+
+  The unchanged-environment fast path reuses the existing `.venv` when its
+  `.soac-ready` marker, Python and pyperformance executables, vendored CPython,
+  `soac_py/pyproject.toml`, and `soac_py/uv.lock` remain current; a root
+  `uv.lock` is also checked when present. SOAC modes reuse
+  `target/release-ext/lib_soac_ext.so` until relevant Rust sources, Cargo
+  manifests/locks, build scripts, Rust toolchain/Cargo configuration, or
+  CPython inputs become stale. A missing or incorrectly staged extension
+  symlink is repaired without invoking Cargo when the release artifact is still
+  current. Missing or stale inputs fall back to the normal offline venv refresh
+  or release build automatically.
+
   SOAC modes inject a recipe-local `sitecustomize` into pyperformance worker
   subprocesses and install `soac.import_hook` before benchmark imports. When
   `output` is omitted, final results are written to
   `work/pyperformance/{stock,soac}-<timestamp>.json`, and pyperformance's own
   benchmark virtual environments are created under `work/pyperformance/venv/`.
-  The first run may install benchmark-specific dependencies from PyPI while
-  creating those virtual environments, even though SOAC's own venv refresh runs
-  offline; allow network access for this initial bootstrap or populate the
-  benchmark environments in advance.
+  A repo-owned pyperformance runner caches successful benchmark-environment
+  preparation, so repeated profile/apply passes and comparison rounds skip
+  unchanged pip install/freeze work. The first encounter, a missing benchmark
+  environment, or changed benchmark dependencies, interpreter, environment,
+  or lock inputs still uses the normal upstream setup. Initial setup may
+  install benchmark-specific dependencies from PyPI even though SOAC's own
+  venv refresh runs offline; allow network access for that bootstrap or
+  populate the benchmark environments in advance.
   When `benchmarks` is omitted, pyperformance uses its default suite selection;
   pass a comma-separated pyperformance benchmark list such as
   `json_dumps,chaos` for a narrower run. Stock runs, `soac-single`, and the
@@ -657,8 +677,11 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 
 - `just pyperformance-compare [benchmarks=chaos] [rounds=3] [baseline] [extra args...]`
   Compare stock CPython with separately profiled SOAC apply runs using
-  independently started, alternating measurements. The default `chaos`
-  benchmark is a quick mixed Python workload that exercises custom classes,
+  independently started, alternating measurements. The comparison and its
+  nested stock/SOAC rounds reuse fresh repo and benchmark virtual environments;
+  SOAC rounds reuse the current release extension instead of rebuilding or
+  restaging it unnecessarily. The default `chaos` benchmark is a quick mixed
+  Python workload that exercises custom classes,
   mutable attributes, operators, calls, nested loops, lists, arithmetic,
   branches, and standard-library functions.
 

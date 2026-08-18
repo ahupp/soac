@@ -406,10 +406,13 @@ so a later turn can resume without rediscovering context.
 - `just pytest-fast ...`
   Fast transformed-runtime pytest entrypoint for repeated focused checks. It
   reuses the existing venv and debug extension when `vendor/cpython/python`,
-  `soac_py/pyproject.toml`, `uv.lock`, and workspace Rust inputs are unchanged,
-  and falls back to the full build path when they are stale or missing. The
-  root pytest config defaults collection to `tests/`, so option-only invocations
-  such as `just pytest-fast -q` do not recurse into vendored CPython tests.
+  `soac_py/pyproject.toml`, the actual `soac_py/uv.lock`, and workspace
+  Rust/build/toolchain inputs are unchanged; a root `uv.lock` is also checked
+  when present. It falls back to the full build path when inputs or ready
+  artifacts are stale or missing, and restages the correct debug extension
+  without Cargo when the built artifact is already fresh. The root pytest
+  config defaults collection to `tests/`, so option-only invocations such as
+  `just pytest-fast -q` do not recurse into vendored CPython tests.
 - `just capture-test-stacks <pid> [out]`
   Hang diagnostic for test runs. Pass the PID printed by `just test-all` for
   `cargo-test`/`pytest`, or the PID of a stuck `just`, `pytest`, or
@@ -459,20 +462,41 @@ another revision's cache.
   for a final suite-wide performance claim. Pass a prior comparison directory
   or SOAC result JSON as `baseline` to also compare the changed SOAC revision
   against its previous revision. Results live under `work/pyperformance/`.
+  The comparison and its nested rounds use unchanged-environment freshness
+  checks instead of recreating the repo venv, rebuilding a current release
+  extension, or reinstalling unchanged benchmark-venv requirements each time.
   Inspect transformed-module and JIT evidence separately: completed benchmarks
   do not show that their standard-library or third-party hot paths were
   transformed. See `OPT_GOAL.md` for acceptance and compatibility policy.
 - `just pyperformance [stock|soac|soac-single] [output] [benchmarks] [extra pyperformance run args...]`
   Runs the pyperformance suite using the repo-local pyperformance install and
-  the vendored CPython executable. `stock` runs plain CPython. The default
-  `soac` mode builds the release SOAC extension, runs a profile pass, then runs
-  an apply pass. The requested `output` is the apply result; the profile pyperf
-  result is written beside it with a `.profile.json` suffix. Use `soac-single`
-  for one-pass debugging; it honors the caller's `SOAC_OPT_MODE` and defaults
-  to `none`. SOAC modes use `scripts/pyperformance_soac_sitecustomize/` to
+  the vendored CPython executable. `stock` runs plain CPython and requires only
+  a fresh repo venv; it does not build or stage an extension. The default
+  `soac` mode ensures a fresh release SOAC extension, runs a profile pass, then
+  runs an apply pass. The requested `output` is the apply result; the profile
+  pyperf result is written beside it with a `.profile.json` suffix. Use
+  `soac-single` for one-pass debugging; it honors the caller's `SOAC_OPT_MODE`
+  and defaults to `none`.
+
+  The shared venv fast path checks `.venv/.soac-ready`, executable Python and
+  pyperformance entrypoints, `vendor/cpython/python`,
+  `soac_py/pyproject.toml`, and `soac_py/uv.lock`, plus a root `uv.lock` when
+  present. The release runtime fast path additionally checks
+  `target/release-ext/lib_soac_ext.so` against relevant Rust/Cargo/build,
+  toolchain, Cargo-configuration, and CPython inputs. If the artifact is fresh
+  but the venv extension points to debug or is missing, restage the release
+  symlink without Cargo. Refresh or rebuild only when freshness checks fail.
+
+  SOAC modes use `scripts/pyperformance_soac_sitecustomize/` to
   install `soac.import_hook` in benchmark worker subprocesses. Results default
   to `work/pyperformance/{stock,soac}-<timestamp>.json`, and pyperformance's
   own benchmark virtual environments live under `work/pyperformance/venv/`.
+  The repo-owned pyperformance runner caches successful benchmark-venv
+  preparation, skipping repeated pip install/freeze work during unchanged
+  profile/apply passes and comparison rounds. Missing environments or changed
+  benchmark dependencies, interpreter, environment, or lock inputs fall back
+  to normal upstream setup; first-time benchmark dependency installation may
+  still require network access.
   `benchmarks` is passed to pyperformance's `--benchmarks` option, and extra
   args are appended to `pyperformance run`. Stock runs, `soac-single`, and the
   SOAC apply pass default pyperf sampling to `--fast --min-time=0.05`; the SOAC

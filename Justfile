@@ -352,19 +352,31 @@ build-test-runtime: (update-venv-offline) ensure-cpython ensure-shared-python
   cd "$REPO_ROOT"
   just build-extension debug
 
-build-test-runtime-fast: ensure-cpython ensure-shared-python
+[private]
+ensure-venv-fast: ensure-cpython
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
 
+  for dependency_input in "$REPO_ROOT/soac_py/pyproject.toml" "$REPO_ROOT/soac_py/uv.lock"; do
+    if [[ ! -f "$dependency_input" ]]; then
+      echo "Python environment dependency input not found: $dependency_input" >&2
+      exit 1
+    fi
+  done
+
   VENV_STAMP="$VENV_DIR/.soac-ready"
   needs_venv_refresh=0
-  if [[ ! -x "$VENV_DIR/bin/python" || ! -f "$VENV_STAMP" \
+  if [[ ! -x "$VENV_DIR/bin/python" || ! -x "$VENV_DIR/bin/pyperformance" \
+      || ! -f "$VENV_STAMP" \
       || "$CPYTHON_BIN" -nt "$VENV_STAMP" \
-      || "$REPO_ROOT/soac_py/pyproject.toml" -nt "$VENV_STAMP" ]]; then
+      || "$REPO_ROOT/soac_py/pyproject.toml" -nt "$VENV_STAMP" \
+      || "$(realpath -m "$VENV_DIR/bin/python")" != "$(realpath -m "$CPYTHON_BIN")" ]]; then
     needs_venv_refresh=1
   elif [[ -f "$REPO_ROOT/uv.lock" && "$REPO_ROOT/uv.lock" -nt "$VENV_STAMP" ]]; then
+    needs_venv_refresh=1
+  elif [[ "$REPO_ROOT/soac_py/uv.lock" -nt "$VENV_STAMP" ]]; then
     needs_venv_refresh=1
   fi
 
@@ -372,34 +384,77 @@ build-test-runtime-fast: ensure-cpython ensure-shared-python
     just update-venv-offline
   fi
 
-  SOURCE_EXT="$REPO_ROOT/target/debug/lib_soac_ext.so"
+build-runtime-fast build="debug": ensure-venv-fast ensure-shared-python
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  BUILD="{{build}}"
+  case "$BUILD" in
+    debug)
+      PROFILE_DIR=debug
+      ;;
+    release)
+      PROFILE_DIR=release-ext
+      ;;
+    *)
+      echo "build must be 'debug' or 'release'" >&2
+      exit 2
+      ;;
+  esac
+
+  SOURCE_EXT="$REPO_ROOT/target/$PROFILE_DIR/lib_soac_ext.so"
   SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
   EXT_SUFFIX="$("$VENV_DIR/bin/python" -c 'import importlib.machinery; print(importlib.machinery.EXTENSION_SUFFIXES[0])')"
   TARGET_EXT="$SITE_PACKAGES/_soac_ext$EXT_SUFFIX"
 
   needs_build=0
-  if [[ ! -f "$SOURCE_EXT" ]]; then
+  if [[ ! -f "$SOURCE_EXT" || "$CPYTHON_BIN" -nt "$SOURCE_EXT" ]]; then
     needs_build=1
-  elif find "$REPO_ROOT" \
-      -path "$REPO_ROOT/.jj" -prune -o \
-      -path "$REPO_ROOT/.venv" -prune -o \
-      -path "$REPO_ROOT/target" -prune -o \
-      -path "$REPO_ROOT/vendor" -prune -o \
-      -path "$REPO_ROOT/bench" -prune -o \
-      -path "$REPO_ROOT/work" -prune -o \
-      \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'build.rs' \) \
+  else
+    for build_input in \
+        "$REPO_ROOT/Cargo.toml" \
+        "$REPO_ROOT/Cargo.lock" \
+        "$REPO_ROOT/rust-toolchain" \
+        "$REPO_ROOT/rust-toolchain.toml" \
+        "$REPO_ROOT/.cargo/config" \
+        "$REPO_ROOT/.cargo/config.toml"; do
+      if [[ -f "$build_input" && "$build_input" -nt "$SOURCE_EXT" ]]; then
+        needs_build=1
+        break
+      fi
+    done
+  fi
+
+  if [[ "$needs_build" -eq 0 ]] && find "$REPO_ROOT/crates" \
+      -type d \( \
+        -name .git -o -name .jj -o -name .venv -o -name target \
+        -o -name vendor -o -name work -o -name .uv-cache -o -name .uv \
+        -o -name .xdg -o -name .pytest_cache -o -name .ruff_cache \
+        -o -name __pycache__ \
+      \) -prune -o \
+      -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.py' \) \
+      -newer "$SOURCE_EXT" -print -quit | grep -q .; then
+    needs_build=1
+  fi
+
+  if [[ "$needs_build" -eq 0 ]] && find "$CPYTHON_LIB_DIR" -maxdepth 1 \
+      -type f \( -name 'libpython*.so' -o -name 'libpython*.so.*' -o -name pyconfig.h \) \
       -newer "$SOURCE_EXT" -print -quit | grep -q .; then
     needs_build=1
   fi
 
   if [[ "$needs_build" -eq 1 ]]; then
-    just build-extension debug
+    just build-extension "$BUILD"
     exit 0
   fi
 
   if [[ ! -L "$TARGET_EXT" || "$(realpath -m "$TARGET_EXT")" != "$(realpath -m "$SOURCE_EXT")" ]]; then
-    just install-extension debug
+    just install-extension "$BUILD"
   fi
+
+build-test-runtime-fast: (build-runtime-fast "debug")
 
 build-all: build-test-runtime
   #!/usr/bin/env bash
@@ -1648,9 +1703,10 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       ;;
   esac
 
-  just update-venv-offline
   if [[ "$MODE" == soac* ]]; then
-    just build-extension release
+    just build-runtime-fast release
+  else
+    just ensure-venv-fast
   fi
 
   mkdir -p "$PYPERFORMANCE_RESULTS_DIR"
@@ -1677,7 +1733,7 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     pyperformance_base_args+=("--affinity=${PYPERFORMANCE_AFFINITY:-${BENCHMARK_CPU:-}}")
   fi
 
-  inherit_csv=""
+  inherit_env=(PIP_CACHE_DIR PIP_DISABLE_PIP_VERSION_CHECK)
   if [[ "$MODE" == soac* ]]; then
     VENV_SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
     PYPERFORMANCE_BENCHMARK_ROOT="$VENV_SITE_PACKAGES/pyperformance/data-files/benchmarks"
@@ -1695,7 +1751,7 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     export SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$PYPERFORMANCE_BENCHMARK_ROOT}"
     mkdir -p "$SOAC_WORK_DIR"
 
-    inherit_env=(
+    inherit_env+=(
       LD_LIBRARY_PATH
       PYTHONPATH
       RUST_BACKTRACE
@@ -1718,8 +1774,8 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       IFS=',' read -r -a extra_inherit_env <<<"$PYPERFORMANCE_INHERIT_ENV_EXTRA"
       inherit_env+=("${extra_inherit_env[@]}")
     fi
-    inherit_csv="$(IFS=,; echo "${inherit_env[*]}")"
   fi
+  inherit_csv="$(IFS=,; echo "${inherit_env[*]}")"
 
   pyperformance_user_args=("$@")
 
@@ -1799,7 +1855,9 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     fi
     (
       cd "$PYPERFORMANCE_RESULTS_DIR"
-      "$VENV_DIR/bin/pyperformance" "${run_args[@]}"
+      "$VENV_DIR/bin/python" \
+        "$REPO_ROOT/scripts/run_pyperformance_cached.py" \
+        "${run_args[@]}"
     )
     if [[ -f "$run_output" ]]; then
       echo "pyperformance result: $run_output"
@@ -1883,7 +1941,7 @@ pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure
     fi
   fi
 
-  just update-venv-offline
+  just ensure-venv-fast
   mkdir -p "$PYPERFORMANCE_RESULTS_DIR"
   RESULT_DIR="$(mktemp -d "$PYPERFORMANCE_RESULTS_DIR/comparison-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
   printf '%s\n' "${BENCHMARK_SELECTOR:-all}" > "$RESULT_DIR/benchmark-selector.txt"
