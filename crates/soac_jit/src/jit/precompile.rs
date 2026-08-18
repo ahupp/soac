@@ -228,11 +228,26 @@ pub(super) struct PrecompiledObjectBytes {
     pub(super) object: Vec<u8>,
     pub(super) function_count: usize,
     pub(super) data_object_count: usize,
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_endian = "little"
+    ))]
     pub(super) function_symbols: Vec<String>,
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_endian = "little"
+    ))]
     pub(super) data_symbols: Vec<String>,
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_endian = "little"
+    ))]
     pub(super) data_symbol_writable: Vec<(String, bool)>,
 }
 
@@ -556,17 +571,32 @@ pub(super) fn precompile_codegen_module_to_object_bytes(
         object,
         function_count: function_definitions.len(),
         data_object_count: data_definitions.len(),
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_endian = "little"
+        ))]
         function_symbols: function_definitions
             .iter()
             .map(|definition| definition.symbol.clone())
             .collect(),
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_endian = "little"
+        ))]
         data_symbols: data_definitions
             .iter()
             .map(|definition| definition.symbol.clone())
             .collect(),
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_endian = "little"
+        ))]
         data_symbol_writable: data_definitions
             .iter()
             .map(|definition| (definition.symbol.clone(), definition.writable))

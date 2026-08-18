@@ -94,7 +94,7 @@ unsafe fn raise_expected_cell(where_name: &str, obj: *mut ffi::PyObject) {
     } else {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"expected cell object\0".as_ptr() as *const i8,
+            b"expected cell object\0".as_ptr().cast(),
         );
     }
 }
@@ -108,7 +108,9 @@ unsafe extern "C" fn py_call_positional_three_hook(
     if tstate.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid null tstate in dp_jit_py_call_positional_three\0".as_ptr() as *const i8,
+            b"invalid null tstate in dp_jit_py_call_positional_three\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -146,7 +148,9 @@ unsafe extern "C" fn py_vectorcall_hook(
     if tstate.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid null tstate in dp_jit_py_vectorcall\0".as_ptr() as *const i8,
+            b"invalid null tstate in dp_jit_py_vectorcall\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -288,7 +292,7 @@ unsafe fn fast_runtime_stop_iteration_match(
     Some(ffi::PyBool_FromLong((matches != 0) as libc::c_long) as ObjPtr)
 }
 unsafe extern "C" fn enter_recursive_call_hook(_tstate: ObjPtr) -> i32 {
-    ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
+    ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr().cast())
 }
 
 #[unsafe(no_mangle)]
@@ -304,7 +308,9 @@ unsafe extern "C" fn guard_method_type_version_hook(
     if receiver.is_null() || expected_type.is_null() || expected_version < 0 {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_guard_method_type_version\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_guard_method_type_version\0"
+                .as_ptr()
+                .cast(),
         );
         return -1;
     }
@@ -331,7 +337,9 @@ unsafe extern "C" fn record_top_value_sample_hook(counter: ObjPtr, value: i64) {
     if counter.is_null() || value < 0 {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_record_top_value_sample\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_record_top_value_sample\0"
+                .as_ptr()
+                .cast(),
         );
         return;
     }
@@ -342,7 +350,7 @@ unsafe extern "C" fn record_top_value_sample_hook(counter: ObjPtr, value: i64) {
         } else {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                b"failed to record top-value sample\0".as_ptr() as *const i8,
+                b"failed to record top-value sample\0".as_ptr().cast(),
             );
         }
     }
@@ -394,7 +402,9 @@ unsafe fn load_global_obj_impl(
     if globals_obj.is_null() || name_obj.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_load_global_obj\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_load_global_obj\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -533,7 +543,9 @@ unsafe extern "C" fn pyobject_getattr_hook(obj: ObjPtr, attr: ObjPtr) -> ObjPtr 
     if obj.is_null() || attr.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_pyobject_getattr\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_pyobject_getattr\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -545,7 +557,9 @@ unsafe extern "C" fn pyobject_setattr_hook(obj: ObjPtr, attr: ObjPtr, value: Obj
     if obj.is_null() || attr.is_null() || value.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_pyobject_setattr\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_pyobject_setattr\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -571,7 +585,9 @@ unsafe extern "C" fn pyobject_getitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_pyobject_getitem\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_pyobject_getitem\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -583,7 +599,9 @@ unsafe extern "C" fn pyobject_setitem_hook(obj: ObjPtr, key: ObjPtr, value: ObjP
     if obj.is_null() || key.is_null() || value.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_pyobject_setitem\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_pyobject_setitem\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -610,7 +628,9 @@ unsafe extern "C" fn pyobject_delitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_pyobject_delitem\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_pyobject_delitem\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -632,7 +652,9 @@ unsafe extern "C" fn store_global_hook(
     if globals_obj.is_null() || name.is_null() || value.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_store_global\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_store_global\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -664,7 +686,7 @@ unsafe extern "C" fn del_quietly_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     if obj.is_null() || key.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_del_quietly\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_del_quietly\0".as_ptr().cast(),
         );
         return ptr::null_mut();
     }
@@ -691,9 +713,11 @@ unsafe extern "C" fn del_global_hook(
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
             if quietly {
-                b"invalid arguments to dp_jit_del_global_quietly\0".as_ptr() as *const i8
+                b"invalid arguments to dp_jit_del_global_quietly\0"
+                    .as_ptr()
+                    .cast()
             } else {
-                b"invalid arguments to dp_jit_del_global\0".as_ptr() as *const i8
+                b"invalid arguments to dp_jit_del_global\0".as_ptr().cast()
             },
         );
         return ptr::null_mut();
@@ -707,7 +731,9 @@ unsafe extern "C" fn pyobject_to_i64_hook(value: ObjPtr) -> i64 {
     if value.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid null value for dp_jit_pyobject_to_i64\0".as_ptr() as *const i8,
+            b"invalid null value for dp_jit_pyobject_to_i64\0"
+                .as_ptr()
+                .cast(),
         );
         return i64::MIN;
     }
@@ -727,7 +753,9 @@ unsafe extern "C" fn raise_unbound_local_error_hook(name_obj: ObjPtr) {
     if name_obj.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_raise_unbound_local_error\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_raise_unbound_local_error\0"
+                .as_ptr()
+                .cast(),
         );
         return;
     }
@@ -751,7 +779,9 @@ unsafe extern "C" fn raise_unbound_local_error_hook(name_obj: ObjPtr) {
     }
     ffi::PyErr_SetString(
         ffi::PyExc_UnboundLocalError,
-        b"cannot access local variable before assignment\0".as_ptr() as *const i8,
+        b"cannot access local variable before assignment\0"
+            .as_ptr()
+            .cast(),
     );
 }
 
@@ -802,7 +832,9 @@ unsafe extern "C" fn load_cell_hook(cell: ObjPtr) -> ObjPtr {
         }
         ffi::PyErr_SetString(
             ffi::PyExc_UnboundLocalError,
-            b"local variable referenced before assignment\0".as_ptr() as *const i8,
+            b"local variable referenced before assignment\0"
+                .as_ptr()
+                .cast(),
         );
     }
     value as ObjPtr
@@ -826,7 +858,7 @@ unsafe extern "C" fn del_deref_hook(cell: ObjPtr) -> ObjPtr {
     }
     let rc = ffi::PyObject_DelAttrString(
         cell as *mut ffi::PyObject,
-        b"cell_contents\0".as_ptr() as *const i8,
+        b"cell_contents\0".as_ptr().cast(),
     );
     if rc == 0 {
         let none = ffi::Py_None();
@@ -837,7 +869,9 @@ unsafe extern "C" fn del_deref_hook(cell: ObjPtr) -> ObjPtr {
         ffi::PyErr_Clear();
         ffi::PyErr_SetString(
             ffi::PyExc_UnboundLocalError,
-            b"local variable referenced before assignment\0".as_ptr() as *const i8,
+            b"local variable referenced before assignment\0"
+                .as_ptr()
+                .cast(),
         );
     }
     ptr::null_mut()
@@ -849,7 +883,7 @@ unsafe extern "C" fn del_deref_quietly_hook(cell: ObjPtr) -> ObjPtr {
     }
     let rc = ffi::PyObject_DelAttrString(
         cell as *mut ffi::PyObject,
-        b"cell_contents\0".as_ptr() as *const i8,
+        b"cell_contents\0".as_ptr().cast(),
     );
     if rc != 0 {
         if ffi::PyErr_ExceptionMatches(ffi::PyExc_ValueError) == 0 {
@@ -877,7 +911,7 @@ unsafe extern "C" fn dict_set_item_hook(dict_obj: ObjPtr, key: ObjPtr, value: Ob
     if dict_obj.is_null() || key.is_null() || value.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid dict_set_item arguments in JIT\0".as_ptr() as *const i8,
+            b"invalid dict_set_item arguments in JIT\0".as_ptr().cast(),
         );
         return -1;
     }
@@ -891,7 +925,7 @@ unsafe extern "C" fn is_true_hook(value: ObjPtr) -> i32 {
     if value.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid null value for dp_jit_is_true\0".as_ptr() as *const i8,
+            b"invalid null value for dp_jit_is_true\0".as_ptr().cast(),
         );
         return -1;
     }
@@ -901,7 +935,9 @@ unsafe extern "C" fn raise_from_exc_hook(exc: ObjPtr) -> i32 {
     if exc.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"missing exception for dp_jit_raise_from_exc\0".as_ptr() as *const i8,
+            b"missing exception for dp_jit_raise_from_exc\0"
+                .as_ptr()
+                .cast(),
         );
         return -1;
     }
@@ -949,7 +985,9 @@ unsafe extern "C" fn push_handled_exception_hook(exc: ObjPtr) -> ObjPtr {
     if exc.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"missing exception for dp_jit_push_handled_exception\0".as_ptr() as *const i8,
+            b"missing exception for dp_jit_push_handled_exception\0"
+                .as_ptr()
+                .cast(),
         );
         return ptr::null_mut();
     }
@@ -1471,7 +1509,7 @@ fn set_deopt_unsupported_continuation_error(detail: String) {
         unsafe {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                b"JIT deopt helper is not implemented\0".as_ptr() as *const i8,
+                b"JIT deopt helper is not implemented\0".as_ptr().cast(),
             );
         }
     }
@@ -1490,7 +1528,7 @@ pub unsafe extern "C" fn dp_jit_is_true(value: ObjPtr) -> i32 {
     is_true_hook(value)
 }
 unsafe fn load_python_capi_symbol(name: &'static [u8]) -> usize {
-    libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const i8) as usize
+    libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr().cast()) as usize
 }
 
 fn python_capi_symbol(name: &'static [u8]) -> *const u8 {

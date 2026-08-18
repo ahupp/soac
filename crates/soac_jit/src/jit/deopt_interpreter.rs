@@ -2397,7 +2397,9 @@ fn set_deopt_unbound_local_error(name: &str) {
         unsafe {
             ffi::PyErr_SetString(
                 ffi::PyExc_UnboundLocalError,
-                b"cannot access local variable before assignment\0".as_ptr() as *const i8,
+                b"cannot access local variable before assignment\0"
+                    .as_ptr()
+                    .cast(),
             );
         }
     }

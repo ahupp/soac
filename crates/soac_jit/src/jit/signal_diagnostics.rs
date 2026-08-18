@@ -1,3 +1,4 @@
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use libc::{c_int, c_void};
 use soac_core::block_py::RuntimeFunctionId;
 use std::ptr;

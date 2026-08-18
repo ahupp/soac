@@ -42,6 +42,7 @@ def value(items):
 
     with soac_module(tmp_path, "multiple_genexprs", source) as module:
         assert module.value([1, 2, 3]) is True
+        assert sys.exception() is None
 
 
 def test_soac_nested_try_can_raise_from_caught_exception(tmp_path):

@@ -1113,7 +1113,9 @@ unsafe fn py_function_jit_extra(
     if ffi::PyFunction_Check(function) == 0 {
         ffi::PyErr_SetString(
             ffi::PyExc_TypeError,
-            b"expected Python function for CLIF vectorcall data lookup\0".as_ptr() as *const i8,
+            b"expected Python function for CLIF vectorcall data lookup\0"
+                .as_ptr()
+                .cast(),
         );
         return Err(());
     }
@@ -1703,7 +1705,7 @@ unsafe fn ensure_clif_direct_entries_compiled(
                     } else {
                         ffi::PyErr_SetString(
                             ffi::PyExc_RuntimeError,
-                            b"failed to compile CLIF function body\0".as_ptr() as *const i8,
+                            b"failed to compile CLIF function body\0".as_ptr().cast(),
                         );
                     }
                     return Err(());
@@ -1721,22 +1723,27 @@ unsafe fn ensure_clif_direct_entries_compiled(
     if data.function_env.direct_code_ptr().is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"compiled CLIF function is missing a direct entry pointer\0".as_ptr() as *const i8,
+            b"compiled CLIF function is missing a direct entry pointer\0"
+                .as_ptr()
+                .cast(),
         );
         return Err(());
     }
     if data.function_env.default_direct_code_ptr().is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"compiled CLIF function is missing a default direct entry pointer\0".as_ptr()
-                as *const i8,
+            b"compiled CLIF function is missing a default direct entry pointer\0"
+                .as_ptr()
+                .cast(),
         );
         return Err(());
     }
     if data.function_env.deopt_table_ptr().is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"compiled CLIF function is missing deopt metadata\0".as_ptr() as *const i8,
+            b"compiled CLIF function is missing deopt metadata\0"
+                .as_ptr()
+                .cast(),
         );
         return Err(());
     }
@@ -2009,8 +2016,9 @@ unsafe fn ensure_clif_vectorcall_compiled(
                 } else {
                     ffi::PyErr_SetString(
                         ffi::PyExc_RuntimeError,
-                        b"failed to compile direct CLIF vectorcall trampoline\0".as_ptr()
-                            as *const i8,
+                        b"failed to compile direct CLIF vectorcall trampoline\0"
+                            .as_ptr()
+                            .cast(),
                     );
                 }
                 return Err(());
@@ -2147,7 +2155,7 @@ unsafe fn bind_function_args_to_output(
             cleanup_output_args(out_args, out_len);
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                b"null vectorcall positional argument\0".as_ptr() as *const i8,
+                b"null vectorcall positional argument\0".as_ptr().cast(),
             );
             return Err(());
         }
@@ -2168,7 +2176,7 @@ unsafe fn bind_function_args_to_output(
                 cleanup_output_args(out_args, out_len);
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
-                    b"null vectorcall positional vararg\0".as_ptr() as *const i8,
+                    b"null vectorcall positional vararg\0".as_ptr().cast(),
                 );
                 return Err(());
             }
@@ -2205,7 +2213,7 @@ unsafe fn bind_function_args_to_output(
             cleanup_output_args(out_args, out_len);
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                b"null vectorcall keyword argument\0".as_ptr() as *const i8,
+                b"null vectorcall keyword argument\0".as_ptr().cast(),
             );
             return Err(());
         }
@@ -2300,7 +2308,7 @@ pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(
         if callable.is_null() || data_ptr.is_null() || out_len < 0 {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                b"invalid direct vectorcall bind input\0".as_ptr() as *const i8,
+                b"invalid direct vectorcall bind input\0".as_ptr().cast(),
             );
             return 0;
         }
@@ -2334,7 +2342,9 @@ pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(
             } else {
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
-                    b"panic in bind_direct_args_from_vectorcall\0".as_ptr() as *const i8,
+                    b"panic in bind_direct_args_from_vectorcall\0"
+                        .as_ptr()
+                        .cast(),
                 );
             }
             0
@@ -2413,7 +2423,9 @@ pub(crate) unsafe extern "C" fn vectorcall_compile_function_env(
         {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                b"invalid vectorcall function env compile input\0".as_ptr() as *const i8,
+                b"invalid vectorcall function env compile input\0"
+                    .as_ptr()
+                    .cast(),
             );
             return ptr::null_mut();
         }
@@ -2435,7 +2447,9 @@ pub(crate) unsafe extern "C" fn vectorcall_compile_function_env(
             } else {
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
-                    b"panic in vectorcall_compile_function_env\0".as_ptr() as *const i8,
+                    b"panic in vectorcall_compile_function_env\0"
+                        .as_ptr()
+                        .cast(),
                 );
             }
             ptr::null_mut()
@@ -2452,7 +2466,9 @@ pub(crate) unsafe extern "C" fn direct_compile_function_env(
         if data_ptr.is_null() {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
-                b"invalid direct function env compile input\0".as_ptr() as *const i8,
+                b"invalid direct function env compile input\0"
+                    .as_ptr()
+                    .cast(),
             );
             return ptr::null_mut();
         }
@@ -2474,7 +2490,7 @@ pub(crate) unsafe extern "C" fn direct_compile_function_env(
             } else {
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
-                    b"panic in direct_compile_function_env\0".as_ptr() as *const i8,
+                    b"panic in direct_compile_function_env\0".as_ptr().cast(),
                 );
             }
             ptr::null_mut()
@@ -2544,8 +2560,9 @@ pub unsafe fn register_clif_vectorcall(
                 } else {
                     ffi::PyErr_SetString(
                         ffi::PyExc_RuntimeError,
-                        b"failed to compile shared CLIF vectorcall trampoline\0".as_ptr()
-                            as *const i8,
+                        b"failed to compile shared CLIF vectorcall trampoline\0"
+                            .as_ptr()
+                            .cast(),
                     );
                 }
             })?;
@@ -2627,7 +2644,9 @@ pub unsafe fn register_clif_vectorcall(
             } else {
                 ffi::PyErr_SetString(
                     ffi::PyExc_RuntimeError,
-                    b"failed to compile shared CLIF vectorcall trampoline\0".as_ptr() as *const i8,
+                    b"failed to compile shared CLIF vectorcall trampoline\0"
+                        .as_ptr()
+                        .cast(),
                 );
             }
         })?;

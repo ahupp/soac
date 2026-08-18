@@ -235,23 +235,54 @@ pub(super) fn parse_runtime_clif_functions() -> Result<Vec<ParsedRuntimeClifFunc
 fn runtime_clif_for_reader(clif_text: &str) -> Cow<'_, str> {
     const DISABLED_COMPACT_UNWIND: &str = "set enable_compact_unwind_abi=0";
 
-    if !clif_text
-        .lines()
-        .any(|line| line.trim() == DISABLED_COMPACT_UNWIND)
-    {
+    if !clif_text.lines().any(|line| {
+        line.trim() == DISABLED_COMPACT_UNWIND
+            || line
+                .trim_start()
+                .strip_prefix("target ")
+                .is_some_and(|target| target.split_whitespace().count() > 1)
+    }) {
         return Cow::Borrowed(clif_text);
     }
 
-    // rustc-codegen-cranelift from newer nightlies emits this disabled setting
-    // before the crates.io Cranelift reader exposes it. It has no effect on the
-    // function body that SOAC imports and recompiles with its own target ISA.
+    // rustc-codegen-cranelift from newer nightlies can emit disabled global
+    // settings and target ISA flags before the crates.io Cranelift reader
+    // exposes them. Neither affects the function bodies that SOAC imports and
+    // recompiles with its own target ISA.
     Cow::Owned(
         clif_text
             .lines()
             .filter(|line| line.trim() != DISABLED_COMPACT_UNWIND)
+            .map(|line| {
+                let Some(target) = line.trim_start().strip_prefix("target ") else {
+                    return line.to_owned();
+                };
+                let Some(isa) = target.split_whitespace().next() else {
+                    return line.to_owned();
+                };
+                format!("target {isa}")
+            })
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+#[cfg(test)]
+mod runtime_clif_reader_tests {
+    use super::runtime_clif_for_reader;
+
+    #[test]
+    fn parses_runtime_clif_with_unknown_target_isa_settings() {
+        let clif_text = format!(
+            "target {} unknown_future_isa_setting=0\nfunction u0:0() system_v {{\nblock0:\n    return\n}}\n",
+            std::env::consts::ARCH
+        );
+
+        let functions = cranelift_reader::parse_functions(&runtime_clif_for_reader(&clif_text))
+            .expect("runtime CLIF should ignore settings from a newer target ISA");
+
+        assert_eq!(functions.len(), 1);
+    }
 }
 
 fn parse_runtime_clif_extern_symbols(

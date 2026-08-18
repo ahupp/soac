@@ -18,13 +18,13 @@ use super::{
     nest_clif_blocks_by_nearest_dominator, normalize_postopt_clif_for_inspection, optimize_blockpy,
     optimize_blockpy_for_shared_state, parse_runtime_clif_functions,
     placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
-    precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
-    predeclare_typed_direct_call_imports, refresh_typed_function_value_facts,
-    render_compiled_clif_and_vcode_disasm, rewrite_clif_function_aliases,
-    run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
-    runtime_jit_deopt_guard_operand_replay_safe, runtime_jit_typed_deopt_guard_operand_replay_safe,
-    scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
-    static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
+    predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
+    refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
+    rewrite_clif_function_aliases, run_blockpy_function_from_entry,
+    run_blockpy_function_from_vectorcall_entry, runtime_jit_deopt_guard_operand_replay_safe,
+    runtime_jit_typed_deopt_guard_operand_replay_safe, scalar_counter_storage_symbol_for_instance,
+    static_runtime_primitive_desc_for_call, static_runtime_primitive_for_call,
+    top_value_counter_storage_symbol_for_instance,
     typed_expr_planned_pyobject_input_is_borrowed_from_local_env,
 };
 use soac_core::block_py::IncrementCounter;
@@ -89,7 +89,6 @@ mod tests {
         local_env_entry_py_facts_for_materialization, local_ref_kind_needs_incref_for_forward,
         local_ref_kind_needs_incref_for_load, local_ref_kind_needs_refcount_call,
         module_constant_object_symbol, module_constant_symbol_prefix_for_instance,
-        module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
         nullable_stack_slot_decref_facts, persistent_function_id_for_module_function,
         plan_direct_call_args_for_target, plan_typed_v3_jit_module_for_test,
@@ -100,6 +99,11 @@ mod tests {
         runtime_primitive_call_static_params_can_satisfy_abi, stable_cranelift_function_hash,
         stable_cranelift_function_name, typed_expr_is_borrowable_from_local_env,
         typed_local_load_direct_result_plan, validate_direct_call_compatibility,
+    };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
+    use super::super::{
+        module_constant_symbol_prefix_for_module_identity,
+        precompile_codegen_module_to_object_bytes,
     };
     use super::{
         AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
@@ -131,11 +135,10 @@ mod tests {
         nest_clif_blocks_by_nearest_dominator, normalize_postopt_clif_for_inspection,
         optimize_blockpy, optimize_blockpy_for_shared_state, parse_runtime_clif_functions,
         placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
-        precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
-        predeclare_typed_direct_call_imports, refresh_typed_function_value_facts,
-        render_compiled_clif_and_vcode_disasm, rewrite_clif_function_aliases,
-        run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
-        runtime_jit_deopt_guard_operand_replay_safe,
+        predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
+        refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
+        rewrite_clif_function_aliases, run_blockpy_function_from_entry,
+        run_blockpy_function_from_vectorcall_entry, runtime_jit_deopt_guard_operand_replay_safe,
         runtime_jit_typed_deopt_guard_operand_replay_safe,
         scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
         static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
@@ -1387,6 +1390,7 @@ def f():
         );
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     #[test]
     fn precompile_codegen_module_emits_relocatable_object() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
@@ -1454,6 +1458,7 @@ def add(a, b):
         }
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     #[test]
     fn precompile_codegen_module_emits_static_pylong_in_data_rel_ro() {
         crate::initialize_test_python();
@@ -1507,6 +1512,7 @@ def get_value():
         );
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     #[test]
     fn precompile_codegen_module_emits_static_big_pylong_in_data_rel_ro() {
         crate::initialize_test_python();
@@ -1561,6 +1567,7 @@ def get_value():
         );
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     #[test]
     fn precompile_codegen_module_emits_static_compact_ascii_unicode_in_data() {
         let module_name = "precompile_static_ascii";
@@ -1606,6 +1613,7 @@ def get_value():
         );
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     #[test]
     fn precompile_codegen_module_emits_static_compact_non_ascii_unicode_in_data() {
         crate::initialize_test_python();

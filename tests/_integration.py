@@ -109,6 +109,7 @@ def _load_module(
 
     module_path = package_dir / f"{module_name}.py"
     module_path.write_text(source, encoding="utf-8")
+    importlib.invalidate_caches()
     register_integration_module(module_path)
 
     package_root = str(tmp_path)

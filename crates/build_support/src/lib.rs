@@ -81,6 +81,7 @@ pub fn vendored_python_lib_dir(repo_root: &std::path::Path) -> std::path::PathBu
 
 fn find_python_shared_lib_name(dir: &std::path::Path) -> Option<String> {
     let entries = std::fs::read_dir(dir).ok()?;
+    let mut candidates = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             continue;
@@ -92,12 +93,22 @@ fn find_python_shared_lib_name(dir: &std::path::Path) -> Option<String> {
         if !file_name.starts_with("libpython") || !file_name.ends_with(".so") {
             continue;
         }
-        return file_name
+        let Some(link_name) = file_name
             .strip_prefix("lib")
             .and_then(|name| name.strip_suffix(".so"))
-            .map(ToOwned::to_owned);
+        else {
+            continue;
+        };
+        if !link_name
+            .strip_prefix("python")
+            .is_some_and(|version| version.contains('.'))
+        {
+            continue;
+        }
+        candidates.push(link_name.to_owned());
     }
-    None
+    candidates.sort_unstable();
+    candidates.pop()
 }
 
 fn collect_identity_paths(
@@ -152,5 +163,42 @@ impl StableHasher {
 
     fn finish(self) -> u64 {
         self.hash
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_python_shared_lib_name;
+
+    #[test]
+    fn selects_versioned_libpython_instead_of_abi_compatibility_stub() {
+        let dir = std::env::temp_dir().join(format!(
+            "soac-build-support-versioned-libpython-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libpython3.so"), b"abi compatibility stub").unwrap();
+        std::fs::write(dir.join("libpython3.15.so"), b"real shared interpreter").unwrap();
+
+        assert_eq!(
+            find_python_shared_lib_name(&dir).as_deref(),
+            Some("python3.15")
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_unversioned_libpython_abi_compatibility_stub() {
+        let dir = std::env::temp_dir().join(format!(
+            "soac-build-support-compatibility-stub-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libpython3.so"), b"abi compatibility stub").unwrap();
+
+        assert_eq!(find_python_shared_lib_name(&dir), None);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

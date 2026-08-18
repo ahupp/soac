@@ -184,6 +184,13 @@ use direct_function::{
 #[cfg(test)]
 use direct_function::{DirectCallIncompatibility, plan_direct_call_args_for_target};
 use function_targets::collect_typed_call_direct_targets;
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_endian = "little"
+))]
+use module_data::module_constant_symbol_prefix_for_module_identity;
 use module_data::{
     ModuleConstantAccess, ModuleConstantAccessTable, declare_module_constant_object_data,
     declare_top_value_counter_storage_import, declare_type_ptr_import,
@@ -194,8 +201,8 @@ use module_data::{
 use module_data::{
     declare_scalar_counter_storage_import, define_scalar_counter_storage_data_for_symbol,
     direct_function_symbol_scope_for_shared_state, module_constant_object_symbol,
-    module_constant_symbol_prefix_for_instance, module_constant_symbol_prefix_for_module_identity,
-    module_constant_symbol_prefix_for_shared_state, persistent_function_id_for_module_function,
+    module_constant_symbol_prefix_for_instance, module_constant_symbol_prefix_for_shared_state,
+    persistent_function_id_for_module_function,
     precompiled_direct_function_symbol_scope_for_persistent, push_shared_module_symbol_identity,
     scalar_counter_storage_symbol_for_instance, top_value_counter_storage_symbol_for_instance,
 };
@@ -218,7 +225,12 @@ pub use planning::{
     render_jit_deopt_resume_module, render_jit_function_locals, render_jit_module_locals,
     typed_exc_dispatch_plan,
 };
-#[cfg(test)]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_endian = "little"
+))]
 use precompile::precompile_codegen_module_to_object_bytes;
 pub use precompile::{
     PrecompileModuleIndex, PrecompileModuleIndexEntry, PrecompileObjectSummary,
@@ -23221,6 +23233,38 @@ fn build_cranelift_run_bb_specialized_function(
         {
             fb.switch_to_block(*cleanup_block);
             let ret_value = fb.block_params(*cleanup_block)[0];
+            let mut popped_exception_names = HashSet::new();
+            for block in &function.blocks {
+                let Some(exception_name) = block.exception_param() else {
+                    continue;
+                };
+                if !popped_exception_names.insert(exception_name) {
+                    continue;
+                }
+                let Some((previous_slot, is_pushed_slot)) =
+                    exception_state_slots.slots_for_exception(exception_name)
+                else {
+                    continue;
+                };
+                let is_pushed = fb.ins().stack_load(ir::types::I64, is_pushed_slot, 0);
+                let should_pop = fb
+                    .ins()
+                    .icmp_imm(ir::condcodes::IntCC::NotEqual, is_pushed, 0);
+                let pop_block = fb.create_block();
+                let done_block = fb.create_block();
+                fb.ins().brif(should_pop, pop_block, &[], done_block, &[]);
+
+                fb.switch_to_block(pop_block);
+                let previous = fb.ins().stack_load(ptr_ty, previous_slot, 0);
+                fb.ins().call(pop_handled_exception_ref, &[previous]);
+                let null_ptr = fb.ins().iconst(ptr_ty, 0);
+                fb.ins().stack_store(null_ptr, previous_slot, 0);
+                let not_pushed = fb.ins().iconst(ir::types::I64, 0);
+                fb.ins().stack_store(not_pushed, is_pushed_slot, 0);
+                fb.ins().jump(done_block, &[]);
+
+                fb.switch_to_block(done_block);
+            }
             stack_slots.decref_all_with_cleanup_root_states_counted(
                 &mut fb,
                 ptr_ty,

@@ -133,7 +133,7 @@ impl StaticPyObjectTemplate {
 
     fn static_object_image(&self) -> Option<StaticPyObjectImage> {
         if !cfg!(all(
-            target_arch = "x86_64",
+            target_pointer_width = "64",
             target_endian = "little",
             not(Py_GIL_DISABLED),
             not(py_sys_config = "Py_TRACE_REFS")
@@ -197,7 +197,7 @@ pub(super) fn build_python_constants(
             ModuleConstantValue::Bytes(bytes) => {
                 let ptr = unsafe {
                     ffi::PyBytes_FromStringAndSize(
-                        bytes.as_ptr() as *const i8,
+                        bytes.as_ptr().cast(),
                         bytes.len() as ffi::Py_ssize_t,
                     )
                 };
@@ -595,7 +595,7 @@ fn static_pyobject_relocation_value(symbol: &str) -> Result<usize, String> {
 fn build_unicode_constant<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyAny>> {
     let mut ptr = unsafe {
         ffi::PyUnicode_DecodeUTF8(
-            bytes.as_ptr() as *const i8,
+            bytes.as_ptr().cast(),
             bytes.len() as ffi::Py_ssize_t,
             c"surrogatepass".as_ptr(),
         )

@@ -550,6 +550,7 @@ mod test {
     use soac_core::profile::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use soac_driver::blockpy_cache::store_blockpy_module_cache;
     use soac_driver::{SourceToBlockPyOptions, source_to_blockpy};
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -774,6 +775,7 @@ mod test {
         );
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     #[test]
     fn offline_precompile_links_shared_library_from_counter_dump_and_cache() {
         if !linker_available(OsStr::new("cc")) {
@@ -903,6 +905,7 @@ mod test {
         ))
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     fn linker_available(linker: &OsStr) -> bool {
         Command::new(linker)
             .arg("--version")
@@ -914,6 +917,7 @@ mod test {
             .unwrap_or(false)
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_endian = "little"))]
     fn assert_elf_file(path: &Path) {
         let bytes = fs::read(path).unwrap_or_else(|err| {
             panic!("failed to read emitted ELF file {}: {err}", path.display())
