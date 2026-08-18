@@ -1542,3 +1542,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   (`1.050x`), `deltablue` `4.69 ms` to `4.58 ms` (`1.024x`), and `richards`
   `43.20 ms` to `44.06 ms` (`0.981x`); mixed-workload geometric improvement
   `1.018x`. The candidate remains `0.357x` stock CPython across that subset.
+
+## 2026-08-18 - Reuse prepared synthetic closure code
+
+- jj change id: `otwslxwo`
+- summary: reuse each synthetic closure's immutable named code object while
+  preserving fresh captures, original source code, runtime mutation, and
+  reentrant initialization.
+- pyperformance SOAC apply: `chaos` `94.56 ms` to `84.28 ms` (`1.122x`
+  faster, statistically significant); three-workload geometric improvement
+  `1.050x`, with unchanged generated code and a `0.401x` stock-CPython score.

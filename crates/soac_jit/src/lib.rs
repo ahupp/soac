@@ -459,6 +459,7 @@ pub(crate) struct FunctionInstantiationTemplate {
     runtime_data_layout: jit::FunctionRuntimeDataLayout,
     binding_plan: DirectArgBindingPlan,
     entry_plan: jit::RuntimeFunctionEntryPlan,
+    prepared_synthetic_code: OnceLock<function_instantiation::PreparedSyntheticCode>,
 }
 
 impl FunctionInstantiationTemplate {
@@ -485,6 +486,7 @@ impl FunctionInstantiationTemplate {
             runtime_data_layout,
             binding_plan,
             entry_plan,
+            prepared_synthetic_code: OnceLock::new(),
         })
     }
 

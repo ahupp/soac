@@ -37,6 +37,18 @@ pub(crate) fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
 }
 
 fn import_dp_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
+    unsafe {
+        let modules = ffi::PyImport_GetModuleDict();
+        if !modules.is_null() {
+            let runtime = ffi::PyDict_GetItemString(modules, c"soac.runtime".as_ptr());
+            if !runtime.is_null() {
+                let runtime = Bound::from_borrowed_ptr(py, runtime);
+                if let Ok(runtime) = runtime.cast_into::<PyModule>() {
+                    return Ok(runtime);
+                }
+            }
+        }
+    }
     PyModule::import(py, "soac.runtime")
 }
 
@@ -261,10 +273,11 @@ fn update_function_metadata(
     name: &str,
     doc: Option<&str>,
     annotate_fn: &Bound<'_, PyAny>,
+    has_prepared_code_metadata: bool,
 ) -> PyResult<()> {
     ignore_attr_or_type_error(py, func.setattr("__qualname__", qualname))?;
     ignore_attr_or_type_error(py, func.setattr("__name__", name))?;
-    if func.cast::<PyFunction>().is_ok() {
+    if !has_prepared_code_metadata && func.cast::<PyFunction>().is_ok() {
         let code = func.getattr("__code__")?;
         let has_matching_name = code.getattr("co_name")?.eq(name)?;
         let has_matching_qualname = code.getattr("co_qualname")?.eq(qualname)?;
@@ -452,7 +465,7 @@ fn split_param_defaults<'py>(
     })?;
     let mut default_index = 0usize;
     let mut positional_defaults = Vec::new();
-    let kwdefaults = PyDict::new(py);
+    let mut kwdefaults = None;
     for param in &function.params.params {
         if !param.has_default {
             continue;
@@ -463,7 +476,9 @@ fn split_param_defaults<'py>(
         default_index += 1;
         match param.kind {
             ParamKind::PosOnly | ParamKind::Any => positional_defaults.push(value.unbind()),
-            ParamKind::KwOnly => kwdefaults.set_item(param.name.as_str(), &value)?,
+            ParamKind::KwOnly => kwdefaults
+                .get_or_insert_with(|| PyDict::new(py))
+                .set_item(param.name.as_str(), &value)?,
             ParamKind::VarArg | ParamKind::KwArg => {
                 return Err(PyRuntimeError::new_err(format!(
                     "invalid default-bearing bb param kind: {:?}",
@@ -481,11 +496,6 @@ fn split_param_defaults<'py>(
         None
     } else {
         Some(tuple_from_owned_objects(py, positional_defaults)?)
-    };
-    let kwdefaults = if kwdefaults.is_empty() {
-        None
-    } else {
-        Some(kwdefaults)
     };
     Ok((positional_defaults, kwdefaults))
 }
@@ -523,12 +533,110 @@ fn make_lazy_clif_entry<'py>(
 
 struct InstantiatedEntry<'py> {
     entry: Bound<'py, PyAny>,
+    has_prepared_code_metadata: bool,
+}
+
+pub(crate) struct PreparedSyntheticCode {
+    runtime_module: usize,
+    code_factory: Py<PyAny>,
+    code: Py<PyAny>,
+}
+
+fn canonical_bootstrap_code_factory(factory: &Bound<'_, PyAny>) -> bool {
+    unsafe {
+        let modules = ffi::PyImport_GetModuleDict();
+        if modules.is_null() {
+            return false;
+        }
+        let bootstrap = ffi::PyDict_GetItemString(modules, c"soac.bootstrap".as_ptr());
+        if bootstrap.is_null()
+            || ffi::Py_TYPE(bootstrap) != std::ptr::addr_of_mut!(ffi::PyModule_Type)
+        {
+            return false;
+        }
+        let globals = ffi::PyModule_GetDict(bootstrap);
+        if globals.is_null() {
+            return false;
+        }
+        let original = ffi::PyDict_GetItemString(globals, c"code_with_freevars".as_ptr());
+        !original.is_null() && original == factory.as_ptr()
+    }
+}
+
+fn synthetic_code_for_template<'py>(
+    py: Python<'py>,
+    dp: &Bound<'py, PyModule>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    function_template: &FunctionInstantiationTemplate,
+    captured_names: &[String],
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let factory = dp.getattr("code_with_freevars")?;
+    let (is_async, is_generator) = match function.lowered_kind() {
+        FunctionKind::Function => (false, false),
+        FunctionKind::Coroutine => (true, false),
+        FunctionKind::Generator => (false, true),
+        FunctionKind::AsyncGenerator => (true, true),
+    };
+
+    if !canonical_bootstrap_code_factory(&factory) {
+        let code = factory.call1((
+            tuple_from_strings(py, captured_names)?,
+            is_async,
+            is_generator,
+        ))?;
+        return Ok((code, false));
+    }
+
+    if let Some(prepared) = function_template.prepared_synthetic_code.get() {
+        if prepared.runtime_module == dp.as_ptr() as usize
+            && prepared.code_factory.as_ptr() == factory.as_ptr()
+        {
+            return Ok((prepared.code.bind(py).clone(), true));
+        }
+        let code = factory.call1((
+            tuple_from_strings(py, captured_names)?,
+            is_async,
+            is_generator,
+        ))?;
+        return Ok((code, false));
+    }
+
+    let code = factory.call1((
+        tuple_from_strings(py, captured_names)?,
+        is_async,
+        is_generator,
+    ))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("co_name", function.names.display_name.as_str())?;
+    kwargs.set_item("co_qualname", function.names.qualname.as_str())?;
+    let code = code.call_method("replace", (), Some(&kwargs))?;
+    let code_factory_ptr = factory.as_ptr();
+    let prepared = PreparedSyntheticCode {
+        runtime_module: dp.as_ptr() as usize,
+        code_factory: factory.unbind(),
+        code: code.clone().unbind(),
+    };
+
+    // Initializing the code invokes Python and can re-enter this same template through an audit
+    // hook or a customized bootstrap cache. Never hold a OnceLock initialization lock there.
+    if function_template
+        .prepared_synthetic_code
+        .set(prepared)
+        .is_err()
+        && let Some(prepared) = function_template.prepared_synthetic_code.get()
+        && prepared.runtime_module == dp.as_ptr() as usize
+        && prepared.code_factory.as_ptr() == code_factory_ptr
+    {
+        return Ok((prepared.code.bind(py).clone(), true));
+    }
+    Ok((code, true))
 }
 
 fn build_closure_shaped_entry_from_ordered_captures<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
     function: &BlockPyFunction<BlockPyModuleShape>,
+    function_template: &FunctionInstantiationTemplate,
     module_globals: &Bound<'py, PyAny>,
     qualname: &str,
     captured_names: &[String],
@@ -537,34 +645,14 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
 ) -> PyResult<InstantiatedEntry<'py>> {
     debug_assert!(!captured_names.is_empty());
     debug_assert_eq!(captured_names.len(), captured_values.len());
-    let code = if let Some(code) = original_code {
+    let (code, has_prepared_code_metadata) = if let Some(code) = original_code {
         if code_freevars_match_names(code, captured_names)? {
-            code.clone()
+            (code.clone(), false)
         } else {
-            let (is_async, is_generator) = match function.lowered_kind() {
-                FunctionKind::Function => (false, false),
-                FunctionKind::Coroutine => (true, false),
-                FunctionKind::Generator => (false, true),
-                FunctionKind::AsyncGenerator => (true, true),
-            };
-            dp.getattr("code_with_freevars")?.call1((
-                tuple_from_strings(py, captured_names)?,
-                is_async,
-                is_generator,
-            ))?
+            synthetic_code_for_template(py, dp, function, function_template, captured_names)?
         }
     } else {
-        let (is_async, is_generator) = match function.lowered_kind() {
-            FunctionKind::Function => (false, false),
-            FunctionKind::Coroutine => (true, false),
-            FunctionKind::Generator => (false, true),
-            FunctionKind::AsyncGenerator => (true, true),
-        };
-        dp.getattr("code_with_freevars")?.call1((
-            tuple_from_strings(py, captured_names)?,
-            is_async,
-            is_generator,
-        ))?
+        synthetic_code_for_template(py, dp, function, function_template, captured_names)?
     };
     let mut closure_cells = Vec::with_capacity(captured_values.len());
     for value in captured_values {
@@ -596,6 +684,7 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
     }
     Ok(InstantiatedEntry {
         entry: func.into_any(),
+        has_prepared_code_metadata,
     })
 }
 
@@ -674,6 +763,7 @@ fn build_closure_shaped_entry<'py>(
     }
     Ok(InstantiatedEntry {
         entry: func.into_any(),
+        has_prepared_code_metadata: false,
     })
 }
 
@@ -826,6 +916,7 @@ fn instantiate_bb_function_inner(
         function.names.display_name.as_str(),
         function.doc.as_deref(),
         annotate_fn,
+        instantiated_entry.has_prepared_code_metadata,
     )?;
     entry.setattr("__module__", module_name)?;
     // soac.runtime's source helpers are the runtime ABI for other transformed
@@ -943,12 +1034,16 @@ fn instantiate_closure_backed_entry<'py>(
                     module_globals,
                     original_code_without_freevars,
                 )?;
-                return Ok(InstantiatedEntry { entry });
+                return Ok(InstantiatedEntry {
+                    entry,
+                    has_prepared_code_metadata: false,
+                });
             } else {
                 return build_closure_shaped_entry_from_ordered_captures(
                     py,
                     dp,
                     function,
+                    function_template,
                     module_globals,
                     qualname,
                     captured_names,
@@ -976,7 +1071,10 @@ fn instantiate_closure_backed_entry<'py>(
             module_globals,
             original_code_without_freevars,
         )?;
-        return Ok(InstantiatedEntry { entry });
+        return Ok(InstantiatedEntry {
+            entry,
+            has_prepared_code_metadata: false,
+        });
     } else {
         return build_closure_shaped_entry(
             py,
