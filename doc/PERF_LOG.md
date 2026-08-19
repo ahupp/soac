@@ -1633,3 +1633,12 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 - eight-workload stock score `0.521x`; previous-SOAC robust improvement
   `1.016x`. Three-round robust improvement `1.067x`, led by `deltablue`
   `1.112x` and `richards` `1.171x`; generated native code grows `4.256%`.
+
+## 2026-08-19 - Fast-path exact positional argument binding
+
+- jj change id: `nnyqlvvy`
+- summary: reuse direct argument plans for fully supplied positional calls.
+- eight-workload stock score `0.548217x` versus prior `0.520917x`;
+  previous-SOAC improvement `1.05714x`, targeted robust `1.05567x`.
+  `deltablue` improves `3.750 ms` to `3.529 ms` and `richards` `33.959 ms`
+  to `31.815 ms`; generated native code remains unchanged.

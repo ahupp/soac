@@ -451,6 +451,14 @@ impl DirectArgBindingPlan {
         self.positional_param_indices.len()
     }
 
+    fn binds_exact_positional(&self, nargsf: usize, kwnames: *mut ffi::PyObject) -> bool {
+        kwnames.is_null()
+            && self.varargs_param.is_none()
+            && self.varkw_param.is_none()
+            && self.positional_capacity() == self.param_count()
+            && unsafe { ffi::PyVectorcall_NARGS(nargsf) as usize } == self.param_count()
+    }
+
     fn param_index(&self, name: &str) -> Option<usize> {
         self.param_indices_by_name.get(name).copied()
     }
@@ -2595,6 +2603,33 @@ unsafe fn bind_function_args_to_output(
         );
         return Err(());
     }
+
+    if plan.binds_exact_positional(nargsf, kwnames) {
+        if out_len != 0 && out_args.is_null() {
+            return initialize_output_args(out_args, out_len);
+        }
+        if out_len != 0 && args.is_null() {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"missing vectorcall argument array in CLIF function binding".as_ptr(),
+            );
+            return Err(());
+        }
+        for position in 0..out_len {
+            let value = *args.add(position);
+            if value.is_null() {
+                cleanup_output_args(out_args, position);
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"null vectorcall positional argument\0".as_ptr().cast(),
+                );
+                return Err(());
+            }
+            write_output_arg_from_borrowed(out_args, position, value);
+        }
+        return Ok(());
+    }
+
     initialize_output_args(out_args, out_len)?;
     let callable_name = plan.callable_name.as_str();
     let nargs = ffi::PyVectorcall_NARGS(nargsf) as usize;
@@ -4027,6 +4062,259 @@ mod tests {
     use super::*;
     use pyo3::types::{PyDict, PyList, PyModule};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn exact_positional_binding_selects_only_fully_supplied_ordered_parameters() {
+        let module = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def zero():
+    return 1
+
+def ordinary(first, second):
+    return first + second
+
+def positional_only(first, /, second):
+    return first + second
+
+def defaulted(first, second=2):
+    return first + second
+
+def keyword_only(first, *, second):
+    return first + second
+
+def variadic(first, *remaining):
+    return first
+
+def keyword_variadic(first, **remaining):
+    return first
+
+def make_closure(captured):
+    def closure(value):
+        return captured + value
+    return closure
+
+def generated(value):
+    yield value
+"#,
+        )
+        .expect("exact-positional binding fixture should lower")
+        .blockpy_module;
+        let plan_for = |qualname: &str| {
+            let function = module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == qualname)
+                .unwrap_or_else(|| panic!("lowered binding fixture should contain {qualname}"));
+            DirectArgBindingPlan::from_function(function)
+        };
+        let no_keywords = ptr::null_mut();
+        let present_keywords = NonNull::<ffi::PyObject>::dangling().as_ptr();
+
+        assert!(plan_for("zero").binds_exact_positional(0, no_keywords));
+        assert!(plan_for("ordinary").binds_exact_positional(2, no_keywords));
+        assert!(
+            plan_for("ordinary")
+                .binds_exact_positional(2 | ffi::PY_VECTORCALL_ARGUMENTS_OFFSET, no_keywords),
+            "the vectorcall offset flag is not part of the positional argument count"
+        );
+        assert!(plan_for("positional_only").binds_exact_positional(2, no_keywords));
+        assert!(plan_for("defaulted").binds_exact_positional(2, no_keywords));
+        assert!(plan_for("make_closure.<locals>.closure").binds_exact_positional(1, no_keywords));
+        assert!(plan_for("generated").binds_exact_positional(1, no_keywords));
+
+        assert!(!plan_for("ordinary").binds_exact_positional(1, no_keywords));
+        assert!(!plan_for("ordinary").binds_exact_positional(3, no_keywords));
+        assert!(!plan_for("ordinary").binds_exact_positional(2, present_keywords));
+        assert!(!plan_for("defaulted").binds_exact_positional(1, no_keywords));
+        assert!(!plan_for("keyword_only").binds_exact_positional(2, no_keywords));
+        assert!(!plan_for("variadic").binds_exact_positional(2, no_keywords));
+        assert!(!plan_for("keyword_variadic").binds_exact_positional(2, no_keywords));
+    }
+
+    #[test]
+    fn exact_positional_binding_preserves_owned_references_and_cleans_only_written_prefix() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| {
+            let module = soac_lowering::lower_python_to_blockpy_for_testing(
+                "def zero():\n    return 1\n\ndef three(first, second, third):\n    return first\n",
+            )
+            .expect("actual vectorcall binding fixture should lower")
+            .blockpy_module;
+            let module_state = module_type::build_shared_state_for_testing(
+                py,
+                module,
+                "exact_positional_binding_test",
+                "",
+            )
+            .expect("actual vectorcall binding fixture should build module state");
+            let globals = PyDict::new(py);
+            let builtins = PyDict::new(py);
+            let data_for = |qualname: &str| {
+                let function = module_state
+                    .lowered_module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.qualname == qualname)
+                    .unwrap_or_else(|| panic!("binding fixture should contain {qualname}"));
+                let function_template = module_state
+                    .lookup_function_template(function.function_id)
+                    .expect("binding fixture template lookup should succeed")
+                    .expect("binding fixture should have a function template");
+                let mut function_env = Box::new(
+                    unsafe {
+                        FunctionEnv::new(
+                            globals.as_ptr(),
+                            builtins.as_ptr(),
+                            module_state.late_bound_owner_fields.cells.as_ptr(),
+                            Vec::new().into_boxed_slice(),
+                        )
+                    }
+                    .expect("binding fixture function environment should allocate"),
+                );
+                PyFunctionJitExtra {
+                    function_env_ptr: function_env.as_mut_ptr(),
+                    function_id: function.function_id,
+                    function_env,
+                    function_template,
+                    compile_session: Arc::new(CompileSession::new()),
+                    module_state: Arc::clone(&module_state),
+                    compiled_vectorcall_entry: None,
+                    previous_vectorcall: None,
+                    registered_code: ptr::null_mut(),
+                    registered_defaults: ptr::null_mut(),
+                    registered_kwdefaults: ptr::null_mut(),
+                }
+            };
+
+            let zero = data_for("zero");
+            assert!(
+                unsafe {
+                    bind_function_args_to_output(
+                        &zero,
+                        ptr::null(),
+                        ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        0,
+                    )
+                }
+                .is_ok(),
+                "zero-argument calls must accept null buffers and the vectorcall offset flag"
+            );
+
+            let three = data_for("three");
+            let first = PyList::empty(py);
+            let second = PyList::empty(py);
+            let third = PyList::empty(py);
+            let first_refcount = unsafe { ffi::Py_REFCNT(first.as_ptr()) };
+            let second_refcount = unsafe { ffi::Py_REFCNT(second.as_ptr()) };
+            let third_refcount = unsafe { ffi::Py_REFCNT(third.as_ptr()) };
+            let args = [first.as_ptr(), second.as_ptr(), third.as_ptr()];
+            let sentinel = NonNull::<ffi::PyObject>::dangling().as_ptr();
+            let mut output = [sentinel; 3];
+            assert!(
+                unsafe {
+                    bind_function_args_to_output(
+                        &three,
+                        args.as_ptr(),
+                        3 | ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
+                        ptr::null_mut(),
+                        output.as_mut_ptr(),
+                        output.len(),
+                    )
+                }
+                .is_ok(),
+                "fully positional arguments should bind in declaration order"
+            );
+            assert_eq!(output, args);
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(first.as_ptr()) },
+                first_refcount + 1
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(second.as_ptr()) },
+                second_refcount + 1
+            );
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(third.as_ptr()) },
+                third_refcount + 1
+            );
+            unsafe { cleanup_output_args(output.as_mut_ptr(), output.len()) };
+            assert_eq!(unsafe { ffi::Py_REFCNT(first.as_ptr()) }, first_refcount);
+            assert_eq!(unsafe { ffi::Py_REFCNT(second.as_ptr()) }, second_refcount);
+            assert_eq!(unsafe { ffi::Py_REFCNT(third.as_ptr()) }, third_refcount);
+
+            let malformed = [first.as_ptr(), ptr::null_mut(), third.as_ptr()];
+            let mut partial_output = [sentinel; 3];
+            assert!(
+                unsafe {
+                    bind_function_args_to_output(
+                        &three,
+                        malformed.as_ptr(),
+                        malformed.len(),
+                        ptr::null_mut(),
+                        partial_output.as_mut_ptr(),
+                        partial_output.len(),
+                    )
+                }
+                .is_err(),
+                "a malformed positional argument must fail without reading unwritten slots"
+            );
+            let malformed_error = pyo3::PyErr::fetch(py);
+            assert!(
+                malformed_error
+                    .to_string()
+                    .contains("null vectorcall positional argument")
+            );
+            assert!(partial_output[0].is_null());
+            assert_eq!(partial_output[1], sentinel);
+            assert_eq!(partial_output[2], sentinel);
+            assert_eq!(unsafe { ffi::Py_REFCNT(first.as_ptr()) }, first_refcount);
+            assert_eq!(unsafe { ffi::Py_REFCNT(third.as_ptr()) }, third_refcount);
+
+            assert!(
+                unsafe {
+                    bind_function_args_to_output(
+                        &three,
+                        ptr::null(),
+                        3,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        3,
+                    )
+                }
+                .is_err()
+            );
+            let missing_output_error = pyo3::PyErr::fetch(py);
+            assert!(
+                missing_output_error
+                    .to_string()
+                    .contains("missing output buffer for direct CLIF function arguments"),
+                "output-buffer validation must retain precedence over a missing argument array"
+            );
+
+            assert!(
+                unsafe {
+                    bind_function_args_to_output(
+                        &three,
+                        ptr::null(),
+                        3,
+                        ptr::null_mut(),
+                        output.as_mut_ptr(),
+                        output.len(),
+                    )
+                }
+                .is_err()
+            );
+            let missing_args_error = pyo3::PyErr::fetch(py);
+            assert!(
+                missing_args_error
+                    .to_string()
+                    .contains("missing vectorcall argument array in CLIF function binding")
+            );
+        });
+    }
 
     #[test]
     fn prepared_direct_entry_key_rejects_other_sessions_codes_and_versions() {

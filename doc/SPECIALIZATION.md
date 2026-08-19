@@ -938,6 +938,72 @@ receiver-method plans are intentionally disabled for now; if such plans appear
 in v3 plan/emission data, specialization-input preparation rejects them because
 their owner/type guard payload is not yet a static mechanical JIT input.
 
+### Exact Positional Argument Binding
+
+The existing immutable `DirectArgBindingPlan` can directly bind a fully
+supplied, exact-arity positional call when positional parameters map
+identically to entry slots and the call has no keywords. The vectorcall
+argument count masks its offset bit before comparison. Keyword-only
+parameters, `*args`, `**kwargs`, missing/excess arguments, or any keyword
+tuple remain on the unchanged generic binder; fully supplied positional
+defaults need no default insertion.
+
+The admitted path skips generic output zeroing and default scanning while
+acquiring exactly one owned reference per supplied argument. Normal entry
+cleanup still decrements each owned value. Zero-arity calls accept the
+existing null argument/output buffer representation. A malformed null
+argument after an acquired prefix decrements **only that written prefix**,
+never touches uninitialized trailing slots, and preserves existing null-output
+versus null-arguments error ordering and exact exceptions. Existing current
+function/code/default refresh and all generic fallback behavior remain in
+force; the path does not bypass mutable `__code__`, `__defaults__`,
+`__kwdefaults__`, interpreted entry, or compiled-handle guards.
+
+A genuine structured regression turns RED-to-GREEN across nine lowered
+callable shapes, including zero-arity, positional-only, fully supplied
+defaults, closure/generator, vectorcall offset, and unsupported argument
+controls. An independent pinned-CPython FFI test constructs real compiled
+function metadata and proves exact list-reference ownership,
+`[object, NULL, object]` prefix-only cleanup, untouched sentinel tail,
+zero-arity null buffers, and original error precedence. Complete JIT Rust
+library and all-target suites each pass **563 / 563**, aligned test-target
+checking and scoped formatting/checks pass, and transformed compatibility
+guardrails pass **95 tests / 2 expected existing xfails / 7 deselected
+across 16 files in 30.42 seconds**. Production changes exactly one existing
+file and adds no public API, helper, template, or global state.
+
+Normally sampled fixed-eight paired-stock score improves
+**0.520917130452074x → 0.5482172650503208x**; previous-SOAC arithmetic
+improvement is **1.05714472883199x**, robust **1.059214x**, and
+stock-adjusted robust **1.052378x**. A targeted **60-versus-60 sample**
+three-round comparison confirms robust subset improvement **1.05567184x**
+(**1.02805729x** stock-adjusted): `deltablue`
+**3.750207 → 3.529319 ms (1.06258668x; 95% 1.01126–1.08508x)**,
+`richards` **33.958922 → 31.815431 ms (1.06737267x; 95%
+1.01524–1.09177x)**, and `comprehensions`
+**63.84438 → 60.14894 us (1.06143821x; 95% 1.03246–1.07916x)**.
+`chaos` is neutral after paired-stock adjustment. Generated native code
+remains exactly **24,353,560 bytes / 1,608,670 machine blocks** and typed
+coverage **3,069 blocks / 218 functions**.
+
+Matched zero-loss delta profiles contain **390 → 365 samples across 400
+loops**; binder inclusive/self ancestry falls **7.181% / 6.925% → 2.740% /
+2.740%**, outer binder ancestry **9.489% → 4.658%**, and `memset`
+**0.513% → 0%**. Matched richards profiles contain **522 → 526 samples
+across 70 loops**; binder inclusive/self ancestry falls **8.424% / 7.466%
+→ 3.231% / 3.231%**, outer ancestry **10.150% → 5.892%**, and `memset`
+**0.958% → 0%**. Cold compiler ancestry persists (delta approximately
+**13.33% → 13.4%**, richards **8.822% → 9.314%**); inclusive stack shares
+overlap and attached profiles are diagnostic, not benchmark headlines. The
+optimization is **retained**, and the authoritative full `just test-all`
+gate passes **1,221 Python nodeids across 88 / 88 isolated file batches
+and eight workers**, plus Rust JIT **563**, typed IR **54**, optimizer
+**210**, lowering **371**, and PyO3 **8**; see
+`work/logs/exact-positional-binder-test-all.log`. Cargo tests take
+**58.807 seconds**, inner / outer pytest **92.972 / 92.986 seconds**, and
+the complete test phase **151.807 seconds**; the known counter-dump batch
+takes **92.18 seconds**. The full-suite stock **1.10x** goal remains unmet.
+
 ### Counted Input
 
 - Source input is `call_hot_targets`.
