@@ -919,6 +919,89 @@ file-local batches**, with **86 / 86 batches passing**, plus **559 JIT**,
 tests; see `work/logs/source-function-templates-test-all.log`. The complete
 test phase takes **157.448 seconds**.
 
+### Guarded Eager Comprehension Callable Elision
+
+Stock CPython's PEP 709 eager list/set/dict comprehensions do not create a
+`PyFunction` or emit synthetic `code.__new__` audit events. SOAC can restore
+that observable behavior without moving the comprehension into its parent's
+CFG: the original parent `Store`/`Delete`, control flow, cleanup roots,
+ownership, profiling counters, and independently compiled child body remain
+intact. Lazy generator expressions, source-authored functions, and
+unsupported shapes retain their existing Python-function path.
+
+Eligibility is limited to a compiler-owned synchronous same-module
+list/set/dict child with exact generated display/name, one `_dp_iter_*`
+parameter, no original source code object, at most **eight** validated
+captured tuples/cells, and no kwargs/defaults/annotations/interpreted mode.
+The optimizer declines a direct-call plan only for the matching actual
+parent-local `Store(MakeFunctionWithClosure target)` and subsequent `Call`;
+ordinary direct calls, source prefix spoofs, lazy generators, and mixed
+Profile evidence remain safe. This is a semantic source/parent/child
+decision, not benchmark-name or rendered-IR matching.
+
+Runtime initialization captures the immutable original bootstrap factory
+code and exact original private cache before module-body execution. Every
+candidate rechecks live `sys.modules`, canonical runtime owner/type
+version, bootstrap aliases, current factory/code, cache identity, exact
+captured builtins, forced-interpreter state, and parent source tracing /
+profiling / local/global monitoring. Factory/cache replacement, cache
+subclasses or reentry, changed code/module, monitoring, custom builtin
+mappings, source/lazy shapes, or interpreted mode fall back unchanged.
+**Arbitrary in-place entries of the original private cache are not
+checked**; only the approved original-cache identity/subclass boundary is
+enforced.
+
+One existing-template `PyCapsule` stores an `Arc` to the ready compiled
+child and method definition while owning **no Python roots**. Each
+invocation creates a genuine GC-tracked `METH_O` `PyCFunction` whose self
+is a normally GC-traversed tuple containing that shared capsule, module
+globals, builtins, and existing capture tuples. The callback uses a bounded
+stack `FunctionEnvAbiHeader` with a NULL default slot, borrowed validated
+closure cells, existing late-owner/deoptimization pointers, panic
+containment, and normal CPython recursion / `tp_call` behavior. Thus
+vectorcall, generic call, deoptimization, lifetime, cycles, and finalizer
+ordering remain valid without hidden Python roots or changed parent cleanup.
+No public API, global mutable state, runtime-helper symbol, generated-child
+ABI, or new IR concept is added.
+
+A genuine structured full optimizer-path regression turns RED-to-GREEN;
+the actual transformed stock/SOAC watcher/audit regression also turns
+RED-to-GREEN with **zero eager CREATE / zero `code.__new__`** across
+Profile, Verify, and Apply. Existing SOAC failing-body finalizer order is
+preserved exactly once. Two legacy canonical artifact expectations are
+intentionally migrated to zero, while a forced original-cache-subclass
+fallback still proves three distinct Python functions, independent closure
+cells, and name/qualname metadata. Combined integrations previously pass
+**3 / 3**, complete optimizer/JIT libraries pass **213 / 213** and
+**568 / 568**, broader transformed tests pass **83 / 83** with **7
+conventionally deselected**, and scoped formatting/combined test-target
+checks pass. The final post-format integration rerun also passes
+**3 / 3 in 7.55 seconds**.
+
+The normal fixed-eight stock score is **0.589676x**, versus **0.588346x**
+previously; arithmetic previous-SOAC **0.955007x** is distorted by extreme
+unrelated outliers, while robust previous-SOAC geometry is **1.011265x**.
+Three matched rounds improve comprehensions **52.4194 -> 49.9408 us
+(1.0496318x; 95% interval [1.027465, 1.076117])**, or **1.0520710x**
+after paired-stock adjustment; chaos remains neutral. Generated native
+code decreases **23,293,040 -> 23,188,640 bytes** with every independently
+compiled parent and child retained. Matched zero-loss profiles contain
+**618 -> 692 comprehensions** and **599 -> 690 chaos** samples;
+comprehensions eager-parent function ancestry falls **13.273% -> 6.074%**
+while lazy generator expressions retain their original source path.
+Profile shares overlap, and attached replay is confounded by kernel page
+clearing. The optimization is **LANDED CANDIDATE / RETAIN**: the
+authoritative full `just test-all` gate passes **1,228 Python nodeids**
+across **91 / 91 isolated file batches on eight workers**, with zero
+failures, plus **568 JIT**, **213 optimizer**, **371 lowering**,
+**54 typed-IR**, and **8 PyO3** Rust tests; see
+`work/logs/eager-comprehension-callable-test-all.log`. Cargo takes
+**91.634 seconds**, pytest **81.696 seconds inner / 81.722 seconds
+outer**, and the complete test phase **173.377 seconds**. The new actual
+stock-parity integration passes in **9.10 seconds**; the known 28-test
+counter-dump batch takes **80.81 seconds**. The full-suite **1.10x stock**
+target remains unmet.
+
 ### Template-Aware Function Registration
 
 Source-backed function instantiation already owns an immutable

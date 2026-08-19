@@ -43,6 +43,7 @@ def test_synthetic_functions_reuse_prepared_code_metadata_without_extra_events(
         from soac.import_hook import install
         install()
         import {module_name} as module
+        import soac.bootstrap as bootstrap
         import soac.runtime as runtime
 
         EVENT_CREATE = 0
@@ -89,9 +90,23 @@ def test_synthetic_functions_reuse_prepared_code_metadata_without_extra_events(
         assert watcher_id >= 0, watcher_id
 
         try:
+            assert module.captured(0) == [0, 1, 2]
+            canonical_created = len(created)
+            assert canonical_created == 0, (created, callback_errors)
+
+            class NoncanonicalCodeCache(dict):
+                pass
+
+            original_cache = bootstrap._DP_CODE_WITH_FREEVARS_CACHE
             values = []
-            for offset in (1, 10, 100):
-                values.append(module.captured(offset))
+            bootstrap._DP_CODE_WITH_FREEVARS_CACHE = NoncanonicalCodeCache(
+                original_cache
+            )
+            try:
+                for offset in (1, 10, 100):
+                    values.append(module.captured(offset))
+            finally:
+                bootstrap._DP_CODE_WITH_FREEVARS_CACHE = original_cache
             assert values == [[1, 2, 3], [10, 11, 12], [100, 101, 102]]
             assert len(created) == 3, (len(created), callback_errors)
 
@@ -146,6 +161,7 @@ def test_synthetic_functions_reuse_prepared_code_metadata_without_extra_events(
         assert created[1].__name__ == "<listcomp>"
 
         print(json.dumps({{
+            "canonical_created": canonical_created,
             "created": len(created),
             "name_identity": name_identity,
             "qualname_identity": qualname_identity,
@@ -178,6 +194,7 @@ def test_synthetic_functions_reuse_prepared_code_metadata_without_extra_events(
     assert completed.returncode == 0, completed.stdout + completed.stderr
     result = json.loads(completed.stdout.splitlines()[-1])
     assert result["callback_errors"] == []
+    assert result["canonical_created"] == 0
     assert result["created"] == 3
     assert result["name_identity"] == [True, True, True], result
     assert result["qualname_identity"] == [True, True, True], result

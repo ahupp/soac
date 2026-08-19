@@ -186,9 +186,9 @@ def test_synthetic_closure_code_is_reused_without_hiding_runtime_mutations(
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     result = json.loads(completed.stdout.splitlines()[-1])
-    assert result["canonical_creation_count"] == 1, (
-        "each synthetic captured-list-comprehension template should prepare "
-        "one named code object and reuse it across closure instantiations",
+    assert result["canonical_creation_count"] == 0, (
+        "canonical eager comprehensions must match stock CPython without "
+        "creating or auditing throwaway synthetic code objects",
         result,
     )
     assert result["prepatch_calls"] == 3

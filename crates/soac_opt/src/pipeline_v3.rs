@@ -2126,6 +2126,86 @@ fn exact_stop_iteration_runtime_match_for_instr_id_v3(
     finder.matches
 }
 
+fn compiler_owned_eager_comprehension_call_for_instr_id_v3(
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    target: &BlockPyFunction<BlockPyModuleShape>,
+    source: InstrId,
+) -> bool {
+    let expected_prefix = match target.names.display_name.as_str() {
+        "<listcomp>" => "_dp_listcomp_",
+        "<setcomp>" => "_dp_setcomp_",
+        "<dictcomp>" => "_dp_dictcomp_",
+        _ => return false,
+    };
+    let Some(generated_suffix) = target.names.bind_name.strip_prefix(expected_prefix) else {
+        return false;
+    };
+    if generated_suffix.is_empty()
+        || !generated_suffix.bytes().all(|byte| byte.is_ascii_digit())
+        || target.lowered_kind() != &FunctionKind::Function
+        || target.execution_mode() != FunctionExecutionMode::Jit
+    {
+        return false;
+    }
+    let [parameter] = target.params.params.as_slice() else {
+        return false;
+    };
+    if !matches!(parameter.kind, ParamKind::Any | ParamKind::PosOnly)
+        || parameter.has_default
+        || !parameter.name.starts_with("_dp_iter_")
+    {
+        return false;
+    }
+
+    struct Finder<'a> {
+        source: InstrId,
+        target: &'a BlockPyFunction<BlockPyModuleShape>,
+        generated_locals: HashSet<LocalLocation>,
+        called_local: Option<LocalLocation>,
+    }
+
+    impl Visit<InstrBlockPy> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
+        where
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
+        {
+            match expr {
+                InstrBlockPy::Store(store)
+                    if store.name.id_str() == self.target.names.bind_name
+                        && let Some(local) = store.name.local_location()
+                        && let InstrBlockPy::MakeFunctionWithClosure(make) =
+                            store.value.as_ref()
+                        && make.function_id() == self.target.function_id =>
+                {
+                    self.generated_locals.insert(local);
+                }
+                InstrBlockPy::Call(call)
+                    if call.try_semantic_instr_id() == Some(self.source)
+                        && call.keywords.is_empty()
+                        && matches!(call.args.as_slice(), [CallArgPositional::Positional(_)])
+                        && let InstrBlockPy::Load(callee) = call.func.as_ref()
+                        && callee.name.id_str() == self.target.names.bind_name =>
+                {
+                    self.called_local = callee.name.local_location();
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut finder = Finder {
+        source,
+        target,
+        generated_locals: HashSet::new(),
+        called_local: None,
+    };
+    finder.visit_fn(function);
+    finder
+        .called_local
+        .is_some_and(|local| finder.generated_locals.contains(&local))
+}
+
 #[derive(Clone, Debug)]
 enum DirectCallSourceCallee {
     Function,
@@ -2213,6 +2293,21 @@ fn direct_call_requests_from_evidence_v3(
                 continue;
             };
             let target_function = &target_entry.function;
+            if target_entry.module == current_module
+                && compiler_owned_eager_comprehension_call_for_instr_id_v3(
+                    function,
+                    target_function,
+                    source,
+                )
+            {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 direct-call declined target {serialized_target}: compiler-owned eager comprehensions use their guarded callable path"
+                    ),
+                });
+                continue;
+            }
             if target_function.execution_mode() != FunctionExecutionMode::Jit {
                 diagnostics.push(PlanDiagnostic {
                     source: Some(source),
@@ -4529,6 +4624,159 @@ class Handler:
                 .collect::<Vec<_>>(),
             vec![Some(instr_id(10)), Some(instr_id(11))],
             "both explicit runtime names and their module-constant aliases need the same planning decision"
+        );
+    }
+
+    #[test]
+    fn direct_call_plans_preserve_eager_comprehension_callable_elision() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def ordinary(value):
+    return value
+
+def caller(offset, values):
+    items = [(offset, value) for value in values]
+    unique = {(offset, value) for value in values}
+    indexed = {value: (offset, value) for value in values}
+    lazy = (value for value in values)
+
+    def _dp_listcomp_777(value):
+        return value
+
+    return items, unique, indexed, lazy, ordinary(offset), _dp_listcomp_777(offset)
+"#,
+        )
+        .expect("eager comprehension direct-call fixture should lower")
+        .blockpy_module;
+        let caller = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("fixture should retain its original caller");
+
+        #[derive(Default)]
+        struct Calls {
+            sources: Vec<(InstrId, String)>,
+        }
+
+        impl Visit<InstrBlockPy> for Calls {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
+            where
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
+            {
+                if let InstrBlockPy::Call(call) = expr
+                    && let InstrBlockPy::Load(callee) = call.func.as_ref()
+                {
+                    self.sources
+                        .push((call.semantic_instr_id(), callee.name.id_str().to_string()));
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut calls = Calls::default();
+        calls.visit_fn(caller);
+        let mut rows = lowered
+            .callable_defs
+            .iter()
+            .map(|function| row("function_entry", function.function_id, instr_id(0), 1, None))
+            .collect::<Vec<_>>();
+        let mut generated_sources = Vec::new();
+        let mut ordinary_source = None;
+        let mut spoof_source = None;
+        let mut lazy_source = None;
+
+        for (source, bind_name) in calls.sources {
+            let Some(target) = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == bind_name)
+            else {
+                continue;
+            };
+            rows.push(row(
+                "call_hot_targets",
+                caller.function_id,
+                source,
+                32,
+                Some(target.function_id.to_packed_runtime_u64()),
+            ));
+
+            match target.names.display_name.as_str() {
+                "<listcomp>" | "<setcomp>" | "<dictcomp>"
+                    if target.params.params.len() == 1
+                        && target.params.params[0].name.starts_with("_dp_iter_") =>
+                {
+                    generated_sources.push(source);
+                }
+                "<listcomp>" if bind_name == "_dp_listcomp_777" => {
+                    spoof_source = Some(source);
+                }
+                "<genexpr>" => lazy_source = Some(source),
+                "ordinary" => ordinary_source = Some(source),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            generated_sources.len(),
+            3,
+            "all three eager display kinds must be profiled"
+        );
+        let ordinary_source = ordinary_source.expect("ordinary source function must be profiled");
+        let spoof_source =
+            spoof_source.expect("source-authored generated-name spoof must be profiled");
+        assert!(
+            lazy_source.is_some(),
+            "real generator factory must remain represented"
+        );
+
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows,
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+
+        let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+            &AlternativeCatalog::default_v3(),
+            module_identity(),
+            &lowered,
+            &evidence_store,
+        )
+        .expect("actual module optimization pipeline should plan profiled callable targets");
+        let caller_plan = artifacts
+            .plan
+            .functions
+            .iter()
+            .find(|function| function.function.debug_name.as_deref() == Some("caller"))
+            .expect("original caller should receive its production optimization plan");
+        let selected_sources = caller_plan
+            .direct_calls
+            .iter()
+            .map(|plan| plan.source)
+            .collect::<Vec<_>>();
+
+        assert!(
+            selected_sources.contains(&ordinary_source),
+            "ordinary direct targets must remain eligible: {selected_sources:?}"
+        );
+        assert!(
+            selected_sources.contains(&spoof_source),
+            "source-authored generated-name spoofs must remain ordinary Python function targets: {selected_sources:?}"
+        );
+        assert!(
+            generated_sources
+                .iter()
+                .all(|source| !selected_sources.contains(source)),
+            "compiler-generated eager comprehension calls must use their callable generic path without stale exact-PyFunction guards: generated={generated_sources:?}, selected={selected_sources:?}"
         );
     }
 

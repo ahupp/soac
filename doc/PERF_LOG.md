@@ -1688,3 +1688,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 - eight-workload stock score declines `0.602845x` to `0.588346x`;
   previous-SOAC ratio `0.996949x`. Repeated `comprehensions` improves
   `1.053x` and `chaos` `1.048x`; native code remains `23,293,040 B`.
+
+## 2026-08-19 - Elide eager comprehension function objects
+
+- jj change id: `wnlnpkrp`
+- summary: use guarded compiled-child callables for eager comprehensions,
+  restoring stock function-watcher and code-audit parity.
+- eight-workload stock score `0.589676x` versus prior `0.588346x`;
+  robust previous-SOAC `1.01127x`. Repeated `comprehensions` improves
+  `1.04963x` (`52.42 us` to `49.94 us`); native code decreases
+  `23,293,040 B` to `23,188,640 B`.

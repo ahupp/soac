@@ -473,6 +473,9 @@ pub(crate) struct FunctionInstantiationTemplate {
     prepared_original_code: OnceLock<Option<function_instantiation::PreparedOriginalCode>>,
     prepared_synthetic_code: OnceLock<function_instantiation::PreparedSyntheticCode>,
     prepared_runtime_lookup_keys: OnceLock<function_instantiation::PreparedRuntimeLookupKeys>,
+    prepared_bootstrap_factory_origin:
+        OnceLock<function_instantiation::PreparedBootstrapFactoryOrigin>,
+    prepared_eager_comprehension: OnceLock<function_instantiation::PreparedEagerComprehension>,
     prepared_direct_entry: OnceLock<PreparedDirectEntry>,
     prepared_vectorcall_trampoline: OnceLock<PreparedVectorcallTrampoline>,
     prepared_generator_factory: OnceLock<PreparedGeneratorFactory>,
@@ -572,6 +575,8 @@ impl FunctionInstantiationTemplate {
             prepared_original_code: OnceLock::new(),
             prepared_synthetic_code: OnceLock::new(),
             prepared_runtime_lookup_keys: OnceLock::new(),
+            prepared_bootstrap_factory_origin: OnceLock::new(),
+            prepared_eager_comprehension: OnceLock::new(),
             prepared_direct_entry: OnceLock::new(),
             prepared_vectorcall_trampoline: OnceLock::new(),
             prepared_generator_factory: OnceLock::new(),

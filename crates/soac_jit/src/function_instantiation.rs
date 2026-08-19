@@ -270,6 +270,7 @@ fn register_jit_vectorcall(
     module_runtime: &ModuleRuntimeContext,
     function_template: Option<&Arc<FunctionInstantiationTemplate>>,
 ) -> PyResult<()> {
+    prepare_bootstrap_factory_origin(py, module_runtime, function_id)?;
     let owned_runtime = unsafe { clone_module_runtime_context(module_runtime) }.map_err(|_| {
         if unsafe { ffi::PyErr_Occurred() }.is_null() {
             PyRuntimeError::new_err("failed to clone module runtime context")
@@ -620,10 +621,651 @@ pub(crate) struct PreparedOriginalCode {
     has_prepared_metadata: bool,
 }
 
+pub(crate) struct PreparedBootstrapFactoryOrigin {
+    code: Py<PyAny>,
+    cache: Py<PyAny>,
+    cache_key: Py<PyString>,
+    builtins_key: Py<PyString>,
+}
+
+pub(crate) struct PreparedEagerComprehension {
+    capsule: Py<PyAny>,
+    compile_session_id: crate::CompileSessionId,
+    runtime_module: usize,
+    runtime_owner: usize,
+    runtime_owner_version: u32,
+    factory: usize,
+    parent_code: usize,
+    origin_code: usize,
+    origin_cache: usize,
+    cache_key: usize,
+    builtins_key: usize,
+}
+
+const MAX_EAGER_COMPREHENSION_CAPTURES: usize = 8;
+const EAGER_COMPREHENSION_CAPSULE_NAME: &CStr = c"soac.eager_comprehension_direct_entry";
+
+struct EagerComprehensionDirectEntry {
+    method: ffi::PyMethodDef,
+    _compiled_function: Arc<crate::jit::CompiledFunctionHandle>,
+    direct_code_ptr: *const u8,
+    default_direct_code_ptr: *const u8,
+    deopt_table_ptr: *const c_void,
+    late_bound_owner_cells: *const crate::module_type::LateBoundOwnerFieldCell,
+    closure_slots: [usize; MAX_EAGER_COMPREHENSION_CAPTURES],
+    closure_count: usize,
+}
+
+#[repr(C)]
+struct EagerComprehensionStackEnv {
+    header: crate::FunctionEnvAbiHeader,
+    runtime_objects: [*mut ffi::PyObject; MAX_EAGER_COMPREHENSION_CAPTURES + 1],
+}
+
 pub(crate) struct PreparedRuntimeLookupKeys {
     runtime_module: Py<PyString>,
     bootstrap_module: Py<PyString>,
     code_factory: Py<PyString>,
+}
+
+fn intern_eager_runtime_name(py: Python<'_>, name: &'static CStr) -> PyResult<Py<PyString>> {
+    let value = unsafe { ffi::PyUnicode_InternFromString(name.as_ptr()) };
+    let value = unsafe { Bound::<PyAny>::from_owned_ptr_or_err(py, value)? };
+    Ok(value.cast_into::<PyString>()?.unbind())
+}
+
+unsafe fn eager_unicode_dict_item(
+    dict: *mut ffi::PyObject,
+    key: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    if dict.is_null() || unsafe { ffi::PyDict_CheckExact(dict) } == 0 {
+        return std::ptr::null_mut();
+    }
+    let keys = unsafe { (*dict.cast::<ffi::PyDictObject>()).ma_keys }.cast::<RawPyDictKeysPrefix>();
+    if keys.is_null() || unsafe { (*keys).dk_kind } == 0 {
+        return std::ptr::null_mut();
+    }
+    unsafe { ffi::PyDict_GetItem(dict, key) }
+}
+
+fn prepare_bootstrap_factory_origin(
+    py: Python<'_>,
+    module_runtime: &ModuleRuntimeContext,
+    function_id: RuntimeFunctionId,
+) -> PyResult<()> {
+    if module_runtime.shared_module_state_owner.module_name != "soac.runtime" {
+        return Ok(());
+    }
+    let Some(function) = module_runtime
+        .shared_module_state_owner
+        .lookup_function(function_id)
+    else {
+        return Ok(());
+    };
+    if function.names.bind_name != "_dp_module_init" {
+        return Ok(());
+    }
+    let Some(template) = module_runtime
+        .shared_module_state_owner
+        .lookup_function_template(function_id)
+        .map_err(PyRuntimeError::new_err)?
+    else {
+        return Ok(());
+    };
+    if template.prepared_bootstrap_factory_origin.get().is_some() {
+        return Ok(());
+    }
+
+    let lookup_keys = prepared_runtime_lookup_keys(py, template.as_ref())?;
+    let globals = module_runtime.mod_ctx.globals_obj.cast::<ffi::PyObject>();
+    let factory =
+        unsafe { eager_unicode_dict_item(globals, lookup_keys.code_factory.bind(py).as_ptr()) };
+    let modules = unsafe { ffi::PyImport_GetModuleDict() };
+    let bootstrap =
+        unsafe { eager_unicode_dict_item(modules, lookup_keys.bootstrap_module.bind(py).as_ptr()) };
+    if factory.is_null()
+        || unsafe { ffi::PyFunction_Check(factory) } == 0
+        || bootstrap.is_null()
+        || unsafe { ffi::PyModule_CheckExact(bootstrap) } == 0
+    {
+        return Ok(());
+    }
+    let bootstrap_globals = unsafe { ffi::PyModule_GetDict(bootstrap) };
+    if unsafe {
+        eager_unicode_dict_item(
+            bootstrap_globals,
+            lookup_keys.code_factory.bind(py).as_ptr(),
+        )
+    } != factory
+    {
+        return Ok(());
+    }
+    let raw_factory = factory.cast::<ffi::PyFunctionObject>();
+    let factory_code = unsafe { (*raw_factory).func_code };
+    if factory_code.is_null()
+        || unsafe { (*raw_factory).func_globals } != bootstrap_globals
+        || !unsafe { (*raw_factory).func_defaults }.is_null()
+        || !unsafe { (*raw_factory).func_kwdefaults }.is_null()
+        || !unsafe { (*raw_factory).func_closure }.is_null()
+    {
+        return Ok(());
+    }
+    let code = unsafe { Bound::<PyAny>::from_borrowed_ptr(py, factory_code) };
+    if !unicode_equals_str(&code.getattr("co_name")?, "code_with_freevars")?
+        || !unicode_equals_str(&code.getattr("co_qualname")?, "code_with_freevars")?
+    {
+        return Ok(());
+    }
+    let code_filename = code.getattr("co_filename")?;
+    let bootstrap_filename =
+        unsafe { ffi::PyDict_GetItemString(bootstrap_globals, c"__file__".as_ptr()) };
+    if bootstrap_filename.is_null()
+        || unsafe { ffi::PyUnicode_CheckExact(bootstrap_filename) } == 0
+        || unsafe { ffi::PyUnicode_CheckExact(code_filename.as_ptr()) } == 0
+        || unsafe { ffi::PyUnicode_Compare(code_filename.as_ptr(), bootstrap_filename) } != 0
+    {
+        return Ok(());
+    }
+
+    let cache_key = intern_eager_runtime_name(py, c"_DP_CODE_WITH_FREEVARS_CACHE")?;
+    let builtins_key = intern_eager_runtime_name(py, c"__builtins__")?;
+    let cache = unsafe { eager_unicode_dict_item(bootstrap_globals, cache_key.bind(py).as_ptr()) };
+    if cache.is_null() || unsafe { ffi::PyDict_CheckExact(cache) } == 0 {
+        return Ok(());
+    }
+    let origin = PreparedBootstrapFactoryOrigin {
+        code: code.unbind(),
+        cache: unsafe { Bound::<PyAny>::from_borrowed_ptr(py, cache) }.unbind(),
+        cache_key,
+        builtins_key,
+    };
+    // This runs while soac.runtime's module init is being registered, before its body or any
+    // user module executes. Keep only the immutable code and compiler-private cache, not modules.
+    let _ = template.prepared_bootstrap_factory_origin.set(origin);
+    Ok(())
+}
+
+fn source_parent_code_for_eager_comprehension(
+    shared_state: &SharedModuleState,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+) -> Option<*mut ffi::PyObject> {
+    let mut qualname = function.names.qualname.as_str();
+    while let Some((parent, _)) = qualname.rsplit_once(".<locals>.") {
+        if let Some(code) = shared_state
+            .lowered_module
+            .callable_defs
+            .iter()
+            .find(|candidate| candidate.names.qualname == parent)
+            .and_then(|candidate| shared_state.lookup_original_code(candidate.function_id))
+        {
+            return Some(code.as_ptr());
+        }
+        qualname = parent;
+    }
+    None
+}
+
+fn runtime_bootstrap_origin_template(
+    compile_session: &CompileSession,
+) -> PyResult<Option<Arc<FunctionInstantiationTemplate>>> {
+    for shared_state in compile_session
+        .shared_module_states_snapshot()
+        .map_err(PyRuntimeError::new_err)?
+    {
+        if shared_state.module_name != "soac.runtime" {
+            continue;
+        }
+        let Some(function) = shared_state
+            .lowered_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "_dp_module_init")
+        else {
+            continue;
+        };
+        let Some(template) = shared_state
+            .lookup_function_template(function.function_id)
+            .map_err(PyRuntimeError::new_err)?
+        else {
+            continue;
+        };
+        if template.prepared_bootstrap_factory_origin.get().is_some() {
+            return Ok(Some(template));
+        }
+    }
+    Ok(None)
+}
+
+fn eager_comprehension_target_is_compiler_owned(
+    module_runtime: &ModuleRuntimeContext,
+    function_template: &FunctionInstantiationTemplate,
+) -> bool {
+    let function = function_template.function();
+    if function.lowered_kind() != &FunctionKind::Function
+        || function.execution_mode() != FunctionExecutionMode::Jit
+    {
+        return false;
+    }
+    let prefix = match function.names.display_name.as_str() {
+        "<listcomp>" => "_dp_listcomp_",
+        "<setcomp>" => "_dp_setcomp_",
+        "<dictcomp>" => "_dp_dictcomp_",
+        _ => return false,
+    };
+    let Some(suffix) = function.names.bind_name.strip_prefix(prefix) else {
+        return false;
+    };
+    let [parameter] = function.params.params.as_slice() else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(parameter.kind, ParamKind::Any | ParamKind::PosOnly)
+        && !parameter.has_default
+        && parameter.name.starts_with("_dp_iter_")
+        && module_runtime
+            .shared_module_state_owner
+            .lookup_original_code(function.function_id)
+            .is_none()
+}
+
+unsafe extern "C" fn drop_eager_comprehension_capsule(capsule: *mut ffi::PyObject) {
+    let state =
+        unsafe { ffi::PyCapsule_GetPointer(capsule, EAGER_COMPREHENSION_CAPSULE_NAME.as_ptr()) }
+            .cast::<EagerComprehensionDirectEntry>();
+    if state.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        return;
+    }
+    drop(unsafe { Box::from_raw(state) });
+}
+
+unsafe extern "C" fn call_eager_comprehension_direct(
+    owner: *mut ffi::PyObject,
+    argument: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    match panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        if owner.is_null() || argument.is_null() || ffi::PyTuple_CheckExact(owner) == 0 {
+            set_runtime_error("eager comprehension callable has an invalid owner or argument");
+            return std::ptr::null_mut();
+        }
+        let capsule = ffi::PyTuple_GetItem(owner, 0);
+        let globals = ffi::PyTuple_GetItem(owner, 1);
+        let builtins = ffi::PyTuple_GetItem(owner, 2);
+        let captures = ffi::PyTuple_GetItem(owner, 3);
+        if capsule.is_null() || globals.is_null() || builtins.is_null() || captures.is_null() {
+            return std::ptr::null_mut();
+        }
+        let state = ffi::PyCapsule_GetPointer(capsule, EAGER_COMPREHENSION_CAPSULE_NAME.as_ptr())
+            .cast::<EagerComprehensionDirectEntry>();
+        if state.is_null() {
+            return std::ptr::null_mut();
+        }
+        let state = &*state;
+        let mut environment = EagerComprehensionStackEnv {
+            header: crate::FunctionEnvAbiHeader {
+                direct_code_ptr: state.direct_code_ptr,
+                default_direct_code_ptr: state.default_direct_code_ptr,
+                deopt_table_ptr: state.deopt_table_ptr,
+                globals_obj: globals,
+                builtins_obj: builtins,
+                late_bound_owner_cells: state.late_bound_owner_cells,
+            },
+            runtime_objects: [std::ptr::null_mut(); MAX_EAGER_COMPREHENSION_CAPTURES + 1],
+        };
+        for index in 0..state.closure_count {
+            let pair = ffi::PyTuple_GetItem(captures, index as ffi::Py_ssize_t);
+            if pair.is_null() {
+                return std::ptr::null_mut();
+            }
+            let cell = ffi::PyTuple_GetItem(pair, 1);
+            if cell.is_null() {
+                return std::ptr::null_mut();
+            }
+            environment.runtime_objects[state.closure_slots[index]] = cell;
+        }
+        let thread_state = ffi::PyThreadState_Get();
+        if thread_state.is_null() {
+            set_runtime_error("eager comprehension callable requires an attached thread state");
+            return std::ptr::null_mut();
+        }
+        let direct: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(state.direct_code_ptr);
+        direct(
+            std::ptr::addr_of_mut!(environment.header).cast(),
+            thread_state.cast(),
+            argument.cast(),
+        )
+        .cast::<ffi::PyObject>()
+    })) {
+        Ok(value) => value,
+        Err(_) => {
+            set_runtime_error("panic in eager comprehension direct callable");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn prepare_eager_comprehension_callable<'template>(
+    py: Python<'_>,
+    module_runtime: &ModuleRuntimeContext,
+    function_template: &'template FunctionInstantiationTemplate,
+    runtime_module: &Bound<'_, PyModule>,
+    origin: &PreparedBootstrapFactoryOrigin,
+    factory: *mut ffi::PyObject,
+    parent_code: *mut ffi::PyObject,
+    owner: usize,
+    owner_version: u32,
+) -> PyResult<Option<&'template PreparedEagerComprehension>> {
+    if let Some(prepared) = function_template.prepared_eager_comprehension.get() {
+        return Ok(Some(prepared));
+    }
+    let function = function_template.function();
+    let engine = module_runtime
+        .compile_session
+        .process_jit()
+        .map_err(PyRuntimeError::new_err)?;
+    let Some(compiled_function) = engine
+        .lookup_ready_direct_function(function)
+        .map_err(PyRuntimeError::new_err)?
+    else {
+        return Ok(None);
+    };
+    let layout = function_template.runtime_data_layout();
+    let mut closure_slots = [0; MAX_EAGER_COMPREHENSION_CAPTURES];
+    for (index, slot) in closure_slots
+        .iter_mut()
+        .take(function_template.capture_names().len())
+        .enumerate()
+    {
+        *slot = layout.closure_cell_slot(index);
+    }
+    let direct_code_ptr = compiled_function
+        .direct_code_ptr()
+        .map_err(PyRuntimeError::new_err)?
+        .cast::<u8>();
+    let default_direct_code_ptr = compiled_function
+        .default_direct_code_ptr()
+        .map_err(PyRuntimeError::new_err)?
+        .cast::<u8>();
+    let deopt_table_ptr = compiled_function
+        .direct_deopt_table_ptr()
+        .map_err(PyRuntimeError::new_err)?
+        .cast::<c_void>();
+    let state = Box::new(EagerComprehensionDirectEntry {
+        method: ffi::PyMethodDef {
+            ml_name: c"<eager comprehension>".as_ptr(),
+            ml_meth: ffi::PyMethodDefPointer {
+                PyCFunction: call_eager_comprehension_direct,
+            },
+            ml_flags: ffi::METH_O,
+            ml_doc: std::ptr::null(),
+        },
+        _compiled_function: compiled_function,
+        direct_code_ptr,
+        default_direct_code_ptr,
+        deopt_table_ptr,
+        late_bound_owner_cells: module_runtime
+            .shared_module_state_owner
+            .late_bound_owner_fields
+            .cells
+            .as_ptr(),
+        closure_slots,
+        closure_count: function_template.capture_names().len(),
+    });
+    let state = Box::into_raw(state);
+    let capsule = unsafe {
+        ffi::PyCapsule_New(
+            state.cast::<c_void>(),
+            EAGER_COMPREHENSION_CAPSULE_NAME.as_ptr(),
+            Some(drop_eager_comprehension_capsule),
+        )
+    };
+    if capsule.is_null() {
+        drop(unsafe { Box::from_raw(state) });
+        return Err(PyErr::fetch(py));
+    }
+    let prepared = PreparedEagerComprehension {
+        capsule: unsafe { Bound::<PyAny>::from_owned_ptr(py, capsule) }.unbind(),
+        compile_session_id: module_runtime.compile_session.id(),
+        runtime_module: runtime_module.as_ptr() as usize,
+        runtime_owner: owner,
+        runtime_owner_version: owner_version,
+        factory: factory as usize,
+        parent_code: parent_code as usize,
+        origin_code: origin.code.as_ptr() as usize,
+        origin_cache: origin.cache.as_ptr() as usize,
+        cache_key: origin.cache_key.as_ptr() as usize,
+        builtins_key: origin.builtins_key.as_ptr() as usize,
+    };
+    let _ = function_template.prepared_eager_comprehension.set(prepared);
+    Ok(function_template.prepared_eager_comprehension.get())
+}
+
+fn make_eager_comprehension_callable(
+    py: Python<'_>,
+    module_runtime: &ModuleRuntimeContext,
+    function_template: &FunctionInstantiationTemplate,
+    runtime_module: &Bound<'_, PyModule>,
+    captures: &Bound<'_, PyAny>,
+    param_defaults: &Bound<'_, PyAny>,
+    annotate_fn: &Bound<'_, PyAny>,
+    module_globals: &Bound<'_, PyAny>,
+) -> PyResult<Option<Py<PyAny>>> {
+    if !eager_comprehension_target_is_compiler_owned(module_runtime, function_template)
+        || crate::entry_interpreter_vectorcall_requested(function_template.function())
+        || !annotate_fn.is_none()
+        || unsafe { ffi::PyTuple_CheckExact(param_defaults.as_ptr()) } == 0
+        || unsafe { ffi::PyTuple_Size(param_defaults.as_ptr()) } != 0
+        || unsafe { ffi::PyTuple_CheckExact(captures.as_ptr()) } == 0
+    {
+        return Ok(None);
+    }
+
+    let capture_names = function_template.capture_names();
+    let capture_count = capture_names.len();
+    let layout = function_template.runtime_data_layout();
+    if capture_count > MAX_EAGER_COMPREHENSION_CAPTURES
+        || layout.positional_default_count() != 1
+        || layout.closure_len() != capture_count
+        || layout.total_len() != capture_count + 1
+        || unsafe { ffi::PyTuple_Size(captures.as_ptr()) } != capture_count as ffi::Py_ssize_t
+    {
+        return Ok(None);
+    }
+    for (index, expected_name) in capture_names.iter().enumerate() {
+        if matches!(expected_name.as_str(), "__class__" | "_dp_classcell") {
+            return Ok(None);
+        }
+        let pair = unsafe { ffi::PyTuple_GetItem(captures.as_ptr(), index as ffi::Py_ssize_t) };
+        if pair.is_null()
+            || unsafe { ffi::PyTuple_CheckExact(pair) } == 0
+            || unsafe { ffi::PyTuple_Size(pair) } != 2
+        {
+            return Ok(None);
+        }
+        let name = unsafe { ffi::PyTuple_GetItem(pair, 0) };
+        let cell = unsafe { ffi::PyTuple_GetItem(pair, 1) };
+        if name.is_null()
+            || cell.is_null()
+            || unsafe { ffi::PyUnicode_CheckExact(name) } == 0
+            || !unicode_equals_str(
+                &unsafe { Bound::<PyAny>::from_borrowed_ptr(py, name) },
+                expected_name,
+            )?
+            || !is_cell_object(cell)
+        {
+            return Ok(None);
+        }
+    }
+
+    let lookup_keys = prepared_runtime_lookup_keys(py, function_template)?;
+    let existing = function_template.prepared_eager_comprehension.get();
+    let origin_template = if existing.is_none() {
+        runtime_bootstrap_origin_template(module_runtime.compile_session.as_ref())?
+    } else {
+        None
+    };
+    let origin = origin_template
+        .as_ref()
+        .and_then(|template| template.prepared_bootstrap_factory_origin.get());
+    let (origin_code, origin_cache, cache_key, builtins_key, parent_code) =
+        if let Some(prepared) = existing {
+            if prepared.compile_session_id != module_runtime.compile_session.id()
+                || prepared.runtime_module != runtime_module.as_ptr() as usize
+            {
+                return Ok(None);
+            }
+            (
+                prepared.origin_code as *mut ffi::PyObject,
+                prepared.origin_cache as *mut ffi::PyObject,
+                prepared.cache_key as *mut ffi::PyObject,
+                prepared.builtins_key as *mut ffi::PyObject,
+                prepared.parent_code as *mut ffi::PyObject,
+            )
+        } else if let Some(origin) = origin {
+            let Some(parent_code) = source_parent_code_for_eager_comprehension(
+                module_runtime.shared_module_state_owner.as_ref(),
+                function_template.function(),
+            ) else {
+                return Ok(None);
+            };
+            (
+                origin.code.as_ptr(),
+                origin.cache.as_ptr(),
+                origin.cache_key.as_ptr(),
+                origin.builtins_key.as_ptr(),
+                parent_code,
+            )
+        } else {
+            return Ok(None);
+        };
+    if unsafe { crate::jit::raw_py_function_activation_is_observed(parent_code) } {
+        return Ok(None);
+    }
+
+    let (owner, owner_version) = if let Some(prepared) = existing {
+        let owner = unsafe { ffi::Py_TYPE(runtime_module.as_ptr()) };
+        if owner as usize != prepared.runtime_owner
+            || unsafe { (*owner).tp_version_tag } != prepared.runtime_owner_version
+            || unsafe { (*owner).tp_version_tag } == 0
+        {
+            return Ok(None);
+        }
+        (prepared.runtime_owner, prepared.runtime_owner_version)
+    } else {
+        let guard = prepared_synthetic_runtime_owner_guard(py, runtime_module, lookup_keys);
+        if guard.0 == 0 {
+            return Ok(None);
+        }
+        guard
+    };
+    let runtime_globals = unsafe { ffi::PyModule_GetDict(runtime_module.as_ptr()) };
+    let factory = unsafe {
+        eager_unicode_dict_item(runtime_globals, lookup_keys.code_factory.bind(py).as_ptr())
+    };
+    if factory.is_null()
+        || unsafe { ffi::PyFunction_Check(factory) } == 0
+        || existing.is_some_and(|prepared| prepared.factory != factory as usize)
+    {
+        return Ok(None);
+    }
+    let modules = unsafe { ffi::PyImport_GetModuleDict() };
+    let bootstrap =
+        unsafe { eager_unicode_dict_item(modules, lookup_keys.bootstrap_module.bind(py).as_ptr()) };
+    if bootstrap.is_null() || unsafe { ffi::PyModule_CheckExact(bootstrap) } == 0 {
+        return Ok(None);
+    }
+    let bootstrap_globals = unsafe { ffi::PyModule_GetDict(bootstrap) };
+    let raw_factory = factory.cast::<ffi::PyFunctionObject>();
+    if unsafe {
+        eager_unicode_dict_item(
+            bootstrap_globals,
+            lookup_keys.code_factory.bind(py).as_ptr(),
+        )
+    } != factory
+        || unsafe { (*raw_factory).func_globals } != bootstrap_globals
+        || unsafe { (*raw_factory).func_code } != origin_code
+        || !unsafe { (*raw_factory).func_defaults }.is_null()
+        || !unsafe { (*raw_factory).func_kwdefaults }.is_null()
+        || !unsafe { (*raw_factory).func_closure }.is_null()
+    {
+        return Ok(None);
+    }
+    let current_cache = unsafe { eager_unicode_dict_item(bootstrap_globals, cache_key) };
+    if current_cache != origin_cache || unsafe { ffi::PyDict_CheckExact(current_cache) } == 0 {
+        return Ok(None);
+    }
+
+    let mut builtins = unsafe { eager_unicode_dict_item(module_globals.as_ptr(), builtins_key) };
+    if builtins.is_null() {
+        return Ok(None);
+    }
+    if unsafe { ffi::PyModule_CheckExact(builtins) } != 0 {
+        builtins = unsafe { ffi::PyModule_GetDict(builtins) };
+    }
+    if builtins.is_null() || unsafe { ffi::PyDict_CheckExact(builtins) } == 0 {
+        return Ok(None);
+    }
+
+    let prepared = if let Some(prepared) = existing {
+        prepared
+    } else {
+        let Some(origin) = origin else {
+            return Ok(None);
+        };
+        let Some(prepared) = prepare_eager_comprehension_callable(
+            py,
+            module_runtime,
+            function_template,
+            runtime_module,
+            origin,
+            factory,
+            parent_code,
+            owner,
+            owner_version,
+        )?
+        else {
+            return Ok(None);
+        };
+        prepared
+    };
+    let owner = unsafe { ffi::PyTuple_New(4) };
+    let owner = unsafe { Bound::<PyAny>::from_owned_ptr_or_err(py, owner)? };
+    for (index, value) in [
+        prepared.capsule.as_ptr(),
+        module_globals.as_ptr(),
+        builtins,
+        captures.as_ptr(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        unsafe { ffi::Py_INCREF(value) };
+        if unsafe { ffi::PyTuple_SetItem(owner.as_ptr(), index as ffi::Py_ssize_t, value) } != 0 {
+            return Err(PyErr::fetch(py));
+        }
+    }
+    let state = unsafe {
+        ffi::PyCapsule_GetPointer(
+            prepared.capsule.as_ptr(),
+            EAGER_COMPREHENSION_CAPSULE_NAME.as_ptr(),
+        )
+    }
+    .cast::<EagerComprehensionDirectEntry>();
+    if state.is_null() {
+        return Err(PyErr::fetch(py));
+    }
+    let callable = unsafe {
+        ffi::PyCFunction_NewEx(
+            std::ptr::addr_of_mut!((*state).method),
+            owner.as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    Ok(Some(
+        unsafe { Bound::<PyAny>::from_owned_ptr_or_err(py, callable)? }.unbind(),
+    ))
 }
 
 fn prepared_runtime_lookup_keys<'template>(
@@ -1504,6 +2146,18 @@ fn instantiate_shared_function(
     let dp = import_dp_module(py, function_template.as_ref())?;
     let module_runtime =
         module_runtime_from_shared_state(compile_session, shared_state, module_globals);
+    if let Some(callable) = make_eager_comprehension_callable(
+        py,
+        &module_runtime,
+        function_template.as_ref(),
+        &dp,
+        captures,
+        param_defaults,
+        annotate_fn,
+        module_globals,
+    )? {
+        return Ok(callable);
+    }
     let func = instantiate_bb_function_with_template(
         py,
         &dp,
