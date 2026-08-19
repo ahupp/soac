@@ -919,6 +919,69 @@ file-local batches**, with **86 / 86 batches passing**, plus **559 JIT**,
 tests; see `work/logs/source-function-templates-test-all.log`. The complete
 test phase takes **157.448 seconds**.
 
+### Interned Trusted Runtime Lookup Keys
+
+An existing source-backed function-instantiation template may lazily own
+exactly **three fallibly interned immutable Unicode lookup keys**. The keys
+replace temporary C-string conversion only in trusted runtime dictionary
+lookups; templates retain no runtime module, module dictionary, bootstrap,
+or factory value. Current `sys.modules`, runtime module, bootstrap, and
+factory bindings are still checked on every call, and fallible interning
+occurs outside the relevant lock.
+
+The fast path requires an **exact dictionary** whose pinned CPython keys
+layout is Unicode-only or split. Existing PyO3 `ffi::PyDictObject.ma_keys`
+and one private C-layout keys-prefix mirror expose the key kind. GENERAL-key
+dictionaries and dict subclasses retain the original
+`PyDict_GetItemString` path: colliding custom `__eq__` callbacks still
+observe fresh lookup-key identity, raised errors are swallowed/reported via
+the existing unraisable behavior, and no pending exception escapes. The
+separate module `dp.getattr("code_with_freevars")` remains unchanged so
+custom module `__getattribute__` / `__getattr__` lookup identity stays
+observable. Existing template-owned Python object lifetime remains in force;
+cross-interpreter or session-reset guarantees are not newly established.
+
+A genuine real-template/production-import regression turns RED-to-GREEN,
+proving three interned identities, successive live runtime-module and
+factory replacement, and no strong module retention. An adversarial
+GENERAL-dictionary/subclass collision-key identity and exception test also
+passes. Complete JIT library and all test targets each pass **565 / 565**;
+grouped transformed runtime tests pass **21 / 21 across 12 files in 17.48
+seconds**, and aligned test-target / scoped-format checks pass. Production
+changes only `crates/soac_jit/src/lib.rs` and
+`crates/soac_jit/src/function_instantiation.rs`; it adds no public API,
+runtime helper, generated-code path, or mutable global cache.
+
+Normally sampled fixed-eight results show an official previous-SOAC
+arithmetic **regression, 0.9899057912132601x**, and stock score decreases
+**0.5594598880789836x → 0.5558386711560767x**; robust full-eight ratio is
+only **1.003392x**. Matched **60-versus-60** targeted samples confirm
+`comprehensions` **1.067068x**, clustered 95% interval
+**1.035739–1.094314x**, or stock-adjusted **1.049671x**, interval
+**1.012618–1.096761x**. Robust affected/control subset is **1.024243x**, or
+**1.013272x** stock-adjusted; adjusted `richards` remains borderline at
+**0.957491x (0.917952–1.000002x)**. All generated native bytes, machine
+blocks, and function bodies are unchanged; these caveats preclude any
+full-suite speedup claim.
+
+Matched zero-loss **50,000-loop / 199 Hz** comprehensions profiles contain
+**782 → 738 samples**. `PyDict_GetItemString` ancestry falls
+**4.860160% → 0%** (import **3.453272% → 0%**, bootstrap
+**1.151091% → 0%**); a previously sampled unrelated **0.255798%** site has
+unchanged source. Unicode allocation/decode falls **2.1743% → 0.4071%** and
+descendant deallocation **2.6859% → 0.5429%**, but samples overlap and
+must not be summed. Existing dict lookup remains, while cold compilation
+**5.2439% → 5.5643%** and GC **14.3217% → 16.3884%** persist; profiler
+replay is diagnostic, not a performance headline. The candidate is
+**retained**, and the authoritative full `just test-all` correctness gate
+passes **1,222 Python nodeids across 89 / 89 file-local batches and eight
+workers**, plus JIT **565**, optimizer **211**, typed IR **54**, lowering
+**371**, and PyO3 **8**; see
+`work/logs/interned-runtime-keys-test-all.log`. Cargo tests take
+**58.487 seconds**, inner / outer pytest **95.296 / 95.311 seconds**, and
+the complete test phase **153.809 seconds**; the known counter-dump batch
+takes **94.53 seconds**. The full-suite stock **1.10x** goal remains unmet.
+
 ## Direct Generator-Instance Preserved State
 
 Canonical original-code generator expressions can avoid the interpreted

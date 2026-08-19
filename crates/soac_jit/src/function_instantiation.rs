@@ -17,7 +17,7 @@ use soac_core::block_py::{
     BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
-use std::ffi::{CString, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,11 +36,45 @@ pub(crate) fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
     unsafe { !obj.is_null() && ffi::Py_TYPE(obj) == std::ptr::addr_of_mut!(PyCell_Type) }
 }
 
-fn import_dp_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
+#[repr(C)]
+struct RawPyDictKeysPrefix {
+    dk_refcnt: ffi::Py_ssize_t,
+    dk_log2_size: u8,
+    dk_log2_index_bytes: u8,
+    dk_kind: u8,
+}
+
+unsafe fn runtime_lookup_dict_item(
+    dict: *mut ffi::PyObject,
+    key: &Bound<'_, PyString>,
+    legacy_key: &'static CStr,
+) -> *mut ffi::PyObject {
+    if !dict.is_null() && unsafe { ffi::PyDict_CheckExact(dict) } != 0 {
+        let keys =
+            unsafe { (*dict.cast::<ffi::PyDictObject>()).ma_keys }.cast::<RawPyDictKeysPrefix>();
+        if !keys.is_null() && unsafe { (*keys).dk_kind } != 0 {
+            return unsafe { ffi::PyDict_GetItem(dict, key.as_ptr()) };
+        }
+    }
+
+    // GENERAL dictionaries can contain arbitrary keys whose equality hooks observe the fresh
+    // Unicode argument. Preserve the existing GetItemString identity and error suppression.
+    unsafe { ffi::PyDict_GetItemString(dict, legacy_key.as_ptr()) }
+}
+
+fn import_dp_module<'py>(
+    py: Python<'py>,
+    function_template: &FunctionInstantiationTemplate,
+) -> PyResult<Bound<'py, PyModule>> {
+    let lookup_keys = prepared_runtime_lookup_keys(py, function_template)?;
     unsafe {
         let modules = ffi::PyImport_GetModuleDict();
         if !modules.is_null() {
-            let runtime = ffi::PyDict_GetItemString(modules, c"soac.runtime".as_ptr());
+            let runtime = runtime_lookup_dict_item(
+                modules,
+                lookup_keys.runtime_module.bind(py),
+                c"soac.runtime",
+            );
             if !runtime.is_null() {
                 let runtime = Bound::from_borrowed_ptr(py, runtime);
                 if let Ok(runtime) = runtime.cast_into::<PyModule>() {
@@ -558,6 +592,40 @@ pub(crate) struct PreparedOriginalCode {
     has_prepared_metadata: bool,
 }
 
+pub(crate) struct PreparedRuntimeLookupKeys {
+    runtime_module: Py<PyString>,
+    bootstrap_module: Py<PyString>,
+    code_factory: Py<PyString>,
+}
+
+fn prepared_runtime_lookup_keys<'template>(
+    py: Python<'_>,
+    function_template: &'template FunctionInstantiationTemplate,
+) -> PyResult<&'template PreparedRuntimeLookupKeys> {
+    if let Some(prepared) = function_template.prepared_runtime_lookup_keys.get() {
+        return Ok(prepared);
+    }
+
+    let intern = |name: &'static CStr| -> PyResult<Py<PyString>> {
+        let value = unsafe { ffi::PyUnicode_InternFromString(name.as_ptr()) };
+        let value = unsafe { Bound::<PyAny>::from_owned_ptr_or_err(py, value)? };
+        Ok(value.cast_into::<PyString>()?.unbind())
+    };
+    let prepared = PreparedRuntimeLookupKeys {
+        runtime_module: intern(c"soac.runtime")?,
+        bootstrap_module: intern(c"soac.bootstrap")?,
+        code_factory: intern(c"code_with_freevars")?,
+    };
+
+    // Unicode allocation can invoke Python-visible callbacks. Prepare outside OnceLock so
+    // reentrant function creation cannot deadlock or expose partially initialized keys.
+    let _ = function_template.prepared_runtime_lookup_keys.set(prepared);
+    Ok(function_template
+        .prepared_runtime_lookup_keys
+        .get()
+        .expect("prepared runtime lookup keys should be initialized"))
+}
+
 fn prepared_original_code_for_template<'template>(
     py: Python<'_>,
     function_template: &'template FunctionInstantiationTemplate,
@@ -605,13 +673,20 @@ fn prepared_original_code_for_template<'template>(
         .as_ref())
 }
 
-fn canonical_bootstrap_code_factory(factory: &Bound<'_, PyAny>) -> bool {
+fn canonical_bootstrap_code_factory(
+    factory: &Bound<'_, PyAny>,
+    lookup_keys: &PreparedRuntimeLookupKeys,
+) -> bool {
     unsafe {
         let modules = ffi::PyImport_GetModuleDict();
         if modules.is_null() {
             return false;
         }
-        let bootstrap = ffi::PyDict_GetItemString(modules, c"soac.bootstrap".as_ptr());
+        let bootstrap = runtime_lookup_dict_item(
+            modules,
+            lookup_keys.bootstrap_module.bind(factory.py()),
+            c"soac.bootstrap",
+        );
         if bootstrap.is_null()
             || ffi::Py_TYPE(bootstrap) != std::ptr::addr_of_mut!(ffi::PyModule_Type)
         {
@@ -621,7 +696,11 @@ fn canonical_bootstrap_code_factory(factory: &Bound<'_, PyAny>) -> bool {
         if globals.is_null() {
             return false;
         }
-        let original = ffi::PyDict_GetItemString(globals, c"code_with_freevars".as_ptr());
+        let original = runtime_lookup_dict_item(
+            globals,
+            lookup_keys.code_factory.bind(factory.py()),
+            c"code_with_freevars",
+        );
         !original.is_null() && original == factory.as_ptr()
     }
 }
@@ -641,7 +720,8 @@ fn synthetic_code_for_template<'py>(
         FunctionKind::AsyncGenerator => (true, true),
     };
 
-    if !canonical_bootstrap_code_factory(&factory) {
+    let lookup_keys = prepared_runtime_lookup_keys(py, function_template)?;
+    if !canonical_bootstrap_code_factory(&factory, lookup_keys) {
         let code = factory.call1((
             tuple_from_strings(py, captured_names)?,
             is_async,
@@ -1278,7 +1358,7 @@ fn instantiate_shared_function(
         function_qualname = function.names.qualname.as_str(),
         "make_function"
     );
-    let dp = import_dp_module(py)?;
+    let dp = import_dp_module(py, function_template.as_ref())?;
     let module_name = shared_state.module_name.clone();
     let module_runtime =
         module_runtime_from_shared_state(compile_session, shared_state, module_globals);
@@ -1453,13 +1533,318 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS, code_freevars_match_names,
+        MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS, RawPyDictKeysPrefix,
+        canonical_bootstrap_code_factory, code_freevars_match_names, import_dp_module,
         keep_source_generator_vectorcall, keep_source_runtime_helper_vectorcall,
-        make_lazy_clif_entry,
+        make_lazy_clif_entry, prepared_runtime_lookup_keys, runtime_lookup_dict_item,
     };
+    use pyo3::ffi;
     use pyo3::prelude::*;
     use pyo3::types::{PyDict, PyModule};
     use soac_core::block_py::FunctionKind;
+
+    #[test]
+    fn runtime_module_lookup_reuses_interned_template_keys_without_retaining_modules() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+                "def source_function():\n    return 1\n",
+            )
+            .expect("runtime lookup fixture should lower")
+            .blockpy_module;
+            let source_function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "source_function")
+                .expect("runtime lookup fixture should contain its source function");
+            let template = crate::FunctionInstantiationTemplate::from_function(source_function)
+                .expect("runtime lookup fixture should prepare its immutable function template");
+            let modules = py
+                .import("sys")
+                .and_then(|sys| sys.getattr("modules"))
+                .and_then(|modules| modules.cast_into::<PyDict>().map_err(Into::into))
+                .expect("the interpreter should expose its real module dictionary");
+            let original_runtime = modules
+                .get_item("soac.runtime")
+                .expect("runtime module lookup should succeed");
+            let first = PyModule::new(py, "runtime_lookup_first")
+                .expect("the first replacement runtime should allocate");
+            let second = PyModule::new(py, "runtime_lookup_second")
+                .expect("the second replacement runtime should allocate");
+
+            let imported = (|| -> PyResult<(usize, usize)> {
+                modules.set_item("soac.runtime", &first)?;
+                let first_import = import_dp_module(py, &template)?;
+                let first_ptr = first_import.as_ptr() as usize;
+                drop(first_import);
+
+                modules.set_item("soac.runtime", &second)?;
+                let second_import = import_dp_module(py, &template)?;
+                let second_ptr = second_import.as_ptr() as usize;
+                drop(second_import);
+                Ok((first_ptr, second_ptr))
+            })();
+            match original_runtime {
+                Some(original_runtime) => modules
+                    .set_item("soac.runtime", original_runtime)
+                    .expect("the original runtime module should be restored"),
+                None => modules
+                    .del_item("soac.runtime")
+                    .expect("the temporary runtime module should be removed"),
+            }
+            let (first_import, second_import) =
+                imported.expect("both actual production module lookups should succeed");
+            assert_eq!(first_import, first.as_ptr() as usize);
+            assert_eq!(second_import, second.as_ptr() as usize);
+
+            let prepared = template
+                .prepared_runtime_lookup_keys
+                .get()
+                .expect("production runtime lookup must prepare reusable interned Unicode keys");
+            for (name, actual) in [
+                ("soac.runtime", prepared.runtime_module.bind(py)),
+                ("soac.bootstrap", prepared.bootstrap_module.bind(py)),
+                ("code_with_freevars", prepared.code_factory.bind(py)),
+            ] {
+                let expected = py
+                    .import("sys")
+                    .and_then(|sys| sys.call_method1("intern", (name,)))
+                    .expect("the expected runtime lookup key should intern");
+                assert_eq!(
+                    actual.as_ptr(),
+                    expected.as_ptr(),
+                    "the {name} lookup key must reuse CPython's exact interned Unicode object"
+                );
+            }
+
+            let builtins = py.import("builtins").expect("builtins should import");
+            let original_factory = builtins
+                .getattr("len")
+                .expect("the first fixture factory should exist");
+            let replacement_factory = builtins
+                .getattr("repr")
+                .expect("the replacement fixture factory should exist");
+            let first_bootstrap = PyModule::new(py, "runtime_lookup_bootstrap_first")
+                .expect("the first replacement bootstrap should allocate");
+            let second_bootstrap = PyModule::new(py, "runtime_lookup_bootstrap_second")
+                .expect("the second replacement bootstrap should allocate");
+            first_bootstrap
+                .setattr("code_with_freevars", &original_factory)
+                .expect("the first bootstrap should accept its factory");
+            second_bootstrap
+                .setattr("code_with_freevars", &replacement_factory)
+                .expect("the second bootstrap should accept its factory");
+            let original_bootstrap = modules
+                .get_item("soac.bootstrap")
+                .expect("bootstrap module lookup should succeed");
+            let factory_matches = (|| -> PyResult<(bool, bool, bool)> {
+                modules.set_item("soac.bootstrap", &first_bootstrap)?;
+                let initial = canonical_bootstrap_code_factory(&original_factory, prepared);
+                first_bootstrap.setattr("code_with_freevars", &replacement_factory)?;
+                let replaced_factory =
+                    canonical_bootstrap_code_factory(&original_factory, prepared);
+                modules.set_item("soac.bootstrap", &second_bootstrap)?;
+                let replaced_module =
+                    canonical_bootstrap_code_factory(&replacement_factory, prepared);
+                Ok((initial, replaced_factory, replaced_module))
+            })();
+            match original_bootstrap {
+                Some(original_bootstrap) => modules
+                    .set_item("soac.bootstrap", original_bootstrap)
+                    .expect("the original bootstrap module should be restored"),
+                None => modules
+                    .del_item("soac.bootstrap")
+                    .expect("the temporary bootstrap module should be removed"),
+            }
+            assert_eq!(
+                factory_matches.expect("actual canonical factory probes should succeed"),
+                (true, false, true),
+                "cached names must reread the current bootstrap module and factory on every call"
+            );
+
+            let weak_first = py
+                .import("weakref")
+                .and_then(|weakref| weakref.call_method1("ref", (&first,)))
+                .expect("runtime modules should support weak references");
+            drop(first);
+            assert!(
+                weak_first
+                    .call0()
+                    .expect("the runtime module weak reference should be callable")
+                    .is_none(),
+                "prepared lookup keys must not retain replaced runtime modules"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_module_lookup_preserves_general_dict_collision_identity_and_error_suppression() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+                "def source_function():\n    return 1\n",
+            )
+            .expect("collision lookup fixture should lower")
+            .blockpy_module;
+            let source_function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "source_function")
+                .expect("collision lookup fixture should contain its source function");
+            let template = crate::FunctionInstantiationTemplate::from_function(source_function)
+                .expect("collision lookup fixture should prepare its immutable function template");
+            let prepared = prepared_runtime_lookup_keys(py, &template)
+                .expect("collision lookup fixture should prepare its interned names");
+            let namespace = PyDict::new(py);
+            py.import("builtins")
+                .and_then(|builtins| builtins.getattr("exec"))
+                .and_then(|exec| {
+                    exec.call1((
+                        r#"
+class CollisionKey:
+    def __init__(self, target):
+        self.target = target
+        self.identities = []
+        self.raise_error = False
+
+    def __hash__(self):
+        return hash(self.target)
+
+    def __eq__(self, other):
+        self.identities.append(other is self.target)
+        if self.raise_error:
+            raise RuntimeError("runtime lookup collision")
+        return False
+
+class DictSubclass(dict):
+    pass
+
+unraisable_errors = []
+
+def observe_unraisable(error):
+    unraisable_errors.append(error.exc_type.__name__)
+"#,
+                        &namespace,
+                    ))
+                })
+                .expect("collision lookup fixture should define its adversarial Python objects");
+            let collision_class = namespace
+                .get_item("CollisionKey")
+                .expect("collision class lookup should succeed")
+                .expect("collision class should exist");
+            let collision = collision_class
+                .call1((prepared.runtime_module.bind(py),))
+                .expect("collision key should allocate");
+            let dict = PyDict::new(py);
+            dict.set_item(&collision, py.None())
+                .expect("collision key should enter the fixture dictionary first");
+            let value = PyModule::new(py, "runtime_lookup_collision_value")
+                .expect("collision fixture value should allocate");
+            dict.set_item(prepared.runtime_module.bind(py), &value)
+                .expect("the actual Unicode key should enter the fixture dictionary");
+            collision
+                .getattr("identities")
+                .and_then(|identities| identities.call_method0("clear"))
+                .expect("fixture insertion observations should clear");
+
+            let keys = unsafe { (*dict.as_ptr().cast::<ffi::PyDictObject>()).ma_keys }
+                .cast::<RawPyDictKeysPrefix>();
+            assert_eq!(
+                unsafe { (*keys).dk_kind },
+                0,
+                "a non-Unicode collision key must force CPython's GENERAL dictionary layout"
+            );
+            let found = unsafe {
+                runtime_lookup_dict_item(
+                    dict.as_ptr(),
+                    prepared.runtime_module.bind(py),
+                    c"soac.runtime",
+                )
+            };
+            assert_eq!(found, value.as_ptr());
+            assert_eq!(
+                collision
+                    .getattr("identities")
+                    .and_then(|identities| identities.extract::<Vec<bool>>())
+                    .expect("collision identity observations should extract"),
+                vec![false],
+                "GENERAL dictionaries must receive the original freshly allocated Unicode key"
+            );
+
+            let subclass = namespace
+                .get_item("DictSubclass")
+                .expect("dictionary subclass lookup should succeed")
+                .expect("dictionary subclass should exist")
+                .call0()
+                .expect("dictionary subclass should allocate");
+            subclass
+                .call_method1("update", (&dict,))
+                .expect("dictionary subclass should copy its collision keys");
+            collision
+                .getattr("identities")
+                .and_then(|identities| identities.call_method0("clear"))
+                .expect("subclass setup observations should clear");
+            let subclass_found = unsafe {
+                runtime_lookup_dict_item(
+                    subclass.as_ptr(),
+                    prepared.runtime_module.bind(py),
+                    c"soac.runtime",
+                )
+            };
+            assert_eq!(subclass_found, value.as_ptr());
+            assert_eq!(
+                collision
+                    .getattr("identities")
+                    .and_then(|identities| identities.extract::<Vec<bool>>())
+                    .expect("subclass collision identity observations should extract"),
+                vec![false],
+                "dictionary subclasses must retain the original fresh-key lookup"
+            );
+
+            collision
+                .setattr("raise_error", true)
+                .expect("collision fixture should enable its raising equality hook");
+            let sys = py.import("sys").expect("sys should import");
+            let original_unraisable_hook = sys
+                .getattr("unraisablehook")
+                .expect("the existing unraisable hook should exist");
+            let replacement_unraisable_hook = namespace
+                .get_item("observe_unraisable")
+                .expect("replacement unraisable hook lookup should succeed")
+                .expect("replacement unraisable hook should exist");
+            sys.setattr("unraisablehook", replacement_unraisable_hook)
+                .expect("the temporary unraisable hook should install");
+            let failed = unsafe {
+                runtime_lookup_dict_item(
+                    dict.as_ptr(),
+                    prepared.runtime_module.bind(py),
+                    c"soac.runtime",
+                )
+            };
+            let raised = unsafe { ffi::PyErr_Occurred() };
+            sys.setattr("unraisablehook", original_unraisable_hook)
+                .expect("the original unraisable hook should restore");
+            assert!(failed.is_null());
+            assert!(
+                raised.is_null(),
+                "legacy PyDict_GetItemString must keep suppressing collision errors"
+            );
+            assert_eq!(
+                namespace
+                    .get_item("unraisable_errors")
+                    .expect("unraisable observations lookup should succeed")
+                    .expect("unraisable observations should exist")
+                    .extract::<Vec<String>>()
+                    .expect("unraisable observations should extract"),
+                vec!["RuntimeError"],
+                "the legacy lookup must preserve CPython's existing unraisable-hook behavior"
+            );
+        });
+    }
 
     #[test]
     fn source_backed_zero_freevar_function_preserves_code_metadata_identity() {

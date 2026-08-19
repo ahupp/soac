@@ -472,6 +472,7 @@ pub(crate) struct FunctionInstantiationTemplate {
     entry_plan: jit::RuntimeFunctionEntryPlan,
     prepared_original_code: OnceLock<Option<function_instantiation::PreparedOriginalCode>>,
     prepared_synthetic_code: OnceLock<function_instantiation::PreparedSyntheticCode>,
+    prepared_runtime_lookup_keys: OnceLock<function_instantiation::PreparedRuntimeLookupKeys>,
     prepared_direct_entry: OnceLock<PreparedDirectEntry>,
     prepared_generator_factory: OnceLock<PreparedGeneratorFactory>,
 }
@@ -531,6 +532,7 @@ impl FunctionInstantiationTemplate {
             entry_plan,
             prepared_original_code: OnceLock::new(),
             prepared_synthetic_code: OnceLock::new(),
+            prepared_runtime_lookup_keys: OnceLock::new(),
             prepared_direct_entry: OnceLock::new(),
             prepared_generator_factory: OnceLock::new(),
         })

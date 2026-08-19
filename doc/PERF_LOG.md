@@ -1652,3 +1652,12 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   previous-SOAC robust improvement `1.003x`, three-round targeted `1.037x`.
   `deltablue` improves `1.057x` and `richards` `1.072x`; `comprehensions`
   regresses `3.34%` and generated native code grows `2.79%`.
+
+## 2026-08-19 - Reuse interned runtime lookup keys
+
+- jj change id: `wtyxsxpv`
+- summary: reuse guarded interned Unicode keys for live runtime lookups.
+- eight-workload stock score `0.555839x` versus prior `0.559460x`; mean
+  previous-SOAC ratio `0.990x`, robust `1.003x`. Repeated `comprehensions`
+  improves `1.067x` (normal median `63.29 us` to `60.68 us`); generated
+  native code remains unchanged.
