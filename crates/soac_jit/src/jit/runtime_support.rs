@@ -149,11 +149,61 @@ impl Inline for RuntimeSupportInliner {
             return InlineCommand::KeepCall;
         };
         let call_srcloc = caller.srcloc(call_inst);
-        let callee = if clif_refcount_family_from_source_loc_bits(call_srcloc.bits()).is_some() {
+        let needs_source_locations =
+            clif_refcount_family_from_source_loc_bits(call_srcloc.bits()).is_some();
+        let needs_global_symbol_remapping = callee_func.global_values.values().any(|data| {
+            matches!(
+                data,
+                ir::GlobalValueData::Symbol {
+                    name: ir::ExternalName::User(_),
+                    ..
+                }
+            )
+        });
+        let callee = if needs_source_locations || needs_global_symbol_remapping {
             let mut callee = callee_func.clone();
-            for block in callee.layout.blocks().collect::<Vec<_>>() {
-                for inst in callee.layout.block_insts(block).collect::<Vec<_>>() {
-                    callee.set_srcloc(inst, call_srcloc);
+            if needs_global_symbol_remapping {
+                let mut name_remaps = Vec::new();
+                for data in callee_func.global_values.values() {
+                    let ir::GlobalValueData::Symbol {
+                        name: ir::ExternalName::User(name_ref),
+                        ..
+                    } = data
+                    else {
+                        continue;
+                    };
+                    let actual_name = &callee_func.params.user_named_funcs()[*name_ref];
+                    let Some((caller_name_ref, _)) = caller
+                        .params
+                        .user_named_funcs()
+                        .iter()
+                        .find(|(_, name)| *name == actual_name)
+                    else {
+                        return InlineCommand::KeepCall;
+                    };
+                    name_remaps.push((*name_ref, caller_name_ref));
+                }
+                for data in callee.global_values.values_mut() {
+                    let ir::GlobalValueData::Symbol {
+                        name: ir::ExternalName::User(name_ref),
+                        ..
+                    } = data
+                    else {
+                        continue;
+                    };
+                    if let Some((_, caller_name_ref)) = name_remaps
+                        .iter()
+                        .find(|(callee_name_ref, _)| callee_name_ref == name_ref)
+                    {
+                        *name_ref = *caller_name_ref;
+                    }
+                }
+            }
+            if needs_source_locations {
+                for block in callee.layout.blocks().collect::<Vec<_>>() {
+                    for inst in callee.layout.block_insts(block).collect::<Vec<_>>() {
+                        callee.set_srcloc(inst, call_srcloc);
+                    }
                 }
             }
             Cow::Owned(callee)
@@ -175,6 +225,19 @@ pub(super) fn inline_runtime_support_calls(
     err_prefix: &str,
 ) -> Result<bool, String> {
     let mut inliner = RuntimeSupportInliner::for_module(codegen_env, env_config)?;
+    for callee in inliner.inlineable.values() {
+        for data in callee.global_values.values() {
+            let ir::GlobalValueData::Symbol {
+                name: ir::ExternalName::User(name_ref),
+                ..
+            } = data
+            else {
+                continue;
+            };
+            let actual_name = callee.params.user_named_funcs()[*name_ref].clone();
+            ctx.func.declare_imported_user_function(actual_name);
+        }
+    }
     ctx.inline(&mut inliner)
         .map_err(|err| format!("{err_prefix}: failed to inline runtime support calls: {err:?}"))
 }
@@ -269,7 +332,14 @@ fn runtime_clif_for_reader(clif_text: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod runtime_clif_reader_tests {
-    use super::runtime_clif_for_reader;
+    use super::{inline_runtime_support_calls, runtime_clif_for_reader};
+    use crate::jit::codegen_env::declare_local_fn;
+    use crate::jit::new_jit_module;
+    use crate::jit::symbols::SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL;
+    use cranelift_codegen::ir::{self, InstBuilder};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_module::{Linkage, Module};
+    use soac_config::SoacEnvConfig;
 
     #[test]
     fn parses_runtime_clif_with_unknown_target_isa_settings() {
@@ -282,6 +352,84 @@ mod runtime_clif_reader_tests {
             .expect("runtime CLIF should ignore settings from a newer target ISA");
 
         assert_eq!(functions.len(), 1);
+    }
+
+    #[test]
+    fn inlined_runtime_global_symbols_preserve_caller_data_import_identity() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test JIT module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+        let mut signature = jit_module.make_signature();
+        signature.params.extend([
+            ir::AbiParam::new(ptr_ty),
+            ir::AbiParam::new(ptr_ty),
+            ir::AbiParam::new(ptr_ty),
+            ir::AbiParam::new(ir::types::I64),
+        ]);
+        signature.returns.push(ir::AbiParam::new(ptr_ty));
+        let helper_id =
+            declare_local_fn(&mut jit_module, SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL, &signature)
+                .expect("runtime global helper should declare");
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "runtime_global_external_data_identity_wrapper",
+            &signature,
+        )
+        .expect("runtime global wrapper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = signature;
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+            let helper_ref = jit_module.declare_func_in_func(helper_id, &mut fb.func);
+            let args = fb.block_params(entry).to_vec();
+            let result = fb.ins().call(helper_ref, &args);
+            let result = fb.inst_results(result)[0];
+            fb.ins().return_(&[result]);
+            fb.finalize();
+        }
+
+        let expected_data_id = jit_module
+            .declare_data(
+                "_PyDict_IndexedValueTombstone",
+                Linkage::Import,
+                false,
+                false,
+            )
+            .expect("runtime tombstone data import should declare");
+        let inlined = inline_runtime_support_calls(
+            &mut jit_module,
+            &SoacEnvConfig::default(),
+            &mut ctx,
+            "runtime global helper should inline",
+        )
+        .expect("runtime global helper inlining should succeed");
+        assert!(inlined, "runtime global fast path must remain inlined");
+
+        let expected_name = ir::UserExternalName::new(1, expected_data_id.as_u32());
+        let actual_names = ctx
+            .func
+            .global_values
+            .values()
+            .filter_map(|data| match data {
+                ir::GlobalValueData::Symbol {
+                    name: ir::ExternalName::User(name_ref),
+                    ..
+                } => Some(ctx.func.params.user_named_funcs()[*name_ref].clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            actual_names.contains(&expected_name),
+            "inlined runtime tombstone must retain the caller's exact external-data namespace/id: {actual_names:?}"
+        );
     }
 }
 

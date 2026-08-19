@@ -62,6 +62,20 @@ soac_runtime_store_field_indexed_inline_values
 soac_runtime_compare_compact_ascii_unicode
 ```
 
+`soac_runtime_load_global(globals, builtins, name, expected_index)` receives
+the current function's captured builtins mapping explicitly, rather than
+re-reading mutable `globals["__builtins__"]`. An indexed globals hit returns
+an owned value immediately; misses delegate to the corresponding
+`soac_runtime_load_global_slow(globals, builtins, name, expected_index)`
+helper below. SOAC's custom indexed globals can contain a private
+indexed-value tombstone after deletion, so the inlined probe must compare
+against the actual external data symbol rather than a JIT-local relocation
+stub. Validated indexed misses check captured builtins directly;
+exact-dictionary fallback uses `PyDict_GetItemRef`, while subclasses/custom
+mappings use `PyMapping_GetOptionalItem`. All paths preserve globals-first
+precedence, mapping callbacks, exceptions, and missing-name behavior;
+specialized NULL results propagate their existing `NameError`.
+
 ## specialized_helpers.rs
 
 Direct exported helpers:
@@ -83,7 +97,6 @@ dp_jit_pyobject_setitem
 dp_jit_pyobject_delitem
 dp_jit_pytype_generic_alloc
 dp_jit_finish_constructor_init
-dp_jit_load_global_obj
 dp_jit_store_global
 dp_jit_del_global
 dp_jit_del_global_quietly

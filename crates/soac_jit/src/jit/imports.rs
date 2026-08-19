@@ -136,7 +136,12 @@ pub(super) static SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT: ImportSpec = ImportS
 );
 pub(super) static SOAC_RUNTIME_LOAD_GLOBAL_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL,
-    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::I64,
+    ],
     &[SigType::Pointer],
 );
 pub(super) static SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
@@ -146,7 +151,12 @@ pub(super) static SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT: ImportSpec = ImportS
 );
 pub(super) static SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT: ImportSpec = ImportSpec::new(
     "soac_runtime_load_global_slow",
-    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::I64,
+    ],
     &[SigType::Pointer],
 );
 pub(super) static SOAC_RUNTIME_STORE_GLOBAL_IMPORT: ImportSpec = ImportSpec::local(
@@ -464,6 +474,7 @@ pub(super) static DP_JIT_POP_HANDLED_EXCEPTION_IMPORT: ImportSpec =
 pub(super) static DP_JIT_DEOPT_RESUME_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_deopt_resume",
     &[
+        SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,

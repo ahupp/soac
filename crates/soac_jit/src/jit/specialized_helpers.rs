@@ -34,6 +34,11 @@ unsafe extern "C" {
         key: *mut ffi::PyObject,
         result: *mut *mut ffi::PyObject,
     ) -> libc::c_int;
+    fn PyMapping_GetOptionalItem(
+        mapping: *mut ffi::PyObject,
+        key: *mut ffi::PyObject,
+        result: *mut *mut ffi::PyObject,
+    ) -> libc::c_int;
 }
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
@@ -396,13 +401,14 @@ unsafe extern "C" fn get_arg_item_hook(args: ObjPtr, index: i64) -> ObjPtr {
 }
 unsafe fn load_global_obj_impl(
     globals_obj: ObjPtr,
+    builtins_obj: ObjPtr,
     name_obj: *mut ffi::PyObject,
     slot_index: i64,
 ) -> ObjPtr {
-    if globals_obj.is_null() || name_obj.is_null() {
+    if globals_obj.is_null() || builtins_obj.is_null() || name_obj.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_load_global_obj\0"
+            b"invalid arguments to soac_runtime_load_global_slow\0"
                 .as_ptr()
                 .cast(),
         );
@@ -418,13 +424,20 @@ unsafe fn load_global_obj_impl(
         if rc > 0 {
             return value as ObjPtr;
         }
+        if rc == 0 {
+            return load_builtin_slow(builtins_obj.cast::<ffi::PyObject>(), name_obj).cast();
+        }
         if rc < 0 {
             // The module dict can be promoted after an unprofiled key insertion.
             // Fall back to the mapping lookup so the JIT remains semantically CPython-like.
             ffi::PyErr_Clear();
         }
     }
-    load_global_slow(globals_obj as *mut ffi::PyObject, name_obj) as ObjPtr
+    load_global_slow(
+        globals_obj as *mut ffi::PyObject,
+        builtins_obj as *mut ffi::PyObject,
+        name_obj,
+    ) as ObjPtr
 }
 unsafe fn ensure_global_load_error(result: ObjPtr, name_obj: *mut ffi::PyObject) -> ObjPtr {
     if result.is_null() && ffi::PyErr_Occurred().is_null() {
@@ -449,95 +462,43 @@ unsafe fn guarded_indexed_global_slot(
     }
     -1
 }
-unsafe fn globals_builtins_owned(globals_obj: *mut ffi::PyObject) -> *mut ffi::PyObject {
-    if ffi::PyDict_Check(globals_obj) != 0 {
-        let builtins = ffi::PyDict_GetItemString(globals_obj, c"__builtins__".as_ptr());
-        if !builtins.is_null() {
-            ffi::Py_INCREF(builtins);
-            return builtins;
-        }
-        if !ffi::PyErr_Occurred().is_null() {
-            return ptr::null_mut();
-        }
-    } else {
-        let key = ffi::PyUnicode_FromString(c"__builtins__".as_ptr());
-        if key.is_null() {
-            return ptr::null_mut();
-        }
-        let builtins = ffi::PyObject_GetItem(globals_obj, key);
-        ffi::Py_DECREF(key);
-        if !builtins.is_null() {
-            return builtins;
-        }
-        if ffi::PyErr_ExceptionMatches(ffi::PyExc_KeyError) == 0 {
-            return ptr::null_mut();
-        }
-        ffi::PyErr_Clear();
-    }
-
-    let builtins = ffi::PyEval_GetBuiltins();
-    if builtins.is_null() {
-        ptr::null_mut()
-    } else {
-        ffi::Py_INCREF(builtins);
-        builtins
-    }
-}
 unsafe fn load_global_slow(
     globals_obj: *mut ffi::PyObject,
+    builtins_obj: *mut ffi::PyObject,
     name_obj: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
-    if ffi::PyDict_Check(globals_obj) != 0 {
-        let mut value = ptr::null_mut();
-        let rc = PyDict_GetItemRef(globals_obj, name_obj, ptr::addr_of_mut!(value));
-        if rc > 0 {
-            return value;
-        }
-        if rc < 0 {
-            return ptr::null_mut();
-        }
-    } else {
-        let value = ffi::PyObject_GetItem(globals_obj, name_obj);
-        if !value.is_null() {
-            return value;
-        }
-        if ffi::PyErr_ExceptionMatches(ffi::PyExc_KeyError) == 0 {
-            return ptr::null_mut();
-        }
-        ffi::PyErr_Clear();
+    let mut value = ptr::null_mut();
+    let result =
+        if ffi::PyDict_CheckExact(globals_obj) != 0 && ffi::PyDict_CheckExact(builtins_obj) != 0 {
+            PyDict_GetItemRef(globals_obj, name_obj, ptr::addr_of_mut!(value))
+        } else {
+            PyMapping_GetOptionalItem(globals_obj, name_obj, ptr::addr_of_mut!(value))
+        };
+    match result {
+        1 => value,
+        0 => load_builtin_slow(builtins_obj, name_obj),
+        _ => ptr::null_mut(),
     }
+}
 
-    let builtins = globals_builtins_owned(globals_obj);
-    if builtins.is_null() {
-        return ptr::null_mut();
-    }
-    let value = if ffi::PyDict_Check(builtins) != 0 {
-        let mut value = ptr::null_mut();
-        let rc = PyDict_GetItemRef(builtins, name_obj, ptr::addr_of_mut!(value));
-        ffi::Py_DECREF(builtins);
-        if rc > 0 {
-            return value;
-        }
-        if rc < 0 {
-            return ptr::null_mut();
-        }
-        raise_name_error_for_missing_name(name_obj);
-        return ptr::null_mut();
+unsafe fn load_builtin_slow(
+    builtins_obj: *mut ffi::PyObject,
+    name_obj: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let mut value = ptr::null_mut();
+    let result = if ffi::PyDict_CheckExact(builtins_obj) != 0 {
+        PyDict_GetItemRef(builtins_obj, name_obj, ptr::addr_of_mut!(value))
     } else {
-        ffi::PyObject_GetAttr(builtins, name_obj)
+        PyMapping_GetOptionalItem(builtins_obj, name_obj, ptr::addr_of_mut!(value))
     };
-    ffi::Py_DECREF(builtins);
-    if !value.is_null() {
-        return value;
+    match result {
+        1 => value,
+        0 => {
+            raise_name_error_for_missing_name(name_obj);
+            ptr::null_mut()
+        }
+        _ => ptr::null_mut(),
     }
-    if ffi::PyErr_ExceptionMatches(ffi::PyExc_KeyError) == 0
-        && ffi::PyErr_ExceptionMatches(ffi::PyExc_AttributeError) == 0
-    {
-        return ptr::null_mut();
-    }
-    ffi::PyErr_Clear();
-    raise_name_error_for_missing_name(name_obj);
-    ptr::null_mut()
 }
 unsafe extern "C" fn pyobject_getattr_hook(obj: ObjPtr, attr: ObjPtr) -> ObjPtr {
     if obj.is_null() || attr.is_null() {
@@ -895,15 +856,6 @@ unsafe extern "C" fn del_deref_quietly_hook(cell: ObjPtr) -> ObjPtr {
     ffi::Py_INCREF(none);
     none as ObjPtr
 }
-unsafe extern "C" fn load_global_obj_hook(
-    globals_obj: ObjPtr,
-    name: ObjPtr,
-    slot_index: i64,
-) -> ObjPtr {
-    let name_obj = name as *mut ffi::PyObject;
-    let result = load_global_obj_impl(globals_obj, name_obj, slot_index);
-    ensure_global_load_error(result, name_obj)
-}
 unsafe extern "C" fn dict_new_hook() -> ObjPtr {
     ffi::PyDict_New() as ObjPtr
 }
@@ -1123,13 +1075,9 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_del_preserved(owner: ObjPtr, slot: i64, name: ObjPtr));
     panic_obj_export!(dp_jit_del_preserved_quietly(owner: ObjPtr, slot: i64, name: ObjPtr));
     panic_obj_export!(dp_jit_pyobject_delitem(obj: ObjPtr, key: ObjPtr));
-    panic_obj_export!(dp_jit_load_global_obj(
-        globals_obj: ObjPtr,
-        name: ObjPtr,
-        slot_index: i64
-    ));
     panic_obj_export!(soac_runtime_load_global_slow(
         globals_obj: ObjPtr,
+        builtins_obj: ObjPtr,
         name: ObjPtr,
         expected_index: i64
     ));
@@ -1159,6 +1107,7 @@ mod test_only_export_stubs {
     panic_obj_export!(dp_jit_deopt_resume(
         deopt_table: ObjPtr,
         globals_obj: ObjPtr,
+        builtins_obj: ObjPtr,
         function_data_obj: ObjPtr,
         record_ordinal: i64,
         live_values: ObjPtr,
@@ -1363,22 +1312,22 @@ pub unsafe extern "C" fn dp_jit_pyobject_delitem(obj: ObjPtr, key: ObjPtr) -> Ob
     pyobject_delitem_hook(obj, key)
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_load_global_obj(
-    globals_obj: ObjPtr,
-    name: ObjPtr,
-    slot_index: i64,
-) -> ObjPtr {
-    load_global_obj_hook(globals_obj, name, slot_index)
-}
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_load_global_slow(
     globals_obj: ObjPtr,
+    builtins_obj: ObjPtr,
     name: ObjPtr,
     expected_index: i64,
 ) -> ObjPtr {
     let name_obj = name as *mut ffi::PyObject;
+    if globals_obj.is_null() || builtins_obj.is_null() || name_obj.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"invalid arguments to soac_runtime_load_global_slow".as_ptr(),
+        );
+        return ptr::null_mut();
+    }
     let slot_index = guarded_indexed_global_slot(globals_obj, name_obj, expected_index);
-    let result = load_global_obj_impl(globals_obj, name_obj, slot_index);
+    let result = load_global_obj_impl(globals_obj, builtins_obj, name_obj, slot_index);
     ensure_global_load_error(result, name_obj)
 }
 #[unsafe(no_mangle)]
@@ -1453,6 +1402,7 @@ pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
 pub unsafe extern "C" fn dp_jit_deopt_resume(
     deopt_table: ObjPtr,
     globals_obj: ObjPtr,
+    builtins_obj: ObjPtr,
     function_data_obj: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
@@ -1462,6 +1412,7 @@ pub unsafe extern "C" fn dp_jit_deopt_resume(
         run_deopt_resume(
             deopt_table,
             globals_obj,
+            builtins_obj,
             function_data_obj,
             record_ordinal,
             live_values,
@@ -1480,6 +1431,7 @@ pub unsafe extern "C" fn dp_jit_deopt_resume(
 unsafe fn run_deopt_resume(
     deopt_table: ObjPtr,
     globals_obj: ObjPtr,
+    builtins_obj: ObjPtr,
     function_data_obj: ObjPtr,
     record_ordinal: i64,
     live_values: ObjPtr,
@@ -1489,6 +1441,7 @@ unsafe fn run_deopt_resume(
         RuntimeJitDeoptInvocation::from_raw(
             deopt_table,
             globals_obj,
+            builtins_obj,
             function_data_obj,
             record_ordinal,
             live_values,
@@ -1685,10 +1638,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_pyobject_delitem",
         dp_jit_pyobject_delitem as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_load_global_obj",
-        dp_jit_load_global_obj as *const u8,
     );
     builder.symbol(
         "soac_runtime_load_global_slow",

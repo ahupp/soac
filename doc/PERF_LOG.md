@@ -1552,3 +1552,14 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 - pyperformance SOAC apply: `chaos` `94.56 ms` to `84.28 ms` (`1.122x`
   faster, statistically significant); three-workload geometric improvement
   `1.050x`, with unchanged generated code and a `0.401x` stock-CPython score.
+
+## 2026-08-18 - Preserve function-captured builtins in global lookup
+
+- jj change id: `zolltvqv`
+- summary: reuse each function's captured builtins for JIT global misses while
+  preserving custom mappings, indexed-dictionary deletion, and missing names.
+- pyperformance SOAC apply: `deltablue` `4.58 ms` to `4.43 ms` (`1.033x`) and
+  `richards` `43.80 ms` to `40.49 ms` (`1.082x`), both statistically
+  significant; four-workload median geometric improvement `1.053x`. The
+  mean-based comparison is `1.006x` after a large `chaos` outlier; the
+  candidate remains `0.274x` stock CPython across the measured subset.

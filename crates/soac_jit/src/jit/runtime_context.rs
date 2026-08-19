@@ -49,14 +49,6 @@ pub struct ModuleJitContext {
 }
 
 #[repr(C)]
-struct FunctionEnvPrefix {
-    direct_code_ptr: *const u8,
-    default_direct_code_ptr: *const u8,
-    deopt_table_ptr: ObjPtr,
-    globals_obj: ObjPtr,
-}
-
-#[repr(C)]
 struct PyFunctionJitExtraPrefix {
     function_env: ObjPtr,
     function_id: u64,
@@ -131,13 +123,17 @@ impl Drop for ModuleRuntimeContext {
 }
 
 pub const FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET: i32 =
-    offset_of!(FunctionEnvPrefix, direct_code_ptr) as i32;
+    offset_of!(crate::FunctionEnvAbiHeader, direct_code_ptr) as i32;
 pub const FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET: i32 =
-    offset_of!(FunctionEnvPrefix, default_direct_code_ptr) as i32;
+    offset_of!(crate::FunctionEnvAbiHeader, default_direct_code_ptr) as i32;
 pub const FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET: i32 =
-    offset_of!(FunctionEnvPrefix, deopt_table_ptr) as i32;
-pub const FUNCTION_ENV_GLOBALS_OBJ_OFFSET: i32 = offset_of!(FunctionEnvPrefix, globals_obj) as i32;
-pub const FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET: i32 = size_of::<FunctionEnvPrefix>() as i32;
+    offset_of!(crate::FunctionEnvAbiHeader, deopt_table_ptr) as i32;
+pub const FUNCTION_ENV_GLOBALS_OBJ_OFFSET: i32 =
+    offset_of!(crate::FunctionEnvAbiHeader, globals_obj) as i32;
+pub const FUNCTION_ENV_BUILTINS_OBJ_OFFSET: i32 =
+    offset_of!(crate::FunctionEnvAbiHeader, builtins_obj) as i32;
+pub const FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET: i32 =
+    size_of::<crate::FunctionEnvAbiHeader>() as i32;
 pub const PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET: i32 =
     offset_of!(PyFunctionJitExtraPrefix, function_env) as i32;
 pub const PY_FUNCTION_CODE_OFFSET: i32 =

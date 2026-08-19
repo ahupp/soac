@@ -327,6 +327,7 @@ struct FunctionEnvAbiHeader {
     default_direct_code_ptr: *const u8,
     deopt_table_ptr: *const c_void,
     globals_obj: *mut ffi::PyObject,
+    builtins_obj: *mut ffi::PyObject,
 }
 
 struct FunctionEnv {
@@ -530,13 +531,19 @@ impl FunctionEnv {
 
     unsafe fn new(
         globals_obj: *mut ffi::PyObject,
+        builtins_obj: *mut ffi::PyObject,
         mut runtime_object_values: Box<[*mut ffi::PyObject]>,
     ) -> Result<Self, ()> {
-        if globals_obj.is_null() {
+        if globals_obj.is_null() || builtins_obj.is_null() {
             unsafe { cleanup_state_values(&mut runtime_object_values) };
-            return set_runtime_error("missing globals while creating JIT function environment");
+            return set_runtime_error(
+                "missing globals or captured builtins while creating JIT function environment",
+            );
         }
-        unsafe { ffi::Py_INCREF(globals_obj) };
+        unsafe {
+            ffi::Py_INCREF(globals_obj);
+            ffi::Py_INCREF(builtins_obj);
+        }
         let runtime_object_len = runtime_object_values.len();
         let layout = Self::allocation_layout(runtime_object_len);
         let raw = unsafe { alloc(layout) };
@@ -549,6 +556,7 @@ impl FunctionEnv {
                 default_direct_code_ptr: ptr::null(),
                 deopt_table_ptr: ptr::null(),
                 globals_obj,
+                builtins_obj,
             });
             let runtime_objects =
                 raw.add(Self::runtime_objects_offset()) as *mut *mut ffi::PyObject;
@@ -580,6 +588,10 @@ impl FunctionEnv {
 
     fn globals_obj(&self) -> *mut ffi::PyObject {
         self.header().globals_obj
+    }
+
+    fn builtins_obj(&self) -> *mut ffi::PyObject {
+        self.header().builtins_obj
     }
 
     fn direct_code_ptr(&self) -> *const u8 {
@@ -665,6 +677,11 @@ impl Drop for FunctionEnv {
         if !globals_obj.is_null() {
             unsafe { ffi::Py_DECREF(globals_obj) };
             self.header_mut().globals_obj = ptr::null_mut();
+        }
+        let builtins_obj = self.builtins_obj();
+        if !builtins_obj.is_null() {
+            unsafe { ffi::Py_DECREF(builtins_obj) };
+            self.header_mut().builtins_obj = ptr::null_mut();
         }
         let layout = Self::allocation_layout(self.runtime_object_len);
         unsafe { dealloc(self.abi.as_ptr() as *mut u8, layout) };
@@ -1073,14 +1090,15 @@ unsafe fn make_clif_function_data(
             None,
         )?
     };
+    let raw_function = callable.cast::<ffi::PyFunctionObject>();
     let mut function_env = unsafe {
         Box::new(FunctionEnv::new(
             module_runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
+            (*raw_function).func_builtins,
             runtime_object_values,
         )?)
     };
     let function_env_ptr = function_env.as_mut_ptr();
-    let raw_function = callable.cast::<ffi::PyFunctionObject>();
     let registered_code = unsafe { (*raw_function).func_code };
     let registered_defaults = unsafe { (*raw_function).func_defaults };
     let registered_kwdefaults = unsafe { (*raw_function).func_kwdefaults };
@@ -3157,6 +3175,7 @@ pub(crate) unsafe fn run_registered_clif_function_from_vectorcall_entry(
         Arc::clone(&data.compile_session),
         Arc::clone(&data.module_state),
         data.function_env.globals_obj().cast::<c_void>(),
+        data.function_env.builtins_obj().cast::<c_void>(),
         data.function_env.runtime_objects_ptr().cast::<c_void>(),
         data.function_template.entry_plan(),
     );

@@ -300,6 +300,7 @@ unsafe extern "C" {
     fn _PyDict_SetIndexedItem(dict: *mut c_void, index: isize, value: *mut c_void) -> i32;
     fn soac_runtime_load_global_slow(
         dict: *mut c_void,
+        builtins: *mut c_void,
         key: *mut c_void,
         index: isize,
     ) -> *mut c_void;
@@ -834,6 +835,7 @@ pub unsafe extern "C" fn soac_runtime_probe_global_indexed(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_load_global(
     dict: *mut c_void,
+    builtins: *mut c_void,
     key: *mut c_void,
     index: isize,
 ) -> *mut c_void {
@@ -849,7 +851,9 @@ pub unsafe extern "C" fn soac_runtime_load_global(
         return value.cast::<c_void>();
     }
 
-    unsafe { soac_runtime_load_global_slow(dict.cast::<c_void>(), key.cast::<c_void>(), index) }
+    unsafe {
+        soac_runtime_load_global_slow(dict.cast::<c_void>(), builtins, key.cast::<c_void>(), index)
+    }
 }
 
 macro_rules! store_global_indexed_body {

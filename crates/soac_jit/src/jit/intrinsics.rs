@@ -1069,6 +1069,13 @@ fn emit_load<'fb>(
         NameLocation::Global(slot) => {
             let globals_obj = state.ctx().consts.block_const;
             let ptr_ty = state.ctx().consts.ptr_ty;
+            let function_env_value = state.ctx().consts.function_env_value;
+            let builtins_obj = super::load_function_env_obj(
+                state.fb(),
+                ptr_ty,
+                function_env_value,
+                super::FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+            );
             let step_null_block = state.ctx().consts.step_null_block;
             let step_null_args = super::step_null_block_args(state.ctx());
             let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
@@ -1082,7 +1089,7 @@ fn emit_load<'fb>(
             let call_inst = state
                 .fb()
                 .ins()
-                .call(func_ref, &[globals_obj, name_obj, slot_index]);
+                .call(func_ref, &[globals_obj, builtins_obj, name_obj, slot_index]);
             state.emit_decref_for_family(
                 name_obj,
                 Some(PyObjFacts::exact_type(PyExactType::Str)),

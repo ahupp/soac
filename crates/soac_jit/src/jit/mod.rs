@@ -234,12 +234,13 @@ pub(crate) use runtime_context::{
     invalidate_py_function_soac_function_id, raw_py_code_version,
 };
 use runtime_context::{
-    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
-    FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_GLOBALS_OBJ_OFFSET,
-    FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_CODE_OFFSET, PY_FUNCTION_DEFAULTS_OFFSET,
-    PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_FUNCTION_KWDEFAULTS_OFFSET,
-    PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET, PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
-    load_function_env_obj, load_py_function_soac_metadata_obj,
+    FUNCTION_ENV_BUILTINS_OBJ_OFFSET, FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET,
+    FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+    FUNCTION_ENV_GLOBALS_OBJ_OFFSET, FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, PY_FUNCTION_CODE_OFFSET,
+    PY_FUNCTION_DEFAULTS_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
+    PY_FUNCTION_KWDEFAULTS_OFFSET, PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET,
+    PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET, load_function_env_obj,
+    load_py_function_soac_metadata_obj,
 };
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 #[cfg(test)]
@@ -615,6 +616,12 @@ fn emit_codegen_non_local_name_load(
         }
         NameLocation::Global(slot) => {
             let globals_obj = ctx.consts.block_const;
+            let builtins_obj = load_function_env_obj(
+                fb,
+                ptr_ty,
+                ctx.consts.function_env_value,
+                FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+            );
             let name_obj = emit_owned_module_constant(
                 fb,
                 ctx.module_constants
@@ -624,7 +631,7 @@ fn emit_codegen_non_local_name_load(
             let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
             let value_inst = fb.ins().call(
                 ctx.load_global_fast_ref,
-                &[globals_obj, name_obj, slot_index],
+                &[globals_obj, builtins_obj, name_obj, slot_index],
             );
             let value = fb.inst_results(value_inst)[0];
             let value_ok_block = fb.create_block();
@@ -821,13 +828,27 @@ fn emit_codegen_indexed_global_load(
                 ctx.global_indexed_fallback_counter_ids,
                 instr_id,
             );
+            let builtins_obj = load_function_env_obj(
+                fb,
+                ptr_ty,
+                ctx.consts.function_env_value,
+                FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+            );
             let fallback_inst = fb.ins().call(
                 ctx.load_global_slow_ref,
-                &[globals_obj, name_obj, slot_index],
+                &[globals_obj, builtins_obj, name_obj, slot_index],
             );
             let fallback_value = fb.inst_results(fallback_inst)[0];
-            fb.ins()
-                .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+            let fallback_is_null =
+                fb.ins()
+                    .icmp(ir::condcodes::IntCC::Equal, fallback_value, null_ptr);
+            fb.ins().brif(
+                fallback_is_null,
+                ctx.consts.step_null_block,
+                &step_null_block_args(ctx),
+                result_block,
+                &[ir::BlockArg::Value(fallback_value)],
+            );
         }
         JitGuardMissDispatch::DeoptResume {
             block,
@@ -1946,6 +1967,12 @@ fn emit_deopt_resume_call(
         target.function_env_value,
         FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
     );
+    let builtins_obj = load_function_env_obj(
+        fb,
+        ptr_ty,
+        target.function_env_value,
+        FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+    );
     let function_data = fb.ins().iadd_imm(
         target.function_env_value,
         i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET),
@@ -1959,6 +1986,7 @@ fn emit_deopt_resume_call(
         &[
             deopt_table,
             globals_obj,
+            builtins_obj,
             function_data,
             record_ordinal,
             live_values_base,

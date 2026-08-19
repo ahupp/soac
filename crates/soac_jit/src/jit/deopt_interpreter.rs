@@ -127,6 +127,7 @@ pub(crate) struct BlockPyEntryRuntimeContext<'a> {
     compile_session: Arc<CompileSession>,
     shared_state: Arc<SharedModuleState>,
     globals_obj: ObjPtr,
+    builtins_obj: ObjPtr,
     function_data_obj: ObjPtr,
     entry_plan: &'a RuntimeFunctionEntryPlan,
 }
@@ -137,6 +138,7 @@ impl<'a> BlockPyEntryRuntimeContext<'a> {
         compile_session: Arc<CompileSession>,
         shared_state: Arc<SharedModuleState>,
         globals_obj: ObjPtr,
+        builtins_obj: ObjPtr,
         function_data_obj: ObjPtr,
         entry_plan: &'a RuntimeFunctionEntryPlan,
     ) -> Self {
@@ -144,6 +146,7 @@ impl<'a> BlockPyEntryRuntimeContext<'a> {
             compile_session,
             shared_state,
             globals_obj,
+            builtins_obj,
             function_data_obj,
             entry_plan,
         }
@@ -183,6 +186,13 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
         match self {
             Self::Deopt(invocation) => invocation.globals_obj(),
             Self::Entry(entry) => entry.context.globals_obj,
+        }
+    }
+
+    fn builtins_obj(&self) -> ObjPtr {
+        match self {
+            Self::Deopt(invocation) => invocation.builtins_obj(),
+            Self::Entry(entry) => entry.context.builtins_obj,
         }
     }
 
@@ -2180,6 +2190,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         let result = unsafe {
             super::specialized_helpers::soac_runtime_load_global_slow(
                 globals_obj,
+                self.source.builtins_obj(),
                 name_obj.cast::<c_void>(),
                 expected_index,
             )

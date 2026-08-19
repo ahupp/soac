@@ -373,6 +373,7 @@ mod tests {
             crate::jit::specialized_helpers::dp_jit_deopt_resume(
                 deopt_table,
                 globals_obj,
+                ffi::PyEval_GetBuiltins().cast(),
                 std::ptr::null_mut(),
                 record_ordinal,
                 live_values,
@@ -393,6 +394,7 @@ mod tests {
             crate::jit::specialized_helpers::dp_jit_deopt_resume(
                 deopt_table,
                 globals_obj,
+                ffi::PyEval_GetBuiltins().cast(),
                 function_data_obj,
                 record_ordinal,
                 live_values,
@@ -1695,6 +1697,7 @@ def add(left, right):
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
+                ffi::PyEval_GetBuiltins().cast(),
                 std::ptr::null_mut(),
                 &entry_plan,
             );
@@ -1754,6 +1757,7 @@ def needs_arg(value):
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
+                unsafe { ffi::PyEval_GetBuiltins().cast() },
                 std::ptr::null_mut(),
                 &entry_plan,
             );
@@ -1813,6 +1817,7 @@ def add_default(left, right=9):
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
+                ffi::PyEval_GetBuiltins().cast(),
                 function_data.as_mut_ptr().cast::<c_void>(),
                 &entry_plan,
             );
@@ -1871,6 +1876,7 @@ def add_default(left, right=9):
             std::sync::Arc::new(crate::session::CompileSession::new()),
             std::sync::Arc::clone(&shared_state),
             globals_obj,
+            ffi::PyEval_GetBuiltins().cast(),
             std::ptr::null_mut(),
             &entry_plan,
         );
@@ -2720,6 +2726,7 @@ def shaped(a, /, b, *args, c, **kwargs):
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
+                ffi::PyEval_GetBuiltins().cast(),
                 std::ptr::null_mut(),
                 &entry_plan,
             );
@@ -2818,6 +2825,7 @@ def add_kw_default(value, *, scale=9):
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
+                ffi::PyEval_GetBuiltins().cast(),
                 function_data.as_mut_ptr().cast::<c_void>(),
                 &entry_plan,
             );
@@ -2874,6 +2882,7 @@ def takes_one(value):
                 std::sync::Arc::new(crate::session::CompileSession::new()),
                 std::sync::Arc::clone(&shared_state),
                 std::ptr::null_mut(),
+                ffi::PyEval_GetBuiltins().cast(),
                 std::ptr::null_mut(),
                 &entry_plan,
             );
@@ -8349,14 +8358,6 @@ def write_point(factory, value):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
             let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("field-getattr-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
@@ -8498,11 +8499,12 @@ def read_point(point):
                 .setattr("x", 112_233_i64)
                 .expect("Other instance should accept x");
 
-            let function_env = TestFunctionEnv {
+            let function_env = crate::FunctionEnvAbiHeader {
                 direct_code_ptr: code_ptr,
                 default_direct_code_ptr: std::ptr::null(),
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: runtime.mod_ctx.globals_obj,
+                globals_obj: runtime.mod_ctx.globals_obj.cast(),
+                builtins_obj: ffi::PyEval_GetBuiltins(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -8540,14 +8542,6 @@ def read_point(point):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
             let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("field-setattr-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
@@ -8688,11 +8682,12 @@ def write_point(point, value):
             let replacement = ffi::PyLong_FromLong(445_566);
             assert!(!replacement.is_null(), "replacement value should allocate");
 
-            let function_env = TestFunctionEnv {
+            let function_env = crate::FunctionEnvAbiHeader {
                 direct_code_ptr: code_ptr,
                 default_direct_code_ptr: std::ptr::null(),
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: runtime.mod_ctx.globals_obj,
+                globals_obj: runtime.mod_ctx.globals_obj.cast(),
+                builtins_obj: ffi::PyEval_GetBuiltins(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -9499,6 +9494,7 @@ def write_point(point, value):
         let invocation = unsafe {
             RuntimeJitDeoptInvocation::from_raw(
                 std::ptr::addr_of!(table).cast_mut().cast(),
+                std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 0,
@@ -10964,6 +10960,80 @@ def f(x):
                 ffi::Py_DECREF(key);
                 ffi::Py_DECREF(globals);
             }
+        });
+    }
+
+    #[test]
+    fn deopt_return_global_uses_captured_function_builtins_after_globals_rebind() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| unsafe {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                ret_term(name_expr(test_global_name("x"))),
+            );
+            let function_id = function.function_id;
+            let block = function.entry_block().label;
+            let table = RuntimeJitDeoptTable {
+                function_id,
+                function: Box::new(function),
+                module_constant_ptrs: Vec::new(),
+                points: vec![RuntimeJitDeoptRecord {
+                    id: PlannedJitDeoptPointId {
+                        function_id,
+                        ordinal: 0,
+                    },
+                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                    locals: vec![],
+                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                    },
+                }],
+            };
+            let globals = ffi::PyDict_New();
+            let captured_builtins = ffi::PyDict_New();
+            let rebound_builtins = ffi::PyDict_New();
+            assert!(
+                !globals.is_null() && !captured_builtins.is_null() && !rebound_builtins.is_null()
+            );
+            let name = ffi::PyUnicode_FromString(c"x".as_ptr());
+            let expected = ffi::PyLong_FromLong(987_654_321);
+            let replacement = ffi::PyLong_FromLong(987_654_322);
+            assert!(!name.is_null() && !expected.is_null() && !replacement.is_null());
+            assert_eq!(ffi::PyDict_SetItem(captured_builtins, name, expected), 0);
+            assert_eq!(ffi::PyDict_SetItem(rebound_builtins, name, replacement), 0);
+            assert_eq!(
+                ffi::PyDict_SetItemString(globals, c"__builtins__".as_ptr(), rebound_builtins),
+                0
+            );
+
+            let expected_refcount = ffi::Py_REFCNT(expected);
+            let result = crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                std::ptr::addr_of!(table).cast_mut().cast(),
+                globals.cast(),
+                captured_builtins.cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(
+                result,
+                expected.cast(),
+                "deopt must use the function's captured builtins, not rebound module globals"
+            );
+            assert!(ffi::PyErr_Occurred().is_null());
+            assert_eq!(ffi::Py_REFCNT(expected), expected_refcount + 1);
+
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            ffi::Py_DECREF(replacement);
+            ffi::Py_DECREF(expected);
+            ffi::Py_DECREF(name);
+            ffi::Py_DECREF(rebound_builtins);
+            ffi::Py_DECREF(captured_builtins);
+            ffi::Py_DECREF(globals);
         });
     }
 
@@ -23375,14 +23445,6 @@ class Point:
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
             let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("direct-call-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
@@ -23603,11 +23665,12 @@ class Point:
             assert!(!callable.is_null(), "test callable should exist");
             ffi::Py_INCREF(callable);
 
-            let function_env = TestFunctionEnv {
+            let function_env = crate::FunctionEnvAbiHeader {
                 direct_code_ptr: code_ptr,
                 default_direct_code_ptr: std::ptr::null(),
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: runtime.mod_ctx.globals_obj,
+                globals_obj: runtime.mod_ctx.globals_obj.cast(),
+                builtins_obj: ffi::PyEval_GetBuiltins(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -23849,14 +23912,6 @@ class Point:
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
             let tuple_value_expr = tuple_expr(vec![op_expr(Load::new(test_global_name("x")))]);
             let mut function = with_single_test_block(
                 test_function(),
@@ -23955,11 +24010,12 @@ class Point:
                 .finalize_definitions()
                 .expect("test jit module should finalize");
             let code_ptr = jit_module.get_finalized_function(built.main_id);
-            let function_env = TestFunctionEnv {
+            let function_env = crate::FunctionEnvAbiHeader {
                 direct_code_ptr: code_ptr,
                 default_direct_code_ptr: std::ptr::null(),
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: runtime.mod_ctx.globals_obj,
+                globals_obj: runtime.mod_ctx.globals_obj.cast(),
+                builtins_obj: ffi::PyEval_GetBuiltins(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -23993,14 +24049,6 @@ class Point:
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
             let function = with_single_test_block(
                 test_function(),
                 vec![op_expr(Load::new(test_global_name("x")))],
@@ -24093,11 +24141,12 @@ class Point:
                 .finalize_definitions()
                 .expect("test jit module should finalize");
             let code_ptr = jit_module.get_finalized_function(built.main_id);
-            let function_env = TestFunctionEnv {
+            let function_env = crate::FunctionEnvAbiHeader {
                 direct_code_ptr: code_ptr,
                 default_direct_code_ptr: std::ptr::null(),
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: runtime.mod_ctx.globals_obj,
+                globals_obj: runtime.mod_ctx.globals_obj.cast(),
+                builtins_obj: ffi::PyEval_GetBuiltins(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -24176,11 +24225,11 @@ class Point:
         };
         assert_eq!(
             deopt_args.len(),
-            6,
-            "deopt helper call should pass table, globals, function data, record ordinal, live buffer, and live count"
+            7,
+            "deopt helper call should pass table, globals, captured builtins, function data, record ordinal, live buffer, and live count"
         );
         assert!(
-            value_is_iconst_imm(&built.ctx.func, deopt_args[5], 1),
+            value_is_iconst_imm(&built.ctx.func, deopt_args[6], 1),
             "guard-miss deopt should pass one live local value for x"
         );
         let materialize_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
@@ -24256,14 +24305,6 @@ class Point:
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
             let function = with_single_test_block(
                 test_function(),
                 vec![],
@@ -24356,11 +24397,12 @@ class Point:
                 .finalize_definitions()
                 .expect("test jit module should finalize");
             let code_ptr = jit_module.get_finalized_function(built.main_id);
-            let function_env = TestFunctionEnv {
+            let function_env = crate::FunctionEnvAbiHeader {
                 direct_code_ptr: code_ptr,
                 default_direct_code_ptr: std::ptr::null(),
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: runtime.mod_ctx.globals_obj,
+                globals_obj: runtime.mod_ctx.globals_obj.cast(),
+                builtins_obj: ffi::PyEval_GetBuiltins(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -24401,14 +24443,6 @@ class Point:
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
             let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("indexed-global-store-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
@@ -24528,11 +24562,12 @@ class Point:
             let value = ffi::PyLong_FromLong(445_566);
             assert!(!value.is_null(), "test value allocation should succeed");
 
-            let function_env = TestFunctionEnv {
+            let function_env = crate::FunctionEnvAbiHeader {
                 direct_code_ptr: code_ptr,
                 default_direct_code_ptr: std::ptr::null(),
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
                 globals_obj: globals.cast(),
+                builtins_obj: ffi::PyEval_GetBuiltins(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);

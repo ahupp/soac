@@ -47,6 +47,7 @@ pub(super) struct RuntimeJitDeoptInvocation<'a> {
     table: &'a RuntimeJitDeoptTable,
     record: &'a RuntimeJitDeoptRecord,
     globals_obj: ObjPtr,
+    builtins_obj: ObjPtr,
     function_data_obj: ObjPtr,
     live_values: &'a [ObjPtr],
 }
@@ -1214,6 +1215,7 @@ impl RuntimeJitDeoptInvocation<'_> {
     pub(super) unsafe fn from_raw<'a>(
         deopt_table: ObjPtr,
         globals_obj: ObjPtr,
+        builtins_obj: ObjPtr,
         function_data_obj: ObjPtr,
         record_ordinal: i64,
         live_values: ObjPtr,
@@ -1239,6 +1241,7 @@ impl RuntimeJitDeoptInvocation<'_> {
             table,
             record,
             globals_obj,
+            builtins_obj,
             function_data_obj,
             live_values,
         })
@@ -1254,6 +1257,10 @@ impl RuntimeJitDeoptInvocation<'_> {
 
     pub(super) fn globals_obj(&self) -> ObjPtr {
         self.globals_obj
+    }
+
+    pub(super) fn builtins_obj(&self) -> ObjPtr {
+        self.builtins_obj
     }
 
     pub(super) fn function_data_obj(&self) -> ObjPtr {
