@@ -919,6 +919,57 @@ file-local batches**, with **86 / 86 batches passing**, plus **559 JIT**,
 tests; see `work/logs/source-function-templates-test-all.log`. The complete
 test phase takes **157.448 seconds**.
 
+### Template-Aware Function Registration
+
+Source-backed function instantiation already owns an immutable
+`Arc<FunctionInstantiationTemplate>`. Private registration and metadata
+creation propagate that existing `Arc` instead of rediscovering the shared
+module, function, template, and eager entry through repeated maps and
+runtime-ID hashes. Initialized original-code presence, including
+`Some(None)`, is reused; the `Arc`-owned module name is borrowed rather
+than allocating a per-function string. Every function still receives fresh
+metadata, independent closure cells, and a distinct boxed `FunctionEnv`;
+the `#[repr(C)]` layout and ABI offsets remain unchanged.
+
+The existing template caches only a successful vectorcall trampoline for
+the exact compile session and parameter arity. Engine initialization occurs
+outside the template `OnceLock`, with no `get_or_init` around reentrant or
+fallible engine work. The unchanged public registration fallback,
+force-interpreter mode, generator convention, and current function/code/
+default guards remain intact. No public API, runtime helper, global state,
+or IR change is added. All **80 measured fixed-eight workers** preserve
+exactly **23,293,040 native bytes / 1,533,550 machine blocks** and
+**2,866 typed blocks / 204 functions**.
+
+A genuine structured RED-to-GREEN regression uses two real lowered nested
+CPython closures, proves shared existing-template identity and compatible
+trampoline reuse, invokes the unchanged public registration path, rejects
+actual alternate-session and alternate-arity trampolines, and preserves
+distinct environments and captures **3** versus **9**. Full JIT library
+and all test targets each pass **567 / 567**; transformed guardrails pass
+**50 / 50 in 35.45 seconds**, and scoped formatting/all-target checks
+pass. Normal fixed-eight stock score improves
+**0.5782047994x -> 0.6028454470x**, with previous-SOAC arithmetic
+**1.02674228x** and robust **1.026794x**. A matched three-round repeat
+improves comprehensions **1.03462367x [1.01672, 1.06397]**, or
+**1.05486663x stock-adjusted**; raw four-workload geometry is neutral at
+**0.999617x**, with raw delta/richards slowdowns becoming neutral after
+paired-stock adjustment. Thus isolated control drift is disclosed rather
+than attributed to the optimization.
+
+Matched zero-loss profiles, **743 -> 707 samples** at **50,000 loops /
+199 Hz**, show duplicated template lookup inside metadata
+**0.8078% -> 0%** and metadata hashing **0.6730% -> 0%**; inclusive
+factory ancestry decreases **21.547% -> 17.529%**. Profile shares overlap,
+and attached replay is diagnostic only. The optimization is retained after
+the authoritative full `just test-all` gate passes **1,227 Python nodeids
+across 90 / 90 isolated batches**, with **567 JIT**, **212 optimizer**,
+**54 typed-IR**, **371 lowering**, and **8 PyO3** Rust tests passing; see
+`work/logs/template-aware-registration-test-all.log`. Cargo takes
+**68.197 seconds**, pytest **78.846 seconds inner / 78.862 seconds outer**,
+and the full test phase **147.071 seconds**. The full-suite **1.10x stock**
+target remains unmet.
+
 ### Interned Trusted Runtime Lookup Keys
 
 An existing source-backed function-instantiation template may lazily own

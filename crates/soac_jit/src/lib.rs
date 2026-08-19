@@ -474,6 +474,7 @@ pub(crate) struct FunctionInstantiationTemplate {
     prepared_synthetic_code: OnceLock<function_instantiation::PreparedSyntheticCode>,
     prepared_runtime_lookup_keys: OnceLock<function_instantiation::PreparedRuntimeLookupKeys>,
     prepared_direct_entry: OnceLock<PreparedDirectEntry>,
+    prepared_vectorcall_trampoline: OnceLock<PreparedVectorcallTrampoline>,
     prepared_generator_factory: OnceLock<PreparedGeneratorFactory>,
     prepared_stop_iteration_matcher: OnceLock<PreparedStopIterationMatcher>,
 }
@@ -512,6 +513,19 @@ struct PreparedDirectEntryKey {
 struct PreparedDirectEntry {
     key: PreparedDirectEntryKey,
     handle: Arc<jit::CompiledFunctionHandle>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedVectorcallTrampoline {
+    compile_session_id: CompileSessionId,
+    param_count: usize,
+    entry: jit::VectorcallEntryFn,
+}
+
+impl PreparedVectorcallTrampoline {
+    fn matches(&self, compile_session_id: CompileSessionId, param_count: usize) -> bool {
+        self.compile_session_id == compile_session_id && self.param_count == param_count
+    }
 }
 
 struct PreparedGeneratorFactory {
@@ -559,6 +573,7 @@ impl FunctionInstantiationTemplate {
             prepared_synthetic_code: OnceLock::new(),
             prepared_runtime_lookup_keys: OnceLock::new(),
             prepared_direct_entry: OnceLock::new(),
+            prepared_vectorcall_trampoline: OnceLock::new(),
             prepared_generator_factory: OnceLock::new(),
             prepared_stop_iteration_matcher: OnceLock::new(),
         })
@@ -1137,11 +1152,22 @@ unsafe fn make_clif_function_data(
     callable: *mut ffi::PyObject,
     function_id: RuntimeFunctionId,
     module_runtime: jit::ModuleRuntimeContext,
+    known_function_template: Option<Arc<FunctionInstantiationTemplate>>,
 ) -> Result<*mut c_void, ()> {
     let module_state = module_runtime.shared_module_state_owner.clone();
-    let function_template = module_state
-        .lookup_function_template(function_id)
-        .map_err(|err| set_runtime_error_message(&err))?;
+    let function_template = match known_function_template {
+        Some(template) => {
+            if template.function().function_id != function_id {
+                return set_runtime_error(
+                    "known function template does not match its CLIF function identifier",
+                );
+            }
+            Some(template)
+        }
+        None => module_state
+            .lookup_function_template(function_id)
+            .map_err(|err| set_runtime_error_message(&err))?,
+    };
     let Some(function_template) = function_template else {
         let module_name = module_state.module_name.as_str();
         let msg = format!(
@@ -1871,8 +1897,12 @@ unsafe fn register_owner_types_from_type(
         let mut metadata_destructor: Option<unsafe extern "C" fn(*mut c_void)> = None;
         if let Some(module_runtime) = module_runtime {
             let owned_runtime = clone_module_runtime_context(module_runtime)?;
-            metadata =
-                make_clif_function_data(constructor_init_function, function_id, owned_runtime)?;
+            metadata = make_clif_function_data(
+                constructor_init_function,
+                function_id,
+                owned_runtime,
+                None,
+            )?;
             metadata_destructor = Some(free_clif_function_data);
         }
         if PyType_SetSoacMetadata(
@@ -2453,6 +2483,39 @@ fn attach_compiled_function_to_env(
     Ok(())
 }
 
+fn prepared_vectorcall_trampoline(
+    function_template: &FunctionInstantiationTemplate,
+    compile_session: &Arc<CompileSession>,
+    param_count: usize,
+) -> Result<jit::VectorcallEntryFn, String> {
+    if let Some(prepared) = function_template
+        .prepared_vectorcall_trampoline
+        .get()
+        .filter(|prepared| prepared.matches(compile_session.id(), param_count))
+    {
+        return Ok(prepared.entry);
+    }
+
+    let entry = compile_session
+        .process_jit()?
+        .vectorcall_trampoline(compile_session, param_count)?;
+    if function_template
+        .prepared_vectorcall_trampoline
+        .get()
+        .is_none()
+    {
+        let _ =
+            function_template
+                .prepared_vectorcall_trampoline
+                .set(PreparedVectorcallTrampoline {
+                    compile_session_id: compile_session.id(),
+                    param_count,
+                    entry,
+                });
+    }
+    Ok(entry)
+}
+
 pub(crate) unsafe fn attach_ready_clif_direct_entry(
     function: *mut ffi::PyObject,
 ) -> Result<bool, ()> {
@@ -2516,11 +2579,11 @@ unsafe fn ensure_clif_vectorcall_compiled(
     }
     if data.compiled_vectorcall_entry.is_none() {
         let param_count = data.function_template.binding_plan().param_count();
-        let entry = match data
-            .compile_session
-            .process_jit()
-            .and_then(|engine| engine.vectorcall_trampoline(&data.compile_session, param_count))
-        {
+        let entry = match prepared_vectorcall_trampoline(
+            data.function_template.as_ref(),
+            &data.compile_session,
+            param_count,
+        ) {
             Ok(value) => value,
             Err(err) => {
                 if let Ok(c_msg) = CString::new(err) {
@@ -3049,7 +3112,7 @@ pub(crate) unsafe fn register_clif_direct_metadata(
         );
         return Err(());
     }
-    let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+    let data_ptr = make_clif_function_data(function, function_id, module_runtime, None)?;
     if PyFunction_SetSoacMetadata(
         function,
         function_id.to_packed_runtime_u64(),
@@ -3067,6 +3130,15 @@ pub unsafe fn register_clif_vectorcall(
     function: *mut ffi::PyObject,
     function_id: RuntimeFunctionId,
     module_runtime: jit::ModuleRuntimeContext,
+) -> Result<(), ()> {
+    unsafe { register_clif_vectorcall_with_template(function, function_id, module_runtime, None) }
+}
+
+unsafe fn register_clif_vectorcall_with_template(
+    function: *mut ffi::PyObject,
+    function_id: RuntimeFunctionId,
+    module_runtime: jit::ModuleRuntimeContext,
+    known_function_template: Option<Arc<FunctionInstantiationTemplate>>,
 ) -> Result<(), ()> {
     if ffi::PyFunction_Check(function) == 0 {
         ffi::PyErr_SetString(
@@ -3089,40 +3161,56 @@ pub unsafe fn register_clif_vectorcall(
             return Ok(());
         }
         let param_count = data.function_template.binding_plan().param_count();
-        let entry = data
-            .compile_session
-            .process_jit()
-            .and_then(|engine| engine.vectorcall_trampoline(&data.compile_session, param_count))
-            .map_err(|err| {
-                if let Ok(c_msg) = CString::new(err) {
-                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-                } else {
-                    ffi::PyErr_SetString(
-                        ffi::PyExc_RuntimeError,
-                        b"failed to compile shared CLIF vectorcall trampoline\0"
-                            .as_ptr()
-                            .cast(),
-                    );
-                }
-            })?;
+        let entry = prepared_vectorcall_trampoline(
+            data.function_template.as_ref(),
+            &data.compile_session,
+            param_count,
+        )
+        .map_err(|err| {
+            if let Ok(c_msg) = CString::new(err) {
+                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+            } else {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    b"failed to compile shared CLIF vectorcall trampoline\0"
+                        .as_ptr()
+                        .cast(),
+                );
+            }
+        })?;
         data.compiled_vectorcall_entry = Some(entry);
         let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
         PyFunction_SetVectorcall(func, Some(vectorcall_entry));
         return Ok(());
     }
-    let blockpy_function = module_runtime
-        .shared_module_state_owner
-        .lookup_function(function_id)
-        .ok_or_else(|| {
-            ffi::PyErr_SetString(
-                ffi::PyExc_RuntimeError,
-                c"no specialized JIT plan found while registering vectorcall".as_ptr(),
+    let function_template = match known_function_template {
+        Some(template) if template.function().function_id == function_id => template,
+        Some(_) => {
+            return set_runtime_error(
+                "known function template does not match its vectorcall function identifier",
             );
-        })?;
+        }
+        None => module_runtime
+            .shared_module_state_owner
+            .lookup_function_template(function_id)
+            .map_err(|err| set_runtime_error_message(&err))?
+            .ok_or_else(|| {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"no specialized JIT plan found while registering vectorcall".as_ptr(),
+                );
+            })?,
+    };
+    let blockpy_function = function_template.function();
     let blockpy_function_kind = *blockpy_function.lowered_kind();
     let blockpy_function_param_count = blockpy_function.params.len();
     if blockpy_function_kind != FunctionKind::Function {
-        let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+        let data_ptr = make_clif_function_data(
+            function,
+            function_id,
+            module_runtime,
+            Some(function_template),
+        )?;
         if PyFunction_SetSoacMetadata(
             function,
             function_id.to_packed_runtime_u64(),
@@ -3137,7 +3225,12 @@ pub unsafe fn register_clif_vectorcall(
         return Ok(());
     }
     if entry_interpreter_vectorcall_requested(blockpy_function) {
-        let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+        let data_ptr = make_clif_function_data(
+            function,
+            function_id,
+            module_runtime,
+            Some(function_template),
+        )?;
         if PyFunction_SetSoacMetadata(
             function,
             function_id.to_packed_runtime_u64(),
@@ -3152,7 +3245,12 @@ pub unsafe fn register_clif_vectorcall(
         return Ok(());
     }
     if entry_interpreter_vectorcall_for_tests_enabled() {
-        let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+        let data_ptr = make_clif_function_data(
+            function,
+            function_id,
+            module_runtime,
+            Some(function_template),
+        )?;
         if PyFunction_SetSoacMetadata(
             function,
             function_id.to_packed_runtime_u64(),
@@ -3168,29 +3266,30 @@ pub unsafe fn register_clif_vectorcall(
         }
         return Ok(());
     }
-    let entry = module_runtime
-        .compile_session
-        .process_jit()
-        .and_then(|engine| {
-            engine.vectorcall_trampoline(
-                &module_runtime.compile_session,
-                blockpy_function_param_count,
-            )
-        })
-        .map_err(|err| {
-            if let Ok(c_msg) = CString::new(err) {
-                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-            } else {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    b"failed to compile shared CLIF vectorcall trampoline\0"
-                        .as_ptr()
-                        .cast(),
-                );
-            }
-        })?;
+    let entry = prepared_vectorcall_trampoline(
+        function_template.as_ref(),
+        &module_runtime.compile_session,
+        blockpy_function_param_count,
+    )
+    .map_err(|err| {
+        if let Ok(c_msg) = CString::new(err) {
+            ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+        } else {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                b"failed to compile shared CLIF vectorcall trampoline\0"
+                    .as_ptr()
+                    .cast(),
+            );
+        }
+    })?;
 
-    let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
+    let data_ptr = make_clif_function_data(
+        function,
+        function_id,
+        module_runtime,
+        Some(function_template),
+    )?;
     let data = unsafe { &mut *(data_ptr as *mut PyFunctionJitExtra) };
     data.compiled_vectorcall_entry = Some(entry);
     if PyFunction_SetSoacMetadata(
@@ -4090,6 +4189,195 @@ mod tests {
     use super::*;
     use pyo3::types::{PyDict, PyList, PyModule};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn repeated_closure_registration_reuses_its_known_template_and_vectorcall_trampoline() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+
+        Python::attach(|py| {
+            let source = "def outer(offset):\n    def inner(value):\n        return offset + value\n    return inner\n";
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .expect("closure registration fixture should lower")
+                .blockpy_module;
+            let module_state = module_type::build_shared_state_for_testing(
+                py,
+                lowered,
+                "template_aware_registration_test",
+                "",
+            )
+            .expect("closure registration fixture should build shared module state");
+            let function = module_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "outer.<locals>.inner")
+                .expect("closure registration fixture should contain its nested function");
+            let function_id = function.function_id;
+            let template = module_state
+                .lookup_function_template(function_id)
+                .expect("closure registration template lookup should succeed")
+                .expect("closure registration template should exist");
+
+            let globals = PyDict::new(py);
+            let builtins = py
+                .import("builtins")
+                .expect("closure registration fixture should import builtins");
+            globals
+                .set_item("__builtins__", &builtins)
+                .expect("closure registration globals should accept builtins");
+            globals
+                .set_item("__name__", "template_aware_registration_test")
+                .expect("closure registration globals should accept their module name");
+            builtins
+                .getattr("exec")
+                .and_then(|exec| exec.call1((source, &globals, &globals)))
+                .expect("closure registration fixture should define actual Python functions");
+            let outer = globals
+                .get_item("outer")
+                .expect("closure registration outer lookup should succeed")
+                .expect("closure registration outer function should exist");
+            let first = outer
+                .call1((3,))
+                .expect("the first real closure should be created");
+            let second = outer
+                .call1((9,))
+                .expect("the second real closure should be created");
+            let public_closure = outer
+                .call1((15,))
+                .expect("the public-registration closure should be created");
+            assert_ne!(
+                first.as_ptr(),
+                second.as_ptr(),
+                "separate registrations must preserve distinct actual Python function objects"
+            );
+
+            let session = Arc::new(CompileSession::new());
+            session
+                .retain_shared_module_state(Arc::clone(&module_state))
+                .expect("the closure registration session should retain its real module state");
+            let runtime = || {
+                unsafe { ffi::Py_INCREF(globals.as_ptr()) };
+                jit::ModuleRuntimeContext {
+                    mod_ctx: jit::ModuleJitContext {
+                        shared_module_state: Arc::as_ptr(&module_state),
+                        globals_obj: globals.as_ptr().cast(),
+                    },
+                    compile_session: Arc::clone(&session),
+                    shared_module_state_owner: Arc::clone(&module_state),
+                }
+            };
+
+            for closure in [&first, &second] {
+                unsafe {
+                    register_clif_vectorcall_with_template(
+                        closure.as_ptr(),
+                        function_id,
+                        runtime(),
+                        Some(Arc::clone(&template)),
+                    )
+                }
+                .expect("each actual closure should register through the production path");
+                let metadata = unsafe { py_function_jit_extra(closure.as_ptr()) }
+                    .expect("each actual closure should expose its registered JIT metadata");
+                assert!(
+                    Arc::ptr_eq(&metadata.function_template, &template),
+                    "registration must retain the already-known immutable function template"
+                );
+            }
+
+            unsafe { register_clif_vectorcall(public_closure.as_ptr(), function_id, runtime()) }
+                .expect("the existing public registration entrypoint should remain supported");
+            let public_metadata = unsafe { py_function_jit_extra(public_closure.as_ptr()) }
+                .expect("public registration should expose its normal JIT metadata");
+            assert!(Arc::ptr_eq(&public_metadata.function_template, &template));
+
+            let prepared = template
+                .prepared_vectorcall_trampoline
+                .get()
+                .expect("repeated actual closure registration should cache its shared trampoline");
+            assert!(prepared.matches(session.id(), 1));
+            assert!(!prepared.matches(session.id(), 2));
+            let other_session = Arc::new(CompileSession::new());
+            assert!(!prepared.matches(other_session.id(), 1));
+            let other_session_entry =
+                prepared_vectorcall_trampoline(template.as_ref(), &other_session, 1)
+                    .expect("a different compile session should prepare its own live trampoline");
+            assert_ne!(
+                other_session_entry as usize, prepared.entry as usize,
+                "a cached trampoline must never be reused across distinct compile sessions"
+            );
+            let other_arity_entry = prepared_vectorcall_trampoline(template.as_ref(), &session, 2)
+                .expect("a different argument shape should prepare its own live trampoline");
+            assert_ne!(
+                other_arity_entry as usize, prepared.entry as usize,
+                "a cached trampoline must never be reused for another argument shape"
+            );
+            assert!(
+                template
+                    .prepared_vectorcall_trampoline
+                    .get()
+                    .expect("the original cached trampoline should remain available")
+                    .matches(session.id(), 1),
+                "session and arity mismatches must not overwrite the original positive cache"
+            );
+
+            let first_metadata = unsafe { py_function_jit_extra(first.as_ptr()) }
+                .expect("the first closure metadata should remain live");
+            let second_metadata = unsafe { py_function_jit_extra(second.as_ptr()) }
+                .expect("the second closure metadata should remain live");
+            assert_ne!(
+                first_metadata.function_env_ptr, second_metadata.function_env_ptr,
+                "sharing a template or trampoline must never share per-function environments"
+            );
+            let closure_slot = template.runtime_data_layout().closure_cell_slot(0);
+            let first_cell = first_metadata.function_env.runtime_object(closure_slot);
+            let second_cell = second_metadata.function_env.runtime_object(closure_slot);
+            assert!(!first_cell.is_null());
+            assert!(!second_cell.is_null());
+            assert_ne!(
+                first_cell, second_cell,
+                "separately instantiated closures must retain their own captured cells"
+            );
+            let first_cell = unsafe { Bound::<PyAny>::from_borrowed_ptr(py, first_cell) };
+            let second_cell = unsafe { Bound::<PyAny>::from_borrowed_ptr(py, second_cell) };
+            assert_eq!(
+                first_cell
+                    .getattr("cell_contents")
+                    .and_then(|value| value.extract::<i64>())
+                    .expect("the first closure cell should expose its original value"),
+                3
+            );
+            assert_eq!(
+                second_cell
+                    .getattr("cell_contents")
+                    .and_then(|value| value.extract::<i64>())
+                    .expect("the second closure cell should expose its original value"),
+                9
+            );
+            assert_eq!(
+                first_metadata
+                    .compiled_vectorcall_entry
+                    .expect("the first closure should have a vectorcall trampoline")
+                    as usize,
+                prepared.entry as usize
+            );
+            assert_eq!(
+                second_metadata
+                    .compiled_vectorcall_entry
+                    .expect("the second closure should have a vectorcall trampoline")
+                    as usize,
+                prepared.entry as usize
+            );
+            assert_eq!(
+                public_metadata
+                    .compiled_vectorcall_entry
+                    .expect("the public registration should have a vectorcall trampoline")
+                    as usize,
+                prepared.entry as usize
+            );
+        });
+    }
 
     #[test]
     fn exact_positional_binding_selects_only_fully_supplied_ordered_parameters() {

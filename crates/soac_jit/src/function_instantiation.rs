@@ -145,9 +145,16 @@ fn register_clif_vectorcall_raw(
     func: &Bound<'_, PyAny>,
     function_id: RuntimeFunctionId,
     module_runtime: ModuleRuntimeContext,
+    function_template: Option<Arc<FunctionInstantiationTemplate>>,
 ) -> PyResult<()> {
     unsafe {
-        crate::register_clif_vectorcall(func.as_ptr(), function_id, module_runtime).map_err(|_| {
+        crate::register_clif_vectorcall_with_template(
+            func.as_ptr(),
+            function_id,
+            module_runtime,
+            function_template,
+        )
+        .map_err(|_| {
             if ffi::PyErr_Occurred().is_null() {
                 PyRuntimeError::new_err("failed to register CLIF vectorcall")
             } else {
@@ -200,6 +207,7 @@ fn maybe_eager_compile_clif_entry(
     func: &Bound<'_, PyAny>,
     module_runtime: &ModuleRuntimeContext,
     function_id: RuntimeFunctionId,
+    function_template: Option<&FunctionInstantiationTemplate>,
 ) -> PyResult<()> {
     if module_runtime.shared_module_state_owner.module_name == "soac.runtime" {
         return Ok(());
@@ -212,11 +220,16 @@ fn maybe_eager_compile_clif_entry(
     {
         return Ok(());
     }
-    if module_runtime
-        .shared_module_state_owner
-        .lookup_function(function_id)
-        .is_some_and(|function| function.execution_mode() != FunctionExecutionMode::Jit)
-    {
+    let is_non_jit_function = function_template.map_or_else(
+        || {
+            module_runtime
+                .shared_module_state_owner
+                .lookup_function(function_id)
+                .is_some_and(|function| function.execution_mode() != FunctionExecutionMode::Jit)
+        },
+        |template| template.function().execution_mode() != FunctionExecutionMode::Jit,
+    );
+    if is_non_jit_function {
         return Ok(());
     }
     if attach_ready_clif_direct_entry_raw(py, func)? {
@@ -255,6 +268,7 @@ fn register_jit_vectorcall(
     func: &Bound<'_, PyAny>,
     function_id: RuntimeFunctionId,
     module_runtime: &ModuleRuntimeContext,
+    function_template: Option<&Arc<FunctionInstantiationTemplate>>,
 ) -> PyResult<()> {
     let owned_runtime = unsafe { clone_module_runtime_context(module_runtime) }.map_err(|_| {
         if unsafe { ffi::PyErr_Occurred() }.is_null() {
@@ -263,8 +277,20 @@ fn register_jit_vectorcall(
             PyErr::fetch(py)
         }
     })?;
-    match register_clif_vectorcall_raw(py, func, function_id, owned_runtime) {
-        Ok(()) => maybe_eager_compile_clif_entry(py, func, module_runtime, function_id),
+    match register_clif_vectorcall_raw(
+        py,
+        func,
+        function_id,
+        owned_runtime,
+        function_template.cloned(),
+    ) {
+        Ok(()) => maybe_eager_compile_clif_entry(
+            py,
+            func,
+            module_runtime,
+            function_id,
+            function_template.map(Arc::as_ref),
+        ),
         Err(err) if err.is_instance_of::<PyNotImplementedError>(py) => Err(err),
         Err(err) => Err(PyRuntimeError::new_err(format!(
             "failed to register CLIF vectorcall for {module_name} function_id={function_id}: {err}",
@@ -988,7 +1014,7 @@ fn instantiate_bb_function_with_template(
     py: Python<'_>,
     dp: &Bound<'_, PyModule>,
     module_name: &str,
-    function_template: &FunctionInstantiationTemplate,
+    function_template: &Arc<FunctionInstantiationTemplate>,
     captures: &Bound<'_, PyAny>,
     param_defaults: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
@@ -1014,7 +1040,7 @@ fn instantiate_bb_function_inner(
     dp: &Bound<'_, PyModule>,
     module_name: &str,
     function: &BlockPyFunction<BlockPyModuleShape>,
-    function_template: Option<&FunctionInstantiationTemplate>,
+    function_template: Option<&Arc<FunctionInstantiationTemplate>>,
     captures: &Bound<'_, PyAny>,
     param_defaults: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
@@ -1028,10 +1054,15 @@ fn instantiate_bb_function_inner(
         .specialization_mode();
     let records_specialization_counters =
         specialization_mode.is_some_and(|mode| mode.records_counters());
-    let has_original_runtime_code = module_runtime
-        .shared_module_state_owner
-        .lookup_original_code(function.function_id)
-        .is_some();
+    let has_original_runtime_code = function_template
+        .and_then(|template| template.prepared_original_code.get())
+        .map(Option::is_some)
+        .unwrap_or_else(|| {
+            module_runtime
+                .shared_module_state_owner
+                .lookup_original_code(function.function_id)
+                .is_some()
+        });
     let keep_source_runtime_helper = keep_source_runtime_helper_vectorcall(
         module_name,
         function.blocks.len(),
@@ -1051,7 +1082,7 @@ fn instantiate_bb_function_inner(
         captures,
         module_globals,
         module_runtime,
-        function_template,
+        function_template.map(Arc::as_ref),
         function.names.display_name.as_str(),
         function.names.qualname.as_str(),
     )?;
@@ -1128,7 +1159,13 @@ fn instantiate_bb_function_inner(
         .map_err(|()| PyErr::fetch(py))?;
         maybe_attach_ready_clif_direct_entry(py, &entry, module_runtime, function.function_id)?;
     } else {
-        register_jit_vectorcall(py, &entry, function.function_id, module_runtime)?;
+        register_jit_vectorcall(
+            py,
+            &entry,
+            function.function_id,
+            module_runtime,
+            function_template,
+        )?;
     }
     Ok(entry.unbind())
 }
@@ -1359,14 +1396,16 @@ fn instantiate_shared_function(
         "make_function"
     );
     let dp = import_dp_module(py, function_template.as_ref())?;
-    let module_name = shared_state.module_name.clone();
     let module_runtime =
         module_runtime_from_shared_state(compile_session, shared_state, module_globals);
     let func = instantiate_bb_function_with_template(
         py,
         &dp,
-        &module_name,
-        function_template.as_ref(),
+        module_runtime
+            .shared_module_state_owner
+            .module_name
+            .as_str(),
+        &function_template,
         captures,
         param_defaults,
         module_globals,

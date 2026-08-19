@@ -1670,3 +1670,12 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 - eight-workload stock score `0.578205x` versus prior `0.555839x`;
   previous-SOAC improvement `1.035x`. Repeated `chaos` improves `1.121x`
   and `deltablue` `1.039x`; generated native code shrinks `6.95%`.
+
+## 2026-08-19 - Reuse known function-instantiation templates
+
+- jj change id: `kvpzmtlp`
+- summary: propagate existing function templates through registration and
+  reuse session/arity-matched vectorcall trampolines.
+- eight-workload stock score `0.602845x` versus prior `0.578205x`;
+  previous-SOAC improvement `1.02674x`. Repeated `comprehensions`
+  improves `1.035x`; generated native code remains exactly `23,293,040 B`.
