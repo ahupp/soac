@@ -1,8 +1,17 @@
 use pyo3::ffi;
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::ptr;
 
 const PRESERVED_STATE_CAPSULE_NAME: &std::ffi::CStr = c"soac.PreservedState";
+const PRESERVED_KIND_BITS: usize = u64::BITS as usize;
+
+unsafe extern "C" {
+    fn _PyCapsule_SetTraverse(
+        capsule: *mut ffi::PyObject,
+        traverse: ffi::traverseproc,
+        clear: ffi::inquiry,
+    ) -> c_int;
+}
 
 pub const PYOBJECT_OR_NULL_KIND_TAG: i64 = 0;
 pub const I64_KIND_TAG: i64 = 1;
@@ -24,67 +33,154 @@ impl PreservedSlotKind {
 }
 
 struct PreservedState {
-    kinds: Box<[PreservedSlotKind]>,
-    // Every payload slot is one machine word. Object slots store owned
-    // `PyObject*` values; i64 slots store the integer bits directly.
-    values: Box<[u64]>,
+    // The original contiguous payload words come first, followed by one
+    // object-kind bit per slot. Keeping the Vec avoids a second allocation.
+    storage: Vec<u64>,
 }
 
 pub(crate) struct PreservedStateBuilder {
-    kinds: Vec<PreservedSlotKind>,
-    values: Vec<u64>,
+    storage: Vec<u64>,
+    slot_count: usize,
+    initialized_slots: usize,
 }
 
 impl PreservedStateBuilder {
     pub(crate) fn with_capacity(slot_count: usize) -> Result<Self, ()> {
-        let mut kinds = Vec::new();
-        let mut values = Vec::new();
-        if kinds.try_reserve_exact(slot_count).is_err()
-            || values.try_reserve_exact(slot_count).is_err()
-        {
+        let kind_words =
+            slot_count / PRESERVED_KIND_BITS + usize::from(slot_count % PRESERVED_KIND_BITS != 0);
+        let Some(word_count) = slot_count.checked_add(kind_words) else {
+            unsafe { ffi::PyErr_NoMemory() };
+            return Err(());
+        };
+        let mut storage = Vec::new();
+        if storage.try_reserve_exact(word_count).is_err() {
             unsafe { ffi::PyErr_NoMemory() };
             return Err(());
         }
-        Ok(Self { kinds, values })
+        storage.resize(word_count, 0);
+        Ok(Self {
+            storage,
+            slot_count,
+            initialized_slots: 0,
+        })
     }
 
     pub(crate) unsafe fn push_owned_object(&mut self, value: *mut ffi::PyObject) {
         debug_assert!(!value.is_null());
-        self.kinds.push(PreservedSlotKind::PyObjectOrNull);
-        self.values.push(value as usize as u64);
+        debug_assert!(self.initialized_slots < self.slot_count);
+        let slot = self.initialized_slots;
+        self.storage[slot] = value as usize as u64;
+        self.storage[self.slot_count + slot / PRESERVED_KIND_BITS] |=
+            1_u64 << (slot % PRESERVED_KIND_BITS);
+        self.initialized_slots += 1;
     }
 
     pub(crate) fn push_i64(&mut self, value: i64) {
-        self.kinds.push(PreservedSlotKind::I64);
-        self.values.push(value as u64);
+        debug_assert!(self.initialized_slots < self.slot_count);
+        self.storage[self.initialized_slots] = value as u64;
+        self.initialized_slots += 1;
     }
 
     pub(crate) unsafe fn into_capsule(mut self) -> *mut ffi::PyObject {
+        debug_assert_eq!(self.initialized_slots, self.slot_count);
         let state = Box::new(PreservedState {
-            kinds: std::mem::take(&mut self.kinds).into_boxed_slice(),
-            values: std::mem::take(&mut self.values).into_boxed_slice(),
+            storage: std::mem::take(&mut self.storage),
         });
+        self.initialized_slots = 0;
         unsafe { capsule_from_preserved_state(state) }
     }
 }
 
 impl Drop for PreservedStateBuilder {
     fn drop(&mut self) {
-        unsafe { cleanup_partial_state(&self.kinds, &mut self.values) };
+        let storage = self.storage.as_mut_ptr();
+        for slot in 0..self.initialized_slots {
+            let kind_word = unsafe { *storage.add(self.slot_count + slot / PRESERVED_KIND_BITS) };
+            if kind_word & (1_u64 << (slot % PRESERVED_KIND_BITS)) == 0 {
+                continue;
+            }
+            let value_slot = unsafe { storage.add(slot) };
+            let value = unsafe { *value_slot };
+            if value != 0 {
+                unsafe {
+                    *value_slot = 0;
+                    ffi::Py_DECREF(value as usize as *mut ffi::PyObject);
+                }
+            }
+        }
     }
 }
 
 impl PreservedState {
-    unsafe fn clear(&mut self) {
-        for (kind, value) in self.kinds.iter().zip(self.values.iter_mut()) {
-            if *kind == PreservedSlotKind::PyObjectOrNull && *value != 0 {
-                unsafe {
-                    ffi::Py_DECREF((*value as usize as *mut ffi::PyObject).cast());
-                }
-            }
-            *value = 0;
+    fn slot_count(&self) -> usize {
+        let word_count = self.storage.len();
+        // n payload words require ceil(n / 64) kind words; equivalently the
+        // packed allocation has ceil(word_count / 65) trailing kind words.
+        let kind_words = word_count / (PRESERVED_KIND_BITS + 1)
+            + usize::from(word_count % (PRESERVED_KIND_BITS + 1) != 0);
+        word_count - kind_words
+    }
+
+    fn slot_kind(&self, slot: usize) -> PreservedSlotKind {
+        let kind_word = self.storage[self.slot_count() + slot / PRESERVED_KIND_BITS];
+        if kind_word & (1_u64 << (slot % PRESERVED_KIND_BITS)) != 0 {
+            PreservedSlotKind::PyObjectOrNull
+        } else {
+            PreservedSlotKind::I64
         }
     }
+
+    unsafe fn clear(state: *mut Self) {
+        let slot_count = unsafe { (*state).slot_count() };
+        let storage = unsafe { (*state).storage.as_mut_ptr() };
+        for slot in 0..slot_count {
+            let kind_word = unsafe { *storage.add(slot_count + slot / PRESERVED_KIND_BITS) };
+            let value_slot = unsafe { storage.add(slot) };
+            let value = unsafe { *value_slot };
+            // Py_CLEAR ordering is required: DECREF can run arbitrary Python
+            // finalizers which reenter this same preserved-state capsule.
+            unsafe { *value_slot = 0 };
+            if kind_word & (1_u64 << (slot % PRESERVED_KIND_BITS)) != 0 && value != 0 {
+                unsafe { ffi::Py_DECREF(value as usize as *mut ffi::PyObject) };
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn preserved_state_capsule_traverse(
+    capsule: *mut ffi::PyObject,
+    visit: ffi::visitproc,
+    arg: *mut c_void,
+) -> c_int {
+    let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
+        unsafe { ffi::PyErr_Clear() };
+        return 0;
+    };
+    let slot_count = unsafe { (*state).slot_count() };
+    let storage = unsafe { (*state).storage.as_ptr() };
+    for slot in 0..slot_count {
+        let kind_word = unsafe { *storage.add(slot_count + slot / PRESERVED_KIND_BITS) };
+        if kind_word & (1_u64 << (slot % PRESERVED_KIND_BITS)) == 0 {
+            continue;
+        }
+        let value = unsafe { *storage.add(slot) } as usize as *mut ffi::PyObject;
+        if !value.is_null() {
+            let result = unsafe { visit(value, arg) };
+            if result != 0 {
+                return result;
+            }
+        }
+    }
+    0
+}
+
+unsafe extern "C" fn preserved_state_capsule_clear(capsule: *mut ffi::PyObject) -> c_int {
+    let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
+        unsafe { ffi::PyErr_Clear() };
+        return 0;
+    };
+    unsafe { PreservedState::clear(state) };
+    0
 }
 
 unsafe extern "C" fn preserved_state_capsule_destructor(capsule: *mut ffi::PyObject) {
@@ -98,10 +194,8 @@ unsafe extern "C" fn preserved_state_capsule_destructor(capsule: *mut ffi::PyObj
         }
         return;
     }
-    let mut state = unsafe { Box::from_raw(state_ptr) };
-    unsafe {
-        state.clear();
-    }
+    unsafe { PreservedState::clear(state_ptr) };
+    drop(unsafe { Box::from_raw(state_ptr) });
 }
 
 unsafe fn capsule_from_preserved_state(state: Box<PreservedState>) -> *mut ffi::PyObject {
@@ -114,15 +208,27 @@ unsafe fn capsule_from_preserved_state(state: Box<PreservedState>) -> *mut ffi::
         )
     };
     if capsule.is_null() {
-        let mut state = unsafe { Box::from_raw(state_ptr) };
-        unsafe { state.clear() };
+        unsafe { PreservedState::clear(state_ptr) };
+        drop(unsafe { Box::from_raw(state_ptr) });
+        return ptr::null_mut();
+    }
+    if unsafe {
+        _PyCapsule_SetTraverse(
+            capsule,
+            preserved_state_capsule_traverse,
+            preserved_state_capsule_clear,
+        )
+    } != 0
+    {
+        // The successful capsule now owns the state; its destructor releases
+        // the Box and object slots exactly once on this failure path.
+        unsafe { ffi::Py_DECREF(capsule) };
+        return ptr::null_mut();
     }
     capsule
 }
 
-unsafe fn state_from_capsule(
-    capsule: *mut ffi::PyObject,
-) -> Result<&'static mut PreservedState, ()> {
+unsafe fn state_from_capsule(capsule: *mut ffi::PyObject) -> Result<*mut PreservedState, ()> {
     let state_ptr = unsafe {
         ffi::PyCapsule_GetPointer(capsule, PRESERVED_STATE_CAPSULE_NAME.as_ptr())
             as *mut PreservedState
@@ -130,7 +236,7 @@ unsafe fn state_from_capsule(
     if state_ptr.is_null() {
         return Err(());
     }
-    Ok(unsafe { &mut *state_ptr })
+    Ok(state_ptr)
 }
 
 unsafe fn py_long_as_i64(value: *mut ffi::PyObject) -> Result<i64, ()> {
@@ -189,20 +295,15 @@ pub unsafe fn new_preserved_state(
         return ptr::null_mut();
     }
 
-    let mut kinds = Vec::with_capacity(slot_count as usize);
-    let mut values = Vec::with_capacity(slot_count as usize);
+    let Ok(mut state) = PreservedStateBuilder::with_capacity(slot_count as usize) else {
+        return ptr::null_mut();
+    };
     for index in 0..slot_count {
         let kind_obj = unsafe { ffi::PyTuple_GetItem(kind_values, index) };
         if kind_obj.is_null() {
-            unsafe {
-                cleanup_partial_state(&kinds, &mut values);
-            }
             return ptr::null_mut();
         }
         let Ok(kind_tag) = (unsafe { py_long_as_i64(kind_obj) }) else {
-            unsafe {
-                cleanup_partial_state(&kinds, &mut values);
-            }
             return ptr::null_mut();
         };
         let Some(kind) = PreservedSlotKind::from_tag(kind_tag) else {
@@ -211,55 +312,29 @@ pub unsafe fn new_preserved_state(
                     ffi::PyExc_ValueError,
                     c"invalid preserved-state slot kind".as_ptr(),
                 );
-                cleanup_partial_state(&kinds, &mut values);
             }
             return ptr::null_mut();
         };
 
         let value_obj = unsafe { ffi::PyTuple_GetItem(initial_values, index) };
         if value_obj.is_null() {
-            unsafe {
-                cleanup_partial_state(&kinds, &mut values);
-            }
             return ptr::null_mut();
         }
-        let value = match kind {
-            PreservedSlotKind::PyObjectOrNull => {
-                unsafe {
-                    ffi::Py_INCREF(value_obj);
-                }
-                value_obj as usize as u64
-            }
+        match kind {
+            PreservedSlotKind::PyObjectOrNull => unsafe {
+                ffi::Py_INCREF(value_obj);
+                state.push_owned_object(value_obj);
+            },
             PreservedSlotKind::I64 => {
                 let Ok(value) = (unsafe { py_long_as_i64(value_obj) }) else {
-                    unsafe {
-                        cleanup_partial_state(&kinds, &mut values);
-                    }
                     return ptr::null_mut();
                 };
-                value as u64
-            }
-        };
-        kinds.push(kind);
-        values.push(value);
-    }
-
-    let state = Box::new(PreservedState {
-        kinds: kinds.into_boxed_slice(),
-        values: values.into_boxed_slice(),
-    });
-    unsafe { capsule_from_preserved_state(state) }
-}
-
-unsafe fn cleanup_partial_state(kinds: &[PreservedSlotKind], values: &mut [u64]) {
-    for (kind, value) in kinds.iter().zip(values.iter_mut()) {
-        if *kind == PreservedSlotKind::PyObjectOrNull && *value != 0 {
-            unsafe {
-                ffi::Py_DECREF((*value as usize as *mut ffi::PyObject).cast());
+                state.push_i64(value);
             }
         }
-        *value = 0;
     }
+
+    unsafe { state.into_capsule() }
 }
 
 pub unsafe fn load_preserved_state_owned(
@@ -269,12 +344,13 @@ pub unsafe fn load_preserved_state_owned(
     let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
         return ptr::null_mut();
     };
-    let Ok(slot) = (unsafe { slot_index(state.values.len(), slot) }) else {
+    let Ok(slot) = (unsafe { slot_index((*state).slot_count(), slot) }) else {
         return ptr::null_mut();
     };
-    match state.kinds[slot] {
+    match unsafe { (*state).slot_kind(slot) } {
         PreservedSlotKind::PyObjectOrNull => {
-            let value = state.values[slot] as usize as *mut ffi::PyObject;
+            let value =
+                unsafe { *(*state).storage.as_ptr().add(slot) } as usize as *mut ffi::PyObject;
             if value.is_null() {
                 unsafe {
                     ffi::PyErr_SetString(
@@ -289,7 +365,9 @@ pub unsafe fn load_preserved_state_owned(
             }
             value
         }
-        PreservedSlotKind::I64 => unsafe { ffi::PyLong_FromLongLong(state.values[slot] as i64) },
+        PreservedSlotKind::I64 => unsafe {
+            ffi::PyLong_FromLongLong(*(*state).storage.as_ptr().add(slot) as i64)
+        },
     }
 }
 
@@ -297,7 +375,7 @@ pub unsafe fn preserved_values_ptr(capsule: *mut ffi::PyObject) -> *mut u64 {
     let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
         return ptr::null_mut();
     };
-    state.values.as_mut_ptr()
+    unsafe { (*state).storage.as_mut_ptr() }
 }
 
 pub unsafe fn store_preserved_state(
@@ -317,16 +395,17 @@ pub unsafe fn store_preserved_state(
     let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
         return ptr::null_mut();
     };
-    let Ok(slot) = (unsafe { slot_index(state.values.len(), slot) }) else {
+    let Ok(slot) = (unsafe { slot_index((*state).slot_count(), slot) }) else {
         return ptr::null_mut();
     };
-    match state.kinds[slot] {
+    match unsafe { (*state).slot_kind(slot) } {
         PreservedSlotKind::PyObjectOrNull => {
             unsafe {
                 ffi::Py_INCREF(value);
             }
-            let old_value = state.values[slot] as usize as *mut ffi::PyObject;
-            state.values[slot] = value as usize as u64;
+            let value_slot = unsafe { (*state).storage.as_mut_ptr().add(slot) };
+            let old_value = unsafe { *value_slot } as usize as *mut ffi::PyObject;
+            unsafe { *value_slot = value as usize as u64 };
             if !old_value.is_null() {
                 unsafe {
                     ffi::Py_DECREF(old_value);
@@ -337,7 +416,7 @@ pub unsafe fn store_preserved_state(
             let Ok(value) = (unsafe { py_long_as_i64(value) }) else {
                 return ptr::null_mut();
             };
-            state.values[slot] = value as u64;
+            unsafe { *(*state).storage.as_mut_ptr().add(slot) = value as u64 };
         }
     }
     unsafe { owned_none() }
@@ -347,16 +426,17 @@ pub unsafe fn clear_preserved_slot(capsule: *mut ffi::PyObject, slot: i64) -> i3
     let Ok(state) = (unsafe { state_from_capsule(capsule) }) else {
         return -1;
     };
-    let Ok(slot) = (unsafe { slot_index(state.values.len(), slot) }) else {
+    let Ok(slot) = (unsafe { slot_index((*state).slot_count(), slot) }) else {
         return -1;
     };
-    match state.kinds[slot] {
+    match unsafe { (*state).slot_kind(slot) } {
         PreservedSlotKind::PyObjectOrNull => {
-            let old_value = state.values[slot] as usize as *mut ffi::PyObject;
+            let value_slot = unsafe { (*state).storage.as_mut_ptr().add(slot) };
+            let old_value = unsafe { *value_slot } as usize as *mut ffi::PyObject;
             if old_value.is_null() {
                 return 0;
             }
-            state.values[slot] = 0;
+            unsafe { *value_slot = 0 };
             unsafe {
                 ffi::Py_DECREF(old_value);
             }
@@ -378,6 +458,128 @@ pub unsafe fn clear_preserved_slot(capsule: *mut ffi::PyObject, slot: i64) -> i3
 mod tests {
     use super::*;
     use pyo3::Python;
+
+    unsafe extern "C" fn collect_preserved_object_visit(
+        object: *mut ffi::PyObject,
+        observed: *mut c_void,
+    ) -> i32 {
+        unsafe { (*observed.cast::<Vec<usize>>()).push(object as usize) };
+        0
+    }
+
+    unsafe extern "C" fn reject_preserved_object_visit(
+        _object: *mut ffi::PyObject,
+        _observed: *mut c_void,
+    ) -> i32 {
+        37
+    }
+
+    #[test]
+    fn compact_preserved_state_tracks_owned_objects_and_cells_across_bitmap_words() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        soac_cpython::initialize_test_python("soac_jit-compact-preserved-state-gc-test")
+            .expect("test Python should initialize");
+        Python::attach(|_| unsafe {
+            let object = ffi::PyList_New(0);
+            assert!(!object.is_null(), "object test value should allocate");
+            let cell = crate::PyCell_New(object);
+            assert!(!cell.is_null(), "owned lexical cell should allocate");
+            let object_before_state = ffi::Py_REFCNT(object);
+            let cell_before_state = ffi::Py_REFCNT(cell);
+
+            const SLOT_COUNT: usize = 130;
+            const OBJECT_SLOTS: [usize; 7] = [0, 63, 64, 65, 127, 128, 129];
+            let mut builder = PreservedStateBuilder::with_capacity(SLOT_COUNT)
+                .expect("packed preserved-state slots should allocate once");
+            let mut expected_objects = Vec::new();
+            for index in 0..SLOT_COUNT {
+                if OBJECT_SLOTS.contains(&index) {
+                    let value = if index == 65 || index == 129 {
+                        cell
+                    } else {
+                        object
+                    };
+                    ffi::Py_INCREF(value);
+                    builder.push_owned_object(value);
+                    expected_objects.push(value as usize);
+                } else {
+                    let value = match index {
+                        1 => i64::MIN,
+                        2 => i64::MAX,
+                        66 => object as usize as i64,
+                        _ => index as i64 - 80,
+                    };
+                    builder.push_i64(value);
+                }
+            }
+
+            let capsule = builder.into_capsule();
+            assert!(!capsule.is_null(), "packed preserved state should allocate");
+            assert_eq!(
+                ffi::PyObject_GC_IsTracked(capsule),
+                1,
+                "real preserved-state capsules must expose owned object and cell edges to cyclic GC"
+            );
+            assert_eq!(
+                std::mem::size_of::<PreservedState>(),
+                std::mem::size_of::<Vec<u64>>(),
+                "payload words and arbitrary-size kind bits must share one compact allocation"
+            );
+            assert_eq!(ffi::Py_REFCNT(object), object_before_state + 5);
+            assert_eq!(ffi::Py_REFCNT(cell), cell_before_state + 2);
+
+            let values = preserved_values_ptr(capsule);
+            assert_eq!(*values, object as usize as u64);
+            assert_eq!(*values.add(1), i64::MIN as u64);
+            assert_eq!(*values.add(2), i64::MAX as u64);
+            assert_eq!(*values.add(63), object as usize as u64);
+            assert_eq!(*values.add(64), object as usize as u64);
+            assert_eq!(*values.add(65), cell as usize as u64);
+            assert_eq!(*values.add(66), object as usize as u64);
+            assert_eq!(*values.add(127), object as usize as u64);
+            assert_eq!(*values.add(128), object as usize as u64);
+            assert_eq!(*values.add(129), cell as usize as u64);
+
+            let traverse = (*ffi::Py_TYPE(capsule))
+                .tp_traverse
+                .expect("capsule type should expose its actual GC visitor");
+            let mut observed_objects = Vec::<usize>::new();
+            assert_eq!(
+                traverse(
+                    capsule,
+                    collect_preserved_object_visit,
+                    ptr::from_mut(&mut observed_objects).cast(),
+                ),
+                0
+            );
+            assert_eq!(
+                observed_objects, expected_objects,
+                "GC must visit exact owned objects and cells without treating scalar bits as pointers"
+            );
+            assert_eq!(
+                traverse(capsule, reject_preserved_object_visit, ptr::null_mut()),
+                37,
+                "capsule traversal must propagate the real visitor's early-stop result"
+            );
+
+            let clear = (*ffi::Py_TYPE(capsule))
+                .tp_clear
+                .expect("tracked capsule type should expose its actual GC clear callback");
+            assert_eq!(clear(capsule), 0);
+            assert_eq!(clear(capsule), 0, "GC clearing must be idempotent");
+            assert_eq!(ffi::Py_REFCNT(object), object_before_state);
+            assert_eq!(ffi::Py_REFCNT(cell), cell_before_state);
+            for index in OBJECT_SLOTS {
+                assert_eq!(*values.add(index), 0);
+            }
+
+            ffi::Py_DECREF(capsule);
+            assert_eq!(ffi::Py_REFCNT(object), object_before_state);
+            assert_eq!(ffi::Py_REFCNT(cell), cell_before_state);
+            ffi::Py_DECREF(cell);
+            ffi::Py_DECREF(object);
+        });
+    }
 
     #[test]
     fn compiler_owned_preserved_state_initializes_raw_slots_without_python_tuples() {
@@ -542,9 +744,9 @@ mod tests {
             );
             ffi::Py_DECREF(reloaded_i64);
 
-            state_from_capsule(state)
-                .expect("preserved state should remain valid")
-                .clear();
+            PreservedState::clear(
+                state_from_capsule(state).expect("preserved state should remain valid"),
+            );
             assert_eq!(
                 ffi::Py_REFCNT(replacement),
                 replacement_before_store,

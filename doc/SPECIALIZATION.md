@@ -1353,6 +1353,100 @@ IR **53**, lowering **371**, optimizer **208**, and PyO3 **8** tests; see
 **93.912 / 93.926 seconds**, and the complete test phase **154.011 seconds**.
 The existing counter-dump batch takes **93.25 seconds**.
 
+### GC-Visible Packed State and Guarded Direct Generator Allocation
+
+A subsequent generator-state iteration fixes a genuine observable CPython
+cycle-collection difference: an iterator captured through a transformed
+generator's previously untracked preserved-state capsule stayed alive and
+its finalizer did not execute, while stock CPython collected the same
+cycle. Both existing public and compiler-owned preserved-state
+construction paths now create GC-tracked capsules using the pinned
+existing `_PyCapsule_SetTraverse` export.
+
+The private **24-byte** preserved state owns one checked `Vec` allocation
+containing contiguous raw `u64` values and a packed, potentially
+multiword immutable object-kind bitmap. Traversal visits only marked
+object and cell slots, never scalar values that happen to resemble
+pointers. Clearing sets the **object payload slot to null before its
+decrement**, preserves the immutable kind bitmap for later stores, and
+holds no Rust borrow across a potentially reentrant finalizer. Overflow /
+bounds checks, owned-reference cleanup, repeated clear/destructor calls,
+resurrection, and both existing construction paths remain sound.
+
+For the exact canonical generator class, the existing factory can use
+`GenericAlloc` and initialize **eight checked slots** directly. Admission
+checks the live class/type version, original initializer function and code,
+initializer vectorcall, allocator / `__new__`, descriptors and hooks,
+recursion, source-function watcher, and active local/global monitoring,
+tracing, or profiling. A monitored initializer is observable in Apply
+mode even though the retained Profile-mode baseline emits no initializer
+`PY_START`; direct allocation falls back whenever the existing callback
+must remain visible. Live initializer/class/code/slot mutation,
+replacement subclasses, forced interpretation, dynamic hooks, and unsafe
+layouts retain the complete original class-call path. Real generator
+identity, laziness, captures, `send` / `throw` / `close`, and finalizer
+ordering remain unchanged. This changes no public API, global, runtime
+helper inventory, IR operation, or native direct-function body. The
+existing successful generator event gains one **new**
+`constructor_path='direct_slots'` / `'python_class'` field; no new event or
+helper is introduced.
+
+A genuine unchanged-production real stock/transformed cycle regression
+turns **RED → GREEN: 1 passed in 5.93 seconds** across
+**Profile → Verify → Apply**, proving weak-reference collection and
+exactly-once finalization, GC tracking, **70** mixed preserved slots, live
+constructor/source-monitoring mutation guards, counters, and unchanged
+native coverage. An independent pinned-CPython structured regression also
+turns RED-to-GREEN across **130** mixed object / cell / scalar slots,
+bitmap boundaries **63 / 64 / 127 / 128**, visitor early-stop **37**,
+payload clear-before-decrement, and idempotent clear. Post-format complete
+JIT library and all test targets each pass **571 / 571**; the transformed
+compatibility matrix passes **52 / 52 across 20 files in 30.07 seconds**
+with no xfails. Scoped package formatting / formatting check and the
+aligned JIT test-target Cargo check pass.
+
+The **570-sample** zero-loss comprehensions profile used to identify the
+factory hotspot comes from earlier comparison **131748**, before the
+retained exact-positional-trampoline revision; it is qualitative source
+evidence, not a matched profile of immediate baseline **141233**.
+Comprehensions was neutral across that intervening revision. A subsequent
+**557-sample** zero-loss candidate profile eliminates historical
+initializer **9.477% → 0%**, interpreted init eval **6.493% → 0%**, and
+reduces direct-factory ancestry **18.776% → 8.259%**. Correct GC tracking
+adds capsule traversal **0% → 6.820% inclusive / 3.049% self**, with GC
+ancestry **14.040% → 23.868%**; source-function instantiation remains
+visible **10.873% → 12.210%**. These historical/candidate profiles span
+different revisions, inclusive frames overlap, and their percentages are
+not additive or causal throughput evidence.
+
+Fixed-eight stock score is **0.6249286764762751x** versus retained
+**0.6146084338507914x**; previous-SOAC arithmetic is
+**1.0003747535524583x**, robust **1.004336x / 1.012863x stock-adjusted**.
+The apparent initial **1.037913x** comprehensions improvement does **not**
+reproduce: the authoritative three-round target is
+**44.923821 → 45.000817 us (0.998289x; 95% 0.979545–1.019565)** /
+paired-stock **1.001340x [0.982678, 1.026006]**. Robust four-workload
+geometry is **1.007762x / 1.002211x stock-adjusted**; richards' raw
+increase is neutral after stock adjustment. All **80** fixed-eight workers
+retain exactly **23,188,640 native bytes / 1,527,950 machine blocks** and
+**365,000** hidden trampoline bytes; all **120** repeated workers retain
+**54,765,720 native bytes / 3,604,800 blocks** and **746,520** hidden
+trampoline bytes, with zero errors.
+
+This iteration is **LANDED CANDIDATE / RETAIN FOR ACTUAL CPYTHON GC /
+FINALIZER CORRECTNESS WITH NEUTRAL REPEATED PERFORMANCE**, not for an
+asserted speedup. Its authoritative full `just test-all` gate **PASSES
+1,231 Python nodeids / 94 isolated batches / 8 workers**, with **94 passed
+/ 0 failed**; see
+`work/logs/direct-generator-instance-state-compact-test-all.log`.
+Workspace Rust JIT **571**, lowering **371**, optimizer **213**, typed IR
+**54**, and PyO3 **8** all pass. Runtime build takes **1.592 seconds**,
+Cargo tests **65.950 seconds**, inner / outer parallel pytest
+**79.423 / 79.439 seconds**, and the complete test phase **145.402
+seconds**. The new real stock-parity regression passes in **8.31
+seconds**; the existing 28-test counter-dump batch takes **79.41
+seconds**. Full-suite stock **1.10x** remains unmet.
+
 ## Direct Function Calls
 
 In v3, the optimizer reads raw `call_hot_targets` evidence,

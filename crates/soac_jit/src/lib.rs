@@ -566,10 +566,15 @@ struct PreparedGeneratorFactory {
     preserved_state_factory: usize,
     generator_class: usize,
     generator_class_version: u32,
+    generator_init: usize,
+    generator_init_code: usize,
+    generator_init_vectorcall: ffi::vectorcallfunc,
+    generator_field_offsets: [usize; 8],
     code_template: usize,
     getattr_key: Py<PyAny>,
     preserved_state_key: Py<PyAny>,
     generator_class_key: Py<PyAny>,
+    generator_init_key: Py<PyAny>,
     code_template_key: Py<PyAny>,
 }
 
@@ -1637,7 +1642,7 @@ unsafe fn owner_type_has_any_class_binding(
 
 unsafe fn late_bound_slot_offset_for_owner(
     owner_type: *mut ffi::PyTypeObject,
-    attr_name: &CString,
+    attr_name: &std::ffi::CStr,
     access: IndexedFieldAccessKind,
 ) -> Option<usize> {
     if (*owner_type).tp_itemsize != 0 || (*owner_type).tp_dict.is_null() {
@@ -3563,6 +3568,11 @@ unsafe fn prepare_generator_factory(
         return Ok(None);
     }
     let owner_type = generator_class.cast::<ffi::PyTypeObject>();
+    if !unsafe { owner_type_supports_direct_constructor_entry(owner_type) }
+        || !unsafe { owner_type_has_generic_attribute_hooks(owner_type) }
+    {
+        return Ok(None);
+    }
     let owner_dict = unsafe { (*owner_type).tp_dict };
     if owner_dict.is_null() {
         return Ok(None);
@@ -3580,8 +3590,34 @@ unsafe fn prepare_generator_factory(
     else {
         return Ok(None);
     };
-    if unsafe { (*init.cast::<ffi::PyFunctionObject>()).func_code } != original_init_code.as_ptr() {
+    let raw_init = init.cast::<ffi::PyFunctionObject>();
+    if unsafe { (*raw_init).func_code } != original_init_code.as_ptr() {
         return Ok(None);
+    }
+    let Some(init_vectorcall) = (unsafe { (*raw_init).vectorcall }) else {
+        return Ok(None);
+    };
+    let field_names = [
+        c"_resume_function",
+        c"_preserved_values",
+        c"_yield_from_slot",
+        c"_throw_context_slot",
+        c"_closed_slot",
+        c"__name__",
+        c"__qualname__",
+        c"gi_code",
+    ];
+    let mut generator_field_offsets = [0; 8];
+    for (index, field_name) in field_names.into_iter().enumerate() {
+        let Some(offset) = (unsafe {
+            late_bound_slot_offset_for_owner(owner_type, field_name, IndexedFieldAccessKind::Store)
+        }) else {
+            return Ok(None);
+        };
+        if generator_field_offsets[..index].contains(&offset) {
+            return Ok(None);
+        }
+        generator_field_offsets[index] = offset;
     }
     let Some(constructor_function_id) = soac_ir_blockpy::constructor_entry_function_id_for_init(
         &helper_data.module_state.lowered_module,
@@ -3622,10 +3658,15 @@ unsafe fn prepare_generator_factory(
         preserved_state_factory: preserved_state_factory as usize,
         generator_class: generator_class as usize,
         generator_class_version,
+        generator_init: init as usize,
+        generator_init_code: original_init_code.as_ptr() as usize,
+        generator_init_vectorcall: init_vectorcall,
+        generator_field_offsets,
         code_template: code_template as usize,
         getattr_key,
         preserved_state_key,
         generator_class_key,
+        generator_init_key: init_key,
         code_template_key,
     }))
 }
@@ -3667,6 +3708,34 @@ unsafe fn generator_factory_still_canonical(
 
     let generator_class = prepared.generator_class as *mut ffi::PyTypeObject;
     (unsafe { (*generator_class).tp_version_tag }) == prepared.generator_class_version
+}
+
+unsafe fn generator_constructor_still_canonical(prepared: &PreparedGeneratorFactory) -> bool {
+    let generator_class = prepared.generator_class as *mut ffi::PyTypeObject;
+    if unsafe { (*generator_class).tp_version_tag } != prepared.generator_class_version {
+        return false;
+    }
+    let owner_dict = unsafe { (*generator_class).tp_dict };
+    if owner_dict.is_null() {
+        return false;
+    }
+    let init = unsafe { ffi::PyDict_GetItem(owner_dict, prepared.generator_init_key.as_ptr()) };
+    if init as usize != prepared.generator_init {
+        return false;
+    }
+    let raw_init = init.cast::<ffi::PyFunctionObject>();
+    if unsafe { (*raw_init).func_code } as usize != prepared.generator_init_code {
+        return false;
+    }
+    let Some(vectorcall) = (unsafe { (*raw_init).vectorcall }) else {
+        return false;
+    };
+    ptr::fn_addr_eq(vectorcall, prepared.generator_init_vectorcall)
+        && !unsafe {
+            jit::raw_py_function_activation_is_observed(
+                prepared.generator_init_code as *mut ffi::PyObject,
+            )
+        }
 }
 
 unsafe fn try_make_source_generator_instance_direct(
@@ -3860,13 +3929,52 @@ unsafe fn try_make_source_generator_instance_direct(
         slot_indices[1],
         slot_indices[2],
     ];
-    let result = unsafe {
-        ffi::PyObject_Vectorcall(
-            prepared.generator_class as *mut ffi::PyObject,
-            constructor_args.as_ptr(),
-            constructor_args.len(),
-            ptr::null_mut(),
-        )
+    let direct_constructor = unsafe { generator_constructor_still_canonical(prepared) };
+    let result = if direct_constructor {
+        if unsafe { ffi::Py_EnterRecursiveCall(c" while calling a Python object".as_ptr()) } != 0 {
+            ptr::null_mut()
+        } else {
+            let _recursive_call = EntryInterpreterRecursiveCallGuard;
+            let result = unsafe {
+                ffi::PyType_GenericAlloc(prepared.generator_class as *mut ffi::PyTypeObject, 0)
+            };
+            if !result.is_null() {
+                let field_values = [
+                    function_obj,
+                    preserved_values,
+                    slot_indices[0],
+                    slot_indices[1],
+                    slot_indices[2],
+                    function_name,
+                    function_qualname,
+                    source_code,
+                ];
+                for (offset, value) in prepared
+                    .generator_field_offsets
+                    .into_iter()
+                    .zip(field_values)
+                {
+                    unsafe {
+                        ffi::Py_INCREF(value);
+                        result
+                            .cast::<u8>()
+                            .add(offset)
+                            .cast::<*mut ffi::PyObject>()
+                            .write(value);
+                    }
+                }
+            }
+            result
+        }
+    } else {
+        unsafe {
+            ffi::PyObject_Vectorcall(
+                prepared.generator_class as *mut ffi::PyObject,
+                constructor_args.as_ptr(),
+                constructor_args.len(),
+                ptr::null_mut(),
+            )
+        }
     };
     for slot in slot_indices {
         unsafe { ffi::Py_DECREF(slot) };
@@ -3878,6 +3986,11 @@ unsafe fn try_make_source_generator_instance_direct(
     tracing::debug!(
         target: "soac_generator_direct_state",
         path = "direct",
+        constructor_path = if direct_constructor {
+            "direct_slots"
+        } else {
+            "python_class"
+        },
         temporary_python_tuples = 0,
         function_id = ?function.function_id,
         qualname = function.names.qualname.as_str(),

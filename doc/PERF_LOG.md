@@ -1719,3 +1719,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   (`3.177 ms` to `2.929 ms`) and `richards` `1.05533x` (`29.845 ms` to
   `28.280 ms`); body native remains `23,188,640 B`, with hidden
   trampolines increasing `287,200 B` to `365,000 B`.
+
+## 2026-08-19 - Restore generator-state GC cycle collection
+
+- jj change id: `mzvpmvzo`
+- summary: track packed generator-state references and preserve stock
+  cycle collection/finalization with guarded direct initialization.
+- eight-workload stock score `0.624929x` versus prior `0.614608x`;
+  previous-SOAC `1.00037x`. Repeated `comprehensions` is neutral
+  `0.99829x` (`44.92 us` to `45.00 us`); ordinary native and hidden
+  trampoline code remain unchanged.
