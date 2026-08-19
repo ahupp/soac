@@ -465,6 +465,7 @@ pub(crate) struct FunctionInstantiationTemplate {
     prepared_original_code: OnceLock<Option<function_instantiation::PreparedOriginalCode>>,
     prepared_synthetic_code: OnceLock<function_instantiation::PreparedSyntheticCode>,
     prepared_direct_entry: OnceLock<PreparedDirectEntry>,
+    prepared_generator_factory: OnceLock<PreparedGeneratorFactory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -477,6 +478,23 @@ struct PreparedDirectEntryKey {
 struct PreparedDirectEntry {
     key: PreparedDirectEntryKey,
     handle: Arc<jit::CompiledFunctionHandle>,
+}
+
+struct PreparedGeneratorFactory {
+    compile_session_id: CompileSessionId,
+    helper_function_id: RuntimeFunctionId,
+    helper: usize,
+    helper_code: usize,
+    runtime_globals: usize,
+    builtin_getattr: usize,
+    preserved_state_factory: usize,
+    generator_class: usize,
+    generator_class_version: u32,
+    code_template: usize,
+    getattr_key: Py<PyAny>,
+    preserved_state_key: Py<PyAny>,
+    generator_class_key: Py<PyAny>,
+    code_template_key: Py<PyAny>,
 }
 
 impl FunctionInstantiationTemplate {
@@ -506,6 +524,7 @@ impl FunctionInstantiationTemplate {
             prepared_original_code: OnceLock::new(),
             prepared_synthetic_code: OnceLock::new(),
             prepared_direct_entry: OnceLock::new(),
+            prepared_generator_factory: OnceLock::new(),
         })
     }
 
@@ -3159,6 +3178,433 @@ unsafe fn tuple_set_owned(
     Ok(())
 }
 
+unsafe fn interned_generator_factory_key(
+    py: Python<'_>,
+    name: &'static std::ffi::CStr,
+) -> Result<Py<PyAny>, ()> {
+    let value = unsafe { ffi::PyUnicode_InternFromString(name.as_ptr()) };
+    if value.is_null() {
+        return Err(());
+    }
+    Ok(unsafe { Bound::<PyAny>::from_owned_ptr(py, value) }.unbind())
+}
+
+unsafe fn exact_c_function_has_name(
+    function: *mut ffi::PyObject,
+    expected_name: &'static std::ffi::CStr,
+) -> bool {
+    if function.is_null() || unsafe { ffi::PyCFunction_CheckExact(function) } == 0 {
+        return false;
+    }
+    let name = unsafe { ffi::PyObject_GetAttrString(function, c"__name__".as_ptr()) };
+    if name.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        return false;
+    }
+    let matches = unsafe { ffi::PyUnicode_CheckExact(name) } != 0
+        && unsafe { ffi::PyUnicode_CompareWithASCIIString(name, expected_name.as_ptr()) } == 0;
+    unsafe { ffi::Py_DECREF(name) };
+    matches
+}
+
+unsafe fn prepare_generator_factory(
+    py: Python<'_>,
+    data: &PyFunctionJitExtra,
+    helper: *mut ffi::PyObject,
+) -> Result<Option<PreparedGeneratorFactory>, ()> {
+    let Some(helper_function_id) = (unsafe { registered_clif_function_id(helper)? }) else {
+        return Ok(None);
+    };
+    let helper_data = unsafe { py_function_jit_extra(helper)? };
+    if helper_data.compile_session.id() != data.compile_session.id()
+        || helper_data.function_id != helper_function_id
+        || helper_data.module_state.module_name != "soac.runtime"
+        || helper_data.function_template.function().names.qualname != "make_generator_instance"
+    {
+        return Ok(None);
+    }
+    let Some(original_helper_code) = helper_data
+        .module_state
+        .lookup_original_code(helper_function_id)
+    else {
+        return Ok(None);
+    };
+    let helper_function = helper.cast::<ffi::PyFunctionObject>();
+    let helper_code = unsafe { (*helper_function).func_code };
+    if helper_code != original_helper_code.as_ptr() || helper_code != helper_data.registered_code {
+        return Ok(None);
+    }
+    let runtime_globals = unsafe { (*helper_function).func_globals };
+    if runtime_globals != helper_data.function_env.globals_obj() {
+        return Ok(None);
+    }
+
+    let getattr_key = unsafe { interned_generator_factory_key(py, c"getattr")? };
+    let preserved_state_key =
+        unsafe { interned_generator_factory_key(py, c"make_preserved_state")? };
+    let generator_class_key = unsafe { interned_generator_factory_key(py, c"ClosureGenerator")? };
+    let code_template_key = unsafe { interned_generator_factory_key(py, c"code_template_gen")? };
+    let extension_key = unsafe { interned_generator_factory_key(py, c"_soac_ext")? };
+    let init_key = unsafe { interned_generator_factory_key(py, c"__init__")? };
+
+    let builtin_getattr = unsafe { ffi::PyDict_GetItem(runtime_globals, getattr_key.as_ptr()) };
+    let builtins = helper_data.function_env.builtins_obj();
+    if builtins.is_null()
+        || unsafe { ffi::PyDict_Check(builtins) } == 0
+        || builtin_getattr != unsafe { ffi::PyDict_GetItem(builtins, getattr_key.as_ptr()) }
+        || !unsafe { exact_c_function_has_name(builtin_getattr, c"getattr") }
+    {
+        return Ok(None);
+    }
+
+    let preserved_state_factory =
+        unsafe { ffi::PyDict_GetItem(runtime_globals, preserved_state_key.as_ptr()) };
+    let extension = unsafe { ffi::PyDict_GetItem(runtime_globals, extension_key.as_ptr()) };
+    if extension.is_null() || unsafe { ffi::PyModule_CheckExact(extension) } == 0 {
+        return Ok(None);
+    }
+    let extension_dict = unsafe { ffi::PyModule_GetDict(extension) };
+    if extension_dict.is_null()
+        || preserved_state_factory
+            != unsafe { ffi::PyDict_GetItem(extension_dict, preserved_state_key.as_ptr()) }
+        || !unsafe { exact_c_function_has_name(preserved_state_factory, c"make_preserved_state") }
+    {
+        return Ok(None);
+    }
+    let preserved_state_owner = unsafe { ffi::PyCFunction_GetSelf(preserved_state_factory) };
+    if !preserved_state_owner.is_null() && preserved_state_owner != extension {
+        return Ok(None);
+    }
+
+    let generator_class =
+        unsafe { ffi::PyDict_GetItem(runtime_globals, generator_class_key.as_ptr()) };
+    if generator_class.is_null() || unsafe { ffi::PyType_CheckExact(generator_class) } == 0 {
+        return Ok(None);
+    }
+    let owner_type = generator_class.cast::<ffi::PyTypeObject>();
+    let owner_dict = unsafe { (*owner_type).tp_dict };
+    if owner_dict.is_null() {
+        return Ok(None);
+    }
+    let init = unsafe { ffi::PyDict_GetItem(owner_dict, init_key.as_ptr()) };
+    if init.is_null() {
+        return Ok(None);
+    }
+    let Some(init_function_id) = (unsafe { registered_clif_function_id(init)? }) else {
+        return Ok(None);
+    };
+    let Some(original_init_code) = helper_data
+        .module_state
+        .lookup_original_code(init_function_id)
+    else {
+        return Ok(None);
+    };
+    if unsafe { (*init.cast::<ffi::PyFunctionObject>()).func_code } != original_init_code.as_ptr() {
+        return Ok(None);
+    }
+    let Some(constructor_function_id) = soac_ir_blockpy::constructor_entry_function_id_for_init(
+        &helper_data.module_state.lowered_module,
+        init_function_id,
+    ) else {
+        return Ok(None);
+    };
+    if unsafe { registered_clif_type_function_id(generator_class)? }
+        != Some(constructor_function_id)
+    {
+        return Ok(None);
+    }
+    if unsafe { (*owner_type).tp_version_tag } == 0
+        && unsafe { PyUnstable_Type_AssignVersionTag(owner_type) } == 0
+    {
+        if !unsafe { ffi::PyErr_Occurred() }.is_null() {
+            return Err(());
+        }
+        return Ok(None);
+    }
+    let generator_class_version = unsafe { (*owner_type).tp_version_tag };
+    if generator_class_version == 0 {
+        return Ok(None);
+    }
+
+    let code_template = unsafe { ffi::PyDict_GetItem(runtime_globals, code_template_key.as_ptr()) };
+    if code_template.is_null() {
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedGeneratorFactory {
+        compile_session_id: data.compile_session.id(),
+        helper_function_id,
+        helper: helper as usize,
+        helper_code: helper_code as usize,
+        runtime_globals: runtime_globals as usize,
+        builtin_getattr: builtin_getattr as usize,
+        preserved_state_factory: preserved_state_factory as usize,
+        generator_class: generator_class as usize,
+        generator_class_version,
+        code_template: code_template as usize,
+        getattr_key,
+        preserved_state_key,
+        generator_class_key,
+        code_template_key,
+    }))
+}
+
+unsafe fn generator_factory_still_canonical(
+    prepared: &PreparedGeneratorFactory,
+    data: &PyFunctionJitExtra,
+    helper: *mut ffi::PyObject,
+) -> bool {
+    if data.compile_session.id() != prepared.compile_session_id
+        || helper as usize != prepared.helper
+        || unsafe { ffi::PyFunction_Check(helper) } == 0
+        || unsafe { (*helper.cast::<ffi::PyFunctionObject>()).func_code } as usize
+            != prepared.helper_code
+        || unsafe { PyFunction_GetSoacFunctionId(helper) }
+            != prepared.helper_function_id.to_packed_runtime_u64()
+        || unsafe {
+            jit::raw_py_function_activation_is_observed(prepared.helper_code as *mut ffi::PyObject)
+        }
+    {
+        return false;
+    }
+
+    let runtime_globals = prepared.runtime_globals as *mut ffi::PyObject;
+    if unsafe { ffi::PyDict_GetItem(runtime_globals, prepared.getattr_key.as_ptr()) } as usize
+        != prepared.builtin_getattr
+        || unsafe { ffi::PyDict_GetItem(runtime_globals, prepared.preserved_state_key.as_ptr()) }
+            as usize
+            != prepared.preserved_state_factory
+        || unsafe { ffi::PyDict_GetItem(runtime_globals, prepared.generator_class_key.as_ptr()) }
+            as usize
+            != prepared.generator_class
+        || unsafe { ffi::PyDict_GetItem(runtime_globals, prepared.code_template_key.as_ptr()) }
+            as usize
+            != prepared.code_template
+    {
+        return false;
+    }
+
+    let generator_class = prepared.generator_class as *mut ffi::PyTypeObject;
+    (unsafe { (*generator_class).tp_version_tag }) == prepared.generator_class_version
+}
+
+unsafe fn try_make_source_generator_instance_direct(
+    py: Python<'_>,
+    function_obj: *mut ffi::PyObject,
+    data: &PyFunctionJitExtra,
+    helper: *mut ffi::PyObject,
+    bound_args: &mut [*mut ffi::PyObject],
+    yieldfrom_slot: usize,
+    throw_context_slot: usize,
+    closed_slot: usize,
+) -> Result<Option<*mut ffi::PyObject>, ()> {
+    let function = data.function_template.function();
+    if *function.lowered_kind() != FunctionKind::Generator
+        || function.names.display_name != "<genexpr>"
+    {
+        return Ok(None);
+    }
+    let raw_function = function_obj.cast::<ffi::PyFunctionObject>();
+    let source_code = unsafe { (*raw_function).func_code };
+    if data
+        .module_state
+        .lookup_original_code(function.function_id)
+        .map(Py::as_ptr)
+        != Some(source_code)
+        || unsafe { jit::raw_py_code_flags(source_code) } & ffi::CO_GENERATOR == 0
+    {
+        return Ok(None);
+    }
+
+    let function_name = unsafe { (*raw_function).func_name };
+    let function_qualname = unsafe { (*raw_function).func_qualname };
+    if function_name.is_null()
+        || function_qualname.is_null()
+        || unsafe { ffi::PyUnicode_CheckExact(function_name) } == 0
+        || unsafe { ffi::PyUnicode_CheckExact(function_qualname) } == 0
+        || !unsafe {
+            jit::raw_py_code_has_function_names(source_code, function_name, function_qualname)
+        }
+        || unsafe { ffi::PyUnicode_CompareWithASCIIString(function_name, c"<genexpr>".as_ptr()) }
+            != 0
+    {
+        return Ok(None);
+    }
+
+    let Some(layout) = function.public_storage_layout() else {
+        return Ok(None);
+    };
+    if layout.preserved_slots.iter().any(|slot| {
+        !matches!(
+            (slot.storage, &slot.init),
+            (
+                PreservedSlotStorage::I64,
+                ClosureInit::RuntimePcUnstarted
+                    | ClosureInit::RuntimeAbruptKindFallthrough
+                    | ClosureInit::RuntimeZero
+            ) | (
+                PreservedSlotStorage::PyObjectOrNull,
+                ClosureInit::Parameter | ClosureInit::RuntimeNone | ClosureInit::Deferred
+            ) | (
+                PreservedSlotStorage::PyCellObject,
+                ClosureInit::Parameter | ClosureInit::EmptyCell
+            )
+        )
+    }) {
+        return Ok(None);
+    }
+
+    let template = data.function_template.as_ref();
+    let prepared = match template.prepared_generator_factory.get() {
+        Some(prepared) => prepared,
+        None => {
+            if unsafe { ffi::PyFunction_Check(helper) } == 0 {
+                return Ok(None);
+            }
+            let helper_code = unsafe { (*helper.cast::<ffi::PyFunctionObject>()).func_code };
+            if unsafe { jit::raw_py_function_activation_is_observed(helper_code) } {
+                return Ok(None);
+            }
+            let Some(prepared) = (unsafe { prepare_generator_factory(py, data, helper)? }) else {
+                return Ok(None);
+            };
+            // Preparation can allocate Python objects and must not hold the OnceLock during
+            // callbacks or reentrant generator creation.
+            let _ = template.prepared_generator_factory.set(prepared);
+            template
+                .prepared_generator_factory
+                .get()
+                .expect("a prepared generator factory should be initialized")
+        }
+    };
+    if !unsafe { generator_factory_still_canonical(prepared, data, helper) } {
+        return Ok(None);
+    }
+
+    let mut state =
+        preserved_state::PreservedStateBuilder::with_capacity(layout.preserved_slots.len())?;
+    for slot in &layout.preserved_slots {
+        match (&slot.storage, &slot.init) {
+            (PreservedSlotStorage::I64, ClosureInit::RuntimePcUnstarted) => state.push_i64(1),
+            (
+                PreservedSlotStorage::I64,
+                ClosureInit::RuntimeAbruptKindFallthrough | ClosureInit::RuntimeZero,
+            ) => state.push_i64(0),
+            (
+                PreservedSlotStorage::PyObjectOrNull,
+                ClosureInit::RuntimeNone | ClosureInit::Deferred,
+            ) => {
+                let value = unsafe { ffi::Py_None() };
+                unsafe { ffi::Py_INCREF(value) };
+                unsafe { state.push_owned_object(value) };
+            }
+            (PreservedSlotStorage::PyCellObject, ClosureInit::EmptyCell) => {
+                let cell = unsafe { PyCell_New(ptr::null_mut()) };
+                if cell.is_null() {
+                    return Err(());
+                }
+                unsafe { state.push_owned_object(cell) };
+            }
+            (
+                storage @ (PreservedSlotStorage::PyObjectOrNull
+                | PreservedSlotStorage::PyCellObject),
+                ClosureInit::Parameter,
+            ) => {
+                let Some(param_index) = data
+                    .function_template
+                    .binding_plan()
+                    .param_index(slot.logical_name.as_str())
+                else {
+                    return set_runtime_error("preserved parameter slot has no public parameter");
+                };
+                let mut value = bound_args[param_index];
+                if value.is_null() {
+                    let Some(default_slot) = data
+                        .function_template
+                        .binding_plan()
+                        .params
+                        .get(param_index)
+                        .and_then(|param| param.default_slot)
+                    else {
+                        return set_runtime_error("preserved parameter slot was not bound");
+                    };
+                    value = data.function_env.runtime_object(default_slot);
+                    if value.is_null() {
+                        return set_runtime_error("preserved parameter slot default was not bound");
+                    }
+                }
+                if *storage == PreservedSlotStorage::PyCellObject {
+                    value = unsafe { PyCell_New(value) };
+                    if value.is_null() {
+                        return Err(());
+                    }
+                } else {
+                    unsafe { ffi::Py_INCREF(value) };
+                }
+                unsafe { state.push_owned_object(value) };
+            }
+            _ => unreachable!("unsupported preserved slots are rejected before direct creation"),
+        }
+    }
+
+    let preserved_values = unsafe { state.into_capsule() };
+    if preserved_values.is_null() {
+        return Err(());
+    }
+    unsafe { cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len()) };
+
+    let mut slot_indices = [ptr::null_mut(); 3];
+    for (index, slot) in [yieldfrom_slot, throw_context_slot, closed_slot]
+        .into_iter()
+        .enumerate()
+    {
+        let value = unsafe { ffi::PyLong_FromSize_t(slot) };
+        if value.is_null() {
+            for previous in slot_indices {
+                unsafe { ffi::Py_XDECREF(previous) };
+            }
+            unsafe { ffi::Py_DECREF(preserved_values) };
+            return Err(());
+        }
+        slot_indices[index] = value;
+    }
+
+    let constructor_args = [
+        function_obj,
+        function_name,
+        function_qualname,
+        source_code,
+        preserved_values,
+        slot_indices[0],
+        slot_indices[1],
+        slot_indices[2],
+    ];
+    let result = unsafe {
+        ffi::PyObject_Vectorcall(
+            prepared.generator_class as *mut ffi::PyObject,
+            constructor_args.as_ptr(),
+            constructor_args.len(),
+            ptr::null_mut(),
+        )
+    };
+    for slot in slot_indices {
+        unsafe { ffi::Py_DECREF(slot) };
+    }
+    unsafe { ffi::Py_DECREF(preserved_values) };
+    if result.is_null() {
+        return Err(());
+    }
+    tracing::debug!(
+        target: "soac_generator_direct_state",
+        path = "direct",
+        temporary_python_tuples = 0,
+        function_id = ?function.function_id,
+        qualname = function.names.qualname.as_str(),
+        "generator_factory_direct_preserved_state",
+    );
+    Ok(Some(result))
+}
+
 unsafe fn make_generator_instance_from_vectorcall(
     function_obj: *mut ffi::PyObject,
     args: *const *mut ffi::PyObject,
@@ -3229,6 +3675,35 @@ unsafe fn make_generator_instance_from_vectorcall(
         bound_args.as_mut_ptr(),
         bound_args.len(),
     )?;
+
+    let make_instance_ptr = data
+        .module_state
+        .runtime_name_owned_cached(RuntimeName::MakeGeneratorInstance);
+    if make_instance_ptr.is_null() {
+        cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+        return Err(());
+    }
+    let make_instance: Bound<'_, PyAny> = Bound::from_owned_ptr(py, make_instance_ptr);
+    match try_make_source_generator_instance_direct(
+        py,
+        function_obj,
+        data,
+        make_instance.as_ptr(),
+        &mut bound_args,
+        yieldfrom_slot,
+        throw_context_slot,
+        closed_slot,
+    ) {
+        Ok(Some(generator)) => {
+            cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+            return Ok(generator);
+        }
+        Ok(None) => {}
+        Err(()) => {
+            cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+            return Err(());
+        }
+    }
 
     let initial_values = ffi::PyTuple_New(layout.preserved_slots.len() as ffi::Py_ssize_t);
     if initial_values.is_null() {
@@ -3333,20 +3808,29 @@ unsafe fn make_generator_instance_from_vectorcall(
 
     let initial_values = Bound::from_owned_ptr(py, initial_values);
     let slot_kinds = Bound::from_owned_ptr(py, slot_kinds);
-    let make_instance_ptr = data
-        .module_state
-        .runtime_name_owned_cached(RuntimeName::MakeGeneratorInstance);
-    if make_instance_ptr.is_null() {
-        return Err(());
-    }
-    let make_instance: Bound<'_, PyAny> = Bound::from_owned_ptr(py, make_instance_ptr);
+    let raw_function = function_obj.cast::<ffi::PyFunctionObject>();
+    let (function_name, function_qualname) = if jit::raw_py_code_has_function_names(
+        (*raw_function).func_code,
+        (*raw_function).func_name,
+        (*raw_function).func_qualname,
+    ) {
+        (
+            Bound::<PyAny>::from_borrowed_ptr(py, (*raw_function).func_name),
+            Bound::<PyAny>::from_borrowed_ptr(py, (*raw_function).func_qualname),
+        )
+    } else {
+        (
+            pyo3::types::PyString::new(py, function.names.display_name.as_str()).into_any(),
+            pyo3::types::PyString::new(py, function.names.qualname.as_str()).into_any(),
+        )
+    };
     let function_obj = Bound::from_borrowed_ptr(py, function_obj);
     let result = make_instance
         .call1((
             function_obj,
             kind_tag,
-            function.names.display_name.as_str(),
-            function.names.qualname.as_str(),
+            function_name,
+            function_qualname,
             initial_values,
             slot_kinds,
             yieldfrom_slot,

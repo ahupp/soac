@@ -98,6 +98,17 @@ struct RawPyCodeVersionPrefix {
     co_ncellvars: c_int,
     co_nfreevars: c_int,
     co_version: u32,
+    co_localsplusnames: *mut ffi::PyObject,
+    co_localspluskinds: *mut ffi::PyObject,
+    co_filename: *mut ffi::PyObject,
+    co_name: *mut ffi::PyObject,
+    co_qualname: *mut ffi::PyObject,
+    co_linetable: *mut ffi::PyObject,
+    co_weakreflist: *mut ffi::PyObject,
+    co_executors: *mut c_void,
+    co_cached: *mut c_void,
+    co_instrumentation_version: usize,
+    co_monitoring: *mut c_void,
 }
 
 #[repr(C)]
@@ -199,6 +210,43 @@ pub(crate) unsafe fn raw_py_code_version(code: *mut ffi::PyObject) -> u32 {
 
 pub(crate) unsafe fn raw_py_code_freevar_count(code: *mut ffi::PyObject) -> c_int {
     unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_nfreevars }
+}
+
+pub(crate) unsafe fn raw_py_code_flags(code: *mut ffi::PyObject) -> c_int {
+    unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_flags }
+}
+
+pub(crate) unsafe fn raw_py_code_has_function_names(
+    code: *mut ffi::PyObject,
+    name: *mut ffi::PyObject,
+    qualname: *mut ffi::PyObject,
+) -> bool {
+    let code = unsafe { &*code.cast::<RawPyCodeVersionPrefix>() };
+    code.co_name == name && code.co_qualname == qualname
+}
+
+pub(crate) unsafe fn raw_py_function_activation_is_observed(code: *mut ffi::PyObject) -> bool {
+    let thread_state =
+        unsafe { ffi::PyThreadState_Get() }.cast::<PyThreadStateCurrentExceptionPrefix>();
+    if thread_state.is_null() {
+        return true;
+    }
+    let thread_state = unsafe { &*thread_state };
+    if !thread_state.c_profilefunc.is_null() || !thread_state.c_tracefunc.is_null() {
+        return true;
+    }
+    if thread_state.interp.is_null() {
+        return true;
+    }
+
+    // In the pinned CPython layout, PyInterpreterState starts with ceval and
+    // ceval starts with its global instrumentation version.
+    if unsafe { *thread_state.interp.cast::<usize>() } != 0 {
+        return true;
+    }
+
+    // Local monitoring does not change the interpreter-global version.
+    !unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_monitoring }.is_null()
 }
 
 #[derive(Clone, Debug)]

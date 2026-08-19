@@ -772,6 +772,76 @@ file-local batches**, with **86 / 86 batches passing**, plus **559 JIT**,
 tests; see `work/logs/source-function-templates-test-all.log`. The complete
 test phase takes **157.448 seconds**.
 
+## Direct Generator-Instance Preserved State
+
+Canonical original-code generator expressions can avoid the interpreted
+Python state-preservation bridge when an existing private trusted-helper
+plan proves the exact original helper metadata, code identity, and compile
+session. Interned cached-key dictionary probes check the currently live
+runtime helper globals and generator class without allocating or invoking
+user code. Any helper rebinding, replacement before its first call, modified
+class/type, unexpected original code, mismatched session, or unavailable
+trusted entry uses the unchanged Python helper path.
+
+The direct path builds the existing preserved-state capsule from raw owned
+object slots and unboxed `i64` scalar slots without temporary Python tuples.
+An RAII builder releases acquired values on partial failure; capsule
+destruction retains normal generator ownership, traversal, and cleanup.
+The actual original `PyFunction` name/qualified-name objects are passed to
+the real `ClosureGenerator`, restoring stock CPython identity for both
+plain and captured original generators. If a live function was renamed and
+no longer matches its immutable code names, the prior compiler-name fallback
+is preserved.
+
+Each evaluation still receives a fresh function, independent closure cells,
+and a fresh lazy generator; `send`, `throw`, `close`, finalizer behavior,
+current runtime globals, and helper/factory mutation remain observable.
+Pinned CPython thread/code prefixes check tracing, profiling, global
+`sys.monitoring`, and code-local `sys.monitoring`; any active observer
+forces the complete original interpreted path. The selected scope is only
+trusted canonical source-backed generator expressions; ordinary named
+generators, coroutines, async generators, and unrelated dynamic factories
+are not admitted as special cases. No public API is added.
+
+Genuine regressions verify direct owned-object/unboxed-scalar capsule
+initialization plus abandoned-builder cleanup and stock generator name /
+qualified-name identity. Both turn RED-to-GREEN; the complete JIT library
+and full Cargo test targets each pass **560 / 560**. Grouped transformed
+generator, source-watcher, mutation, async, and previous-optimization
+checks report **35 passed / 1 preexisting expected xfail**; the aligned
+Cargo `--tests` check and scoped formatting/format checks also pass. The
+production change is frozen to four existing files and adds no public API.
+
+Normally sampled fixed-eight pyperformance shows robust previous-SOAC
+improvement **1.006422x** and paired stock score **0.5099697650277614x**;
+`comprehensions` improves **66.3955 → 63.9919 us (1.037561x)**. Three
+independent affected/guardrail rounds confirm **66.3955 → 62.1283 us
+(1.068684x)** for comprehensions, clustered 95% interval
+**1.032661–1.107134x**, or **1.121045x** after paired-stock adjustment.
+The affected/guardrail subset overall is **1.005639x** robust and
+**1.021786x** stock-adjusted. Nbody and spectral have no eligible original
+generator expression and show no statistically established regression;
+their generated code remains unchanged. Across all eight workloads,
+generated code remains exactly **23,359,400 native bytes / 1,549,290
+machine blocks**, with unchanged **3,069 typed blocks / 218 functions**.
+
+Matched zero-loss native profiles contain **849 baseline / 844 candidate
+samples**; the old interpreted helper bridge drops **15.425% → 0%**, the
+state-preservation PyO3 bridge **4.003% → 0%**, and factory ancestry
+**18.133% → 16.357%**. Stack samples overlap: candidate slot initialization
+**10.432%** includes **7.826%** periodic GC, leaving approximately
+**2.606%** non-GC initialization; productive factory ancestry after
+excluding GC falls **12.127% → 8.531%**. The old initializer may compile
+while profiling but has no handle in measured Apply execution. This change
+is **retained**; the stock **1.10x** acceptance target remains unmet. The
+authoritative full `just test-all` gate passes **1,220 Python nodeids across
+87 / 87 isolated batches and eight workers**, plus Rust JIT **560**, typed
+IR **53**, lowering **371**, optimizer **208**, and PyO3 **8** tests; see
+`work/logs/direct-generator-state-test-all.log`. Runtime test build takes
+**20.539 seconds**, Cargo tests **60.073 seconds**, inner / outer pytest
+**93.912 / 93.926 seconds**, and the complete test phase **154.011 seconds**.
+The existing counter-dump batch takes **93.25 seconds**.
+
 ## Direct Function Calls
 
 In v3, the optimizer reads raw `call_hot_targets` evidence,

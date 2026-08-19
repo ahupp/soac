@@ -30,6 +30,50 @@ struct PreservedState {
     values: Box<[u64]>,
 }
 
+pub(crate) struct PreservedStateBuilder {
+    kinds: Vec<PreservedSlotKind>,
+    values: Vec<u64>,
+}
+
+impl PreservedStateBuilder {
+    pub(crate) fn with_capacity(slot_count: usize) -> Result<Self, ()> {
+        let mut kinds = Vec::new();
+        let mut values = Vec::new();
+        if kinds.try_reserve_exact(slot_count).is_err()
+            || values.try_reserve_exact(slot_count).is_err()
+        {
+            unsafe { ffi::PyErr_NoMemory() };
+            return Err(());
+        }
+        Ok(Self { kinds, values })
+    }
+
+    pub(crate) unsafe fn push_owned_object(&mut self, value: *mut ffi::PyObject) {
+        debug_assert!(!value.is_null());
+        self.kinds.push(PreservedSlotKind::PyObjectOrNull);
+        self.values.push(value as usize as u64);
+    }
+
+    pub(crate) fn push_i64(&mut self, value: i64) {
+        self.kinds.push(PreservedSlotKind::I64);
+        self.values.push(value as u64);
+    }
+
+    pub(crate) unsafe fn into_capsule(mut self) -> *mut ffi::PyObject {
+        let state = Box::new(PreservedState {
+            kinds: std::mem::take(&mut self.kinds).into_boxed_slice(),
+            values: std::mem::take(&mut self.values).into_boxed_slice(),
+        });
+        unsafe { capsule_from_preserved_state(state) }
+    }
+}
+
+impl Drop for PreservedStateBuilder {
+    fn drop(&mut self) {
+        unsafe { cleanup_partial_state(&self.kinds, &mut self.values) };
+    }
+}
+
 impl PreservedState {
     unsafe fn clear(&mut self) {
         for (kind, value) in self.kinds.iter().zip(self.values.iter_mut()) {
@@ -58,6 +102,22 @@ unsafe extern "C" fn preserved_state_capsule_destructor(capsule: *mut ffi::PyObj
     unsafe {
         state.clear();
     }
+}
+
+unsafe fn capsule_from_preserved_state(state: Box<PreservedState>) -> *mut ffi::PyObject {
+    let state_ptr = Box::into_raw(state);
+    let capsule = unsafe {
+        ffi::PyCapsule_New(
+            state_ptr.cast::<c_void>(),
+            PRESERVED_STATE_CAPSULE_NAME.as_ptr(),
+            Some(preserved_state_capsule_destructor),
+        )
+    };
+    if capsule.is_null() {
+        let mut state = unsafe { Box::from_raw(state_ptr) };
+        unsafe { state.clear() };
+    }
+    capsule
 }
 
 unsafe fn state_from_capsule(
@@ -188,21 +248,7 @@ pub unsafe fn new_preserved_state(
         kinds: kinds.into_boxed_slice(),
         values: values.into_boxed_slice(),
     });
-    let state_ptr = Box::into_raw(state);
-    let capsule = unsafe {
-        ffi::PyCapsule_New(
-            state_ptr.cast::<c_void>(),
-            PRESERVED_STATE_CAPSULE_NAME.as_ptr(),
-            Some(preserved_state_capsule_destructor),
-        )
-    };
-    if capsule.is_null() {
-        let mut state = unsafe { Box::from_raw(state_ptr) };
-        unsafe {
-            state.clear();
-        }
-    }
-    capsule
+    unsafe { capsule_from_preserved_state(state) }
 }
 
 unsafe fn cleanup_partial_state(kinds: &[PreservedSlotKind], values: &mut [u64]) {
@@ -332,6 +378,61 @@ pub unsafe fn clear_preserved_slot(capsule: *mut ffi::PyObject, slot: i64) -> i3
 mod tests {
     use super::*;
     use pyo3::Python;
+
+    #[test]
+    fn compiler_owned_preserved_state_initializes_raw_slots_without_python_tuples() {
+        soac_cpython::initialize_test_python("soac_jit-direct-preserved-state-test")
+            .expect("test Python should initialize");
+        Python::attach(|_| unsafe {
+            let object = ffi::PyList_New(0);
+            assert!(!object.is_null(), "object test value should allocate");
+            let object_before_state = ffi::Py_REFCNT(object);
+
+            let mut builder = PreservedStateBuilder::with_capacity(3)
+                .expect("direct preserved-state slots should allocate");
+            ffi::Py_INCREF(object);
+            builder.push_owned_object(object);
+            builder.push_i64(1);
+            builder.push_i64(0);
+
+            let state = builder.into_capsule();
+            assert!(
+                !state.is_null(),
+                "compiler-owned object and scalar slots should create a capsule without tuples"
+            );
+            assert_eq!(
+                ffi::Py_REFCNT(object),
+                object_before_state + 1,
+                "the direct capsule should own exactly one object reference"
+            );
+            let values = preserved_values_ptr(state);
+            assert_eq!(*values, object as usize as u64);
+            assert_eq!(*values.add(1), 1);
+            assert_eq!(*values.add(2), 0);
+
+            ffi::Py_DECREF(state);
+            assert_eq!(
+                ffi::Py_REFCNT(object),
+                object_before_state,
+                "destroying the capsule should release its owned object exactly once"
+            );
+            ffi::Py_DECREF(object);
+
+            let abandoned = ffi::PyList_New(0);
+            let abandoned_before_builder = ffi::Py_REFCNT(abandoned);
+            let mut builder = PreservedStateBuilder::with_capacity(1)
+                .expect("partial preserved-state slots should allocate");
+            ffi::Py_INCREF(abandoned);
+            builder.push_owned_object(abandoned);
+            drop(builder);
+            assert_eq!(
+                ffi::Py_REFCNT(abandoned),
+                abandoned_before_builder,
+                "abandoned partially initialized state must release every owned object"
+            );
+            ffi::Py_DECREF(abandoned);
+        });
+    }
 
     #[test]
     fn preserved_state_owns_object_slots_and_round_trips_i64_slots() {

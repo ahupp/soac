@@ -1615,3 +1615,12 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   `1.043x`. Three-round affected-workload robust improvement `1.096x`, led
   by `comprehensions` `83.21 us` to `66.60 us` (`1.249x`); generated native
   code remains unchanged.
+
+## 2026-08-19 - Initialize trusted generator state directly
+
+- jj change id: `okqlrmxm`
+- summary: avoid interpreted generator-state tuple bridging and restore
+  canonical generator-name identity.
+- eight-workload stock score `0.510x`; previous-SOAC robust improvement
+  `1.006x`. Repeated `comprehensions` improves `66.40 us` to `62.13 us`
+  (`1.069x`); generated native code remains unchanged.
