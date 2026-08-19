@@ -107,7 +107,11 @@ Current migration surface:
   materialization, exact-int comparison returns with explicit Python bool
   materialization, and exact-string comparison branches or return-shaped
   expressions with exact-unicode guards and Python bool materialization when an
-  object result is demanded. Store RHS lowering can consume return-shaped
+  object result is demanded. Profiled exact-float arithmetic trees containing at
+  least two eligible operations use separate, source-keyed v3 function plans,
+  validated typed-root sidecars, ordered exact-type guards, unboxed `f64`
+  intermediate operations, and one final Python float materialization. Store
+  RHS lowering can consume return-shaped
   expression regions, so simple lowered code like `c = a + b; if c > 0: ...`
   can optimize the add store and the later branch as separate v3 regions.
   Profiled ordinary
@@ -203,7 +207,9 @@ The hot streams consumed by the current replay path are:
   - Instrumented for candidate `BinOp` and `UnaryOp` expressions in
     `instrument_bb_module_with_call_target_counters`, at
     `crates/soac_lowering/src/passes/trace/mod.rs:235`.
-  - Records packed operand shape tags, currently exact-type tags only.
+  - Records packed exact operand-type tags: `Int = 1`, `Str = 2`, and the
+    append-only `Float = 3`; an exact-float/exact-float pair is packed as
+    `3 | (3 << 8) = 771`.
   - Consumed from the binary counter dump in
     `collect_operator_specializations_for_function`, at
     `crates/soac_jit/src/counter_dump.rs:789`.
@@ -1202,8 +1208,10 @@ paths; unplanned item access goes through the CPython item APIs.
   `crates/soac_lowering/src/passes/trace/mod.rs`.
 - Shapes are packed exact-type tags defined in
   `crates/soac_opt/src/operator_specialization.rs`.
-- Exact type tags currently include `ExactTypeTag::Int` and
-  `ExactTypeTag::Str`.
+- Exact type tags include `ExactTypeTag::Int = 1`, `ExactTypeTag::Str = 2`,
+  and `ExactTypeTag::Float = 3`. The float tag is consumed by the separate
+  exact-float expression-tree specialization below; exact-int regions retain
+  their existing tag and semantics.
 - Unary operators, division, modulo, shifts, power, identity/contains tests,
   matmul, and in-place variants are not counted for this specialization and use
   generic lowering unless v3 grows explicit alternatives for them.
@@ -1240,9 +1248,92 @@ paths; unplanned item access goes through the CPython item APIs.
   - unsupported or mismatched shapes either deopt to the generic
     continuation or fall back to generic lowering
 - Natural extensions:
-  - `float`, `str`, `bytes`, `bool`, and mixed-type shapes
+  - additional `str`, `bytes`, `bool`, and mixed-type operator shapes; exact
+    float arithmetic is handled separately as a multi-operation expression tree
   - richer shape encodings
   - specialization for more operators that are currently generic
+
+
+## Profiled Exact-Float Expression Trees
+
+### Counted Input and Planning
+
+- Source input is the existing `operator_hot_shapes` Profile evidence, keyed to
+  the original lowered function and each semantic arithmetic `InstrId`.
+- Exact `PyFloat_Type` operands use append-only `ExactTypeTag::Float = 3`; an
+  exact-float/exact-float binary observation is packed as **771**. Existing
+  exact-int and exact-string tags remain unchanged. Profile mode records the
+  unspecialized original operation graph; Apply consumes only that completed
+  source-keyed evidence.
+- A valid `ExactFloatExpressionSpecializationPlan` selects one maximal tree of
+  **at least two** `Add`, `Sub`, or `Mul` operations. Every internal operation
+  must have exact-float shape **771**; every leaf must be a direct resolved
+  local or immutable module-constant load. The function plan retains the root
+  source, all operations and their original order/kinds, and all leaf source
+  identities.
+- Normal whole-module planning and the existing single-function paths both
+  recurse through enclosing expression containers, so an eligible arithmetic
+  subtree remains selectable beneath an otherwise generic call or power.
+  The collector chooses maximal trees; source-keyed validation rejects stale
+  roots, changed operation/leaf order, unsupported leaf effects, and
+  overlapping selections.
+- The resolved `TypedExactFloatExpressionPlan` sidecar is attached immediately
+  after initial typed conversion. The existing typed expression linearizer
+  preserves that explicitly selected complete tree as one atomic expression;
+  unselected expressions retain their ordinary linearization. This keeps
+  enclosing `Call`/`Pow` boundaries unchanged and prevents nested operations
+  from being replaced by temporary loads before mechanical code generation.
+- Explicit public crate APIs are the crate-root
+  `soac_ir_typed::TypedExactFloatExpressionPlan` re-export and
+  `soac_ir_typed::plan_v3::{ExactFloatExpressionSpecializationPlan,
+  ExactFloatExpressionOperationPlan}`.
+
+### Codegen
+
+- Codegen consumes only the validated typed-root sidecar. It loads and checks
+  each leaf against relocatable `PyFloat_Type` **immediately and in the
+  original left-to-right evaluation order**; a mismatch branches at once to a
+  cold clone of the complete original generic subtree.
+- Guarded exact floats are read as `f64`; selected operations emit separate
+  `fadd`, `fsub`, and `fmul` instructions in the original expression tree and
+  association. The hot path calls `PyFloat_FromDouble` **once**, for the final
+  observable expression result. A five-operation sum-of-squares therefore
+  emits three `fmul`, two `fadd`, no `fma`, and one Python-float allocation;
+  its complete generic arithmetic and enclosing power remain available.
+- Exact-type checks execute on every optimized invocation. Failed guards do
+  not carry assumptions between calls, skip subclass/reflected callbacks,
+  inspect a later unbound local before an earlier callback, or resume from a
+  partially evaluated unboxed subtree.
+
+### Limitations / Soundness / Extensions
+
+- Only profiled exact-float trees with at least two `Add`/`Sub`/`Mul` nodes
+  and direct local/constant leaves are eligible. Isolated operations, in-place
+  arithmetic, divisions, modulo, powers, comparisons, float subclasses,
+  mixed-type values, attribute/index/call leaves, and missing/stale evidence
+  retain their original generic behavior; an enclosing call/power may still
+  contain a selected arithmetic child.
+- Preserve source evaluation order, single evaluation, full-subtree generic
+  fallback, Python ownership and exception behavior, NaN/infinity, signed zero,
+  and the IEEE rounding of each separate operation. **Never contract a
+  multiply/add into FMA, reassociate operations, or enable fast-math.**
+- Focused structured codegen and transformed Profile→Apply regressions pass,
+  including nested call/power trees, exact shape **771**, one final box,
+  subclass/reflected fallback, a rounding case that distinguishes FMA from
+  separate operations, and a raising subclass before a later unbound local.
+  Three additional structured optimizer cases verify maximal call/power tree
+  selection, unsupported-shape/effectful-leaf rejection, and one atomic
+  selected-tree lift versus five ordinary generic lifts. The full typed-IR
+  suite passes **49 / 49**, including malformed-tree and reordered-plan
+  rejection; the full optimizer suite passes **205 / 205**. Expanded
+  transformed-Python guardrails pass **40 / 40 in 122.32 seconds**, and the
+  combined Cargo test-target check plus scoped formatting checks pass.
+  Two repeated normally sampled rounds significantly improve the eligible
+  `float` and `nbody` workload medians **1.047x** and **1.072x**, while the
+  eight-workload median geometric result is approximately unchanged
+  (**0.996x**) and includes unrelated outliers. The complete correctness
+  gate passes **1,216 Python nodeids across 83 batches / 8 workers**, plus
+  all Rust suites; see `work/logs/fused-float-test-all.log`.
 
 
 ## Exact Comparisons

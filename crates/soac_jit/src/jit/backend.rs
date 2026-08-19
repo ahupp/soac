@@ -78,6 +78,10 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
         std::ptr::addr_of_mut!(PyLong_Type).cast::<u8>(),
     );
     builder.symbol(
+        cpython_type_symbol_name(CpythonTypeSymbol::Float),
+        std::ptr::addr_of_mut!(super::PyFloat_Type).cast::<u8>(),
+    );
+    builder.symbol(
         cpython_type_symbol_name(CpythonTypeSymbol::List),
         std::ptr::addr_of_mut!(PyList_Type).cast::<u8>(),
     );

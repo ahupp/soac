@@ -131,6 +131,9 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
         let rewritten = match instr {
             InstrTyped::Truthy(op) => InstrTyped::Truthy(op.try_map_same_children(self)?),
             InstrTyped::Load(op) => InstrTyped::Load(op.try_map_same_children(self)?),
+            InstrTyped::BinOp(op) if op.extra().exact_float_expression_plan().is_some() => {
+                InstrTyped::BinOp(op)
+            }
             InstrTyped::BinOp(op) => InstrTyped::BinOp(op.try_map_same_children(self)?),
             InstrTyped::Tuple(op) => InstrTyped::Tuple(op.try_map_same_children(self)?),
             InstrTyped::UnaryOp(op) => InstrTyped::UnaryOp(op.try_map_same_children(self)?),

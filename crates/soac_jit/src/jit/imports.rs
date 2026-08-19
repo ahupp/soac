@@ -51,6 +51,7 @@ pub(super) enum SigType {
     Pointer,
     I64,
     I32,
+    F64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -694,6 +695,7 @@ pub(super) fn predeclare_jit_runtime_imports(jit_module: &mut JITModule) -> Resu
         CpythonTypeSymbol::Method,
         CpythonTypeSymbol::Type,
         CpythonTypeSymbol::Long,
+        CpythonTypeSymbol::Float,
         CpythonTypeSymbol::List,
         CpythonTypeSymbol::Tuple,
         CpythonTypeSymbol::Unicode,

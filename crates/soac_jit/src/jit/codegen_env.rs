@@ -184,6 +184,7 @@ pub(super) fn lower_static_signature(
         SigType::Pointer => codegen_env.codegen_target_config().pointer_type(),
         SigType::I64 => ir::types::I64,
         SigType::I32 => ir::types::I32,
+        SigType::F64 => ir::types::F64,
     };
     for param in signature.params {
         lowered

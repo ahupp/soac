@@ -228,6 +228,7 @@ pub fn plan_function_optimization_v3(
         regions: Vec::new(),
         direct_calls,
         opaque_fused_iterations,
+        exact_float_expressions: Vec::new(),
         exact_list_items,
         indexed_fields,
         indexed_globals,

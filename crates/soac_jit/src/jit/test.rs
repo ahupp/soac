@@ -58,8 +58,8 @@ mod tests {
     };
     use super::super::symbols::{reloc_type_ref_for_type, resolve_reloc_type_ref_to_type};
     use super::super::typed_pipeline::{
-        annotate_typed_attr_accesses, annotate_typed_exact_int_selections,
-        annotate_typed_indexed_global_accesses,
+        annotate_typed_attr_accesses, annotate_typed_exact_float_expressions,
+        annotate_typed_exact_int_selections, annotate_typed_indexed_global_accesses,
     };
     use super::super::{
         BlockParamFacts, BlockPyBlock, ClifBlockDisplayAnnotations,
@@ -3810,6 +3810,7 @@ def build(values):
                     regions: Vec::new(),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -3825,6 +3826,7 @@ def build(values):
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -4001,6 +4003,8 @@ def build(values):
         let mut typed_function = lower_blockpy_function_to_typed(function.clone());
         annotate_typed_exact_int_selections(&mut typed_function, artifacts)
             .expect("exact-int v3 artifacts should annotate the typed test function");
+        annotate_typed_exact_float_expressions(&mut typed_function, artifacts)
+            .expect("exact-float v3 artifacts should annotate the typed test function");
         typed_function
     }
 
@@ -15931,6 +15935,137 @@ def f(x):
     }
 
     #[test]
+    fn specialized_jit_opt_v3_fused_exact_float_expression_emits_single_box() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_opt_v3_fused_exact_float_expression_emits_single_box",
+        ) {
+            return;
+        }
+
+        let blocks = [1usize as ObjPtr];
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: ["a", "b", "c", "power"]
+                .into_iter()
+                .map(|name| Param {
+                    name: name.into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                })
+                .collect(),
+        };
+
+        let a_squared = with_instr_id(
+            op_expr(BinOp::new(
+                BinOpKind::Mul,
+                with_instr_id(name_expr(test_name("a")), InstrId::new(0)),
+                with_instr_id(name_expr(test_name("a")), InstrId::new(1)),
+            )),
+            InstrId::new(2),
+        );
+        let b_squared = with_instr_id(
+            op_expr(BinOp::new(
+                BinOpKind::Mul,
+                with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(3)),
+                with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(4)),
+            )),
+            InstrId::new(5),
+        );
+        let first_sum = with_instr_id(
+            op_expr(BinOp::new(BinOpKind::Add, a_squared, b_squared)),
+            InstrId::new(6),
+        );
+        let c_squared = with_instr_id(
+            op_expr(BinOp::new(
+                BinOpKind::Mul,
+                with_instr_id(name_expr(test_local_name("c", 2)), InstrId::new(7)),
+                with_instr_id(name_expr(test_local_name("c", 2)), InstrId::new(8)),
+            )),
+            InstrId::new(9),
+        );
+        let sum = with_instr_id(
+            op_expr(BinOp::new(BinOpKind::Add, first_sum, c_squared)),
+            InstrId::new(10),
+        );
+        let power = with_instr_id(
+            op_expr(BinOp::new(
+                BinOpKind::Pow,
+                sum,
+                with_instr_id(name_expr(test_local_name("power", 3)), InstrId::new(11)),
+            )),
+            InstrId::new(12),
+        );
+        function = with_single_test_block(function, Vec::new(), ret_term(power));
+        set_stack_slots(&mut function, &["a", "b", "c", "power"]);
+
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let mut evidence = FunctionProfileEvidence::default();
+        for source in [2, 5, 6, 9, 10] {
+            evidence
+                .operator_specializations
+                .insert(InstrId::new(source), vec![0x0303]);
+        }
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: "test".to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .expect("profiled nested float arithmetic should produce a valid v3 plan");
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            blocks.as_slice(),
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(typed_function_with_exact_int_artifacts(
+                    &function, &artifacts,
+                )),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            count_opcode(&built.ctx.func, ir::Opcode::Fmul),
+            3,
+            "one maximal exact-float tree nested under power should preserve its three multiplies"
+        );
+        assert_eq!(count_opcode(&built.ctx.func, ir::Opcode::Fadd), 2);
+        assert_eq!(count_opcode(&built.ctx.func, ir::Opcode::Fma), 0);
+        let float_box = import_user_names_for_symbols(&built, &["PyFloat_FromDouble"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &float_box),
+            1,
+            "the entire expression should materialize exactly one final float"
+        );
+        let generic_helpers = import_user_names_for_symbols(
+            &built,
+            &["PyNumber_Multiply", "PyNumber_Add", "PyNumber_Power"],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
+            6,
+            "the complete original arithmetic tree and outer power must remain available"
+        );
+    }
+
+    #[test]
     fn specialized_jit_opt_v3_exact_int_branch_artifact_emits_machine_path() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -16851,6 +16986,7 @@ def f(x):
                     regions: Vec::new(),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16866,6 +17002,7 @@ def f(x):
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16944,6 +17081,7 @@ def f(x):
                         reason: "profiled direct call".to_string(),
                     }],
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16968,6 +17106,7 @@ def f(x):
                         reason: "profiled direct call".to_string(),
                     }],
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -17073,6 +17212,7 @@ def f(x):
                         reason: "profiled cross-module direct call".to_string(),
                     }],
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -17097,6 +17237,7 @@ def f(x):
                         reason: "profiled cross-module direct call".to_string(),
                     }],
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -17215,6 +17356,7 @@ def f(x):
                     regions: Vec::new(),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![
                         IndexedFieldSpecializationPlan {
@@ -17261,6 +17403,7 @@ def f(x):
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![
                         soac_ir_typed::emit_v3::MechanicalIndexedFieldEmission {
@@ -17399,6 +17542,7 @@ def f(x):
                     regions: Vec::new(),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: vec![
@@ -17437,6 +17581,7 @@ def f(x):
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: vec![
@@ -18256,6 +18401,7 @@ def read_point(point):
                         reason: "profiled direct call".to_string(),
                     }],
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -18271,6 +18417,7 @@ def read_point(point):
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -18335,6 +18482,7 @@ def read_point(point):
                     regions: Vec::new(),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![IndexedFieldSpecializationPlan {
                         source,
@@ -18363,6 +18511,7 @@ def read_point(point):
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
                     opaque_fused_iterations: Vec::new(),
+                    exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),

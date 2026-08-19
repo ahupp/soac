@@ -4,6 +4,7 @@ use crate::evidence_v3::{
     PlannerFactHints, planner_fact_hints_from_module_constants_v3,
     planner_facts_from_profile_evidence_v3,
 };
+use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
 use crate::passes::{
     BlockPyModuleShape, InlineUnsupportedReason, InlineValueBindings, InstrBlockPy,
     build_cross_module_direct_call_inline_fragment_to_target,
@@ -21,8 +22,8 @@ use crate::region_v3::{
 use anyhow::Result;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
-    ConstantExpr, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId,
+    BinOpKind, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional,
+    ChildVisitable, ConstantExpr, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId,
     LocalFunctionId, LocalLocation, ModuleContentId, NameLike, NameLocation, ParamKind,
     PersistentFunctionId, ResolvedName, RuntimeName, SerializedFunctionDebugName,
     SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
@@ -33,6 +34,7 @@ use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
 use soac_ir_typed::plan_v3::{
     DirectCallArgPlan, DirectCallArgSource, DirectCallCallee, DirectCallSpecializationPlan,
     EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, EXACT_TUPLE_EXACT_INT_ITEM_SHAPE_TAG,
+    ExactFloatExpressionOperationPlan, ExactFloatExpressionSpecializationPlan,
     ExactListItemAccessKind, ExactListItemShape, ExactListItemSpecializationPlan,
     FunctionOptimizationPlanV3, FunctionPlanIdentity, IndexedFieldAccessKind,
     IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
@@ -229,14 +231,16 @@ pub fn plan_and_emit_function_exact_int_branches_v3(
     hints_by_region: &HashMap<RegionId, PlannerFactHints>,
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
     let attempts = extract_function_regions_v3(lowered_function);
-    plan_and_emit_extracted_exact_int_branches_v3(
+    let mut artifacts = plan_and_emit_extracted_exact_int_branches_v3(
         catalog,
         module,
         function,
         attempts,
         evidence,
         hints_by_region,
-    )
+    )?;
+    attach_exact_float_expression_plans(&mut artifacts, lowered_function, evidence)?;
+    Ok(artifacts)
 }
 
 pub fn plan_and_emit_function_exact_int_branches_v3_with_module_constants(
@@ -258,14 +262,30 @@ pub fn plan_and_emit_function_exact_int_branches_v3_with_module_constants(
             ))
         })
         .collect::<HashMap<_, _>>();
-    plan_and_emit_extracted_exact_int_branches_v3(
+    let mut artifacts = plan_and_emit_extracted_exact_int_branches_v3(
         catalog,
         module,
         function,
         attempts,
         evidence,
         &hints_by_region,
-    )
+    )?;
+    attach_exact_float_expression_plans(&mut artifacts, lowered_function, evidence)?;
+    Ok(artifacts)
+}
+
+fn attach_exact_float_expression_plans(
+    artifacts: &mut ExactIntBranchV3Artifacts,
+    lowered_function: &BlockPyFunction<BlockPyModuleShape>,
+    evidence: &FunctionProfileEvidence,
+) -> Result<(), ExactIntBranchV3Error> {
+    if let Some(planned_function) = artifacts.plan.functions.first_mut() {
+        planned_function.exact_float_expressions =
+            exact_float_expression_plans_from_profile_evidence_v3(lowered_function, evidence);
+    }
+    artifacts.emission =
+        emit_mechanical_plan_v3(&artifacts.plan).map_err(ExactIntBranchV3Error::Emit)?;
+    Ok(())
 }
 
 pub fn plan_and_emit_module_v3_from_raw_evidence(
@@ -295,6 +315,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(module_identity);
     let mut functions = Vec::new();
     let mut diagnostics_by_function = Vec::new();
+    let mut exact_float_expressions_by_function = Vec::new();
     for function in &lowered_module.callable_defs {
         let attempts = if function_uses_generator_resume_state(function) {
             Vec::new()
@@ -353,6 +374,9 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             function,
             evidence_store,
         );
+        exact_float_expressions_by_function.push(
+            exact_float_expression_plans_from_profile_evidence_v3(function, &evidence),
+        );
         functions.push(FunctionPlanRequest {
             function: function_plan_identity_v3(function),
             regions: region_requests,
@@ -374,8 +398,14 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             functions,
         },
     );
-    for (function, diagnostics) in plan.functions.iter_mut().zip(diagnostics_by_function) {
+    for ((function, diagnostics), exact_float_expressions) in plan
+        .functions
+        .iter_mut()
+        .zip(diagnostics_by_function)
+        .zip(exact_float_expressions_by_function)
+    {
         function.diagnostics.extend(diagnostics);
+        function.exact_float_expressions = exact_float_expressions;
     }
     validate_module_plan_v3_against_lowered_module(&plan, lowered_module)
         .map_err(ExactIntBranchV3Error::Emit)?;
@@ -478,6 +508,25 @@ fn validate_function_plan_v3_against_lowered_function(
     lowered_module: &BlockPyModule<BlockPyModuleShape>,
     lowered_function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Result<(), MechanicalEmitError> {
+    if !planned_function.exact_float_expressions.is_empty() {
+        let lowered_expressions = lowered_exact_float_expressions_by_instr_v3(lowered_function);
+        for selected in &planned_function.exact_float_expressions {
+            let Some(lowered) = lowered_expressions.get(&selected.source) else {
+                return Err(MechanicalEmitError::EmissionMismatch(format!(
+                    "function {} exact-float expression at {} has no replay-safe lowered expression",
+                    planned_function.function.function, selected.source
+                )));
+            };
+            if lowered.operations != selected.operations
+                || lowered.leaf_sources != selected.leaf_sources
+            {
+                return Err(MechanicalEmitError::EmissionMismatch(format!(
+                    "function {} exact-float expression at {} does not match its lowered arithmetic tree",
+                    planned_function.function.function, selected.source
+                )));
+            }
+        }
+    }
     if !planned_function.direct_calls.is_empty() {
         let lowered_calls = lowered_calls_by_instr_v3(lowered_module, lowered_function)?;
         for direct_call in &planned_function.direct_calls {
@@ -919,6 +968,128 @@ fn function_plan_identity_v3(
         ),
         debug_name: Some(function.names.qualname.clone()),
     }
+}
+
+fn exact_float_expression_plan_for_instr_v3(
+    expr: &InstrBlockPy,
+    evidence: Option<&FunctionProfileEvidence>,
+) -> Option<ExactFloatExpressionSpecializationPlan> {
+    fn collect(
+        expr: &InstrBlockPy,
+        evidence: Option<&FunctionProfileEvidence>,
+        operations: &mut Vec<ExactFloatExpressionOperationPlan>,
+        leaf_sources: &mut Vec<InstrId>,
+    ) -> Option<()> {
+        match expr {
+            InstrBlockPy::BinOp(op)
+                if matches!(op.kind, BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul) =>
+            {
+                let source = op.try_semantic_instr_id()?;
+                if let Some(evidence) = evidence {
+                    let expected = pack_binary_shape(ExactTypeTag::Float, ExactTypeTag::Float);
+                    if !evidence
+                        .operator_specializations
+                        .get(&source)
+                        .is_some_and(|shapes| shapes.contains(&expected))
+                    {
+                        return None;
+                    }
+                }
+                collect(op.left.as_ref(), evidence, operations, leaf_sources)?;
+                collect(op.right.as_ref(), evidence, operations, leaf_sources)?;
+                operations.push(ExactFloatExpressionOperationPlan {
+                    source,
+                    kind: op.kind,
+                });
+                Some(())
+            }
+            InstrBlockPy::Load(op)
+                if matches!(
+                    op.name.location,
+                    NameLocation::Local(_) | NameLocation::Constant(_)
+                ) =>
+            {
+                leaf_sources.push(op.try_semantic_instr_id()?);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    let InstrBlockPy::BinOp(root) = expr else {
+        return None;
+    };
+    let mut operations = Vec::new();
+    let mut leaf_sources = Vec::new();
+    collect(expr, evidence, &mut operations, &mut leaf_sources)?;
+    if operations.len() < 2 {
+        return None;
+    }
+    Some(ExactFloatExpressionSpecializationPlan {
+        source: root.try_semantic_instr_id()?,
+        operations,
+        leaf_sources,
+        reason: "profiled exact-float arithmetic selected a maximal multi-operation expression"
+            .to_string(),
+    })
+}
+
+fn exact_float_expression_plans_from_profile_evidence_v3(
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    evidence: &FunctionProfileEvidence,
+) -> Vec<ExactFloatExpressionSpecializationPlan> {
+    struct Collector<'a> {
+        evidence: &'a FunctionProfileEvidence,
+        plans: Vec<ExactFloatExpressionSpecializationPlan>,
+    }
+
+    impl Visit<InstrBlockPy> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
+        where
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
+        {
+            if let Some(plan) = exact_float_expression_plan_for_instr_v3(expr, Some(self.evidence))
+            {
+                self.plans.push(plan);
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        evidence,
+        plans: Vec::new(),
+    };
+    collector.visit_fn(function);
+    collector.plans.sort_by_key(|plan| plan.source);
+    collector.plans
+}
+
+fn lowered_exact_float_expressions_by_instr_v3(
+    function: &BlockPyFunction<BlockPyModuleShape>,
+) -> HashMap<InstrId, ExactFloatExpressionSpecializationPlan> {
+    struct Collector {
+        plans: HashMap<InstrId, ExactFloatExpressionSpecializationPlan>,
+    }
+
+    impl Visit<InstrBlockPy> for Collector {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
+        where
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
+        {
+            if let Some(plan) = exact_float_expression_plan_for_instr_v3(expr, None) {
+                self.plans.insert(plan.source, plan);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        plans: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.plans
 }
 
 fn exact_list_item_requests_from_profile_evidence_v3(
@@ -2096,7 +2267,7 @@ mod tests {
         CallArgPositional, FunctionName, GetAttr, GetItem, InstrId, Load, LocalFunctionId,
         LocalLocation, Meta, ModuleNameGen, NameLocation, Param, ParamSpec, ResolvedName,
         RuntimeFunctionId, SerializedFunctionId, SerializedModuleId, SetAttr, SetItem,
-        StorageLayout, Store, TermIf, WithMeta,
+        StorageLayout, Store, TermIf, VisitMut, WithMeta,
     };
     use soac_core::profile::{
         CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
@@ -2106,6 +2277,9 @@ mod tests {
         CONSTRUCTOR_ENTRY_FUNCTION_NAME, CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME, InstrBlockPy,
     };
     use soac_ir_typed::plan_v3::{CallBodyKind, RegionId, validate_module_plan_v3};
+    use soac_ir_typed::{
+        InstrTyped, TypedExactFloatExpressionPlan, lower_blockpy_function_to_typed,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3065,6 +3239,226 @@ mod tests {
         assert_eq!(requests[1].source, set_source);
         assert_eq!(requests[1].access, ExactListItemAccessKind::Set);
         assert_eq!(requests[1].shape, ExactListItemShape::ExactListExactInt);
+    }
+
+    fn exact_float_sum_tree_for_test() -> InstrBlockPy {
+        let first = binary(
+            BinOpKind::Mul,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("a", 0), 1),
+            2,
+        );
+        let second = binary(
+            BinOpKind::Mul,
+            with_instr_id(local("b", 1), 3),
+            with_instr_id(local("b", 1), 4),
+            5,
+        );
+        let prefix = binary(BinOpKind::Add, first, second, 6);
+        let third = binary(
+            BinOpKind::Mul,
+            with_instr_id(local("c", 2), 7),
+            with_instr_id(local("c", 2), 8),
+            9,
+        );
+        binary(BinOpKind::Add, prefix, third, 10)
+    }
+
+    fn exact_float_sum_evidence_for_test() -> FunctionProfileEvidence {
+        let mut evidence = FunctionProfileEvidence::default();
+        let shape = pack_binary_shape(ExactTypeTag::Float, ExactTypeTag::Float);
+        for source in [2, 5, 6, 9, 10] {
+            evidence
+                .operator_specializations
+                .insert(instr_id(source), vec![shape]);
+        }
+        evidence
+    }
+
+    #[test]
+    fn exact_float_expression_plans_select_maximal_trees_under_calls_and_powers() {
+        for wrap_in_call in [true, false] {
+            let tree = exact_float_sum_tree_for_test();
+            let wrapped = if wrap_in_call {
+                with_instr_id(
+                    InstrBlockPy::Call(Call::new(
+                        local("sink", 3),
+                        vec![CallArgPositional::Positional(tree)],
+                        Vec::new(),
+                    )),
+                    12,
+                )
+            } else {
+                binary(
+                    BinOpKind::Pow,
+                    tree,
+                    with_instr_id(local("power", 4), 11),
+                    12,
+                )
+            };
+            let mut function = function_with_blocks(vec![Block::new(
+                label(0),
+                Vec::new(),
+                BlockTerm::Return(wrapped),
+                Vec::<BlockParam>::new(),
+                None,
+            )]);
+            set_stack_slots(&mut function, &["a", "b", "c", "sink", "power"]);
+            let evidence = exact_float_sum_evidence_for_test();
+            let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+                &AlternativeCatalog::default_v3(),
+                module_identity(),
+                function_identity(),
+                &function,
+                &evidence,
+                &[],
+            )
+            .expect("nested exact-float trees should produce a valid v3 plan");
+
+            let selected = &artifacts.plan.functions[0].exact_float_expressions;
+            assert_eq!(
+                selected.len(),
+                1,
+                "only the maximal tree should be selected"
+            );
+            assert_eq!(selected[0].source, instr_id(10));
+            assert_eq!(
+                selected[0]
+                    .operations
+                    .iter()
+                    .map(|operation| (operation.source, operation.kind))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (instr_id(2), BinOpKind::Mul),
+                    (instr_id(5), BinOpKind::Mul),
+                    (instr_id(6), BinOpKind::Add),
+                    (instr_id(9), BinOpKind::Mul),
+                    (instr_id(10), BinOpKind::Add),
+                ]
+            );
+            assert_eq!(
+                artifacts.emission.functions[0].exact_float_expressions, *selected,
+                "mechanical emission must preserve the complete source-keyed decision"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_float_expression_plans_reject_single_mixed_and_side_effectful_trees() {
+        let shape = pack_binary_shape(ExactTypeTag::Float, ExactTypeTag::Float);
+        let single = binary(
+            BinOpKind::Mul,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(instr_id(2), vec![shape]);
+        assert!(exact_float_expression_plan_for_instr_v3(&single, Some(&evidence)).is_none());
+
+        let tree = exact_float_sum_tree_for_test();
+        let mut mixed_evidence = exact_float_sum_evidence_for_test();
+        mixed_evidence.operator_specializations.insert(
+            instr_id(5),
+            vec![pack_binary_shape(ExactTypeTag::Int, ExactTypeTag::Float)],
+        );
+        assert!(
+            exact_float_expression_plan_for_instr_v3(&tree, Some(&mixed_evidence)).is_none(),
+            "every arithmetic node must have exact-float profile evidence"
+        );
+
+        let effectful = binary(
+            BinOpKind::Add,
+            single,
+            with_instr_id(
+                InstrBlockPy::Call(Call::new(local("effect", 2), Vec::new(), Vec::new())),
+                3,
+            ),
+            4,
+        );
+        evidence
+            .operator_specializations
+            .insert(instr_id(4), vec![shape]);
+        assert!(
+            exact_float_expression_plan_for_instr_v3(&effectful, Some(&evidence)).is_none(),
+            "calls and other observable operand evaluation must retain generic evaluation"
+        );
+    }
+
+    #[test]
+    fn exact_float_expression_linearization_preserves_only_selected_atomic_trees() {
+        let root = exact_float_sum_tree_for_test();
+        let wrapped = with_instr_id(
+            InstrBlockPy::Call(Call::new(
+                local("sink", 3),
+                vec![CallArgPositional::Positional(root.clone())],
+                Vec::new(),
+            )),
+            12,
+        );
+        let mut function = function_with_blocks(vec![Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(wrapped),
+            Vec::<BlockParam>::new(),
+            None,
+        )]);
+        set_stack_slots(&mut function, &["a", "b", "c", "sink"]);
+        let evidence = exact_float_sum_evidence_for_test();
+        let plan = exact_float_expression_plan_for_instr_v3(&root, Some(&evidence))
+            .expect("profile should select the five-operation expression");
+        let mut selected = lower_blockpy_function_to_typed(function.clone());
+        let mut ordinary = lower_blockpy_function_to_typed(function);
+
+        struct Annotator {
+            plan: ExactFloatExpressionSpecializationPlan,
+        }
+
+        impl VisitMut<InstrTyped> for Annotator {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::BinOp(op) = expr
+                    && op.try_semantic_instr_id() == Some(self.plan.source)
+                {
+                    op.extra_mut()
+                        .set_exact_float_expression_plan(TypedExactFloatExpressionPlan {
+                            source: self.plan.source,
+                            operations: self.plan.operations.clone(),
+                            leaf_sources: self.plan.leaf_sources.clone(),
+                        });
+                    return;
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        Annotator { plan }.visit_fn_mut(&mut selected);
+        let selected_stats = crate::passes::linearize_typed_function_expressions(&mut selected)
+            .expect("selected arithmetic should linearize as one opaque expression");
+        let ordinary_stats = crate::passes::linearize_typed_function_expressions(&mut ordinary)
+            .expect("unselected arithmetic should retain ordinary linearization");
+        assert_eq!(selected_stats.lifted_nested_exprs, 1);
+        assert_eq!(ordinary_stats.lifted_nested_exprs, 5);
+
+        struct SelectedTreeCollector {
+            operation_counts: Vec<usize>,
+        }
+
+        impl Visit<InstrTyped> for SelectedTreeCollector {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let Some(plan) = expr.exact_float_expression_plan() {
+                    self.operation_counts.push(plan.operations.len());
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut collector = SelectedTreeCollector {
+            operation_counts: Vec::new(),
+        };
+        collector.visit_fn(&selected);
+        assert_eq!(collector.operation_counts, vec![5]);
     }
 
     #[test]

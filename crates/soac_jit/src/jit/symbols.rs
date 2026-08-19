@@ -1,6 +1,6 @@
 use super::{
-    PyFunction_Type, PyList_Type, PyLong_Type, PyMethod_Type, PyThreadState_GetUnchecked,
-    PyTuple_Type, PyType_Type, PyUnicode_Type,
+    PyFloat_Type, PyFunction_Type, PyList_Type, PyLong_Type, PyMethod_Type,
+    PyThreadState_GetUnchecked, PyTuple_Type, PyType_Type, PyUnicode_Type,
 };
 use crate::module_type::SharedModuleState;
 use pyo3::ffi;
@@ -18,6 +18,7 @@ pub(super) enum CpythonTypeSymbol {
     Method,
     Type,
     Long,
+    Float,
     List,
     Tuple,
     Unicode,
@@ -108,6 +109,7 @@ pub(super) fn cpython_type_symbol_name(symbol: CpythonTypeSymbol) -> &'static st
         CpythonTypeSymbol::Method => "PyMethod_Type",
         CpythonTypeSymbol::Type => "PyType_Type",
         CpythonTypeSymbol::Long => "PyLong_Type",
+        CpythonTypeSymbol::Float => "PyFloat_Type",
         CpythonTypeSymbol::List => "PyList_Type",
         CpythonTypeSymbol::Tuple => "PyTuple_Type",
         CpythonTypeSymbol::Unicode => "PyUnicode_Type",
@@ -120,6 +122,7 @@ pub(super) fn cpython_type_symbol_from_name(name: &str) -> Option<CpythonTypeSym
         "PyMethod_Type" => Some(CpythonTypeSymbol::Method),
         "PyType_Type" => Some(CpythonTypeSymbol::Type),
         "PyLong_Type" => Some(CpythonTypeSymbol::Long),
+        "PyFloat_Type" => Some(CpythonTypeSymbol::Float),
         "PyList_Type" => Some(CpythonTypeSymbol::List),
         "PyTuple_Type" => Some(CpythonTypeSymbol::Tuple),
         "PyUnicode_Type" => Some(CpythonTypeSymbol::Unicode),
@@ -339,6 +342,7 @@ fn cpython_type_symbol_for_type(owner_type: *mut ffi::PyTypeObject) -> Option<Cp
         ptr if ptr == std::ptr::addr_of_mut!(PyMethod_Type) => Some(CpythonTypeSymbol::Method),
         ptr if ptr == std::ptr::addr_of_mut!(PyType_Type) => Some(CpythonTypeSymbol::Type),
         ptr if ptr == std::ptr::addr_of_mut!(PyLong_Type) => Some(CpythonTypeSymbol::Long),
+        ptr if ptr == std::ptr::addr_of_mut!(PyFloat_Type) => Some(CpythonTypeSymbol::Float),
         ptr if ptr == std::ptr::addr_of_mut!(PyList_Type) => Some(CpythonTypeSymbol::List),
         ptr if ptr == std::ptr::addr_of_mut!(PyTuple_Type) => Some(CpythonTypeSymbol::Tuple),
         ptr if ptr == std::ptr::addr_of_mut!(PyUnicode_Type) => Some(CpythonTypeSymbol::Unicode),
@@ -352,6 +356,7 @@ fn resolve_cpython_type_symbol(symbol: CpythonTypeSymbol) -> *mut ffi::PyTypeObj
         CpythonTypeSymbol::Method => std::ptr::addr_of_mut!(PyMethod_Type),
         CpythonTypeSymbol::Type => std::ptr::addr_of_mut!(PyType_Type),
         CpythonTypeSymbol::Long => std::ptr::addr_of_mut!(PyLong_Type),
+        CpythonTypeSymbol::Float => std::ptr::addr_of_mut!(PyFloat_Type),
         CpythonTypeSymbol::List => std::ptr::addr_of_mut!(PyList_Type),
         CpythonTypeSymbol::Tuple => std::ptr::addr_of_mut!(PyTuple_Type),
         CpythonTypeSymbol::Unicode => std::ptr::addr_of_mut!(PyUnicode_Type),

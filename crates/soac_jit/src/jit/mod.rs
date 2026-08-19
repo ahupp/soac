@@ -75,6 +75,7 @@ unsafe extern "C" {
     static mut PyMethod_Type: ffi::PyTypeObject;
     static mut PyType_Type: ffi::PyTypeObject;
     static mut PyLong_Type: ffi::PyTypeObject;
+    static mut PyFloat_Type: ffi::PyTypeObject;
     static mut PyList_Type: ffi::PyTypeObject;
     static mut PyTuple_Type: ffi::PyTypeObject;
     static mut PyUnicode_Type: ffi::PyTypeObject;

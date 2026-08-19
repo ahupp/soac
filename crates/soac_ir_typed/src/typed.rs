@@ -1518,6 +1518,13 @@ pub struct TypedOpaqueFusedIterationPlan {
     pub entry_guards: Vec<TypedOpaqueFusedEntryGuard>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedExactFloatExpressionPlan {
+    pub source: InstrId,
+    pub operations: Vec<crate::plan_v3::ExactFloatExpressionOperationPlan>,
+    pub leaf_sources: Vec<InstrId>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
@@ -1534,6 +1541,7 @@ pub struct TypedInstrExtra {
     pub generator_instance: Option<TypedGeneratorInstancePlan>,
     pub generator_resume: Option<TypedGeneratorResumePlan>,
     pub opaque_fused_iteration: Option<TypedOpaqueFusedIterationPlan>,
+    pub exact_float_expression: Option<TypedExactFloatExpressionPlan>,
     pub guard_miss_deopt: bool,
 }
 
@@ -1793,6 +1801,22 @@ impl TypedInstrExtra {
         self.opaque_fused_iteration.take().is_some()
     }
 
+    pub fn exact_float_expression_plan(&self) -> Option<&TypedExactFloatExpressionPlan> {
+        self.exact_float_expression.as_ref()
+    }
+
+    pub fn set_exact_float_expression_plan(&mut self, plan: TypedExactFloatExpressionPlan) -> bool {
+        if self.exact_float_expression.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.exact_float_expression = Some(plan);
+        true
+    }
+
+    pub fn clear_exact_float_expression_plan(&mut self) -> bool {
+        self.exact_float_expression.take().is_some()
+    }
+
     pub fn guard_miss_deopt_enabled(&self) -> bool {
         self.guard_miss_deopt
     }
@@ -1893,6 +1917,11 @@ impl InstrTyped {
     pub fn opaque_fused_iteration_plan(&self) -> Option<&TypedOpaqueFusedIterationPlan> {
         self.typed_extra()
             .and_then(TypedInstrExtra::opaque_fused_iteration_plan)
+    }
+
+    pub fn exact_float_expression_plan(&self) -> Option<&TypedExactFloatExpressionPlan> {
+        self.typed_extra()
+            .and_then(TypedInstrExtra::exact_float_expression_plan)
     }
 
     pub fn guard_miss_deopt_enabled(&self) -> bool {

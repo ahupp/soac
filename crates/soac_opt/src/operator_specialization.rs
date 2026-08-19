@@ -3,6 +3,7 @@
 pub enum ExactTypeTag {
     Int = 1,
     Str = 2,
+    Float = 3,
 }
 
 impl ExactTypeTag {
@@ -14,6 +15,7 @@ impl ExactTypeTag {
         match value as u8 {
             1 => Some(Self::Int),
             2 => Some(Self::Str),
+            3 => Some(Self::Float),
             _ => None,
         }
     }

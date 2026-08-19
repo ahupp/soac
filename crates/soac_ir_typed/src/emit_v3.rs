@@ -1,16 +1,17 @@
 use crate::plan_v3::{
     CallBodyPlan, ConversionKind, Cost, DeoptPointId, DirectCallArgPlan,
-    DirectCallSpecializationPlan, ExactListItemAccessKind, ExactListItemFallbackPlan,
-    ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
-    GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldFallbackPlan,
-    IndexedFieldGuardKind, IndexedFieldOwnerType, IndexedFieldReceiverSource,
-    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackPlan,
-    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
-    ModuleOptimizationPlanV3, OpaqueFusedAlgorithmPlan, OpaqueFusedCompatibilityMode,
-    OpaqueFusedEntryGuardPlan, OpaqueFusedFallbackPlan, OpaqueFusedProducerStagePlan,
-    OpaqueFusedSinkPlan, OpaqueFusedStageId, OperationNode, PlanNodeId, PlanNodeKind,
-    PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget,
-    RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp, validate_module_plan_v3,
+    DirectCallSpecializationPlan, ExactFloatExpressionSpecializationPlan, ExactListItemAccessKind,
+    ExactListItemFallbackPlan, ExactListItemGuardPlan, ExactListItemShape,
+    ExactListItemSpecializationPlan, FailureMode, GuardFailure, GuardKind, IndexedFieldAccessKind,
+    IndexedFieldFallbackPlan, IndexedFieldGuardKind, IndexedFieldOwnerType,
+    IndexedFieldReceiverSource, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
+    IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
+    MaterializeKind, ModuleOptimizationPlanV3, OpaqueFusedAlgorithmPlan,
+    OpaqueFusedCompatibilityMode, OpaqueFusedEntryGuardPlan, OpaqueFusedFallbackPlan,
+    OpaqueFusedProducerStagePlan, OpaqueFusedSinkPlan, OpaqueFusedStageId, OperationNode,
+    PlanNodeId, PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp,
+    RegionExitKind, RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
+    validate_module_plan_v3,
 };
 #[cfg(test)]
 use crate::plan_v3::{
@@ -34,6 +35,7 @@ pub struct MechanicalFunctionEmission {
     pub debug_name: Option<String>,
     pub direct_calls: Vec<MechanicalDirectCallEmission>,
     pub opaque_fused_iterations: Vec<MechanicalOpaqueFusedIterationEmission>,
+    pub exact_float_expressions: Vec<ExactFloatExpressionSpecializationPlan>,
     pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
     pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
@@ -888,6 +890,7 @@ fn emit_function(
             .iter()
             .map(emit_opaque_fused_iteration)
             .collect(),
+        exact_float_expressions: function.exact_float_expressions.clone(),
         exact_list_items: function
             .exact_list_items
             .iter()
@@ -1930,6 +1933,7 @@ mod tests {
                 ],
                 direct_calls: Vec::new(),
                 opaque_fused_iterations: Vec::new(),
+                exact_float_expressions: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -2025,6 +2029,46 @@ mod tests {
                     if message.contains("does not match the selected plan")
             ),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn emits_and_validates_exact_float_expression_mechanically() {
+        let mut plan = test_plan(true);
+        plan.functions[0].exact_float_expressions.push(
+            crate::plan_v3::ExactFloatExpressionSpecializationPlan {
+                source: InstrId::new(53),
+                operations: vec![
+                    crate::plan_v3::ExactFloatExpressionOperationPlan {
+                        source: InstrId::new(51),
+                        kind: soac_core::block_py::BinOpKind::Mul,
+                    },
+                    crate::plan_v3::ExactFloatExpressionOperationPlan {
+                        source: InstrId::new(53),
+                        kind: soac_core::block_py::BinOpKind::Add,
+                    },
+                ],
+                leaf_sources: vec![InstrId::new(49), InstrId::new(50), InstrId::new(52)],
+                reason: "profiled exact-float expression".to_string(),
+            },
+        );
+
+        let mut emission = emit_mechanical_plan_v3(&plan).unwrap();
+        assert_eq!(
+            emission.functions[0].exact_float_expressions,
+            plan.functions[0].exact_float_expressions,
+            "mechanical float emission must preserve source, operation order, and leaves"
+        );
+
+        emission.functions[0].exact_float_expressions[0]
+            .operations
+            .swap(0, 1);
+        assert!(
+            matches!(
+                validate_mechanical_emission_matches_plan_v3(&plan, &emission),
+                Err(MechanicalEmitError::EmissionMismatch(_))
+            ),
+            "mechanical float emission must reject reordered arithmetic"
         );
     }
 

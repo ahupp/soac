@@ -1575,3 +1575,14 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   (`12.60x`) and `spectral_norm` `484.4 ms` to `56.2 ms` (`8.62x`).
   Repeated `comprehensions`, `deltablue`, and `fannkuch` regressions remain
   unresolved.
+
+## 2026-08-18 - Fuse profiled exact-float expression trees
+
+- jj change id: `tsrrtrqm`
+- summary: execute validated multi-operation exact-float trees as guarded
+  native arithmetic with one final Python-float allocation.
+- repeated significant SOAC median improvements: `float` `53.56 ms` to
+  `51.16 ms` (`1.047x`) and `nbody` `69.80 ms` to `65.14 ms` (`1.072x`);
+  eligible-workload geometric improvement `1.059x`. The noisy eight-workload
+  mean/median ratios are `0.904x` / `0.996x`; paired stock score moves from
+  `0.460x` to `0.468x`.

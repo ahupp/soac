@@ -13,8 +13,8 @@ use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
     CallableScopeKind, CellLocation, ChildVisitable, ConstantExpr, CounterSite, FunctionKind,
     HasMeta, HasSemanticInstrId, InstrId, InstrLocationMap, Literal, LocalLocation, NameLike,
-    PreservedLocation, ResolvedName, RuntimeFunctionId, RuntimeName, Visit, VisitMut, WithMeta,
-    current_instr_locations,
+    NameLocation, PreservedLocation, ResolvedName, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
+    WithMeta, current_instr_locations,
 };
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_entry_function_id_for_init,
@@ -22,7 +22,8 @@ use soac_ir_blockpy::{
 };
 use soac_ir_typed::emit_v3::MechanicalRegionEmission;
 use soac_ir_typed::plan_v3::{
-    CallBodyKind, CallBodyPlan, Cost, DirectCallCallee, ExactListItemAccessKind,
+    CallBodyKind, CallBodyPlan, Cost, DirectCallCallee, ExactFloatExpressionOperationPlan,
+    ExactFloatExpressionSpecializationPlan, ExactListItemAccessKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind, IndexedFieldReceiverSource,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, RegionInputSource, RegionPlan,
     RegionSource,
@@ -32,11 +33,11 @@ use soac_ir_typed::{
     TypedBlockPyModuleShape, TypedBuiltinImplementationPlan, TypedCall, TypedCallEmissionPlan,
     TypedCallEmissionPlans, TypedConstructorInitPlan, TypedConstructorInitPlanSource,
     TypedDirectCallArgPlan, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
-    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
-    TypedExactListItemAccessPlan, TypedExactListItemCounterSource, TypedExactListItemPlanSource,
-    TypedGeneratorInstancePlan, TypedGeneratorResumePlan, TypedIndexedFieldCounterSource,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
-    assign_missing_typed_function_instr_ids,
+    TypedExactFloatExpressionPlan, TypedExactIntBranchPlan, TypedExactIntPlanSource,
+    TypedExactIntReturnPlan, TypedExactListItemAccessPlan, TypedExactListItemCounterSource,
+    TypedExactListItemPlanSource, TypedGeneratorInstancePlan, TypedGeneratorResumePlan,
+    TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
+    TypedIndexedGlobalPlanSource, assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -3363,6 +3364,149 @@ fn annotate_typed_exact_list_item_accesses_from_profile(
     Ok(())
 }
 
+pub(super) fn annotate_typed_exact_float_expressions(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    artifacts: &ExactIntBranchV3Artifacts,
+) -> Result<usize, String> {
+    let Some(emitted_function) = artifacts.emission.functions.first() else {
+        return Ok(0);
+    };
+    if emitted_function.exact_float_expressions.is_empty() {
+        return Ok(0);
+    }
+
+    fn collect_typed_shape(
+        expr: &InstrTyped,
+        operations: &mut Vec<ExactFloatExpressionOperationPlan>,
+        leaf_sources: &mut Vec<InstrId>,
+    ) -> Result<(), String> {
+        match expr {
+            InstrTyped::BinOp(op)
+                if matches!(
+                    op.kind,
+                    soac_core::block_py::BinOpKind::Add
+                        | soac_core::block_py::BinOpKind::Sub
+                        | soac_core::block_py::BinOpKind::Mul
+                ) =>
+            {
+                collect_typed_shape(op.left.as_ref(), operations, leaf_sources)?;
+                collect_typed_shape(op.right.as_ref(), operations, leaf_sources)?;
+                operations.push(ExactFloatExpressionOperationPlan {
+                    source: op.semantic_instr_id(),
+                    kind: op.kind,
+                });
+                Ok(())
+            }
+            InstrTyped::Load(op)
+                if matches!(
+                    op.name.location,
+                    NameLocation::Local(_) | NameLocation::Constant(_)
+                ) =>
+            {
+                leaf_sources.push(op.semantic_instr_id());
+                Ok(())
+            }
+            _ => {
+                Err("selected exact-float expression has a non-replay-safe typed leaf".to_string())
+            }
+        }
+    }
+
+    struct Annotator<'a> {
+        plans: HashMap<InstrId, &'a ExactFloatExpressionSpecializationPlan>,
+        used: HashSet<InstrId>,
+        error: Option<String>,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            if let InstrTyped::BinOp(op) = expr
+                && let Some(source) = op.try_semantic_instr_id()
+                && let Some(plan) = self.plans.get(&source)
+            {
+                let mut operations = Vec::new();
+                let mut leaf_sources = Vec::new();
+                if let Err(error) =
+                    collect_typed_shape(op.left.as_ref(), &mut operations, &mut leaf_sources)
+                        .and_then(|()| {
+                            collect_typed_shape(
+                                op.right.as_ref(),
+                                &mut operations,
+                                &mut leaf_sources,
+                            )
+                        })
+                {
+                    self.error = Some(format!(
+                        "optimizer v3 exact-float expression at {source} is invalid: {error}"
+                    ));
+                    return;
+                }
+                operations.push(ExactFloatExpressionOperationPlan {
+                    source,
+                    kind: op.kind,
+                });
+                if operations != plan.operations || leaf_sources != plan.leaf_sources {
+                    self.error = Some(format!(
+                        "optimizer v3 exact-float expression at {source} no longer matches its typed arithmetic tree: planned operations {:?}, typed operations {:?}, planned leaves {:?}, typed leaves {:?}",
+                        plan.operations, operations, plan.leaf_sources, leaf_sources
+                    ));
+                    return;
+                }
+                op.extra_mut()
+                    .set_exact_float_expression_plan(TypedExactFloatExpressionPlan {
+                        source,
+                        operations,
+                        leaf_sources,
+                    });
+                self.used.insert(source);
+                return;
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let live_instr_ids = collect_typed_semantic_instr_ids(function);
+    let plans = emitted_function
+        .exact_float_expressions
+        .iter()
+        .filter(|plan| live_instr_ids.contains(&plan.source))
+        .map(|plan| (plan.source, plan))
+        .collect::<HashMap<_, _>>();
+    let mut annotator = Annotator {
+        plans,
+        used: HashSet::new(),
+        error: None,
+    };
+    annotator.visit_fn_mut(function);
+    if let Some(error) = annotator.error {
+        return Err(error);
+    }
+    if annotator.used.len() != annotator.plans.len() {
+        return Err(
+            "optimizer v3 exact-float expression plans were not attached to typed roots"
+                .to_string(),
+        );
+    }
+    Ok(annotator.used.len())
+}
+
+fn annotate_typed_exact_float_expressions_from_profile(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    let Some(artifacts) = profile
+        .opt_v3_exact_int_branch_artifacts
+        .get(&function.function_id)
+    else {
+        return Ok(());
+    };
+    annotate_typed_exact_float_expressions(function, artifacts)?;
+    Ok(())
+}
+
 fn typed_exact_int_branch_plan_from_opt_v3(
     instr_id: InstrId,
     selection: OptV3ExactIntBranchSelection<'_>,
@@ -3724,6 +3868,7 @@ fn apply_profile_access_and_scalar_plans_to_typed_function(
         remapped_exact_list_items,
     )?;
     annotate_typed_exact_int_selections_from_profile(function, profile)?;
+    annotate_typed_exact_float_expressions_from_profile(function, profile)?;
     annotate_typed_remapped_exact_int_selections(
         function,
         remapped_exact_int_branches,
@@ -9666,6 +9811,9 @@ fn optimize_blockpy_with_external_inline_callees(
             if let Some(profile) = profile
                 && env_config.specialization_mode() != Some(SpecializationMode::Profile)
             {
+                for function in &mut typed_module.callable_defs {
+                    annotate_typed_exact_float_expressions_from_profile(function, profile)?;
+                }
                 let mut static_direct_calls =
                     static_direct_calls_for_module(typed_module, &static_targets);
                 static_direct_calls.extend(static_direct_calls_for_external_callees(

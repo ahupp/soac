@@ -40,6 +40,12 @@ struct RawPyLongObject {
     long_value: RawPyLongValue,
 }
 
+#[repr(C)]
+struct RawPyFloatObject {
+    ob_base: ffi::PyObject,
+    ob_fval: f64,
+}
+
 pub(super) trait OperationEmitState<'fb, E> {
     fn ctx(&self) -> &JitEmitCtx<'_>;
     fn fb(&mut self) -> &mut FunctionBuilder<'fb>;
@@ -213,6 +219,11 @@ define_owned_import_spec!(
     PYLONG_FROM_LONGLONG_IMPORT,
     "PyLong_FromLongLong",
     &[SigType::I64]
+);
+define_owned_import_spec!(
+    PYFLOAT_FROM_DOUBLE_IMPORT,
+    "PyFloat_FromDouble",
+    &[SigType::F64]
 );
 define_owned_import_spec!(
     PYNUMBER_SUBTRACT_IMPORT,
@@ -403,6 +414,7 @@ static PYNUMBER_POWER_IMPORT: ImportSpec = ImportSpec::new(
 );
 pub(super) static OPERATION_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYNUMBER_ADD_IMPORT,
+    &PYFLOAT_FROM_DOUBLE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &PYNUMBER_SUBTRACT_IMPORT,
     &PYNUMBER_MULTIPLY_IMPORT,
@@ -616,6 +628,9 @@ fn emit_exact_type_tag_for_value<'fb, E>(
     let py_unicode_type = state
         .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Unicode))
         .expect("PyUnicode_Type symbol should bind during JIT codegen");
+    let py_float_type = state
+        .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Float))
+        .expect("PyFloat_Type symbol should bind during JIT codegen");
     let object_type = state.fb().ins().load(
         ptr_ty,
         ir::MemFlags::trusted(),
@@ -639,8 +654,20 @@ fn emit_exact_type_tag_for_value<'fb, E>(
         .fb()
         .ins()
         .iconst(i64_ty, ExactTypeTag::Str.packed() as i64);
+    let is_float = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, object_type, py_float_type);
+    let exact_float_tag = state
+        .fb()
+        .ins()
+        .iconst(i64_ty, ExactTypeTag::Float.packed() as i64);
     let zero = state.fb().ins().iconst(i64_ty, 0);
-    let non_int_tag = state.fb().ins().select(is_unicode, exact_str_tag, zero);
+    let non_float_tag = state.fb().ins().select(is_unicode, exact_str_tag, zero);
+    let non_int_tag = state
+        .fb()
+        .ins()
+        .select(is_float, exact_float_tag, non_float_tag);
     state.fb().ins().select(is_long, exact_int_tag, non_int_tag)
 }
 
@@ -922,6 +949,132 @@ where
     let arg_values = state.emit_arg_values(&[op.left.as_ref(), op.right.as_ref()]);
     record_binary_operator_shape_counter(op, state, &arg_values);
     emit_binop_with_arg_values(op.kind, state, &arg_values)
+}
+
+fn emit_exact_float_expression_value<'fb>(
+    expr: &InstrTyped,
+    state: &mut impl OperationEmitState<'fb, InstrTyped>,
+    py_float_type: ir::Value,
+    fallback_block: ir::Block,
+) -> ir::Value {
+    match expr {
+        InstrTyped::BinOp(op) => {
+            let left = emit_exact_float_expression_value(
+                op.left.as_ref(),
+                state,
+                py_float_type,
+                fallback_block,
+            );
+            let right = emit_exact_float_expression_value(
+                op.right.as_ref(),
+                state,
+                py_float_type,
+                fallback_block,
+            );
+            match op.kind {
+                blockpy_intrinsics::BinOpKind::Add => state.fb().ins().fadd(left, right),
+                blockpy_intrinsics::BinOpKind::Sub => state.fb().ins().fsub(left, right),
+                blockpy_intrinsics::BinOpKind::Mul => state.fb().ins().fmul(left, right),
+                unsupported => panic!(
+                    "validated exact-float expression contains unsupported arithmetic {unsupported:?}"
+                ),
+            }
+        }
+        InstrTyped::Load(_) => {
+            let arg_values = state.emit_arg_values(&[expr]);
+            let [(value, borrowed)] = arg_values.as_slice() else {
+                panic!("exact-float expression leaf must produce exactly one value");
+            };
+            let value = *value;
+            let borrowed = *borrowed;
+            let ptr_ty = state.ctx().consts.ptr_ty;
+            let actual_type = state.fb().ins().load(
+                ptr_ty,
+                ir::MemFlags::trusted(),
+                value,
+                PYOBJECT_OB_TYPE_OFFSET,
+            );
+            let is_exact_float =
+                state
+                    .fb()
+                    .ins()
+                    .icmp(ir::condcodes::IntCC::Equal, actual_type, py_float_type);
+            let float_block = state.fb().create_block();
+            let guard_miss_block = state.fb().create_block();
+            state.fb().set_cold_block(guard_miss_block);
+            state
+                .fb()
+                .ins()
+                .brif(is_exact_float, float_block, &[], guard_miss_block, &[]);
+
+            state.fb().switch_to_block(guard_miss_block);
+            if !borrowed {
+                state.emit_decref_for_family(value, None, RefcountFamily::OwnedTemporary);
+            }
+            state.fb().ins().jump(fallback_block, &[]);
+
+            state.fb().switch_to_block(float_block);
+            let unboxed = state.fb().ins().load(
+                ir::types::F64,
+                ir::MemFlags::trusted(),
+                value,
+                offset_of!(RawPyFloatObject, ob_fval) as i32,
+            );
+            if !borrowed {
+                state.emit_decref_for_family(
+                    value,
+                    Some(PyObjFacts::exact_type(PyExactType::Float)),
+                    RefcountFamily::OwnedTemporary,
+                );
+            }
+            unboxed
+        }
+        _ => panic!("validated exact-float expression contains a non-load leaf"),
+    }
+}
+
+fn emit_fused_exact_float_expression<'fb>(
+    op: &blockpy_intrinsics::BinOp<InstrTyped>,
+    state: &mut impl OperationEmitState<'fb, InstrTyped>,
+) -> ir::Value {
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let fallback_block = state.fb().create_block();
+    state.fb().set_cold_block(fallback_block);
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let py_float_type = state
+        .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Float))
+        .expect("PyFloat_Type symbol should bind during fused arithmetic codegen");
+    let left =
+        emit_exact_float_expression_value(op.left.as_ref(), state, py_float_type, fallback_block);
+    let right =
+        emit_exact_float_expression_value(op.right.as_ref(), state, py_float_type, fallback_block);
+    let result = match op.kind {
+        blockpy_intrinsics::BinOpKind::Add => state.fb().ins().fadd(left, right),
+        blockpy_intrinsics::BinOpKind::Sub => state.fb().ins().fsub(left, right),
+        blockpy_intrinsics::BinOpKind::Mul => state.fb().ins().fmul(left, right),
+        unsupported => {
+            panic!("validated exact-float expression has unsupported root {unsupported:?}")
+        }
+    };
+    let float_box = state.import_func(&PYFLOAT_FROM_DOUBLE_IMPORT);
+    let call = state.fb().ins().call(float_box, &[result]);
+    let boxed = state.fb().inst_results(call)[0];
+    let boxed = state.finish_owned_result(boxed);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(boxed)]);
+
+    state.fb().switch_to_block(fallback_block);
+    let fallback = emit_counted_binop(op, state);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback)]);
+
+    state.fb().switch_to_block(result_block);
+    state.fb().block_params(result_block)[0]
 }
 
 fn emit_unary_op_with_arg_values<'fb, E>(
@@ -1436,7 +1589,11 @@ pub(super) fn emit_typed_operation<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrTyped>,
 ) -> Option<ir::Value> {
     match operation {
-        InstrTyped::BinOp(op) => Some(emit_counted_binop(op, state)),
+        InstrTyped::BinOp(op) => Some(if op.extra().exact_float_expression_plan().is_some() {
+            emit_fused_exact_float_expression(op, state)
+        } else {
+            emit_counted_binop(op, state)
+        }),
         InstrTyped::UnaryOp(op) => {
             Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))
         }

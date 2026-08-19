@@ -1,5 +1,6 @@
 use soac_core::block_py::{
-    InstrId, RuntimeName, SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
+    BinOpKind, InstrId, RuntimeName, SerializedFunctionId, SerializedIdentityTables,
+    SerializedModuleId,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -29,6 +30,7 @@ pub struct FunctionOptimizationPlanV3 {
     pub regions: Vec<RegionPlan>,
     pub direct_calls: Vec<DirectCallSpecializationPlan>,
     pub opaque_fused_iterations: Vec<OpaqueFusedIterationPlan>,
+    pub exact_float_expressions: Vec<ExactFloatExpressionSpecializationPlan>,
     pub exact_list_items: Vec<ExactListItemSpecializationPlan>,
     pub indexed_fields: Vec<IndexedFieldSpecializationPlan>,
     pub indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
@@ -41,6 +43,20 @@ pub struct FunctionOptimizationPlanV3 {
 pub struct FunctionPlanIdentity {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ExactFloatExpressionSpecializationPlan {
+    pub source: InstrId,
+    pub operations: Vec<ExactFloatExpressionOperationPlan>,
+    pub leaf_sources: Vec<InstrId>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ExactFloatExpressionOperationPlan {
+    pub source: InstrId,
+    pub kind: BinOpKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -1020,6 +1036,7 @@ fn validate_function_plan(
     }
     validate_direct_call_plans(function, identity_tables, errors);
     validate_opaque_fused_iteration_plans(function, identity_tables, errors);
+    validate_exact_float_expression_plans(function, errors);
     validate_exact_list_item_plans(function, errors);
     validate_indexed_field_plans(function, errors);
     validate_indexed_global_plans(function, errors);
@@ -1029,6 +1046,54 @@ fn validate_function_plan(
                 "function {} has ownership action for {:?} without reason",
                 function.function.function, action.value
             ));
+        }
+    }
+}
+
+fn validate_exact_float_expression_plans(
+    function: &FunctionOptimizationPlanV3,
+    errors: &mut Vec<String>,
+) {
+    let mut selected_sources = HashSet::new();
+    let mut selected_operations = HashSet::new();
+    for plan in &function.exact_float_expressions {
+        let context = format!(
+            "function {} exact-float expression at {}",
+            function.function.function, plan.source
+        );
+        if !selected_sources.insert(plan.source) {
+            errors.push(format!("{context} duplicates a selected source"));
+        }
+        if plan.operations.len() < 2 {
+            errors.push(format!(
+                "{context} requires at least two arithmetic operations"
+            ));
+        }
+        if plan.operations.last().map(|operation| operation.source) != Some(plan.source) {
+            errors.push(format!("{context} must end with its root operation"));
+        }
+        if plan.leaf_sources.len() != plan.operations.len().saturating_add(1) {
+            errors.push(format!("{context} has an invalid binary-tree leaf count"));
+        }
+        for operation in &plan.operations {
+            if !matches!(
+                operation.kind,
+                BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul
+            ) {
+                errors.push(format!(
+                    "{context} contains unsupported arithmetic {:?}",
+                    operation.kind
+                ));
+            }
+            if !selected_operations.insert(operation.source) {
+                errors.push(format!(
+                    "{context} duplicates or overlaps arithmetic source {}",
+                    operation.source
+                ));
+            }
+        }
+        if plan.reason.is_empty() {
+            errors.push(format!("{context} has no selection reason"));
         }
     }
 }
@@ -2634,6 +2699,7 @@ mod tests {
                 regions,
                 direct_calls: Vec::new(),
                 opaque_fused_iterations: Vec::new(),
+                exact_float_expressions: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -2793,6 +2859,61 @@ mod tests {
         let plan = module_with_opaque_fused_iterations(vec![valid_opaque_fused_iteration(30)]);
 
         validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn validates_exact_float_expression_and_rejects_malformed_trees() {
+        let selected = ExactFloatExpressionSpecializationPlan {
+            source: InstrId::new(5),
+            operations: vec![
+                ExactFloatExpressionOperationPlan {
+                    source: InstrId::new(2),
+                    kind: BinOpKind::Mul,
+                },
+                ExactFloatExpressionOperationPlan {
+                    source: InstrId::new(5),
+                    kind: BinOpKind::Add,
+                },
+            ],
+            leaf_sources: vec![InstrId::new(0), InstrId::new(1), InstrId::new(4)],
+            reason: "profiled exact-float expression".to_string(),
+        };
+        let mut module = module_with_regions(Vec::new());
+        module.functions[0].exact_float_expressions = vec![selected.clone()];
+        validate_module_plan_v3(&module).expect("a complete arithmetic tree should validate");
+
+        let mut single = selected.clone();
+        single.operations.remove(0);
+        single.leaf_sources.pop();
+        module.functions[0].exact_float_expressions = vec![single];
+        let error = validate_module_plan_v3(&module).unwrap_err();
+        assert!(
+            error.contains("at least two arithmetic operations"),
+            "{error}"
+        );
+
+        let mut unsupported = selected.clone();
+        unsupported.operations[0].kind = BinOpKind::TrueDiv;
+        module.functions[0].exact_float_expressions = vec![unsupported];
+        let error = validate_module_plan_v3(&module).unwrap_err();
+        assert!(error.contains("unsupported arithmetic"), "{error}");
+
+        let mut invalid_root = selected.clone();
+        invalid_root.source = InstrId::new(9);
+        module.functions[0].exact_float_expressions = vec![invalid_root];
+        let error = validate_module_plan_v3(&module).unwrap_err();
+        assert!(
+            error.contains("must end with its root operation"),
+            "{error}"
+        );
+
+        module.functions[0].exact_float_expressions = vec![selected.clone(), selected];
+        let error = validate_module_plan_v3(&module).unwrap_err();
+        assert!(error.contains("duplicates a selected source"), "{error}");
+        assert!(
+            error.contains("duplicates or overlaps arithmetic source"),
+            "{error}"
+        );
     }
 
     #[test]
