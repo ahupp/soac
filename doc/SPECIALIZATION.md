@@ -2076,6 +2076,80 @@ for downstream planning; this change does not add a new helper, alter
 optimizer direct-call selection, or bypass mutable runtime-helper globals.
 
 
+## Guarded Canonical StopIteration Matching
+
+Profiled direct-call planning declines only a source-proven compiler-owned
+`RuntimeName::ExceptionMatches` invocation whose exception type is the
+compiler-owned runtime `StopIteration`, including resolved constant-pool
+runtime aliases. Ordinary local handlers, callbacks, `ValueError`, and
+other direct-call targets remain unchanged. The declined matcher reaches the
+existing generic vectorcall hook mechanically; no new IR operation,
+runtime helper, owner catalog, public API, or process-global cache is added.
+The previous unsound process-global static matcher cache is removed.
+
+An existing private helper-instantiation template owns a zero-allocation
+pointer/index/session metadata cache. It records **seven custom-indexed
+runtime-global dependency slots and four exact combined-Unicode builtin
+entries**, not new Python keys or strong module references. At every use,
+the guard rechecks live globals dictionary / `ma_keys` / `ma_values`, exact
+original key identity, slot index, value pointer, null/tombstone absence,
+and current builtin table/value. This detects both replacement of an
+existing raw indexed `isinstance` slot and insertion into a previously
+absent `issubclass` slot even when watcher/version/`ma_used` metadata does
+not change. Canonical original registered helper and validator functions,
+their code objects, compile session, globals mappings, and expected current
+dependency values must all still match.
+
+Both helper and validator are checked for tracing, profiling, global
+monitoring, and code-local monitoring; any active observer takes the full
+original Python path. The native match accepts **only an exact
+`StopIteration` instance**. All subclasses, spoofed or raising `__class__`,
+exception class objects, nonmatching exceptions, code/module/helper/builtin
+replacement, and descriptor or callback changes fall back, preserving the
+original helper's early `isinstance(exc, RecursionError)` visibility.
+Existing watcher-bypassing runtime stores therefore cannot silently erase
+observable callbacks.
+
+The genuine structured production planner regression turns RED-to-GREEN
+while preserving three unrelated direct targets. The genuine transformed
+integration improves **5 failed / 3.78 seconds → 5 passed / 4.87 seconds**,
+fixing four preexisting user-visible helper/validator mutation callback
+bugs and proving actual nested Profile→Verify→Apply direct-edge removal;
+an unrelated direct edge remains. Real pinned-CPython FFI regression proves
+unchanged indexed dict versions/usage and unchanged builtin `ma_keys` still
+invalidate live guards with balanced owned references. Full optimizer/JIT
+suites pass **212 / 212** and **566 / 566**; transformed compatibility
+guardrails pass **37 / 37 across 16 files in 26.92 seconds**; package-scoped
+format checks and combined all-target Cargo checks pass. Exactly three
+production files change; no public API or helper is added.
+
+Normally sampled fixed-eight paired-stock score improves
+**0.5558386711560767x → 0.5782047994439117x**; previous-SOAC mean
+improvement is **1.0350348551699229x**, robust **1.02855x**. Matched
+60-versus-60 three-round chaos improves **1.120774x**, clustered 95%
+interval **1.07971–1.14830x**, or **1.121950x** stock-adjusted; deltablue
+improves **1.038626x**. Robust subset improvement is **1.045955x**, or
+**1.063296x** stock-adjusted. Normal native code shrinks
+**25,033,800 → 23,293,040 bytes (-6.9536%)**: only compiler-owned matcher
+and validator helper bodies disappear; no user function coverage is lost.
+
+Matched zero-loss **70-loop / 199 Hz** chaos profiles record **806 → 639
+raw samples** and **415 → 349 aggregated stacks**. Matcher ancestry falls
+**10.421% → 0%**, nested validator **5.334% → 0%**,
+`builtin_isinstance` **2.357% → 0%**, `object_isinstance`
+**1.861% → 0%**, and runtime-global slow lookup **3.225% → 0%**. The new
+live guard accounts for **2.035% inclusive**, with overlapping **0.939%**
+slot checks and **0.312%** monitoring. Existing eager factory remains
+**9.428% → 10.010%**; profile shares overlap and attached replay is
+diagnostic only. The optimization is **retained**, and the authoritative
+full `just test-all` correctness gate passes **1,227 Python nodeids across
+90 / 90 isolated file batches and eight workers**, plus JIT **566**,
+optimizer **212**, typed IR **54**, lowering **371**, and PyO3 **8**; see
+`work/logs/live-guarded-stop-iteration-test-all.log`. Cargo tests take
+**70.160 seconds**, inner / outer pytest **74.533 / 74.546 seconds**, and
+the complete test phase **144.721 seconds**; the known counter-dump batch
+takes **74.13 seconds**. The full-suite stock **1.10x** goal remains unmet.
+
 ## Static Runtime Builtin Primitives
 
 ### Counted Input

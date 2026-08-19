@@ -1661,3 +1661,12 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   previous-SOAC ratio `0.990x`, robust `1.003x`. Repeated `comprehensions`
   improves `1.067x` (normal median `63.29 us` to `60.68 us`); generated
   native code remains unchanged.
+
+## 2026-08-19 - Guard canonical StopIteration matcher dependencies
+
+- jj change id: `rllxmowx`
+- summary: replace unsafe matcher direct calls with exact-exception,
+  live-dependency-guarded runtime dispatch.
+- eight-workload stock score `0.578205x` versus prior `0.555839x`;
+  previous-SOAC improvement `1.035x`. Repeated `chaos` improves `1.121x`
+  and `deltablue` `1.039x`; generated native code shrinks `6.95%`.

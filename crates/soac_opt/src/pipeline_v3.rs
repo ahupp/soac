@@ -2079,6 +2079,53 @@ fn runtime_protocol_method_for_call_v3(
     }
 }
 
+fn exact_stop_iteration_runtime_match_for_instr_id_v3(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    source: InstrId,
+) -> bool {
+    struct Finder<'a> {
+        module: &'a BlockPyModule<BlockPyModuleShape>,
+        source: InstrId,
+        matches: bool,
+    }
+
+    impl Visit<InstrBlockPy> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
+        where
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
+        {
+            if self.matches {
+                return;
+            }
+            if let InstrBlockPy::Call(call) = expr
+                && call.try_semantic_instr_id() == Some(self.source)
+                && call.keywords.is_empty()
+                && let [
+                    CallArgPositional::Positional(_),
+                    CallArgPositional::Positional(expected),
+                ] = call.args.as_slice()
+                && codegen_runtime_name_value_v3(self.module, call.func.as_ref())
+                    == Some(RuntimeName::ExceptionMatches)
+                && codegen_runtime_name_value_v3(self.module, expected)
+                    == Some(RuntimeName::StopIteration)
+            {
+                self.matches = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut finder = Finder {
+        module,
+        source,
+        matches: false,
+    };
+    finder.visit_fn(function);
+    finder.matches
+}
+
 #[derive(Clone, Debug)]
 enum DirectCallSourceCallee {
     Function,
@@ -2130,6 +2177,13 @@ fn direct_call_requests_from_evidence_v3(
         .collect::<Vec<_>>();
     entries.sort_by_key(|(source, _)| *source);
     for (source, targets) in entries {
+        if exact_stop_iteration_runtime_match_for_instr_id_v3(lowered_module, function, source) {
+            diagnostics.push(PlanDiagnostic {
+                source: Some(source),
+                message: "v3 direct-call declined exact runtime StopIteration match: preserve its live-guarded generic vectorcall path".to_string(),
+            });
+            continue;
+        }
         let source_callee = match direct_call_source_callee_for_instr_id_v3(
             lowered_module,
             function,
@@ -4340,6 +4394,142 @@ class Handler:
             &DirectCallCallee::Function,
             &default_plan,
         ));
+    }
+
+    #[test]
+    fn direct_call_requests_preserve_exact_stop_iteration_runtime_fast_path() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let make_call = |source, callable, handler| {
+            InstrBlockPy::Store(Store::new(
+                local_name("result", 3),
+                with_instr_id(
+                    InstrBlockPy::Call(Call::new(
+                        callable,
+                        vec![
+                            CallArgPositional::Positional(local("error", 0)),
+                            CallArgPositional::Positional(handler),
+                        ],
+                        Vec::new(),
+                    )),
+                    source,
+                ),
+            ))
+        };
+        let mut caller = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "caller",
+            "caller",
+            vec![Block::new(
+                label(0),
+                vec![
+                    make_call(
+                        10,
+                        runtime_name(RuntimeName::ExceptionMatches),
+                        runtime_name(RuntimeName::StopIteration),
+                    ),
+                    make_call(11, constant_name(0), constant_name(1)),
+                    make_call(
+                        12,
+                        runtime_name(RuntimeName::ExceptionMatches),
+                        runtime_name(RuntimeName::ValueError),
+                    ),
+                    make_call(
+                        13,
+                        runtime_name(RuntimeName::ExceptionMatches),
+                        local("handler", 1),
+                    ),
+                    make_call(
+                        14,
+                        local("callback", 2),
+                        runtime_name(RuntimeName::StopIteration),
+                    ),
+                ],
+                BlockTerm::Return(local("result", 3)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        set_stack_slots(&mut caller, &["error", "handler", "callback", "result"]);
+
+        let mut target = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "exception_matches",
+            "exception_matches",
+            vec![Block::new(
+                label(0),
+                Vec::new(),
+                BlockTerm::Return(local("error", 0)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        target.params.params = vec![any_param("error", false), any_param("expected", false)];
+        set_stack_slots(&mut target, &["error", "expected"]);
+
+        let caller_id = caller.function_id;
+        let target_id = target.function_id;
+        let module = BlockPyModule {
+            module_name_gen,
+            global_names: Vec::new(),
+            callable_defs: vec![caller.clone(), target],
+            module_constants: vec![
+                ConstantExpr::RuntimeName(RuntimeName::ExceptionMatches),
+                ConstantExpr::RuntimeName(RuntimeName::StopIteration),
+            ],
+            counter_defs: Vec::new(),
+        };
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: (10..=14)
+                .map(|source| {
+                    row(
+                        "call_hot_targets",
+                        caller_id,
+                        instr_id(source),
+                        32,
+                        Some(target_id.to_packed_runtime_u64()),
+                    )
+                })
+                .collect(),
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+        let module_identity = module_identity();
+        let target_index = DirectCallTargetIndex::from_current_module(&module_identity, &module);
+        let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(&module_identity);
+
+        let (requests, diagnostics) = direct_call_requests_from_evidence_v3(
+            &module,
+            &module_identity,
+            &caller,
+            &evidence_store,
+            &target_index,
+            &mut identity_builder,
+        );
+
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.source)
+                .collect::<Vec<_>>(),
+            vec![instr_id(12), instr_id(13), instr_id(14)],
+            "only proven compiler-owned StopIteration matches should retain the guarded generic vectorcall path"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.source)
+                .collect::<Vec<_>>(),
+            vec![Some(instr_id(10)), Some(instr_id(11))],
+            "both explicit runtime names and their module-constant aliases need the same planning decision"
+        );
     }
 
     #[test]

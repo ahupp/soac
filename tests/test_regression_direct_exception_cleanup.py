@@ -155,13 +155,15 @@ def test_apply_mode_runtime_unpack_path_preserves_exception_cleanup(
         """,
     )
 
-    direct_edge_rows = [
+    summary_path = tmp_path / "soac-work" / "jit-code-summary.jsonl"
+    compiled_run_bodies = [
         row
-        for row in rows
-        if row.get("target") == "soac_jit_direct_edges"
-        and row.get("clif_direct_edges", 0) > 0
+        for line in summary_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+        if (row := json.loads(line)).get("entry_kind") == "direct_function_body"
+        and row.get("function_qualname") == "run"
     ]
-    assert direct_edge_rows, rows
+    assert compiled_run_bodies, rows
     assert result == [1, 2]
 
 

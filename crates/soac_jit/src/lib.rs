@@ -475,6 +475,31 @@ pub(crate) struct FunctionInstantiationTemplate {
     prepared_runtime_lookup_keys: OnceLock<function_instantiation::PreparedRuntimeLookupKeys>,
     prepared_direct_entry: OnceLock<PreparedDirectEntry>,
     prepared_generator_factory: OnceLock<PreparedGeneratorFactory>,
+    prepared_stop_iteration_matcher: OnceLock<PreparedStopIterationMatcher>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedStopIterationDictionaryEntry {
+    index: usize,
+    key: usize,
+    value: usize,
+}
+
+struct PreparedStopIterationMatcher {
+    compile_session_id: CompileSessionId,
+    helper_function_id: RuntimeFunctionId,
+    helper: usize,
+    helper_code: usize,
+    validator_function_id: RuntimeFunctionId,
+    validator: usize,
+    validator_code: usize,
+    runtime_globals: usize,
+    runtime_keys: usize,
+    runtime_values: usize,
+    builtins: usize,
+    builtin_keys: usize,
+    runtime_entries: [PreparedStopIterationDictionaryEntry; 7],
+    builtin_entries: [PreparedStopIterationDictionaryEntry; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,6 +560,7 @@ impl FunctionInstantiationTemplate {
             prepared_runtime_lookup_keys: OnceLock::new(),
             prepared_direct_entry: OnceLock::new(),
             prepared_generator_factory: OnceLock::new(),
+            prepared_stop_iteration_matcher: OnceLock::new(),
         })
     }
 

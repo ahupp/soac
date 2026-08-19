@@ -10,7 +10,6 @@ use pyo3::ffi;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
@@ -304,40 +303,374 @@ unsafe fn fast_builtin_next_range_iter(
     Some(ffi::PyLong_FromLong(result) as ObjPtr)
 }
 
-unsafe fn cached_runtime_exception_matches() -> *mut ffi::PyObject {
-    static EXCEPTION_MATCHES: AtomicUsize = AtomicUsize::new(0);
-    let cached = EXCEPTION_MATCHES.load(Ordering::Acquire);
-    if cached != 0 {
-        return cached as *mut ffi::PyObject;
+#[repr(C)]
+struct RawPyDictIndexedValues {
+    capacity: ffi::Py_ssize_t,
+    order_size: ffi::Py_ssize_t,
+    values: [*mut ffi::PyObject; 1],
+}
+
+unsafe fn stop_iteration_unicode_entries(
+    keys: *mut super::RawPyDictKeysObjectForJit,
+) -> *mut super::RawPyDictUnicodeEntryForJit {
+    keys.cast::<u8>()
+        .add(
+            std::mem::size_of::<super::RawPyDictKeysObjectForJit>()
+                + (1usize << (*keys).dk_log2_index_bytes),
+        )
+        .cast()
+}
+
+unsafe fn stop_iteration_indexed_value(
+    values: *mut RawPyDictIndexedValues,
+    index: usize,
+) -> *mut ffi::PyObject {
+    *(&raw const (*values).values)
+        .cast::<*mut ffi::PyObject>()
+        .add(index)
+}
+
+unsafe fn prepare_stop_iteration_runtime_entry(
+    data: &crate::PyFunctionJitExtra,
+    keys: *mut super::RawPyDictKeysObjectForJit,
+    values: *mut RawPyDictIndexedValues,
+    name: &'static CStr,
+) -> Option<crate::PreparedStopIterationDictionaryEntry> {
+    let name_str = name.to_str().ok()?;
+    let index = data
+        .module_state
+        .lowered_module
+        .global_names
+        .iter()
+        .position(|global| global == name_str)?;
+    if index >= (*keys).dk_nentries as usize || index >= (*values).capacity as usize {
+        return None;
+    }
+    let entry = &*stop_iteration_unicode_entries(keys).add(index);
+    if entry.me_key.is_null()
+        || ffi::PyUnicode_CheckExact(entry.me_key) == 0
+        || ffi::PyUnicode_CompareWithASCIIString(entry.me_key, name.as_ptr()) != 0
+    {
+        return None;
+    }
+    let value = stop_iteration_indexed_value(values, index);
+    let value = if value.is_null()
+        || value.cast::<i8>() == ptr::addr_of_mut!(super::_PyDict_IndexedValueTombstone)
+    {
+        0
+    } else {
+        value as usize
+    };
+    Some(crate::PreparedStopIterationDictionaryEntry {
+        index,
+        key: entry.me_key as usize,
+        value,
+    })
+}
+
+unsafe fn prepare_stop_iteration_builtin_entry(
+    keys: *mut super::RawPyDictKeysObjectForJit,
+    name: &'static CStr,
+) -> Option<crate::PreparedStopIterationDictionaryEntry> {
+    for index in 0..(*keys).dk_nentries as usize {
+        let entry = &*stop_iteration_unicode_entries(keys).add(index);
+        if entry.me_key.is_null()
+            || ffi::PyUnicode_CheckExact(entry.me_key) == 0
+            || ffi::PyUnicode_CompareWithASCIIString(entry.me_key, name.as_ptr()) != 0
+        {
+            continue;
+        }
+        if entry.me_value.is_null() {
+            return None;
+        }
+        return Some(crate::PreparedStopIterationDictionaryEntry {
+            index,
+            key: entry.me_key as usize,
+            value: entry.me_value as usize,
+        });
+    }
+    None
+}
+
+unsafe fn stop_iteration_exact_builtin(
+    function: *mut ffi::PyObject,
+    name: &'static CStr,
+    builtins: *mut ffi::PyObject,
+) -> bool {
+    if function.is_null() || ffi::PyCFunction_CheckExact(function) == 0 {
+        return false;
+    }
+    let function = &*function.cast::<ffi::PyCFunctionObject>();
+    if function.m_ml.is_null()
+        || (*function.m_ml).ml_name.is_null()
+        || CStr::from_ptr((*function.m_ml).ml_name) != name
+        || function.m_self.is_null()
+        || ffi::PyModule_CheckExact(function.m_self) == 0
+    {
+        return false;
+    }
+    ffi::PyModule_GetDict(function.m_self) == builtins
+}
+
+unsafe fn prepare_stop_iteration_matcher(
+    helper: *mut ffi::PyObject,
+    data: &crate::PyFunctionJitExtra,
+) -> Option<crate::PreparedStopIterationMatcher> {
+    if data.module_state.module_name != "soac.runtime"
+        || data.function_template.function().names.qualname != "exception_matches"
+        || crate::PyFunction_GetSoacFunctionId(helper) != data.function_id.to_packed_runtime_u64()
+    {
+        return None;
+    }
+    let helper_function = &*helper.cast::<ffi::PyFunctionObject>();
+    let helper_code = helper_function.func_code;
+    if helper_code != data.registered_code
+        || data
+            .module_state
+            .lookup_original_code(data.function_id)
+            .map(pyo3::Py::as_ptr)
+            != Some(helper_code)
+        || super::raw_py_function_activation_is_observed(helper_code)
+    {
+        return None;
     }
 
-    let modules = ffi::PyImport_GetModuleDict();
-    if modules.is_null() {
-        return ptr::null_mut();
+    let globals = helper_function.func_globals;
+    let builtins = helper_function.func_builtins;
+    if globals.is_null()
+        || builtins.is_null()
+        || globals != data.function_env.globals_obj()
+        || builtins != data.function_env.builtins_obj()
+        || ffi::PyDict_CheckExact(globals) == 0
+        || ffi::PyDict_CheckExact(builtins) == 0
+    {
+        return None;
     }
-    let runtime = ffi::PyDict_GetItemString(modules, c"soac.runtime".as_ptr());
-    if runtime.is_null() {
-        if !ffi::PyErr_Occurred().is_null() {
-            ffi::PyErr_Clear();
-        }
-        return ptr::null_mut();
-    }
-    let function = ffi::PyObject_GetAttrString(runtime, c"exception_matches".as_ptr());
-    if function.is_null() {
-        if !ffi::PyErr_Occurred().is_null() {
-            ffi::PyErr_Clear();
-        }
-        return ptr::null_mut();
+    let globals_dict = &*globals.cast::<ffi::PyDictObject>();
+    let runtime_keys = globals_dict
+        .ma_keys
+        .cast::<super::RawPyDictKeysObjectForJit>();
+    let runtime_values = globals_dict.ma_values.cast::<RawPyDictIndexedValues>();
+    if runtime_keys.is_null()
+        || runtime_values.is_null()
+        || (*runtime_keys).dk_kind != 3
+        || (*runtime_keys).dk_nentries < 0
+        || (*runtime_values).capacity < 0
+    {
+        return None;
     }
 
-    let raw = function as usize;
-    match EXCEPTION_MATCHES.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => function,
-        Err(existing) => {
-            ffi::Py_DECREF(function);
-            existing as *mut ffi::PyObject
+    let builtin_dict = &*builtins.cast::<ffi::PyDictObject>();
+    let builtin_keys = builtin_dict
+        .ma_keys
+        .cast::<super::RawPyDictKeysObjectForJit>();
+    if builtin_keys.is_null()
+        || !builtin_dict.ma_values.is_null()
+        || (*builtin_keys).dk_kind != 1
+        || (*builtin_keys).dk_nentries < 0
+    {
+        return None;
+    }
+
+    let runtime_entries = [
+        prepare_stop_iteration_runtime_entry(
+            data,
+            runtime_keys,
+            runtime_values,
+            c"_validate_exception_type",
+        )?,
+        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"isinstance")?,
+        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"tuple")?,
+        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"type")?,
+        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"issubclass")?,
+        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"BaseException")?,
+        prepare_stop_iteration_runtime_entry(
+            data,
+            runtime_keys,
+            runtime_values,
+            c"RecursionError",
+        )?,
+    ];
+    let builtin_entries = [
+        prepare_stop_iteration_builtin_entry(builtin_keys, c"isinstance")?,
+        prepare_stop_iteration_builtin_entry(builtin_keys, c"issubclass")?,
+        prepare_stop_iteration_builtin_entry(builtin_keys, c"BaseException")?,
+        prepare_stop_iteration_builtin_entry(builtin_keys, c"RecursionError")?,
+    ];
+    if runtime_entries[1].value != builtin_entries[0].value
+        || !stop_iteration_exact_builtin(
+            runtime_entries[1].value as *mut ffi::PyObject,
+            c"isinstance",
+            builtins,
+        )
+        || runtime_entries[2].value
+            != ptr::addr_of_mut!(ffi::PyTuple_Type).cast::<ffi::PyObject>() as usize
+        || runtime_entries[3].value
+            != ptr::addr_of_mut!(ffi::PyType_Type).cast::<ffi::PyObject>() as usize
+        || runtime_entries[4].value != 0
+        || runtime_entries[5].value != 0
+        || runtime_entries[6].value != 0
+        || !stop_iteration_exact_builtin(
+            builtin_entries[1].value as *mut ffi::PyObject,
+            c"issubclass",
+            builtins,
+        )
+        || builtin_entries[2].value != ffi::PyExc_BaseException as usize
+        || builtin_entries[3].value != ffi::PyExc_RecursionError as usize
+    {
+        return None;
+    }
+
+    let validator = runtime_entries[0].value as *mut ffi::PyObject;
+    if validator.is_null() || ffi::PyFunction_Check(validator) == 0 {
+        return None;
+    }
+    let validator_metadata = crate::PyFunction_GetSoacMetadata(validator);
+    if validator_metadata.is_null() {
+        return None;
+    }
+    let validator_data = &*validator_metadata.cast::<crate::PyFunctionJitExtra>();
+    let validator_function = &*validator.cast::<ffi::PyFunctionObject>();
+    if validator_data.compile_session.id() != data.compile_session.id()
+        || validator_data.module_state.module_name != "soac.runtime"
+        || validator_data.function_template.function().names.qualname != "_validate_exception_type"
+        || crate::PyFunction_GetSoacFunctionId(validator)
+            != validator_data.function_id.to_packed_runtime_u64()
+        || validator_function.func_globals != globals
+        || validator_function.func_builtins != builtins
+        || validator_function.func_code != validator_data.registered_code
+        || validator_data
+            .module_state
+            .lookup_original_code(validator_data.function_id)
+            .map(pyo3::Py::as_ptr)
+            != Some(validator_function.func_code)
+        || super::raw_py_function_activation_is_observed(validator_function.func_code)
+    {
+        return None;
+    }
+
+    Some(crate::PreparedStopIterationMatcher {
+        compile_session_id: data.compile_session.id(),
+        helper_function_id: data.function_id,
+        helper: helper as usize,
+        helper_code: helper_code as usize,
+        validator_function_id: validator_data.function_id,
+        validator: validator as usize,
+        validator_code: validator_function.func_code as usize,
+        runtime_globals: globals as usize,
+        runtime_keys: runtime_keys as usize,
+        runtime_values: runtime_values as usize,
+        builtins: builtins as usize,
+        builtin_keys: builtin_keys as usize,
+        runtime_entries,
+        builtin_entries,
+    })
+}
+
+unsafe fn stop_iteration_matcher_still_canonical(
+    prepared: &crate::PreparedStopIterationMatcher,
+    helper: *mut ffi::PyObject,
+    data: &crate::PyFunctionJitExtra,
+) -> bool {
+    if helper as usize != prepared.helper
+        || data.compile_session.id() != prepared.compile_session_id
+        || crate::PyFunction_GetSoacFunctionId(helper)
+            != prepared.helper_function_id.to_packed_runtime_u64()
+        || (*helper.cast::<ffi::PyFunctionObject>()).func_code as usize != prepared.helper_code
+        || (*helper.cast::<ffi::PyFunctionObject>()).func_globals as usize
+            != prepared.runtime_globals
+        || (*helper.cast::<ffi::PyFunctionObject>()).func_builtins as usize != prepared.builtins
+        || super::raw_py_function_activation_is_observed(prepared.helper_code as *mut ffi::PyObject)
+    {
+        return false;
+    }
+
+    let globals = &*(prepared.runtime_globals as *mut ffi::PyDictObject);
+    let runtime_keys = globals.ma_keys.cast::<super::RawPyDictKeysObjectForJit>();
+    let runtime_values = globals.ma_values.cast::<RawPyDictIndexedValues>();
+    if runtime_keys as usize != prepared.runtime_keys
+        || runtime_values as usize != prepared.runtime_values
+        || (*runtime_keys).dk_kind != 3
+        || (*runtime_keys).dk_nentries < 0
+        || (*runtime_values).capacity < 0
+    {
+        return false;
+    }
+    if !stop_iteration_runtime_entries_still_match(
+        runtime_keys,
+        runtime_values,
+        &prepared.runtime_entries,
+    ) {
+        return false;
+    }
+
+    let builtins = &*(prepared.builtins as *mut ffi::PyDictObject);
+    let builtin_keys = builtins.ma_keys.cast::<super::RawPyDictKeysObjectForJit>();
+    if builtin_keys as usize != prepared.builtin_keys
+        || !builtins.ma_values.is_null()
+        || (*builtin_keys).dk_kind != 1
+        || (*builtin_keys).dk_nentries < 0
+        || !stop_iteration_builtin_entries_still_match(builtin_keys, &prepared.builtin_entries)
+    {
+        return false;
+    }
+
+    let validator = prepared.validator as *mut ffi::PyObject;
+    ffi::PyFunction_Check(validator) != 0
+        && crate::PyFunction_GetSoacFunctionId(validator)
+            == prepared.validator_function_id.to_packed_runtime_u64()
+        && (*validator.cast::<ffi::PyFunctionObject>()).func_code as usize
+            == prepared.validator_code
+        && (*validator.cast::<ffi::PyFunctionObject>()).func_globals as usize
+            == prepared.runtime_globals
+        && (*validator.cast::<ffi::PyFunctionObject>()).func_builtins as usize == prepared.builtins
+        && !super::raw_py_function_activation_is_observed(
+            prepared.validator_code as *mut ffi::PyObject,
+        )
+}
+
+unsafe fn stop_iteration_runtime_entries_still_match(
+    runtime_keys: *mut super::RawPyDictKeysObjectForJit,
+    runtime_values: *mut RawPyDictIndexedValues,
+    entries: &[crate::PreparedStopIterationDictionaryEntry],
+) -> bool {
+    let runtime_key_entries = stop_iteration_unicode_entries(runtime_keys);
+    for expected in entries {
+        if expected.index >= (*runtime_keys).dk_nentries as usize
+            || expected.index >= (*runtime_values).capacity as usize
+            || (*runtime_key_entries.add(expected.index)).me_key as usize != expected.key
+        {
+            return false;
+        }
+        let value = stop_iteration_indexed_value(runtime_values, expected.index);
+        if expected.value == 0 {
+            if !value.is_null()
+                && value.cast::<i8>() != ptr::addr_of_mut!(super::_PyDict_IndexedValueTombstone)
+            {
+                return false;
+            }
+        } else if value as usize != expected.value {
+            return false;
         }
     }
+    true
+}
+
+unsafe fn stop_iteration_builtin_entries_still_match(
+    builtin_keys: *mut super::RawPyDictKeysObjectForJit,
+    entries: &[crate::PreparedStopIterationDictionaryEntry],
+) -> bool {
+    let builtin_key_entries = stop_iteration_unicode_entries(builtin_keys);
+    for expected in entries {
+        if expected.index >= (*builtin_keys).dk_nentries as usize {
+            return false;
+        }
+        let entry = &*builtin_key_entries.add(expected.index);
+        if entry.me_key as usize != expected.key || entry.me_value as usize != expected.value {
+            return false;
+        }
+    }
+    true
 }
 
 unsafe fn fast_runtime_stop_iteration_match(
@@ -353,21 +686,202 @@ unsafe fn fast_runtime_stop_iteration_match(
     if nargs != 2 {
         return None;
     }
-    let exception_matches = cached_runtime_exception_matches();
-    if exception_matches.is_null() || callable as *mut ffi::PyObject != exception_matches {
-        return None;
-    }
-
     let args = args as *const *mut ffi::PyObject;
     let exc = *args;
     let exc_type = *args.add(1);
-    if exc_type != ffi::PyExc_StopIteration {
+    if exc.is_null()
+        || exc_type != ffi::PyExc_StopIteration
+        || ffi::Py_TYPE(exc) != ffi::PyExc_StopIteration.cast::<ffi::PyTypeObject>()
+    {
+        // Even a real StopIteration subclass can override __class__, observed by the
+        // helper's initial isinstance(exc, RecursionError) check.
         return None;
     }
 
-    let matches = ffi::PyErr_GivenExceptionMatches(exc, ffi::PyExc_StopIteration);
-    Some(ffi::PyBool_FromLong((matches != 0) as libc::c_long) as ObjPtr)
+    let helper = callable.cast::<ffi::PyObject>();
+    if helper.is_null() || ffi::PyFunction_Check(helper) == 0 {
+        return None;
+    }
+    let metadata = crate::PyFunction_GetSoacMetadata(helper);
+    if metadata.is_null() {
+        return None;
+    }
+    let data = &*metadata.cast::<crate::PyFunctionJitExtra>();
+    let prepared = match data.function_template.prepared_stop_iteration_matcher.get() {
+        Some(prepared) => prepared,
+        None => {
+            let prepared = prepare_stop_iteration_matcher(helper, data)?;
+            let _ = data
+                .function_template
+                .prepared_stop_iteration_matcher
+                .set(prepared);
+            data.function_template
+                .prepared_stop_iteration_matcher
+                .get()?
+        }
+    };
+    if !stop_iteration_matcher_still_canonical(prepared, helper, data) {
+        return None;
+    }
+    Some(ffi::PyBool_FromLong(1) as ObjPtr)
 }
+
+#[cfg(test)]
+#[test]
+fn stop_iteration_live_dictionary_guards_observe_unversioned_slot_mutations() {
+    unsafe extern "C" {
+        fn _PyDict_NewIndexedKeySet(keys: *mut ffi::PyObject) -> *mut c_void;
+        fn _PyDict_NewWithIndexedKeySet(keys: *mut c_void) -> *mut ffi::PyObject;
+        fn _PyDictKeys_DecRef(keys: *mut c_void);
+    }
+
+    let _guard = crate::python_runtime_test_lock().lock().unwrap();
+    crate::initialize_test_python();
+    pyo3::Python::attach(|_| unsafe {
+        let key_names = ffi::PyTuple_New(2);
+        assert!(!key_names.is_null(), "indexed key tuple must allocate");
+        for (index, name) in [c"present", c"missing"].iter().enumerate() {
+            let mut key = ffi::PyUnicode_FromString(name.as_ptr());
+            assert!(!key.is_null(), "indexed key must allocate");
+            ffi::PyUnicode_InternInPlace(&mut key);
+            assert_eq!(ffi::PyTuple_SetItem(key_names, index as isize, key), 0);
+        }
+
+        let indexed_keys = _PyDict_NewIndexedKeySet(key_names);
+        assert!(
+            !indexed_keys.is_null(),
+            "actual indexed key set must allocate"
+        );
+        let indexed_dict = _PyDict_NewWithIndexedKeySet(indexed_keys);
+        _PyDictKeys_DecRef(indexed_keys);
+        assert!(
+            !indexed_dict.is_null(),
+            "actual indexed dictionary must allocate"
+        );
+
+        let present_key = ffi::PyTuple_GetItem(key_names, 0);
+        let missing_key = ffi::PyTuple_GetItem(key_names, 1);
+        let present_index = _PyDict_IndexedKeyIndex(indexed_dict, present_key);
+        let missing_index = _PyDict_IndexedKeyIndex(indexed_dict, missing_key);
+        assert!(present_index >= 0 && missing_index >= 0);
+
+        let present = ffi::PyList_New(0);
+        let replacement = ffi::PyList_New(0);
+        assert!(!present.is_null() && !replacement.is_null());
+        assert_eq!(
+            _PyDict_SetIndexedItem(indexed_dict, present_index, present),
+            0
+        );
+        let present_refcount = ffi::Py_REFCNT(present);
+        let replacement_refcount = ffi::Py_REFCNT(replacement);
+        assert_eq!(
+            present_refcount, 2,
+            "the local and indexed slot each own one reference"
+        );
+        assert_eq!(
+            replacement_refcount, 1,
+            "the replacement begins locally owned"
+        );
+
+        let dict = &*indexed_dict.cast::<ffi::PyDictObject>();
+        let keys = dict.ma_keys.cast::<super::RawPyDictKeysObjectForJit>();
+        let values = dict.ma_values.cast::<RawPyDictIndexedValues>();
+        assert_eq!((*keys).dk_kind, 3);
+        let key_entries = stop_iteration_unicode_entries(keys);
+        let expected = [
+            crate::PreparedStopIterationDictionaryEntry {
+                index: present_index as usize,
+                key: (*key_entries.add(present_index as usize)).me_key as usize,
+                value: present as usize,
+            },
+            crate::PreparedStopIterationDictionaryEntry {
+                index: missing_index as usize,
+                key: (*key_entries.add(missing_index as usize)).me_key as usize,
+                value: 0,
+            },
+        ];
+        assert!(stop_iteration_runtime_entries_still_match(
+            keys, values, &expected,
+        ));
+
+        let slots = (&raw mut (*values).values).cast::<*mut ffi::PyObject>();
+        let version = (*keys).dk_version;
+        let used = dict.ma_used;
+
+        ffi::Py_INCREF(replacement);
+        *slots.add(present_index as usize) = replacement;
+        ffi::Py_DECREF(present);
+        assert_eq!(ffi::Py_REFCNT(present), present_refcount - 1);
+        assert_eq!(ffi::Py_REFCNT(replacement), replacement_refcount + 1);
+        assert_eq!((*keys).dk_version, version);
+        assert_eq!(dict.ma_used, used);
+        assert!(
+            !stop_iteration_runtime_entries_still_match(keys, values, &expected),
+            "replacing a present indexed value without watcher/version updates must invalidate"
+        );
+        ffi::Py_INCREF(present);
+        *slots.add(present_index as usize) = present;
+        ffi::Py_DECREF(replacement);
+        assert_eq!(ffi::Py_REFCNT(present), present_refcount);
+        assert_eq!(ffi::Py_REFCNT(replacement), replacement_refcount);
+        assert!(stop_iteration_runtime_entries_still_match(
+            keys, values, &expected,
+        ));
+
+        let missing_slot = slots.add(missing_index as usize);
+        let original_missing = *missing_slot;
+        ffi::Py_INCREF(replacement);
+        *missing_slot = replacement;
+        assert_eq!(ffi::Py_REFCNT(replacement), replacement_refcount + 1);
+        assert_eq!((*keys).dk_version, version);
+        assert_eq!(dict.ma_used, used);
+        assert!(
+            !stop_iteration_runtime_entries_still_match(keys, values, &expected),
+            "populating a formerly absent indexed shadow without metadata updates must invalidate"
+        );
+        *missing_slot = original_missing;
+        ffi::Py_DECREF(replacement);
+        assert_eq!(ffi::Py_REFCNT(replacement), replacement_refcount);
+        assert!(stop_iteration_runtime_entries_still_match(
+            keys, values, &expected,
+        ));
+
+        let builtin_dict = ffi::PyDict_New();
+        let builtin_key = ffi::PyUnicode_FromString(c"guarded".as_ptr());
+        assert!(!builtin_dict.is_null() && !builtin_key.is_null());
+        assert_eq!(ffi::PyDict_SetItem(builtin_dict, builtin_key, present), 0);
+        let builtin_keys = (*builtin_dict.cast::<ffi::PyDictObject>())
+            .ma_keys
+            .cast::<super::RawPyDictKeysObjectForJit>();
+        assert_eq!((*builtin_keys).dk_kind, 1);
+        let builtin_entry = prepare_stop_iteration_builtin_entry(builtin_keys, c"guarded").unwrap();
+        assert!(stop_iteration_builtin_entries_still_match(
+            builtin_keys,
+            &[builtin_entry],
+        ));
+        assert_eq!(
+            ffi::PyDict_SetItem(builtin_dict, builtin_key, replacement),
+            0
+        );
+        assert_eq!(
+            (*builtin_dict.cast::<ffi::PyDictObject>()).ma_keys as usize,
+            builtin_keys as usize,
+            "replacing an existing builtin value must retain its keys object"
+        );
+        assert!(
+            !stop_iteration_builtin_entries_still_match(builtin_keys, &[builtin_entry]),
+            "combined builtin value replacement must invalidate even when keys are unchanged"
+        );
+
+        ffi::Py_DECREF(builtin_key);
+        ffi::Py_DECREF(builtin_dict);
+        ffi::Py_DECREF(replacement);
+        ffi::Py_DECREF(present);
+        ffi::Py_DECREF(indexed_dict);
+        ffi::Py_DECREF(key_names);
+    });
+}
+
 unsafe extern "C" fn enter_recursive_call_hook(_tstate: ObjPtr) -> i32 {
     ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr().cast())
 }
