@@ -462,7 +462,21 @@ pub(crate) struct FunctionInstantiationTemplate {
     runtime_data_layout: jit::FunctionRuntimeDataLayout,
     binding_plan: DirectArgBindingPlan,
     entry_plan: jit::RuntimeFunctionEntryPlan,
+    prepared_original_code: OnceLock<Option<function_instantiation::PreparedOriginalCode>>,
     prepared_synthetic_code: OnceLock<function_instantiation::PreparedSyntheticCode>,
+    prepared_direct_entry: OnceLock<PreparedDirectEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreparedDirectEntryKey {
+    compile_session_id: CompileSessionId,
+    code_ptr: usize,
+    code_version: u32,
+}
+
+struct PreparedDirectEntry {
+    key: PreparedDirectEntryKey,
+    handle: Arc<jit::CompiledFunctionHandle>,
 }
 
 impl FunctionInstantiationTemplate {
@@ -489,7 +503,9 @@ impl FunctionInstantiationTemplate {
             runtime_data_layout,
             binding_plan,
             entry_plan,
+            prepared_original_code: OnceLock::new(),
             prepared_synthetic_code: OnceLock::new(),
+            prepared_direct_entry: OnceLock::new(),
         })
     }
 
@@ -2309,22 +2325,47 @@ pub(crate) unsafe fn attach_ready_clif_direct_entry(
     if data.function_env.compiled_function.is_some() {
         return Ok(true);
     }
+    let registered_code_is_current =
+        unsafe { (*function.cast::<ffi::PyFunctionObject>()).func_code == data.registered_code };
+    let key = PreparedDirectEntryKey {
+        compile_session_id: data.compile_session.id(),
+        code_ptr: data.registered_code as usize,
+        code_version: unsafe { jit::raw_py_code_version(data.registered_code) },
+    };
     let ready = {
         let function = data.function()?;
         if entry_interpreter_vectorcall_requested(function) {
             return Ok(false);
         }
-        let engine = data
-            .compile_session
-            .process_jit()
-            .map_err(|err| set_runtime_error_message(&err))?;
-        engine
-            .lookup_ready_direct_function(function)
-            .map_err(|err| set_runtime_error_message(&err))?
+        if let Some(prepared) = data
+            .function_template
+            .prepared_direct_entry
+            .get()
+            .filter(|prepared| registered_code_is_current && prepared.key == key)
+        {
+            Some(Arc::clone(&prepared.handle))
+        } else {
+            let engine = data
+                .compile_session
+                .process_jit()
+                .map_err(|err| set_runtime_error_message(&err))?;
+            engine
+                .lookup_ready_direct_function(function)
+                .map_err(|err| set_runtime_error_message(&err))?
+        }
     };
     let Some(compiled_function) = ready else {
         return Ok(false);
     };
+    if registered_code_is_current && data.function_template.prepared_direct_entry.get().is_none() {
+        let _ = data
+            .function_template
+            .prepared_direct_entry
+            .set(PreparedDirectEntry {
+                key,
+                handle: Arc::clone(&compiled_function),
+            });
+    }
     attach_compiled_function_to_env(&mut data.function_env, compiled_function)?;
     Ok(true)
 }
@@ -3422,6 +3463,50 @@ mod tests {
     use super::*;
     use pyo3::types::{PyDict, PyList, PyModule};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn prepared_direct_entry_key_rejects_other_sessions_codes_and_versions() {
+        let first_session = CompileSession::new();
+        let second_session = CompileSession::new();
+        let original = PreparedDirectEntryKey {
+            compile_session_id: first_session.id(),
+            code_ptr: 7,
+            code_version: 11,
+        };
+        assert_eq!(
+            original,
+            PreparedDirectEntryKey {
+                compile_session_id: first_session.id(),
+                code_ptr: 7,
+                code_version: 11,
+            },
+            "a prepared entry must be reusable for the same immutable source code"
+        );
+        assert_ne!(
+            original,
+            PreparedDirectEntryKey {
+                compile_session_id: second_session.id(),
+                ..original
+            },
+            "a prepared entry must never cross compile sessions"
+        );
+        assert_ne!(
+            original,
+            PreparedDirectEntryKey {
+                code_ptr: 13,
+                ..original
+            },
+            "a prepared entry must not attach to a different source code object"
+        );
+        assert_ne!(
+            original,
+            PreparedDirectEntryKey {
+                code_version: 17,
+                ..original
+            },
+            "a prepared entry must not attach to another source code version"
+        );
+    }
 
     unsafe extern "C" {
         fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;

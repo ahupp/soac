@@ -1,6 +1,6 @@
 use crate::jit::{
     FIRST_VALID_CPYTHON_FUNCTION_VERSION, ModuleJitContext, ModuleRuntimeContext,
-    raw_py_code_version,
+    raw_py_code_freevar_count, raw_py_code_version,
 };
 use crate::module_type::SharedModuleState;
 use crate::{
@@ -371,11 +371,16 @@ fn unicode_equals_str(obj: &Bound<'_, PyAny>, expected: &str) -> PyResult<bool> 
 }
 
 fn code_freevars_match_names(code: &Bound<'_, PyAny>, expected_names: &[String]) -> PyResult<bool> {
-    let freevars_obj = code.getattr("co_freevars")?;
-    let freevars = freevars_obj.cast::<PyTuple>()?;
-    if freevars.len() != expected_names.len() {
+    let freevar_count = unsafe { raw_py_code_freevar_count(code.as_ptr()) };
+    if usize::try_from(freevar_count).ok() != Some(expected_names.len()) {
         return Ok(false);
     }
+    if expected_names.is_empty() {
+        return Ok(true);
+    }
+    let freevars_obj = code.getattr("co_freevars")?;
+    let freevars = freevars_obj.cast::<PyTuple>()?;
+    debug_assert_eq!(freevars.len(), expected_names.len());
     for (index, expected_name) in expected_names.iter().enumerate() {
         let item = unsafe { ffi::PyTuple_GetItem(freevars.as_ptr(), index as ffi::Py_ssize_t) };
         if item.is_null() {
@@ -508,6 +513,7 @@ fn make_lazy_clif_entry<'py>(
     function_name: &str,
     module_globals: &Bound<'py, PyAny>,
     original_code: Option<&Bound<'py, PyAny>>,
+    has_prepared_code_metadata: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let module_globals = module_globals
         .cast::<PyDict>()
@@ -528,7 +534,9 @@ fn make_lazy_clif_entry<'py>(
             return Err(PyErr::fetch(py));
         }
         let func = Bound::from_owned_ptr(py, func);
-        func.setattr("__name__", function_name)?;
+        if !has_prepared_code_metadata {
+            func.setattr("__name__", function_name)?;
+        }
         Ok(func)
     }
 }
@@ -542,6 +550,59 @@ pub(crate) struct PreparedSyntheticCode {
     runtime_module: usize,
     code_factory: Py<PyAny>,
     code: Py<PyAny>,
+}
+
+pub(crate) struct PreparedOriginalCode {
+    code: Py<PyAny>,
+    capture_layout_matches: bool,
+    has_prepared_metadata: bool,
+}
+
+fn prepared_original_code_for_template<'template>(
+    py: Python<'_>,
+    function_template: &'template FunctionInstantiationTemplate,
+    shared_state: &SharedModuleState,
+) -> PyResult<Option<&'template PreparedOriginalCode>> {
+    if let Some(prepared) = function_template.prepared_original_code.get() {
+        return Ok(prepared.as_ref());
+    }
+
+    let prepared = match shared_state.lookup_original_code(function_template.function().function_id)
+    {
+        Some(code) => {
+            let code = code.bind(py);
+            let capture_layout_matches =
+                code_freevars_match_names(code, function_template.capture_names())?;
+            let has_prepared_metadata = if capture_layout_matches {
+                let name = code.getattr("co_name")?;
+                let qualname = code.getattr("co_qualname")?;
+                unicode_equals_str(
+                    &name,
+                    function_template.function().names.display_name.as_str(),
+                )? && unicode_equals_str(
+                    &qualname,
+                    function_template.function().names.qualname.as_str(),
+                )?
+            } else {
+                false
+            };
+            Some(PreparedOriginalCode {
+                code: code.clone().unbind(),
+                capture_layout_matches,
+                has_prepared_metadata,
+            })
+        }
+        None => None,
+    };
+
+    // Preparing code metadata can invoke Python and must never run while a OnceLock
+    // initialization lock is held: callbacks may re-enter this same function template.
+    let _ = function_template.prepared_original_code.set(prepared);
+    Ok(function_template
+        .prepared_original_code
+        .get()
+        .expect("original code metadata should be initialized")
+        .as_ref())
 }
 
 fn canonical_bootstrap_code_factory(factory: &Bound<'_, PyAny>) -> bool {
@@ -643,13 +704,16 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
     qualname: &str,
     captured_names: &[String],
     captured_values: &[Bound<'py, PyAny>],
-    original_code: Option<&Bound<'py, PyAny>>,
+    original_code: Option<&PreparedOriginalCode>,
 ) -> PyResult<InstantiatedEntry<'py>> {
     debug_assert!(!captured_names.is_empty());
     debug_assert_eq!(captured_names.len(), captured_values.len());
-    let (code, has_prepared_code_metadata) = if let Some(code) = original_code {
-        if code_freevars_match_names(code, captured_names)? {
-            (code.clone(), false)
+    let (code, has_prepared_code_metadata) = if let Some(prepared) = original_code {
+        if prepared.capture_layout_matches {
+            (
+                prepared.code.bind(py).clone(),
+                prepared.has_prepared_metadata,
+            )
         } else {
             synthetic_code_for_template(py, dp, function, function_template, captured_names)?
         }
@@ -772,24 +836,30 @@ fn build_closure_shaped_entry<'py>(
 }
 
 fn apply_function_defaults(
-    py: Python<'_>,
     func: &Bound<'_, PyAny>,
     positional_defaults: Option<&Bound<'_, PyTuple>>,
     kwdefaults: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<()> {
-    let defaults_obj = positional_defaults.map_or_else(
-        || py.None().into_any(),
-        |value| value.clone().into_any().unbind(),
-    );
-    if unsafe { ffi::PyFunction_SetDefaults(func.as_ptr(), defaults_obj.as_ptr()) } != 0 {
-        return Err(PyErr::fetch(py));
-    }
-    let kwdefaults_obj = kwdefaults.map_or_else(
-        || py.None().into_any(),
-        |value| value.clone().into_any().unbind(),
-    );
-    if unsafe { ffi::PyFunction_SetKwDefaults(func.as_ptr(), kwdefaults_obj.as_ptr()) } != 0 {
-        return Err(PyErr::fetch(py));
+    let raw_function = func.as_ptr().cast::<ffi::PyFunctionObject>();
+    unsafe {
+        if positional_defaults.is_some() && !(*raw_function).func_defaults.is_null() {
+            return Err(PyRuntimeError::new_err(
+                "new Python function already has positional defaults",
+            ));
+        }
+        if kwdefaults.is_some() && !(*raw_function).func_kwdefaults.is_null() {
+            return Err(PyRuntimeError::new_err(
+                "new Python function already has keyword defaults",
+            ));
+        }
+        if let Some(defaults) = positional_defaults {
+            ffi::Py_INCREF(defaults.as_ptr());
+            (*raw_function).func_defaults = defaults.as_ptr();
+        }
+        if let Some(defaults) = kwdefaults {
+            ffi::Py_INCREF(defaults.as_ptr());
+            (*raw_function).func_kwdefaults = defaults.as_ptr();
+        }
     }
     Ok(())
 }
@@ -907,12 +977,7 @@ fn instantiate_bb_function_inner(
     )?;
     let entry = instantiated_entry.entry;
     let (positional_defaults, kwdefaults) = split_param_defaults(py, function, param_defaults)?;
-    apply_function_defaults(
-        py,
-        &entry,
-        positional_defaults.as_ref(),
-        kwdefaults.as_ref(),
-    )?;
+    apply_function_defaults(&entry, positional_defaults.as_ref(), kwdefaults.as_ref())?;
     update_function_metadata(
         py,
         &entry,
@@ -922,7 +987,16 @@ fn instantiate_bb_function_inner(
         annotate_fn,
         instantiated_entry.has_prepared_code_metadata,
     )?;
-    entry.setattr("__module__", module_name)?;
+    let existing_module = unsafe { (*entry.as_ptr().cast::<ffi::PyFunctionObject>()).func_module };
+    let module_already_matches = !existing_module.is_null()
+        && unsafe { ffi::PyUnicode_CheckExact(existing_module) } != 0
+        && unicode_equals_str(
+            &unsafe { Bound::from_borrowed_ptr(py, existing_module) },
+            module_name,
+        )?;
+    if !module_already_matches {
+        entry.setattr("__module__", module_name)?;
+    }
     // soac.runtime's source helpers are the runtime ABI for other transformed
     // modules. Keep them on their source implementation outside countered
     // specialization runs so calls from generated code do not implicitly
@@ -1017,30 +1091,45 @@ fn instantiate_closure_backed_entry<'py>(
     entry_name: &str,
     qualname: &str,
 ) -> PyResult<InstantiatedEntry<'py>> {
-    let original_code = module_runtime
-        .shared_module_state_owner
-        .lookup_original_code(function.function_id)
-        .map(|code| code.bind(py));
+    let prepared_original_code = function_template
+        .map(|template| {
+            prepared_original_code_for_template(
+                py,
+                template,
+                module_runtime.shared_module_state_owner.as_ref(),
+            )
+        })
+        .transpose()?
+        .flatten();
+    let original_code = if function_template.is_some() {
+        prepared_original_code.map(|prepared| prepared.code.bind(py))
+    } else {
+        module_runtime
+            .shared_module_state_owner
+            .lookup_original_code(function.function_id)
+            .map(|code| code.bind(py))
+    };
     if let Some(function_template) = function_template {
         let captured_names = function_template.capture_names();
         if let Some(captured_values) = build_ordered_capture_values(py, captures, captured_names)? {
             if captured_names.is_empty() {
-                let original_code_without_freevars = match original_code.as_ref() {
-                    Some(code) if code_freevars_match_names(code.as_any(), captured_names)? => {
-                        Some(code.as_any())
-                    }
-                    _ => None,
-                };
+                let prepared_original_code =
+                    prepared_original_code.filter(|prepared| prepared.capture_layout_matches);
+                let original_code_without_freevars =
+                    prepared_original_code.map(|prepared| prepared.code.bind(py).as_any());
+                let has_prepared_code_metadata =
+                    prepared_original_code.is_some_and(|prepared| prepared.has_prepared_metadata);
                 let entry = make_lazy_clif_entry(
                     py,
                     dp,
                     entry_name,
                     module_globals,
                     original_code_without_freevars,
+                    has_prepared_code_metadata,
                 )?;
                 return Ok(InstantiatedEntry {
                     entry,
-                    has_prepared_code_metadata: false,
+                    has_prepared_code_metadata,
                 });
             } else {
                 return build_closure_shaped_entry_from_ordered_captures(
@@ -1052,7 +1141,7 @@ fn instantiate_closure_backed_entry<'py>(
                     qualname,
                     captured_names,
                     captured_values.as_slice(),
-                    original_code.as_ref().map(|code| code.as_any()),
+                    prepared_original_code,
                 );
             }
         }
@@ -1061,12 +1150,9 @@ fn instantiate_closure_backed_entry<'py>(
     let (captured_names, closure_values) = build_capture_map(py, captures)?;
     if captured_names.is_empty() {
         let original_code_without_freevars = match original_code.as_ref() {
-            Some(code) => {
-                let freevars_obj = code.getattr("co_freevars")?;
-                let freevars = freevars_obj.cast::<PyTuple>()?;
-                freevars.is_empty().then_some(code.as_any())
-            }
+            Some(code) if code_freevars_match_names(code.as_any(), &[])? => Some(code.as_any()),
             None => None,
+            Some(_) => None,
         };
         let entry = make_lazy_clif_entry(
             py,
@@ -1074,6 +1160,7 @@ fn instantiate_closure_backed_entry<'py>(
             entry_name,
             module_globals,
             original_code_without_freevars,
+            false,
         )?;
         return Ok(InstantiatedEntry {
             entry,
@@ -1366,10 +1453,64 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS, keep_source_generator_vectorcall,
-        keep_source_runtime_helper_vectorcall,
+        MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS, code_freevars_match_names,
+        keep_source_generator_vectorcall, keep_source_runtime_helper_vectorcall,
+        make_lazy_clif_entry,
     };
+    use pyo3::prelude::*;
+    use pyo3::types::{PyDict, PyModule};
     use soac_core::block_py::FunctionKind;
+
+    #[test]
+    fn source_backed_zero_freevar_function_preserves_code_metadata_identity() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            globals
+                .set_item("__name__", "source_function_template_structured")
+                .expect("source globals should contain a module name");
+            PyModule::import(py, "builtins")
+                .and_then(|builtins| builtins.getattr("exec"))
+                .and_then(|exec| exec.call1(("def original(value):\n    return value\n", &globals)))
+                .expect("source function should compile");
+            let source_function = globals
+                .get_item("original")
+                .expect("source function lookup should succeed")
+                .expect("source function should exist");
+            let source_code = source_function
+                .getattr("__code__")
+                .expect("source function should expose its immutable code");
+            assert!(
+                code_freevars_match_names(&source_code, &[])
+                    .expect("source code should expose its freevar layout")
+            );
+
+            let runtime = PyModule::new(py, "unused_source_function_runtime")
+                .expect("unused runtime module should allocate");
+            let instantiated = make_lazy_clif_entry(
+                py,
+                &runtime,
+                "original",
+                globals.as_any(),
+                Some(source_code.as_any()),
+                true,
+            )
+            .expect("source-backed function should instantiate");
+            let function_name = instantiated
+                .getattr("__name__")
+                .expect("instantiated function should expose its name");
+            let code_name = source_code
+                .getattr("co_name")
+                .expect("original source code should expose its name");
+            assert_eq!(
+                function_name.as_ptr(),
+                code_name.as_ptr(),
+                "a source-backed function must reuse its immutable code name"
+            );
+        });
+    }
 
     #[test]
     fn source_runtime_helpers_keep_cpython_vectorcall_outside_counter_modes() {

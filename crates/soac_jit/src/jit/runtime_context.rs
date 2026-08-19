@@ -197,6 +197,10 @@ pub(crate) unsafe fn raw_py_code_version(code: *mut ffi::PyObject) -> u32 {
     unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_version }
 }
 
+pub(crate) unsafe fn raw_py_code_freevar_count(code: *mut ffi::PyObject) -> c_int {
+    unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_nfreevars }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FunctionRuntimeDataLayout {
     positional_default_count: usize,

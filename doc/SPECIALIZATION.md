@@ -701,6 +701,77 @@ stock-performance target remains unmet.
   class mutation invalidates that inspection.
 
 
+## Source-Backed Function Materialization
+
+Source-backed nested functions and generator expressions retain their actual
+immutable CPython code objects. Each existing
+`FunctionInstantiationTemplate` stores lazily initialized immutable
+source-code facts in a reentry-safe `OnceLock`; the existing private
+`RawPyCodeVersionPrefix.co_nfreevars` accessor identifies zero-freevar code
+without rebuilding or scanning its immutable closure metadata. Zero-freevar
+functions avoid constructing an unnecessary closure tuple, while captured
+functions still receive fresh, independent cells.
+
+Original-code construction passes a NULL qualified-name override so CPython
+reuses the original code's canonical name and qualified-name objects.
+Freshly validated positional and keyword defaults are installed directly in
+their owned CPython function slots with the required INCREF; function CREATE
+watchers still observe pre-initialization defaults/closure as `None`, and
+initialization does not emit spurious MODIFY_DEFAULTS, MODIFY_KWDEFAULTS, or
+MODIFY_QUALNAME events. Module metadata uses an exact-Unicode guard. Later
+real user assignments still dispatch their required watcher events.
+
+An additional private, positive-only template `OnceLock` can retain an
+already-ready immutable compiled handle for an exact compile-session,
+registered-code pointer, and code version. Every attachment rechecks
+interpreted/test-force settings; both lookup and insertion require the
+current live `PyFunction.func_code` to match the registered snapshot. Each
+Python evaluation still creates a distinct function object, fresh closure
+cells, and a distinct `FunctionEnv`; a cached handle is cloned into that
+environment rather than sharing mutable Python state. Mismatched session,
+code, version, forced-interpreter mode, user-mutated code/defaults, replaced
+factories, or unavailable readiness preserve the ordinary guarded path.
+The private `PreparedDirectEntryKey` test verifies key equality and
+session/code/version inequality only; it does not itself exercise cache
+retrieval, insertion, force-mode, or current-code paths. Those guards are
+source-reviewed, while mutation and fallback behavior is covered by
+transformed-runtime regressions. No public API is added.
+
+The actual same-interpreter stock-versus-SOAC function watcher proves
+CREATE-only initialization, canonical code/name/qualified-name identity,
+original zero-freevar generator expressions, captured nested functions,
+nonempty defaults, fresh object/cell identities, later genuine MODIFY events,
+and synthetic factory replacement. Full JIT tests pass **559 / 559**;
+grouped transformed-runtime regressions pass **31 / 31 in 15.81 seconds**;
+the aligned Cargo test-target check passes in **5.04 seconds**, and scoped
+format/check gates pass.
+
+The normal fixed-eight comparison improves robust previous-SOAC throughput
+**1.0426394914876491x**, with paired stock score
+**0.5132971537493283x**. `comprehensions` median improves
+**83.212579 → 66.395 us (1.253287x)**. An independent three-round,
+four-workload repeat improves robust previous-SOAC throughput
+**1.095507476732x**, or **1.092128843x** after paired-stock adjustment;
+`comprehensions` median improves **83.21258 → 66.6000 us (1.249438x)**,
+and all **60 candidate values** are below all **20 baseline values**.
+Guardrail workloads show no reproduced material regression. All **80 Apply
+workers** retain exactly **23,359,400 native bytes / 1,549,290 machine
+blocks** and **3,069 typed blocks / 218 functions**.
+
+Matched zero-loss native profiles contain **916 → 849 CPU-clock samples**.
+Inclusive original source-backed creation decreases **17.573% → 7.067%**,
+`co_freevars` scanning **2.401% → 0%**, and ready-entry lookup
+**2.401% → 0.118%**. Native stack shares overlap; first-call compilation
+and attached replay are diagnostic, not the throughput headline. Valid
+function-watcher events still occur; only spurious initialization MODIFY
+events disappear. The optimization is retained, but the **1.10x full-suite
+stock-performance target remains unmet**. The authoritative full
+`just test-all` correctness gate **passes 1,219 Python nodeids across 86
+file-local batches**, with **86 / 86 batches passing**, plus **559 JIT**,
+**53 typed-IR**, **208 optimizer**, **371 lowering**, and **8 PyO3** Rust
+tests; see `work/logs/source-function-templates-test-all.log`. The complete
+test phase takes **157.448 seconds**.
+
 ## Direct Function Calls
 
 In v3, the optimizer reads raw `call_hot_targets` evidence,

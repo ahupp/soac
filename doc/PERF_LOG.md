@@ -1605,3 +1605,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 - eight-workload paired stock score `0.484x`; previous-SOAC robust median
   improvement `1.009x`. Three-round affected-workload robust improvement
   `1.037x`; generated native code shrinks `0.247%`.
+
+## 2026-08-19 - Reuse source-backed function materialization
+
+- jj change id: `xtnupnyk`
+- summary: reuse immutable original-function metadata and ready-entry keys
+  while restoring CPython function-watcher initialization behavior.
+- eight-workload stock score `0.513x`; previous-SOAC robust improvement
+  `1.043x`. Three-round affected-workload robust improvement `1.096x`, led
+  by `comprehensions` `83.21 us` to `66.60 us` (`1.249x`); generated native
+  code remains unchanged.

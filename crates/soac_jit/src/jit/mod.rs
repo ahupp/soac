@@ -232,7 +232,7 @@ pub(crate) use process::{ProcessJitEngine, process_jit_is_currently_compiling};
 use refcount_lowering::RefcountLowering;
 pub(crate) use runtime_context::{
     FIRST_VALID_CPYTHON_FUNCTION_VERSION, FunctionRuntimeDataLayout,
-    invalidate_py_function_soac_function_id, raw_py_code_version,
+    invalidate_py_function_soac_function_id, raw_py_code_freevar_count, raw_py_code_version,
 };
 use runtime_context::{
     FUNCTION_ENV_BUILTINS_OBJ_OFFSET, FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET,
