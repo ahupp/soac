@@ -1708,3 +1708,14 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   official previous `1.06128x` is outlier-sensitive, with robust previous
   `0.99921x`. Repeated `comprehensions` improves `1.11263x`
   (`49.93 us` to `44.87 us`); native code remains `23,188,640 B`.
+
+## 2026-08-19 - Inline exact positional vectorcall binding
+
+- jj change id: `rukzksko`
+- summary: partition exact-arity trampolines and enter validated core
+  function bodies directly.
+- eight-workload stock score `0.614608x` versus prior `0.632661x`;
+  previous-SOAC `1.03884x`. Repeated `deltablue` improves `1.08465x`
+  (`3.177 ms` to `2.929 ms`) and `richards` `1.05533x` (`29.845 ms` to
+  `28.280 ms`); body native remains `23,188,640 B`, with hidden
+  trampolines increasing `287,200 B` to `365,000 B`.

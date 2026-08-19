@@ -845,7 +845,7 @@ pub(crate) struct ProcessJitEngine {
     env_config: SoacEnvConfig,
     module: ProcessJitModule,
     state: Mutex<ProcessJitState>,
-    vectorcall_trampolines: Mutex<HashMap<usize, VectorcallEntryFn>>,
+    vectorcall_trampolines: Mutex<HashMap<(usize, bool), VectorcallEntryFn>>,
 }
 
 struct ProcessJitModule {
@@ -2253,26 +2253,49 @@ impl ProcessJitEngine {
 
     pub(crate) fn vectorcall_trampoline(
         &self,
-        _compile_session: &crate::session::CompileSession,
+        compile_session: &crate::session::CompileSession,
         param_count: usize,
     ) -> Result<VectorcallEntryFn, String> {
+        self.vectorcall_trampoline_for_shape(compile_session, param_count, false)
+    }
+
+    pub(crate) fn exact_positional_vectorcall_trampoline(
+        &self,
+        compile_session: &crate::session::CompileSession,
+        param_count: usize,
+    ) -> Result<VectorcallEntryFn, String> {
+        self.vectorcall_trampoline_for_shape(compile_session, param_count, true)
+    }
+
+    fn vectorcall_trampoline_for_shape(
+        &self,
+        _compile_session: &crate::session::CompileSession,
+        param_count: usize,
+        exact_positional: bool,
+    ) -> Result<VectorcallEntryFn, String> {
+        let cache_key = (param_count, exact_positional);
         let mut trampolines = self
             .vectorcall_trampolines
             .lock()
             .map_err(|_| "process JIT vectorcall trampoline cache lock poisoned".to_string())?;
-        if let Some(entry) = trampolines.get(&param_count).copied() {
+        if let Some(entry) = trampolines.get(&cache_key).copied() {
             return Ok(entry);
         }
 
         let mut jit_module = self.module.lock_for_serial_phase()?;
-        let symbol = format!("__soac_vectorcall_arity_{param_count}");
+        let symbol = if exact_positional {
+            format!("__soac_vectorcall_arity_{param_count}_exact_positional")
+        } else {
+            format!("__soac_vectorcall_arity_{param_count}")
+        };
         let entry = define_shared_vectorcall_trampoline(
             &mut jit_module,
             &self.env_config,
             param_count,
+            exact_positional,
             &symbol,
         )?;
-        trampolines.insert(param_count, entry);
+        trampolines.insert(cache_key, entry);
         Ok(entry)
     }
 

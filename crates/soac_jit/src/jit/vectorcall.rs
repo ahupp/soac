@@ -1,15 +1,18 @@
 use super::backend::{define_prepared_function, register_jit_signal_diagnostics};
 use super::codegen_env::{FuncBuildImports, JitCodegenEnv, declare_local_fn};
 use super::imports::{
-    DP_JIT_DECREF_IMPORT, DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
-    DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT, DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
+    DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT, DP_JIT_DECREF_IMPORT,
+    DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT,
+    DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
     DP_JIT_VECTORCALL_PREVIOUS_FOR_CHANGED_CODE_IMPORT, ModuleFuncImports,
     PY_THREAD_STATE_GET_UNCHECKED_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
 };
+use super::refcount_lowering::RefcountLowering;
 use super::runtime_context::{
-    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, PY_FUNCTION_CODE_OFFSET,
-    PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, load_function_env_obj,
-    load_py_function_soac_metadata_obj,
+    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+    PY_FUNCTION_CODE_OFFSET, PY_FUNCTION_DEFAULTS_OFFSET,
+    PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_FUNCTION_KWDEFAULTS_OFFSET,
+    load_function_env_obj, load_py_function_soac_metadata_obj,
 };
 use super::{
     RuntimeFunctionId, SoacEnvConfig, VectorcallEntryFn,
@@ -19,11 +22,14 @@ use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
+use pyo3::ffi;
+use soac_ir_typed::PyObjFacts;
 
 pub(super) fn define_shared_vectorcall_trampoline(
     jit_module: &mut JITModule,
     env_config: &SoacEnvConfig,
     param_count: usize,
+    exact_positional: bool,
     symbol_name: &str,
 ) -> Result<VectorcallEntryFn, String> {
     let ptr_ty = jit_module.codegen_target_config().pointer_type();
@@ -94,6 +100,17 @@ pub(super) fn define_shared_vectorcall_trampoline(
             &mut fb.func,
             &SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
         );
+        let explicit_refcounts = if exact_positional {
+            Some(RefcountLowering::Explicit {
+                dealloc_preserving_error_ref: func_imports.get_or_panic(
+                    jit_module,
+                    &mut fb.func,
+                    &DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
+                ),
+            })
+        } else {
+            None
+        };
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         let function_extra_val = load_py_function_soac_metadata_obj(&mut fb, ptr_ty, callable_val);
@@ -288,6 +305,141 @@ pub(super) fn define_shared_vectorcall_trampoline(
                 0,
             )))
         };
+
+        let generic_bind_block = fb.create_block();
+        let direct_call_block = fb.create_block();
+        fb.append_block_param(direct_call_block, ptr_ty);
+        for _ in 0..param_count {
+            fb.append_block_param(direct_call_block, ptr_ty);
+        }
+
+        if let Some(explicit_refcounts) = explicit_refcounts {
+            fb.set_cold_block(generic_bind_block);
+
+            let no_keywords = fb
+                .ins()
+                .icmp_imm(ir::condcodes::IntCC::Equal, kwnames_val, 0);
+            let positional_count = fb
+                .ins()
+                .band_imm(nargsf_val, !(ffi::PY_VECTORCALL_ARGUMENTS_OFFSET as i64));
+            let exact_count = fb.ins().icmp_imm(
+                ir::condcodes::IntCC::Equal,
+                positional_count,
+                param_count as i64,
+            );
+
+            let current_defaults = fb.ins().load(
+                ptr_ty,
+                ir::MemFlags::trusted(),
+                callable_val,
+                PY_FUNCTION_DEFAULTS_OFFSET,
+            );
+            let registered_defaults = fb.ins().load(
+                ptr_ty,
+                ir::MemFlags::trusted(),
+                function_extra_val,
+                crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_DEFAULTS_OFFSET,
+            );
+            let defaults_match = fb.ins().icmp(
+                ir::condcodes::IntCC::Equal,
+                current_defaults,
+                registered_defaults,
+            );
+            let current_kwdefaults = fb.ins().load(
+                ptr_ty,
+                ir::MemFlags::trusted(),
+                callable_val,
+                PY_FUNCTION_KWDEFAULTS_OFFSET,
+            );
+            let registered_kwdefaults = fb.ins().load(
+                ptr_ty,
+                ir::MemFlags::trusted(),
+                function_extra_val,
+                crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_KWDEFAULTS_OFFSET,
+            );
+            let kwdefaults_match = fb.ins().icmp(
+                ir::condcodes::IntCC::Equal,
+                current_kwdefaults,
+                registered_kwdefaults,
+            );
+            let kwdefaults_are_immutable =
+                fb.ins()
+                    .icmp_imm(ir::condcodes::IntCC::Equal, current_kwdefaults, 0);
+
+            let core_callee_ptr = load_function_env_obj(
+                &mut fb,
+                ptr_ty,
+                function_env_val,
+                FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
+            );
+            let core_is_ready =
+                fb.ins()
+                    .icmp_imm(ir::condcodes::IntCC::NotEqual, core_callee_ptr, 0);
+            let shape_matches = fb.ins().band(no_keywords, exact_count);
+            let defaults_are_current = fb.ins().band(defaults_match, kwdefaults_match);
+            let defaults_are_safe = fb
+                .ins()
+                .band(defaults_are_current, kwdefaults_are_immutable);
+            let shape_and_defaults_match = fb.ins().band(shape_matches, defaults_are_safe);
+            let mut fast_path_matches = fb.ins().band(shape_and_defaults_match, core_is_ready);
+            if param_count != 0 {
+                let arguments_are_present =
+                    fb.ins()
+                        .icmp_imm(ir::condcodes::IntCC::NotEqual, args_val, 0);
+                fast_path_matches = fb.ins().band(fast_path_matches, arguments_are_present);
+            }
+
+            let exact_arguments_block = fb.create_block();
+            fb.ins().brif(
+                fast_path_matches,
+                exact_arguments_block,
+                &[],
+                generic_bind_block,
+                &[],
+            );
+            fb.seal_block(exact_arguments_block);
+            fb.switch_to_block(exact_arguments_block);
+
+            let mut exact_args = Vec::with_capacity(param_count);
+            for index in 0..param_count {
+                let value = fb.ins().load(
+                    ptr_ty,
+                    ir::MemFlags::trusted(),
+                    args_val,
+                    (index * std::mem::size_of::<u64>()) as i32,
+                );
+                let value_is_present = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, value, 0);
+                let next_argument_block = fb.create_block();
+                fb.ins().brif(
+                    value_is_present,
+                    next_argument_block,
+                    &[],
+                    generic_bind_block,
+                    &[],
+                );
+                fb.seal_block(next_argument_block);
+                fb.switch_to_block(next_argument_block);
+                exact_args.push(value);
+            }
+
+            for value in exact_args.iter().copied() {
+                explicit_refcounts.emit_incref(
+                    &mut fb,
+                    ptr_ty,
+                    value,
+                    Some(PyObjFacts::unknown().with_non_null_ref()),
+                );
+            }
+            let mut fast_call_args = Vec::with_capacity(param_count + 1);
+            fast_call_args.push(ir::BlockArg::Value(core_callee_ptr));
+            fast_call_args.extend(exact_args.into_iter().map(ir::BlockArg::Value));
+            fb.ins().jump(direct_call_block, &fast_call_args);
+        } else {
+            fb.ins().jump(generic_bind_block, &[]);
+        }
+
+        fb.seal_block(generic_bind_block);
+        fb.switch_to_block(generic_bind_block);
         let bound_args_ptr = if let Some(slot) = bound_args_slot {
             fb.ins().stack_addr(ptr_ty, slot, 0)
         } else {
@@ -318,23 +470,30 @@ pub(super) fn define_shared_vectorcall_trampoline(
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(ok_block);
-        let direct_sig_ref = fb.import_signature(direct_sig);
-        let mut call_args = Vec::with_capacity(param_count + 2);
-        call_args.push(function_env_val);
-        call_args.push(thread_state_val);
-        let mut owned_args = Vec::with_capacity(param_count);
+        let mut generic_call_args = Vec::with_capacity(param_count + 1);
+        generic_call_args.push(ir::BlockArg::Value(callee_ptr));
         if let Some(slot) = bound_args_slot {
             for index in 0..param_count {
                 let value =
                     fb.ins()
                         .stack_load(ptr_ty, slot, (index * std::mem::size_of::<u64>()) as i32);
-                owned_args.push(value);
-                call_args.push(value);
+                generic_call_args.push(ir::BlockArg::Value(value));
             }
         }
+        fb.ins().jump(direct_call_block, &generic_call_args);
+        fb.seal_block(direct_call_block);
+
+        fb.switch_to_block(direct_call_block);
+        let selected_callee_ptr = fb.block_params(direct_call_block)[0];
+        let owned_args = fb.block_params(direct_call_block)[1..].to_vec();
+        let direct_sig_ref = fb.import_signature(direct_sig);
+        let mut call_args = Vec::with_capacity(param_count + 2);
+        call_args.push(function_env_val);
+        call_args.push(thread_state_val);
+        call_args.extend(owned_args.iter().copied());
         let call_inst = fb
             .ins()
-            .call_indirect(direct_sig_ref, callee_ptr, &call_args);
+            .call_indirect(direct_sig_ref, selected_callee_ptr, &call_args);
         let result = fb.inst_results(call_inst)[0];
         let result_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
         let direct_null_block = fb.create_block();

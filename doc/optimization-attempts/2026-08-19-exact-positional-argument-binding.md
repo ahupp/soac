@@ -4,9 +4,19 @@ title: "Exact Positional Argument Binding"
 
 # Exact positional argument binding
 
-- Status: **LANDED / RETAIN; NORMAL FIXED-EIGHT, TARGETED THREE-ROUND,
-  MATCHED ZERO-LOSS PROFILES, IDENTICAL NATIVE CODE, AND FULL CORRECTNESS
-  GATE ALL VERIFIED**.
+- Status: **ATTEMPT 1 LANDED / RETAINED; ATTEMPT 2 LANDED CANDIDATE /
+  RETAIN, FULL CORRECTNESS GATE GREEN**. Attempt 1's normal fixed-eight,
+  targeted three-round,
+  matched zero-loss profiles, identical native code, and full correctness
+  gate remain verified. Attempt 2 has genuine unchanged-production
+  transformed-integration and independent structured Rust RED-to-GREEN
+  regressions, a complete **570 / 570** JIT Rust library, and expanded
+  transformed coverage **35 passed / 1 known expected xfail**; final
+  scoped formatting/checks, post-format regressions, release smoke,
+  normally sampled fixed-eight and repeated target comparisons, and matched
+  zero-loss profiles are complete; the authoritative full correctness gate
+  passes **1,230 Python nodeids / 93 isolated batches** and every Rust
+  suite.
 - Pacific date: **2026-08-19 PDT**.
 - Baseline revision: integrated `main` change **`nvvlrumm`**, commit
   **`7684c2fa`**.
@@ -364,3 +374,290 @@ seconds**; the known counter-dump batch accounts for **92.18 seconds**.
   current mutable-target refresh before adding a fast path.
 - Next action: integrate the validated retained one-file change; subsequent
   work must continue toward the unmet full-suite stock **1.10x** objective.
+
+## Attempt 2: generated exact-positional trampoline binding
+
+- Status: **LANDED CANDIDATE / RETAIN; genuine unchanged-production transformed
+  specialization integration AND independent production-path structured
+  Rust RED-to-GREEN verified; full JIT library 570 / 570 GREEN; expanded
+  transformed suite 35 PASS / 1 expected xfail; final scoped
+  formatting/checks, post-format regressions, and release smoke GREEN;
+  normally sampled and repeated target comparisons plus matched zero-loss
+  profiles complete; authoritative full correctness gate GREEN**. Attempt 1
+  above remains landed and retained;
+  this is a subsequent iteration of the same strategy, not a replacement
+  for its historical architecture, measurements, or verdict.
+- Integrated baseline: change **`lnxvnnml`**, commit **`89cf1193`**.
+  Candidate change **`rukzksko`** was initially observed at mutable working
+  commit **`ad1a4479`**; that commit identifier will change as the working
+  revision is snapshotted.
+- Authoritative retained fixed-eight baseline
+  **`comparison-20260819-131748-1b79JF`** has stock geometric score
+  **0.6326613107877241x**, **23,188,640 native bytes / 1,527,950 machine
+  blocks**, and optimized typed coverage **2,866 blocks / 204 functions**.
+  Retained targeted three-round baseline
+  **`comparison-20260819-132104-LvP5XE`** has stock score
+  **0.44758856139159614x** and per-round generated coverage **18,255,240
+  native bytes / 1,201,600 machine blocks / 2,265 typed blocks / 183
+  functions**. The corresponding retained release smoke is comparison
+  **131641**. The full-suite stock **1.10x** objective remains unmet.
+
+### Current source and zero-loss profile evidence
+
+- The retained immutable exact-positional binder from Attempt 1 removes
+  generic binding work after entry, but the actual generated vectorcall
+  trampoline still calls the Rust binder and then enters a default adapter.
+  The existing process-wide trampoline cache is keyed only by arity, so
+  eligible positional functions currently share their generated trampoline
+  with same-arity keyword-only or variadic functions that are ineligible.
+- Current zero-loss richards profile attributes a **7.922%** whole-workload
+  binding union to direct-wrapper self **3.873%**, nested binder **3.169%**,
+  and refresh **0.880%**. These describe that union; inclusive parent frames
+  must not be added again, and required ownership/default checks are not
+  automatically removable. A separate default-adapter **self** share of
+  **2.112%** gives a source-backed, disjoint **10.034 percentage-point gross
+  ceiling**, not a predicted speedup. An earlier profile's binder share was
+  **4.628%**, illustrating sampling/revision sensitivity rather than a
+  separately additive gain.
+- Existing delta profiles attribute binder **4.658–7.065%** plus disjoint
+  default-adapter self **1.370–1.694%**, or an approximately
+  **6.028–8.759 percentage-point gross range**. Chaos attributes binder
+  **2.318%** plus adapter self **0.435%**, or **2.753 percentage points
+  gross**. Comprehensions is approximately zero for this opportunity and
+  must be treated as an unchanged guardrail, not a promised target win.
+- Source census finds **39 / 39 richards** and **23 / 23 chaos** functions
+  eligible for an immutable fully supplied exact-positional plan; the hot
+  wrapper arities are **1 / 2 / 3**, with chaos also exercising arity **4**.
+  Static eligibility does not prove every dynamic call has matching
+  arguments, current defaults, or an unchanged code object.
+- Existing generated benchmark-body summaries exclude vectorcall
+  trampolines. Direct measured-worker `jitdump` inspection gives hidden
+  retained trampoline totals **richards 5,824 bytes**, **deltablue 5,236
+  bytes**, **chaos 5,236 bytes**, and **comprehensions 3,276 bytes**;
+  observed individual arity sizes are **0: 588**, **1: 756**, **2: 884**,
+  **3: 1,048**, **4: 1,128**, and **6: 1,420 bytes**. Candidate trampoline
+  growth must be audited independently even if normal native-body summaries
+  remain unchanged.
+
+### Bounded candidate production architecture
+
+- Final candidate implementation is **FROZEN** in exactly three authorized
+  existing production files:
+  `crates/soac_jit/src/lib.rs`,
+  `crates/soac_jit/src/jit/process.rs`, and
+  `crates/soac_jit/src/jit/vectorcall.rs`. It was written only after both
+  unchanged-production REDs, compiles, and passes both focused production
+  regressions. Independent host source review reports no blocker; no
+  user-visible CPython mismatch is claimed.
+- Reuse the existing immutable
+  `binds_exact_positional(requested_arity, NULL)` decision rather than
+  introducing another binding concept; cap generated exact-positional
+  trampolines at **eight arguments**. Partition the existing process cache
+  by **`(arity, exact_positional_eligible)`**, so same-arity keyword-only,
+  variadic, over-cap, or otherwise ineligible functions retain the original
+  shared generic trampoline. A default-capable exact function remains
+  eligible and installs the exact trampoline; a call omitting its defaults
+  takes that same trampoline's embedded original generic-binder /
+  default-adapter fallback arm. Preserve the existing two-argument generic
+  engine method because other current production paths and tests still
+  call it; the new exact-shape engine path uses distinct generated symbols
+  and the partitioned existing cache.
+- In the eligible trampoline, guard the vectorcall argument count after
+  masking its offset flag, exact requested arity, null keyword names,
+  current function/default snapshots, null keyword defaults, and valid
+  non-null positional argument pointers. Preserve the original `nargsf`,
+  zero-arity handling, null-buffer/error precedence, recursion behavior,
+  current-code/default mutation detection, per-prefix cleanup, and the
+  original Rust binder on every guard miss.
+- After every argument is validated and supplied, use existing pinned
+  `RefcountLowering` for inline immortal-aware owned-reference increments.
+  The all-arguments/no-omitted-default proof also permits entering existing
+  **`FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET`** core code directly instead of
+  its default adapter; both existing entries share the same ABI. The
+  current direct-call planner already chooses `Core` for fully supplied
+  arguments. Every generic/mutated/partial call must continue through
+  **`FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET`** and the unchanged
+  original binder; core entry must never observe an omitted default.
+- Preserve exact mortal/immortal increments and decrements, malformed
+  partial-argument cleanup, exception ordering, recursion and monitoring,
+  source/code/default mutations, keyword/default/keyword-only/variadic
+  calls, generator behavior, and forced-interpreter fallback. Reuse
+  existing private ABI offsets and process state; add no public API,
+  runtime helper, global mutable state, IR node, or benchmark direct-body
+  shape. Trampoline code itself is expected to change and requires the
+  explicit `jitdump` size audit described above.
+
+### Required regressions, measurements, and verdict
+
+- Independent genuine unchanged-production structured Rust **RED**:
+  `cargo test -p soac_jit --lib
+  exact_positional_vectorcall_trampolines_partition_actual_template_shapes`
+  runs **1 failed / 0 passed / 569 filtered** through real lowered
+  function templates, `CompileSession`, and the existing process cache.
+  Eligible exact and ineligible generic targets incorrectly share actual
+  installed pointer **`267842752615856`**, failing only the final required
+  partition assertion. Same-shape eligible/default sharing, keyword-only /
+  `*args` / `**kwargs` generic sharing, and the **nine-argument cap**
+  fallback all pass before that intended failure.
+- Reviewer-owned actual transformed integration
+  **`tests/test_exact_positional_vectorcall_trampoline.py`** now establishes
+  a genuine unchanged-production **RED: 1 failed in 2.36 seconds**. Real
+  **Profile → Verify → Apply** subprocesses all execute successfully, and
+  exported **`PyVectorcall_Function`** reports both eligible `exact_a` and
+  ineligible `keyword_only` installed at the same actual pointer
+  **`261253012398080`**. The sole final failing assertion requires those
+  same-arity trampoline/cache identities to be partitioned.
+- Before that intended structural failure, all existing controls pass:
+  same-shape trampoline reuse, current defaults/keyword-default/code
+  mutations, keyword and variadic fallback, vectorcall offset handling,
+  owned references/finalizers/exceptions, actual `call_hot_targets`
+  execution, and compiled native direct-body evidence. This is a genuine
+  missed-specialization RED, not a claimed user-visible CPython mismatch;
+  production was unchanged when the failure was captured.
+- The unchanged structured Rust regression now verifies genuine production
+  **RED → GREEN: 1 passed / 569 filtered**. Its real lowered templates,
+  compile session, and process cache prove eligible exact targets share the
+  exact trampoline, keyword-only / `*args` / `**kwargs` targets share the
+  separate generic trampoline, defaults preserve their intended shape, and
+  arity **nine** retains the existing capped generic fallback.
+- The frozen transformed integration independently verifies genuine
+  **RED → GREEN: 1 passed in 1.50 seconds**. Actual
+  **Profile → Verify → Apply** subprocesses now expose distinct installed
+  exact/generic `PyVectorcall_Function` pointers while retaining every
+  defaults/keyword-default/code-mutation, variadic/keyword, offset,
+  reference/finalizer/exception, counter, and compiled native body/adapter
+  control. Separate debug-extension staging/build took **30.29 seconds** as
+  workflow overhead, not transformed test runtime or benchmark evidence.
+- Initial complete `cargo test -p soac_jit --lib` passes **570 / 570**
+  tests in **6.05 seconds**, including the new structured production-path
+  regression; the retained baseline previously had **569** JIT tests.
+- Expanded actual transformed compatibility matrix passes **35 tests / 1
+  known preexisting expected xfail**, across **13 files / 36 cases in
+  21.87 seconds**. Coverage includes real **Profile → Verify → Apply**,
+  current defaults/keyword-default/code mutation, omitted arguments and
+  arity/keywords, function watchers, closures, generators, previously
+  retained guarded `any` / `all`, exception behavior, owner guards, and
+  captured builtins.
+- Final post-format complete JIT Rust library and all Cargo test targets
+  each pass **570 / 570**, with the final test run taking **6.99 seconds**.
+  The unchanged frozen real transformed **Profile → Verify → Apply**
+  integration passes again **1 / 1 in 1.58 seconds**. Package-scoped
+  `just fmt-rust soac_jit`, `just fmt-rust-check soac_jit`, and
+  `cargo check -p soac_jit --tests` all pass; the aligned test-target check
+  completes in **2.94 seconds**.
+- Final implementation is frozen in the **three authorized production
+  files**, with the immutable capped exact-positional decision, unchanged
+  generic engine method plus exact method / `(arity, shape)` cache, unique
+  generated symbols, existing inline immortal-aware reference increments,
+  full current-code/default/keyword-default/argument guards, direct `Core`
+  entry, original cleanup, and untouched generic binder/default-adapter
+  fallback. Both focused genuine RED-to-GREEN regressions, the complete
+  **570 / 570** JIT Rust library, and expanded **35 passed / 1 expected
+  xfail** transformed matrix now pass, as do scoped formatting, formatting
+  check, aligned Cargo test-target check, and final post-format library /
+  integration reruns. The authoritative full `just test-all` gate also
+  **PASSES**; complete counts and timings are recorded below.
+- Release debug-single fixed-eight smoke comparison **141038** against
+  retained mode-matched **131641** completes **8 / 8**, with **zero
+  errors**. All **397** actual measured Apply direct-function and adapter
+  rows match exactly, retaining **2,242,168 native bytes / 148,116 machine
+  blocks**, optimized coverage **2,866 typed blocks / 204 functions**, and
+  **7,199,376 pre-optimization BlockPy bytes**.
+- Separately audited `jitdump` exposes real hidden trampoline growth absent
+  from ordinary direct-body summaries: aggregate **28,720 → 36,500 bytes**,
+  or **+7,780 bytes / +27.09%** (**+0.347%** relative to the smoke's
+  **2,242,168** ordinary direct-body bytes). Each workload adds only the
+  intended **`_exact_positional`** trampoline shape, with no duplicated
+  generic trampoline: chaos **5,236 → 6,692**, comprehensions
+  **3,276 → 4,088**, deltablue **5,236 → 6,692**, fannkuch
+  **756 → 952**, float **1,640 → 2,076**, nbody **5,112 → 6,512**,
+  richards **5,824 → 7,412**, and spectral norm **1,640 → 2,076 bytes**.
+  Retained per-arity sizes are documented above; this hidden code growth
+  is a real compatibility/maintenance tradeoff even though all regular
+  emitted-body rows are unchanged.
+- Aggregated measured-worker setup changes **3,450.663 → 2,911.542 ms**,
+  but is nonheadline workflow context. All cold debug-single timing,
+  arithmetic, and setup comparisons are invalid as throughput evidence;
+  no candidate speedup is claimed.
+- Normally sampled fixed-eight comparison **141233** against retained
+  **131748** completes **8 / 8**. Official candidate stock geometric score
+  is **0.6146084338507914x**, down from retained
+  **0.6326613107877241x**; official previous-SOAC arithmetic is
+  **1.0388446426221598x**. Robust fixed-eight previous geometry is
+  **1.036288x**, but stock-adjusted geometry is only **0.995015x**;
+  unusually large paired-stock float drift **40.951 → 34.269** and
+  benchmark outliers prevent either official aggregate from establishing a
+  causal suite-wide gain.
+- Actual target richards improves median **30.027457 → 27.912782 ms**,
+  **1.075760x [1.04830, 1.08815]**, or stock-adjusted
+  **1.064496x [1.03199, 1.08259]**. Deltablue improves
+  **3.212536 → 2.832788 ms**, **1.134054x [1.10732, 1.20505]**, or
+  stock-adjusted **1.109951x [1.08253, 1.19208]**. Chaos is **1.034747x**
+  raw but stock-adjusted **0.993167x**, consistent with neutral;
+  comprehensions is **1.006726x** raw / **0.972032x** adjusted and does
+  not establish a source-backed target gain.
+- Independent actual Apply-PID audit confirms all **80** normal workers /
+  **3,970** direct-function and adapter rows match exactly, with **zero
+  errors**, **23,188,640 native bytes / 1,527,950 machine blocks**, and
+  unchanged **2,866 typed blocks / 204 functions**. Separate measured-worker
+  `jitdump` audit exposes hidden trampolines **287,200 → 365,000 bytes**,
+  **+77,800 / +27.09%**, approximately **0.335%** of ordinary native
+  code; only the exact shape grows, with no duplicated generic trampoline.
+  Median setup does not regress: richards **671.0 → 669.9 ms**, deltablue
+  **733.3 → 591.7 ms**, chaos **557.7 → 545.1 ms**, and comprehensions
+  **461.7 → 453 ms**. Setup remains supporting context, not throughput.
+- Final clean three-round targeted comparison **141538** against immediate
+  retained **132104** confirms richards **29.844901 → 28.280179 ms**, or
+  **1.055329x [1.046396, 1.074325]** / paired-stock
+  **1.060877x [1.050755, 1.082730]**; the three raw rounds are
+  **1.084518x / 1.071323x / 1.044516x**. Deltablue improves
+  **3.176625 → 2.928699 ms**, or **1.084654x [1.069272, 1.099800]** /
+  paired-stock **1.084153x [1.062347, 1.100416]**, with rounds
+  **1.085989x / 1.055059x / 1.098654x**. Both target confidence intervals
+  exclude neutral before and after paired-stock adjustment.
+- Three-round chaos is **1.008679x** raw / **0.999914x** paired and its
+  interval includes neutral; comprehensions is **0.998851x** raw /
+  **0.980417x** paired, with an interval including neutral and mild stock
+  sensitivity. Four-workload robust geometry is **1.036295x** /
+  stock-adjusted **1.030463x**. Official targeted previous-SOAC arithmetic
+  is **1.0410906398909108x** and stock score
+  **0.4625866444625596x**, compared with retained
+  **0.44758856139159614x**; that subset does not satisfy or establish the
+  full-suite stock goal.
+- All **120** targeted Apply PIDs preserve **10,650** direct-function /
+  adapter rows, zero errors, and aggregate **54,765,720 native bytes /
+  3,604,800 machine blocks** across three rounds; per round this is exactly
+  **18,255,240 bytes / 1,201,600 blocks / 2,265 typed blocks / 183
+  functions**. Separate all-worker hidden trampolines grow
+  **587,160 → 746,520 bytes (+159,360)**, entirely the intended exact
+  shape with no duplicated generic trampoline.
+- Matched **same-source**, zero-loss richards profiles contain **568 → 395
+  samples across 70 loops**. Entire old binder ancestry falls
+  **7.92182% → 0%**, including binder-wrapper self **3.87289% → 0%**,
+  nested binder **3.16873% → 0%**, and refresh **0.88020% → 0%**;
+  separately disjoint default-adapter **self** falls
+  **2.11249% → 0%**. The **10.03431-percentage-point** gross opportunity
+  is not a speedup prediction; direct-wrapper self increases
+  **6.51350% → 8.86146%** from inlined validation/reference work, and
+  inclusive ancestry overlaps. Candidate delta has a zero-loss **276-sample
+  / 400-loop** profile with residual binder **0.72435%** and adapter self
+  **0%** on rare generic calls; the available older **365-sample** delta
+  baseline is from a different revision and is not a valid causal match.
+- Authoritative full `just test-all` **exits zero**; see
+  **`work/logs/exact-positional-trampoline-test-all.log`**. All **1,230
+  Python nodeids / 93 isolated batches / 8 workers** pass (**93 passed / 0
+  failed**). Rust suites pass JIT **570**, lowering **371**, optimizer
+  **213**, typed IR **54**, and PyO3 **8**. Cargo takes **67.263
+  seconds**, inner / outer parallel pytest **77.522 / 77.537 seconds**,
+  and the complete test phase **144.812 seconds**. The new actual
+  transformed integration passes in **2.03 seconds**; the existing
+  **28-node** counter-dump batch takes **77.38 seconds**.
+- Current verdict: **ATTEMPT 2 LANDED CANDIDATE / RETAIN; Attempt 1
+  remains RETAINED; FULL CORRECTNESS GATE GREEN**. Independent repeated
+  richards and delta target improvements,
+  matched-source mechanism elimination, unchanged ordinary native bodies,
+  and genuine structured/transformed RED-to-GREEN support retention while
+  explicitly accepting real hidden trampoline growth and lower fixed-eight
+  stock score under drift. The authoritative full `just test-all` gate
+  passes all **1,230 Python nodeids / 93 batches** and every workspace
+  Rust suite; full-suite stock **1.10x** remains unmet.

@@ -2527,9 +2527,17 @@ fn prepared_vectorcall_trampoline(
         return Ok(prepared.entry);
     }
 
-    let entry = compile_session
-        .process_jit()?
-        .vectorcall_trampoline(compile_session, param_count)?;
+    const MAX_EXACT_POSITIONAL_VECTORCALL_ARITY: usize = 8;
+    let process_jit = compile_session.process_jit()?;
+    let entry = if param_count <= MAX_EXACT_POSITIONAL_VECTORCALL_ARITY
+        && function_template
+            .binding_plan()
+            .binds_exact_positional(param_count, ptr::null_mut())
+    {
+        process_jit.exact_positional_vectorcall_trampoline(compile_session, param_count)?
+    } else {
+        process_jit.vectorcall_trampoline(compile_session, param_count)?
+    };
     if function_template
         .prepared_vectorcall_trampoline
         .get()
@@ -4406,6 +4414,108 @@ mod tests {
                     .expect("the public registration should have a vectorcall trampoline")
                     as usize,
                 prepared.entry as usize
+            );
+        });
+    }
+
+    #[test]
+    fn exact_positional_vectorcall_trampolines_partition_actual_template_shapes() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+
+        Python::attach(|py| {
+            let source = r#"
+def exact_a(first, second):
+    return first
+
+def exact_b(first, second=2):
+    return first
+
+def keyword_only(first, *, second):
+    return first
+
+def variadic(first, *remaining):
+    return first
+
+def keyword_variadic(first, **remaining):
+    return first
+
+def capped_exact(first, second, third, fourth, fifth, sixth, seventh, eighth, ninth):
+    return first
+
+def capped_keyword_only(first, second, third, fourth, fifth, sixth, seventh, eighth, *, ninth):
+    return first
+"#;
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .expect("vectorcall trampoline shape fixture should lower")
+                .blockpy_module;
+            let module_state = module_type::build_shared_state_for_testing(
+                py,
+                lowered,
+                "exact_positional_vectorcall_trampoline_shape_test",
+                "",
+            )
+            .expect("vectorcall trampoline shape fixture should build shared module state");
+            let session = Arc::new(CompileSession::new());
+            session
+                .retain_shared_module_state(Arc::clone(&module_state))
+                .expect("vectorcall trampoline shape session should retain its module state");
+
+            let trampoline_for = |qualname: &str| {
+                let function = module_state
+                    .lowered_module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.qualname == qualname)
+                    .unwrap_or_else(|| {
+                        panic!("vectorcall trampoline shape fixture should contain {qualname}")
+                    });
+                let template = module_state
+                    .lookup_function_template(function.function_id)
+                    .expect("vectorcall trampoline shape template lookup should succeed")
+                    .expect("vectorcall trampoline shape template should exist");
+                let param_count = template.binding_plan().param_count();
+                let entry =
+                    prepared_vectorcall_trampoline(template.as_ref(), &session, param_count)
+                        .expect("production template trampoline preparation should succeed");
+                (entry as usize, param_count)
+            };
+
+            let (exact_a, exact_arity) = trampoline_for("exact_a");
+            let (exact_b, defaulted_arity) = trampoline_for("exact_b");
+            let (keyword_only, keyword_only_arity) = trampoline_for("keyword_only");
+            let (variadic, variadic_arity) = trampoline_for("variadic");
+            let (keyword_variadic, keyword_variadic_arity) = trampoline_for("keyword_variadic");
+            let (capped_exact, capped_exact_arity) = trampoline_for("capped_exact");
+            let (capped_keyword_only, capped_keyword_only_arity) =
+                trampoline_for("capped_keyword_only");
+
+            assert_eq!(exact_arity, 2);
+            assert_eq!(defaulted_arity, exact_arity);
+            assert_eq!(keyword_only_arity, exact_arity);
+            assert_eq!(variadic_arity, exact_arity);
+            assert_eq!(keyword_variadic_arity, exact_arity);
+            assert_eq!(capped_exact_arity, 9);
+            assert_eq!(capped_keyword_only_arity, capped_exact_arity);
+            assert_eq!(
+                exact_a, exact_b,
+                "compatible fully supplied positional templates should share one trampoline"
+            );
+            assert_eq!(
+                keyword_only, variadic,
+                "same-arity keyword-only and variadic templates must share the generic trampoline"
+            );
+            assert_eq!(
+                keyword_only, keyword_variadic,
+                "variadic keyword templates must remain on the generic trampoline"
+            );
+            assert_eq!(
+                capped_exact, capped_keyword_only,
+                "exact signatures beyond the bounded fast-path cap must reuse the generic shape"
+            );
+            assert_ne!(
+                exact_a, keyword_only,
+                "the production process cache must distinguish same-arity exact and generic shapes"
             );
         });
     }

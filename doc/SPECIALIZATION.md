@@ -1123,7 +1123,10 @@ metadata, independent closure cells, and a distinct boxed `FunctionEnv`;
 the `#[repr(C)]` layout and ABI offsets remain unchanged.
 
 The existing template caches only a successful vectorcall trampoline for
-the exact compile session and parameter arity. Engine initialization occurs
+the exact compile session and parameter arity. The underlying process
+trampoline cache additionally partitions the same arity by immutable
+exact-positional eligibility, so keyword-only or variadic functions never
+reuse an exact-positional trampoline. Engine initialization occurs
 outside the template `OnceLock`, with no `get_or_init` around reentrant or
 fallible engine work. The unchanged public registration fallback,
 force-interpreter mode, generator convention, and current function/code/
@@ -1433,6 +1436,93 @@ and eight workers**, plus Rust JIT **563**, typed IR **54**, optimizer
 **58.807 seconds**, inner / outer pytest **92.972 / 92.986 seconds**, and
 the complete test phase **151.807 seconds**; the known counter-dump batch
 takes **92.18 seconds**. The full-suite stock **1.10x** goal remains unmet.
+
+The subsequent generated-trampoline iteration reuses the same immutable
+`DirectArgBindingPlan::binds_exact_positional(requested_arity, NULL)`
+decision, capped at **eight** parameters. The existing process cache is
+keyed by **`(arity, exact_positional_eligible)`**; its original generic
+engine method and trampoline remain intact, while an eligible private
+sibling receives a distinct generated symbol. Thus same-arity
+keyword-only, `*args`, `**kwargs`, and above-cap targets cannot accidentally
+share an exact trampoline. A default-capable exact function remains
+eligible and installs the exact trampoline; a call omitting a default takes
+the embedded generic-binder / default-adapter fallback arm within that same
+trampoline rather than installing a separate generic trampoline.
+
+The exact trampoline mechanically checks the current function/code/default
+and keyword-default snapshots, masks the vectorcall offset flag, requires
+the original expected argument count and null keyword tuple, and validates
+each argument pointer. Existing `RefcountLowering` acquires one
+immortal-safe owned reference per supplied argument. Because every
+positional parameter is proven supplied, it enters the existing
+`FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET` **core** entry without passing
+through the default adapter. Any failed guard retains the original Rust
+binder and `FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET` default entry;
+existing recursion checks, mutable-function refresh, prefix cleanup,
+error ordering, decrements, and finalizer behavior remain unchanged. No
+public API, runtime helper, global, IR operation, ABI offset, or generated
+benchmark direct-function body is added or changed.
+
+Both genuine unchanged-production regressions turn RED-to-GREEN: one real
+lowered-template / compile-session / process-cache Rust test partitions
+actual installed trampoline pointers and preserves all generic/cap
+controls; a frozen transformed **Profile → Verify → Apply** integration
+also verifies exported `PyVectorcall_Function` pointers, defaults/code
+mutations, offset vectorcall, ownership/finalizers, and existing native
+bodies. Final post-format JIT library and all test targets each pass
+**570 / 570**; the frozen integration passes **1 / 1 in 1.58 seconds**,
+and the expanded transformed matrix passes **35 tests / 1 known expected
+xfail across 13 files in 21.87 seconds**. Scoped package formatting,
+formatting check, and JIT test-target Cargo check pass.
+
+Generated vectorcall trampolines are absent from ordinary benchmark-body
+native summaries, so their code-size tradeoff must be independently
+checked in measured-worker `jitdump`: retained per-workload baselines are
+richards **5,824 bytes**, chaos and deltablue **5,236 bytes each**, and
+comprehensions **3,276 bytes**. All **80** normal Apply workers preserve
+their **3,970** ordinary direct-function / adapter rows and exactly
+**23,188,640 native bytes / 1,527,950 machine blocks / 2,866 typed blocks
+/ 204 functions**, but hidden trampoline code really grows
+**287,200 → 365,000 bytes (+27.09%; approximately +0.335% of ordinary
+native code)**. Only the exact shape is added; generic trampolines are not
+duplicated. All **120** repeated target workers similarly preserve
+**54,765,720 ordinary native bytes / 3,604,800 machine blocks** across
+three rounds, while hidden trampolines grow **587,160 → 746,520 bytes**.
+
+Normally sampled fixed-eight stock score declines
+**0.6326613107877241x → 0.6146084338507914x**; previous-SOAC arithmetic is
+**1.0388446426221598x**, robust **1.036288x**, but stock-adjusted robust
+**0.995015x** amid substantial float-stock drift. Thus these aggregate
+results do not establish a stock improvement. Clean repeated target
+measurements instead support retention: richards
+**29.844901 → 28.280179 ms (1.055329x; 95% 1.046396–1.074325)** /
+stock-adjusted **1.060877x**, and deltablue
+**3.176625 → 2.928699 ms (1.084654x; 95% 1.069272–1.099800)** /
+stock-adjusted **1.084153x**. Chaos and comprehensions are neutral; robust
+four-workload geometry is **1.036295x / 1.030463x stock-adjusted**.
+
+Matched same-source zero-loss richards profiles (**568 → 395 samples / 70
+loops**) eliminate prior binder ancestry **7.92182% → 0%** and separate
+default-adapter self **2.11249% → 0%**; direct-wrapper self rises
+**6.51350% → 8.86146%** from actual inline work. The
+**10.03431-percentage-point** gross sum is not a speedup prediction and
+inclusive shares overlap. A **276-sample / 400-loop** candidate delta
+profile retains rare generic binder ancestry **0.72435%**, but its older
+baseline is a different revision and cannot establish causality.
+
+The generated-trampoline iteration is **LANDED CANDIDATE / RETAIN** with
+explicit hidden-code cost. Its own authoritative full `just test-all`
+gate **passes 1,230 Python nodeids / 93 isolated batches / 8 workers**, with
+**93 passed / 0 failed**; see
+`work/logs/exact-positional-trampoline-test-all.log`. Rust JIT **570**,
+lowering **371**, optimizer **213**, typed IR **54**, and PyO3 **8** all
+pass. Cargo takes **67.263 seconds**, inner / outer parallel pytest
+**77.522 / 77.537 seconds**, and the complete test phase **144.812
+seconds**; the new transformed regression passes in **2.03 seconds**, and
+the existing 28-test counter-dump batch takes **77.38 seconds**. This
+validates the subsequent iteration independently of the earlier retained
+binder's historical gate. The full-suite stock **1.10x** goal remains
+unmet.
 
 ### Counted Input
 
