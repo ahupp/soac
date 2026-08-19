@@ -1187,6 +1187,8 @@ pub struct TypedIndexedFieldCounterSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedLateBoundOwnerFieldPlan {
     pub counter_source: TypedIndexedFieldCounterSource,
+    pub owner_type: crate::plan_v3::IndexedFieldOwnerType,
+    pub attr_name: String,
     pub storage: crate::plan_v3::LateBoundOwnerFieldStorage,
     pub cell_index: u32,
 }

@@ -1659,6 +1659,8 @@ struct JitEmitCtx<'mc> {
     function_id: RuntimeFunctionId,
     function_kind: FunctionKind,
     indexed_field_guards_by_instr: &'mc HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
+    indexed_field_counter_sources_by_instr: &'mc HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    late_bound_owner_fields_by_instr: &'mc HashMap<InstrId, TypedLateBoundOwnerFieldPlan>,
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
@@ -18198,6 +18200,61 @@ fn typed_indexed_field_guards_by_instr(
     collector.guards_by_instr
 }
 
+fn typed_indexed_field_counter_sources_by_instr(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<InstrId, TypedIndexedFieldCounterSource> {
+    struct Collector {
+        sources_by_instr: HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    }
+
+    impl Visit<InstrTyped> for Collector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::GetAttrTyped(op) = expr
+                && let TypedAttrAccessPlan::IndexedField {
+                    counter_source: Some(source),
+                    ..
+                } = &op.access
+            {
+                self.sources_by_instr
+                    .insert(op.semantic_instr_id(), *source);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        sources_by_instr: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.sources_by_instr
+}
+
+fn typed_late_bound_owner_fields_by_instr(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<InstrId, TypedLateBoundOwnerFieldPlan> {
+    struct Collector {
+        plans_by_instr: HashMap<InstrId, TypedLateBoundOwnerFieldPlan>,
+    }
+
+    impl Visit<InstrTyped> for Collector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::GetAttrTyped(op) = expr
+                && let TypedAttrAccessPlan::LateBoundOwnerField(plan) = &op.access
+            {
+                self.plans_by_instr
+                    .insert(op.semantic_instr_id(), plan.clone());
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        plans_by_instr: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.plans_by_instr
+}
+
 fn emit_typed_exact_int_branch_truth_i32(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrTyped,
@@ -18971,6 +19028,91 @@ fn opt_v3_indexed_field_receiver_value(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_borrowed_late_bound_owner_field_input(
+    fb: &mut FunctionBuilder<'_>,
+    source: InstrId,
+    receiver: MechanicalIndexedFieldReceiverSource<'_>,
+    owner_type: &IndexedFieldOwnerType,
+    attr_name: &str,
+    expected_index: u32,
+    plan: &TypedLateBoundOwnerFieldPlan,
+    fallback_block: ir::Block,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    context: &str,
+) -> Result<ir::Value, String> {
+    if plan.counter_source.function_id.runtime_module_id()
+        != emit_ctx.function_id.runtime_module_id()
+        || &plan.owner_type != owner_type
+        || plan.attr_name != attr_name
+        || !matches!(
+            plan.storage,
+            LateBoundOwnerFieldStorage::SplitDict {
+                expected_index: guarded_index,
+            } if guarded_index == expected_index
+        )
+    {
+        return Err(format!(
+            "optimizer v3 {context} borrowed late-bound owner-field input {source} for {}.{}[{expected_index}] does not match its typed split-field guard",
+            owner_type.qualname, attr_name,
+        ));
+    }
+
+    let receiver = opt_v3_indexed_field_receiver_value(fb, receiver, local_env, emit_ctx, context)?;
+    let hit_block = fb.create_block();
+    fb.append_block_param(hit_block, emit_ctx.consts.ptr_ty);
+    let miss_block = fb.create_block();
+    fb.set_cold_block(miss_block);
+    let (guarded_owner, _) = emit_late_bound_owner_guard(fb, receiver, plan, miss_block, emit_ctx)?;
+    let attr = emit_owned_module_constant(
+        fb,
+        emit_ctx
+            .module_constants
+            .require_unicode_constant_id(attr_name),
+        emit_ctx,
+    );
+    emit_late_bound_split_key_guard(
+        fb,
+        guarded_owner,
+        attr,
+        expected_index,
+        miss_block,
+        emit_ctx,
+    )?;
+    emit_trusted_inline_values_field_probe(
+        fb,
+        receiver,
+        guarded_owner,
+        expected_index,
+        hit_block,
+        miss_block,
+        emit_ctx,
+    )?;
+
+    fb.switch_to_block(miss_block);
+    if let Some(counter) = typed_indexed_field_counter_ref(
+        source,
+        Some(plan.counter_source),
+        emit_ctx.field_indexed_fallback_counter_ids,
+        emit_ctx.field_indexed_fallback_counter_ids_by_source,
+    ) {
+        emit_increment_counter_ref(fb, counter, emit_ctx);
+    }
+    fb.ins().jump(fallback_block, &[]);
+
+    fb.switch_to_block(hit_block);
+    if let Some(counter) = typed_indexed_field_counter_ref(
+        source,
+        Some(plan.counter_source),
+        emit_ctx.field_indexed_hit_counter_ids,
+        emit_ctx.field_indexed_hit_counter_ids_by_source,
+    ) {
+        emit_increment_counter_ref(fb, counter, emit_ctx);
+    }
+    Ok(fb.block_params(hit_block)[0])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_opt_v3_borrowed_indexed_field_input(
     fb: &mut FunctionBuilder<'_>,
     source: InstrId,
@@ -18985,6 +19127,24 @@ fn emit_opt_v3_borrowed_indexed_field_input(
     indexed_field_guards_by_instr: &HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
     context: &str,
 ) -> Result<ir::Value, String> {
+    if !indexed_field_guards_by_instr.contains_key(&source)
+        && let Some(plan) = emit_ctx.late_bound_owner_fields_by_instr.get(&source)
+    {
+        return emit_opt_v3_borrowed_late_bound_owner_field_input(
+            fb,
+            source,
+            receiver,
+            owner_type,
+            attr_name,
+            expected_index,
+            plan,
+            fallback_block,
+            local_env,
+            emit_ctx,
+            context,
+        );
+    }
+
     let specializations = if let Some(guards) = indexed_field_guards_by_instr
         .get(&source)
         .map(Vec::as_slice)
@@ -19074,12 +19234,17 @@ fn emit_opt_v3_borrowed_indexed_field_input(
 
         fb.switch_to_block(direct_block);
         let direct_value = fb.block_params(direct_block)[0];
-        emit_optional_counter_increment_for_kind(
-            fb,
-            emit_ctx,
-            emit_ctx.field_indexed_hit_counter_ids,
+        if let Some(counter) = typed_indexed_field_counter_ref(
             source,
-        );
+            emit_ctx
+                .indexed_field_counter_sources_by_instr
+                .get(&source)
+                .copied(),
+            emit_ctx.field_indexed_hit_counter_ids,
+            emit_ctx.field_indexed_hit_counter_ids_by_source,
+        ) {
+            emit_increment_counter_ref(fb, counter, emit_ctx);
+        }
         fb.ins()
             .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
@@ -19089,12 +19254,17 @@ fn emit_opt_v3_borrowed_indexed_field_input(
     }
 
     fb.switch_to_block(miss_block);
-    emit_optional_counter_increment_for_kind(
-        fb,
-        emit_ctx,
-        emit_ctx.field_indexed_fallback_counter_ids,
+    if let Some(counter) = typed_indexed_field_counter_ref(
         source,
-    );
+        emit_ctx
+            .indexed_field_counter_sources_by_instr
+            .get(&source)
+            .copied(),
+        emit_ctx.field_indexed_fallback_counter_ids,
+        emit_ctx.field_indexed_fallback_counter_ids_by_source,
+    ) {
+        emit_increment_counter_ref(fb, counter, emit_ctx);
+    }
     fb.ins().jump(fallback_block, &[]);
 
     fb.switch_to_block(result_block);
@@ -19107,12 +19277,17 @@ fn emit_opt_v3_indexed_field_input_fallback_value(
     fallback_block: ir::Block,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    emit_optional_counter_increment_for_kind(
-        fb,
-        emit_ctx,
-        emit_ctx.field_indexed_fallback_counter_ids,
+    if let Some(counter) = typed_indexed_field_counter_ref(
         source,
-    );
+        emit_ctx
+            .indexed_field_counter_sources_by_instr
+            .get(&source)
+            .copied(),
+        emit_ctx.field_indexed_fallback_counter_ids,
+        emit_ctx.field_indexed_fallback_counter_ids_by_source,
+    ) {
+        emit_increment_counter_ref(fb, counter, emit_ctx);
+    }
     fb.ins().jump(fallback_block, &[]);
     let dead_block = fb.create_block();
     fb.switch_to_block(dead_block);
@@ -22156,6 +22331,9 @@ fn build_cranelift_run_bb_specialized_function(
         value_facts,
     )?;
     let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(&typed_function);
+    let indexed_field_counter_sources_by_instr =
+        typed_indexed_field_counter_sources_by_instr(&typed_function);
+    let late_bound_owner_fields_by_instr = typed_late_bound_owner_fields_by_instr(&typed_function);
     let guard_miss_deopt_instr_ids = collect_typed_guard_miss_deopt_instr_ids(&typed_function);
     let guard_miss_deopt_without_refcounts_instr_ids =
         collect_typed_exact_int_guard_miss_deopt_instr_ids(&typed_function);
@@ -23002,6 +23180,8 @@ fn build_cranelift_run_bb_specialized_function(
                 function_id: function.function_id,
                 function_kind: function.kind,
                 indexed_field_guards_by_instr: &indexed_field_guards_by_instr,
+                indexed_field_counter_sources_by_instr: &indexed_field_counter_sources_by_instr,
+                late_bound_owner_fields_by_instr: &late_bound_owner_fields_by_instr,
                 module_constants,
                 value_facts,
                 deopt_resume_plan: jit_deopt_resume_plan,

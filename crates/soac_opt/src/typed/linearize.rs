@@ -3,10 +3,15 @@ use super::{
     try_allocate_typed_stack_temp, typed_store_temp,
 };
 use soac_core::block_py::{
-    BlockPyFunction, BlockTerm, Load, Mappable, Meta, ResolvedName, TryMapInstr, WithMeta,
+    BlockPyFunction, BlockTerm, ChildVisitable, HasSemanticInstrId, InstrId, Load, Mappable, Meta,
+    ResolvedName, RuntimeFunctionId, TryMapInstr, Visit, WithMeta,
+};
+use soac_ir_typed::plan_v3::{
+    IndexedFieldOwnerType, LateBoundOwnerFieldStorage, RegionInputSource, RegionPlan, Rep,
 };
 use soac_ir_typed::{
-    InstrTyped, TypedBlockPyModuleShape, TypedCallAccessPlan, TypedInstrExtra, ValueFacts,
+    InstrTyped, TypedAttrAccessPlan, TypedBlockPyModuleShape, TypedCallAccessPlan, TypedInstrExtra,
+    ValueFacts,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -128,66 +133,75 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
     ) -> Result<InstrTyped, TypedInlineUnsupportedReason> {
         let is_root = self.depth == 0;
         self.depth += 1;
-        let rewritten = match instr {
-            InstrTyped::Truthy(op) => InstrTyped::Truthy(op.try_map_same_children(self)?),
-            InstrTyped::Load(op) => InstrTyped::Load(op.try_map_same_children(self)?),
-            InstrTyped::BinOp(op) if op.extra().exact_float_expression_plan().is_some() => {
-                InstrTyped::BinOp(op)
-            }
-            InstrTyped::BinOp(op) => InstrTyped::BinOp(op.try_map_same_children(self)?),
-            InstrTyped::Tuple(op) => InstrTyped::Tuple(op.try_map_same_children(self)?),
-            InstrTyped::UnaryOp(op) => InstrTyped::UnaryOp(op.try_map_same_children(self)?),
-            InstrTyped::CalleeFunctionId(op) => {
-                InstrTyped::CalleeFunctionId(op.try_map_same_children(self)?)
-            }
-            InstrTyped::CallTyped(op) => {
-                let mut op = op.try_map_same_children(self)?;
-                if matches!(op.access, TypedCallAccessPlan::GuardedMethod { .. })
-                    && !matches!(op.func.as_ref(), InstrTyped::GetAttrTyped(_))
-                {
-                    op.access = TypedCallAccessPlan::Generic;
+        let rewritten = if typed_exact_int_late_bound_scalar_expression_is_atomic(
+            &instr,
+            self.function.function_id,
+        ) {
+            instr
+        } else {
+            match instr {
+                InstrTyped::Truthy(op) => InstrTyped::Truthy(op.try_map_same_children(self)?),
+                InstrTyped::Load(op) => InstrTyped::Load(op.try_map_same_children(self)?),
+                InstrTyped::BinOp(op) if op.extra().exact_float_expression_plan().is_some() => {
+                    InstrTyped::BinOp(op)
                 }
-                InstrTyped::CallTyped(op)
-            }
-            InstrTyped::GuardedCallableCallTyped(op) => {
-                InstrTyped::GuardedCallableCallTyped(op.try_map_same_children(self)?)
-            }
-            InstrTyped::GuardedMethodCallTyped(op) => {
-                let op = op.try_map_same_children(self)?;
-                if matches!(op.func.as_ref(), InstrTyped::GetAttrTyped(_)) {
-                    InstrTyped::GuardedMethodCallTyped(op)
-                } else {
-                    let mut call = op.into_typed_call();
-                    call.access = TypedCallAccessPlan::Generic;
-                    InstrTyped::CallTyped(call)
+                InstrTyped::BinOp(op) => InstrTyped::BinOp(op.try_map_same_children(self)?),
+                InstrTyped::Tuple(op) => InstrTyped::Tuple(op.try_map_same_children(self)?),
+                InstrTyped::UnaryOp(op) => InstrTyped::UnaryOp(op.try_map_same_children(self)?),
+                InstrTyped::CalleeFunctionId(op) => {
+                    InstrTyped::CalleeFunctionId(op.try_map_same_children(self)?)
                 }
-            }
-            InstrTyped::DirectCallableCallTyped(op) => {
-                InstrTyped::DirectCallableCallTyped(op.try_map_same_children(self)?)
-            }
-            InstrTyped::DirectMethodCallTyped(op) => {
-                InstrTyped::DirectMethodCallTyped(op.try_map_same_children(self)?)
-            }
-            InstrTyped::DirectCallGuardTest(op) => {
-                InstrTyped::DirectCallGuardTest(op.try_map_same_children(self)?)
-            }
-            InstrTyped::CallDirect(op) => InstrTyped::CallDirect(op.try_map_same_children(self)?),
-            InstrTyped::GetAttrTyped(op) => {
-                InstrTyped::GetAttrTyped(op.try_map_same_children(self)?)
-            }
-            InstrTyped::SetAttrTyped(op) => {
-                InstrTyped::SetAttrTyped(op.try_map_same_children(self)?)
-            }
-            InstrTyped::GetItem(op) => InstrTyped::GetItem(op.try_map_same_children(self)?),
-            InstrTyped::SetItem(op) => InstrTyped::SetItem(op.try_map_same_children(self)?),
-            InstrTyped::DelItem(op) => InstrTyped::DelItem(op.try_map_same_children(self)?),
-            InstrTyped::Store(op) => InstrTyped::Store(op.try_map_same_children(self)?),
-            InstrTyped::Del(op) => InstrTyped::Del(op.try_map_same_children(self)?),
-            InstrTyped::MakeCell(op) => InstrTyped::MakeCell(op.try_map_same_children(self)?),
-            InstrTyped::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
-            InstrTyped::CellRef(op) => InstrTyped::CellRef(op),
-            InstrTyped::MakeFunctionWithClosure(op) => {
-                InstrTyped::MakeFunctionWithClosure(op.try_map_same_children(self)?)
+                InstrTyped::CallTyped(op) => {
+                    let mut op = op.try_map_same_children(self)?;
+                    if matches!(op.access, TypedCallAccessPlan::GuardedMethod { .. })
+                        && !matches!(op.func.as_ref(), InstrTyped::GetAttrTyped(_))
+                    {
+                        op.access = TypedCallAccessPlan::Generic;
+                    }
+                    InstrTyped::CallTyped(op)
+                }
+                InstrTyped::GuardedCallableCallTyped(op) => {
+                    InstrTyped::GuardedCallableCallTyped(op.try_map_same_children(self)?)
+                }
+                InstrTyped::GuardedMethodCallTyped(op) => {
+                    let op = op.try_map_same_children(self)?;
+                    if matches!(op.func.as_ref(), InstrTyped::GetAttrTyped(_)) {
+                        InstrTyped::GuardedMethodCallTyped(op)
+                    } else {
+                        let mut call = op.into_typed_call();
+                        call.access = TypedCallAccessPlan::Generic;
+                        InstrTyped::CallTyped(call)
+                    }
+                }
+                InstrTyped::DirectCallableCallTyped(op) => {
+                    InstrTyped::DirectCallableCallTyped(op.try_map_same_children(self)?)
+                }
+                InstrTyped::DirectMethodCallTyped(op) => {
+                    InstrTyped::DirectMethodCallTyped(op.try_map_same_children(self)?)
+                }
+                InstrTyped::DirectCallGuardTest(op) => {
+                    InstrTyped::DirectCallGuardTest(op.try_map_same_children(self)?)
+                }
+                InstrTyped::CallDirect(op) => {
+                    InstrTyped::CallDirect(op.try_map_same_children(self)?)
+                }
+                InstrTyped::GetAttrTyped(op) => {
+                    InstrTyped::GetAttrTyped(op.try_map_same_children(self)?)
+                }
+                InstrTyped::SetAttrTyped(op) => {
+                    InstrTyped::SetAttrTyped(op.try_map_same_children(self)?)
+                }
+                InstrTyped::GetItem(op) => InstrTyped::GetItem(op.try_map_same_children(self)?),
+                InstrTyped::SetItem(op) => InstrTyped::SetItem(op.try_map_same_children(self)?),
+                InstrTyped::DelItem(op) => InstrTyped::DelItem(op.try_map_same_children(self)?),
+                InstrTyped::Store(op) => InstrTyped::Store(op.try_map_same_children(self)?),
+                InstrTyped::Del(op) => InstrTyped::Del(op.try_map_same_children(self)?),
+                InstrTyped::MakeCell(op) => InstrTyped::MakeCell(op.try_map_same_children(self)?),
+                InstrTyped::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
+                InstrTyped::CellRef(op) => InstrTyped::CellRef(op),
+                InstrTyped::MakeFunctionWithClosure(op) => {
+                    InstrTyped::MakeFunctionWithClosure(op.try_map_same_children(self)?)
+                }
             }
         };
         self.depth -= 1;
@@ -205,6 +219,88 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
     ) -> Result<ResolvedName, TypedInlineUnsupportedReason> {
         Ok(name)
     }
+}
+
+fn typed_exact_int_late_bound_scalar_expression_is_atomic(
+    expr: &InstrTyped,
+    function_id: RuntimeFunctionId,
+) -> bool {
+    let Some(extra) = expr.typed_extra() else {
+        return false;
+    };
+
+    struct MatchingField<'a> {
+        source: InstrId,
+        owner_type: &'a IndexedFieldOwnerType,
+        attr_name: &'a str,
+        expected_index: u32,
+        function_id: RuntimeFunctionId,
+        found: bool,
+    }
+
+    impl Visit<InstrTyped> for MatchingField<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.found {
+                return;
+            }
+            if let InstrTyped::GetAttrTyped(op) = expr
+                && op.semantic_instr_id() == self.source
+                && let TypedAttrAccessPlan::LateBoundOwnerField(plan) = &op.access
+                && plan.counter_source.function_id.runtime_module_id()
+                    == self.function_id.runtime_module_id()
+                && &plan.owner_type == self.owner_type
+                && plan.attr_name == self.attr_name
+                && matches!(
+                    plan.storage,
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index }
+                        if expected_index == self.expected_index
+                )
+            {
+                self.found = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    fn has_matching_field(
+        expr: &InstrTyped,
+        region: &RegionPlan,
+        function_id: RuntimeFunctionId,
+    ) -> bool {
+        region.inputs.iter().any(|input| {
+            if input.value.rep != Rep::PyObjectBorrowed {
+                return false;
+            }
+            let RegionInputSource::IndexedField {
+                source,
+                owner_type,
+                attr_name,
+                expected_index,
+                ..
+            } = &input.source
+            else {
+                return false;
+            };
+            let mut matcher = MatchingField {
+                source: *source,
+                owner_type,
+                attr_name,
+                expected_index: *expected_index,
+                function_id,
+                found: false,
+            };
+            matcher.visit_instr(expr);
+            matcher.found
+        })
+    }
+
+    extra
+        .exact_int_branch_plan()
+        .is_some_and(|plan| has_matching_field(expr, &plan.hot_plan, function_id))
+        || extra
+            .exact_int_return_plan()
+            .is_some_and(|plan| has_matching_field(expr, &plan.hot_plan, function_id))
 }
 
 fn typed_nested_expr_requires_temp(expr: &InstrTyped) -> bool {

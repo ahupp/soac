@@ -25,8 +25,8 @@ use soac_ir_typed::plan_v3::{
     CallBodyKind, CallBodyPlan, Cost, DirectCallCallee, ExactFloatExpressionOperationPlan,
     ExactFloatExpressionSpecializationPlan, ExactListItemAccessKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind, IndexedFieldReceiverSource,
-    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, RegionInputSource, RegionPlan,
-    RegionSource,
+    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, LateBoundOwnerFieldStorage,
+    RegionInputSource, RegionPlan, RegionSource,
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, ProvenanceFact, TypedAttrAccessPlan, TypedAttrOwnerRef,
@@ -3545,6 +3545,8 @@ pub(super) fn annotate_typed_late_bound_owner_fields(
                         function_id: self.function_id,
                         instr_id: source,
                     },
+                    owner_type: plan.owner_type.clone(),
+                    attr_name: plan.attr_name.clone(),
                     storage: plan.storage,
                     cell_index: plan.cell_index,
                 });
@@ -3756,6 +3758,201 @@ pub(super) fn annotate_typed_exact_int_selections(
 
     let mut annotator = Annotator {
         artifacts,
+        count: 0,
+        error: None,
+    };
+    for block in &mut function.blocks {
+        if let BlockTerm::IfTerm(if_term) = &mut block.term {
+            annotator.attach_branch_plan(&mut if_term.test);
+            if let Some(error) = annotator.error.take() {
+                return Err(error);
+            }
+        }
+        for instr in &mut block.body {
+            annotator.visit_instr_mut(instr);
+            if let Some(error) = annotator.error.take() {
+                return Err(error);
+            }
+        }
+        annotator.visit_term_mut(&mut block.term);
+        if let Some(error) = annotator.error.take() {
+            return Err(error);
+        }
+    }
+    Ok(annotator.count)
+}
+
+fn late_bound_exact_int_region_matches_expression(
+    expr: &InstrTyped,
+    region: &RegionPlan,
+    function_id: RuntimeFunctionId,
+) -> bool {
+    struct MatchingField<'a> {
+        source: InstrId,
+        owner_type: &'a soac_ir_typed::plan_v3::IndexedFieldOwnerType,
+        attr_name: &'a str,
+        expected_index: u32,
+        function_id: RuntimeFunctionId,
+        found: bool,
+    }
+
+    impl Visit<InstrTyped> for MatchingField<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.found {
+                return;
+            }
+            if let InstrTyped::GetAttrTyped(op) = expr
+                && op.semantic_instr_id() == self.source
+                && let TypedAttrAccessPlan::LateBoundOwnerField(plan) = &op.access
+                && plan.counter_source.function_id.runtime_module_id()
+                    == self.function_id.runtime_module_id()
+                && &plan.owner_type == self.owner_type
+                && plan.attr_name == self.attr_name
+                && matches!(
+                    plan.storage,
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index }
+                        if expected_index == self.expected_index
+                )
+            {
+                self.found = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    region.inputs.iter().any(|input| {
+        if input.value.rep != soac_ir_typed::plan_v3::Rep::PyObjectBorrowed {
+            return false;
+        }
+        let RegionInputSource::IndexedField {
+            source,
+            owner_type,
+            attr_name,
+            expected_index,
+            ..
+        } = &input.source
+        else {
+            return false;
+        };
+        let mut matcher = MatchingField {
+            source: *source,
+            owner_type,
+            attr_name,
+            expected_index: *expected_index,
+            function_id,
+            found: false,
+        };
+        matcher.visit_instr(expr);
+        matcher.found
+    })
+}
+
+fn annotate_typed_late_bound_remapped_exact_int_selections(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    branch_plans: Option<&HashMap<InstrId, TypedExactIntBranchPlan>>,
+    return_plans: Option<&HashMap<InstrId, TypedExactIntReturnPlan>>,
+) -> Result<usize, String> {
+    let empty_branch_plans = HashMap::new();
+    let empty_return_plans = HashMap::new();
+    let branch_plans = branch_plans.unwrap_or(&empty_branch_plans);
+    let return_plans = return_plans.unwrap_or(&empty_return_plans);
+    if branch_plans.is_empty() && return_plans.is_empty() {
+        return Ok(0);
+    }
+
+    struct Annotator<'a> {
+        function_id: RuntimeFunctionId,
+        branch_plans: &'a HashMap<InstrId, TypedExactIntBranchPlan>,
+        return_plans: &'a HashMap<InstrId, TypedExactIntReturnPlan>,
+        count: usize,
+        error: Option<String>,
+    }
+
+    impl Annotator<'_> {
+        fn attach_branch_plan(&mut self, expr: &mut InstrTyped) {
+            let Some(instr_id) = expr.try_semantic_instr_id() else {
+                return;
+            };
+            let Some(plan) = self.branch_plans.get(&instr_id) else {
+                return;
+            };
+            if plan.instr_id != instr_id
+                || !late_bound_exact_int_region_matches_expression(
+                    expr,
+                    &plan.hot_plan,
+                    self.function_id,
+                )
+            {
+                return;
+            }
+            let Some(extra) = expr.typed_extra_mut() else {
+                self.error = Some(format!(
+                    "remapped late-owner exact-int branch plan for {instr_id} reached a typed node without metadata"
+                ));
+                return;
+            };
+            if let Some(existing) = extra.exact_int_branch_plan()
+                && existing != plan
+                && existing.instr_id == instr_id
+            {
+                self.error = Some(format!(
+                    "remapped late-owner exact-int branch plan for {instr_id} collides with an existing branch plan"
+                ));
+                return;
+            }
+            self.count += usize::from(extra.set_exact_int_branch_plan(plan.clone()));
+        }
+
+        fn attach_return_plan(&mut self, expr: &mut InstrTyped) {
+            let Some(instr_id) = expr.try_semantic_instr_id() else {
+                return;
+            };
+            let Some(plan) = self.return_plans.get(&instr_id) else {
+                return;
+            };
+            if plan.instr_id != instr_id
+                || !late_bound_exact_int_region_matches_expression(
+                    expr,
+                    &plan.hot_plan,
+                    self.function_id,
+                )
+            {
+                return;
+            }
+            let Some(extra) = expr.typed_extra_mut() else {
+                self.error = Some(format!(
+                    "remapped late-owner exact-int return plan for {instr_id} reached a typed node without metadata"
+                ));
+                return;
+            };
+            if let Some(existing) = extra.exact_int_return_plan()
+                && existing != plan
+                && existing.instr_id == instr_id
+            {
+                self.error = Some(format!(
+                    "remapped late-owner exact-int return plan for {instr_id} collides with an existing return plan"
+                ));
+                return;
+            }
+            self.count += usize::from(extra.set_exact_int_return_plan(plan.clone()));
+        }
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            self.attach_return_plan(expr);
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        function_id: function.function_id,
+        branch_plans,
+        return_plans,
         count: 0,
         error: None,
     };
@@ -5838,9 +6035,12 @@ fn invalidate_unguarded_exact_int_selections(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> usize {
     let indexed_field_guards = super::typed_indexed_field_guards_by_instr(function);
+    let late_bound_owner_fields = super::typed_late_bound_owner_fields_by_instr(function);
 
     struct Validator<'a> {
+        function_id: RuntimeFunctionId,
         indexed_field_guards: &'a HashMap<InstrId, Vec<soac_ir_typed::TypedIndexedFieldGuard>>,
+        late_bound_owner_fields: &'a HashMap<InstrId, TypedLateBoundOwnerFieldPlan>,
         missing_field_sources: HashSet<InstrId>,
         invalidated_branch_regions: usize,
         invalidated_return_regions: usize,
@@ -5856,6 +6056,7 @@ fn invalidate_unguarded_exact_int_selections(
                 let RegionInputSource::IndexedField {
                     source,
                     owner_type,
+                    attr_name,
                     expected_index,
                     ..
                 } = &input.source
@@ -5875,7 +6076,21 @@ fn invalidate_unguarded_exact_int_selections(
                                         && qualname == &owner_type.qualname
                                 )
                         })
-                    });
+                    }) || self
+                        .late_bound_owner_fields
+                        .get(source)
+                        .is_some_and(|plan| {
+                            plan.counter_source.function_id.runtime_module_id()
+                                == self.function_id.runtime_module_id()
+                                && &plan.owner_type == owner_type
+                                && plan.attr_name == *attr_name
+                                && matches!(
+                                    plan.storage,
+                                    LateBoundOwnerFieldStorage::SplitDict {
+                                        expected_index: guarded_index,
+                                    } if guarded_index == *expected_index
+                                )
+                        });
                 if !has_matching_guard {
                     self.missing_field_sources.insert(*source);
                     valid = false;
@@ -5911,7 +6126,9 @@ fn invalidate_unguarded_exact_int_selections(
     }
 
     let mut validator = Validator {
+        function_id: function.function_id,
         indexed_field_guards: &indexed_field_guards,
+        late_bound_owner_fields: &late_bound_owner_fields,
         missing_field_sources: HashSet::new(),
         invalidated_branch_regions: 0,
         invalidated_return_regions: 0,
@@ -10543,6 +10760,11 @@ fn apply_typed_v3_module_rewrites(
         let mut inline_rewrite_pass_count = 0usize;
         let mut inline_maintenance_pass_count = 0usize;
         loop {
+            annotate_typed_late_bound_remapped_exact_int_selections(
+                function,
+                remapped_exact_int_branches.get(&function.function_id),
+                remapped_exact_int_returns.get(&function.function_id),
+            )?;
             if !typed_inline_function_within_cfg_budget(function) {
                 tracing::info!(
                     target: "soac_inline_budget",
@@ -11529,6 +11751,11 @@ fn apply_typed_v3_module_rewrites(
                     &mut remapped_exact_int_returns,
                 )?;
             }
+            annotate_typed_late_bound_remapped_exact_int_selections(
+                function,
+                remapped_exact_int_branches.get(&caller_function_id),
+                remapped_exact_int_returns.get(&caller_function_id),
+            )?;
             inline_sidecar_remap_elapsed += inline_sidecar_remap_start.elapsed();
             let inline_refresh_start = Instant::now();
             let inline_tuple_simplify_start = Instant::now();
@@ -11630,6 +11857,11 @@ fn apply_typed_v3_module_rewrites(
                     &mut constructor_capture_bindings_by_origin,
                     &mut generator_state_instr_ids_by_origin,
                     &mut generator_state_pending_alias_use_instr_ids_by_origin,
+                )?;
+                annotate_typed_late_bound_remapped_exact_int_selections(
+                    function,
+                    remapped_exact_int_branches.get(&caller_function_id),
+                    remapped_exact_int_returns.get(&caller_function_id),
                 )?;
             }
             inline_post_split_elapsed += inline_post_split_start.elapsed();
@@ -11748,6 +11980,11 @@ fn apply_typed_v3_module_rewrites(
         let mut late_stop_iteration_rewrites = 0;
         let mut late_trusted_owner_states = TrustedOwnerStateCache::default();
         loop {
+            annotate_typed_late_bound_remapped_exact_int_selections(
+                function,
+                remapped_exact_int_branches.get(&function.function_id),
+                remapped_exact_int_returns.get(&function.function_id),
+            )?;
             if !typed_inline_function_within_cfg_budget(function) {
                 tracing::info!(
                     target: "soac_inline_budget",
@@ -22283,6 +22520,61 @@ def large(x):\n{large_body}"
         )
     }
 
+    fn late_bound_indexed_field_exact_int_sidecar_fixture(
+        owner_module: &str,
+        owner_qualname: &str,
+        attr_name: &str,
+        storage: LateBoundOwnerFieldStorage,
+        foreign_runtime_module: bool,
+    ) -> (BlockPyFunction<TypedBlockPyModuleShape>, InstrId) {
+        let (mut function, branch_source, field_source) =
+            indexed_field_exact_int_sidecar_fixture(false);
+        let counter_function_id = if foreign_runtime_module {
+            let foreign_id =
+                RuntimeFunctionId::new(RuntimeModuleId::new(999), LocalFunctionId::new(1));
+            assert_ne!(
+                foreign_id.runtime_module_id(),
+                function.function_id.runtime_module_id(),
+                "late-bound fixture must use a genuinely foreign runtime module",
+            );
+            foreign_id
+        } else {
+            function.function_id
+        };
+
+        struct GuardAnnotator {
+            plan: TypedLateBoundOwnerFieldPlan,
+        }
+
+        impl VisitMut<InstrTyped> for GuardAnnotator {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::GetAttrTyped(op) = expr {
+                    op.access = TypedAttrAccessPlan::LateBoundOwnerField(self.plan.clone());
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        GuardAnnotator {
+            plan: TypedLateBoundOwnerFieldPlan {
+                counter_source: TypedIndexedFieldCounterSource {
+                    function_id: counter_function_id,
+                    instr_id: field_source,
+                },
+                owner_type: soac_ir_typed::plan_v3::IndexedFieldOwnerType {
+                    module_name: owner_module.to_string(),
+                    qualname: owner_qualname.to_string(),
+                },
+                attr_name: attr_name.to_string(),
+                storage,
+                cell_index: 7,
+            },
+        }
+        .visit_fn_mut(&mut function);
+
+        (function, branch_source)
+    }
+
     #[test]
     fn exact_int_indexed_field_sidecars_preserve_live_typed_guards() {
         let (mut function, branch_source, _) = indexed_field_exact_int_sidecar_fixture(true);
@@ -22342,6 +22634,353 @@ def large(x):\n{large_body}"
                 exact_int_sidecars_for_branch(&function, branch_source),
                 (false, false),
                 "field index and owner identity must both match the dependent scalar region",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_int_indexed_field_sidecars_preserve_matching_late_bound_split_guards() {
+        let (mut function, branch_source) = late_bound_indexed_field_exact_int_sidecar_fixture(
+            "fixture",
+            "Record",
+            "value",
+            LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+            false,
+        );
+
+        assert_eq!(invalidate_unguarded_exact_int_selections(&mut function), 0);
+        assert_eq!(
+            exact_int_sidecars_for_branch(&function, branch_source),
+            (true, true),
+            "a matching late-bound split-owner guard should preserve both scalar regions",
+        );
+    }
+
+    #[test]
+    fn exact_int_indexed_field_sidecars_reject_mismatched_late_bound_split_guards() {
+        let mismatches = [
+            (
+                "foreign owner module",
+                "other",
+                "Record",
+                "value",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+                false,
+            ),
+            (
+                "different owner",
+                "fixture",
+                "OtherRecord",
+                "value",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+                false,
+            ),
+            (
+                "different attribute",
+                "fixture",
+                "Record",
+                "other",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+                false,
+            ),
+            (
+                "different shared-key index",
+                "fixture",
+                "Record",
+                "value",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 1 },
+                false,
+            ),
+            (
+                "slot storage",
+                "fixture",
+                "Record",
+                "value",
+                LateBoundOwnerFieldStorage::ObjectSlot,
+                false,
+            ),
+            (
+                "foreign runtime module",
+                "fixture",
+                "Record",
+                "value",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+                true,
+            ),
+        ];
+
+        for (description, owner_module, owner, attr, storage, foreign_module) in mismatches {
+            let (mut function, branch_source) = late_bound_indexed_field_exact_int_sidecar_fixture(
+                owner_module,
+                owner,
+                attr,
+                storage,
+                foreign_module,
+            );
+
+            assert_eq!(
+                invalidate_unguarded_exact_int_selections(&mut function),
+                2,
+                "{description} must invalidate dependent scalar regions",
+            );
+            assert_eq!(
+                exact_int_sidecars_for_branch(&function, branch_source),
+                (false, false),
+                "{description} must not retain either dependent scalar region",
+            );
+        }
+    }
+
+    #[test]
+    fn remapped_late_bound_scalar_sidecars_preserve_inlined_and_cloned_trees() {
+        for stale_cloned_sidecar in [false, true] {
+            let (mut function, branch_source) = late_bound_indexed_field_exact_int_sidecar_fixture(
+                "fixture",
+                "Record",
+                "value",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+                false,
+            );
+            let branch = function
+                .blocks
+                .iter_mut()
+                .find_map(|block| match &mut block.term {
+                    BlockTerm::IfTerm(if_term)
+                        if if_term.test.try_semantic_instr_id() == Some(branch_source) =>
+                    {
+                        Some(&mut if_term.test)
+                    }
+                    _ => None,
+                })
+                .expect("remapped late-owner fixture should retain its scalar branch");
+            let extra = branch
+                .typed_extra_mut()
+                .expect("remapped late-owner branch should carry typed extras");
+            let branch_plan = extra
+                .exact_int_branch_plan()
+                .cloned()
+                .expect("fixture should start with a branch plan");
+            let return_plan = extra
+                .exact_int_return_plan()
+                .cloned()
+                .expect("fixture should start with a return plan");
+            if stale_cloned_sidecar {
+                extra
+                    .exact_int_branch_plan_mut()
+                    .expect("cloned branch sidecar should exist")
+                    .instr_id = InstrId::new(998);
+                extra
+                    .exact_int_return_plan_mut()
+                    .expect("cloned return sidecar should exist")
+                    .instr_id = InstrId::new(999);
+            } else {
+                extra.clear_exact_int_branch_plan();
+                extra.clear_exact_int_return_plan();
+            }
+
+            let branches = HashMap::from([(branch_source, branch_plan)]);
+            let returns = HashMap::from([(branch_source, return_plan)]);
+            assert_eq!(
+                annotate_typed_late_bound_remapped_exact_int_selections(
+                    &mut function,
+                    Some(&branches),
+                    Some(&returns),
+                )
+                .expect("matching remapped scalar plans should attach before relinearization"),
+                2,
+                "late-owner {} sidecars must use the corrected caller source",
+                if stale_cloned_sidecar {
+                    "continuation-cloned"
+                } else {
+                    "inlined"
+                },
+            );
+            assert_eq!(
+                exact_int_sidecars_for_branch(&function, branch_source),
+                (true, true),
+            );
+
+            let stats = linearize_typed_function_expressions(&mut function)
+                .expect("remapped late-owner scalar expression should remain atomic");
+            assert_eq!(
+                stats.lifted_nested_exprs, 0,
+                "corrected remapped late-owner scalar sidecars must protect the complete getter/comparison tree",
+            );
+        }
+
+        let (mut generic, branch_source, _) = indexed_field_exact_int_sidecar_fixture(false);
+        let branch = generic
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                BlockTerm::IfTerm(if_term)
+                    if if_term.test.try_semantic_instr_id() == Some(branch_source) =>
+                {
+                    Some(&mut if_term.test)
+                }
+                _ => None,
+            })
+            .expect("generic scalar fixture should retain its branch");
+        let extra = branch
+            .typed_extra_mut()
+            .expect("generic scalar branch should carry typed extras");
+        let branches = HashMap::from([(
+            branch_source,
+            extra
+                .exact_int_branch_plan()
+                .cloned()
+                .expect("generic fixture should start with a branch plan"),
+        )]);
+        let returns = HashMap::from([(
+            branch_source,
+            extra
+                .exact_int_return_plan()
+                .cloned()
+                .expect("generic fixture should start with a return plan"),
+        )]);
+        extra.clear_exact_int_branch_plan();
+        extra.clear_exact_int_return_plan();
+        assert_eq!(
+            annotate_typed_late_bound_remapped_exact_int_selections(
+                &mut generic,
+                Some(&branches),
+                Some(&returns),
+            )
+            .expect("unrelated remapped scalar plans should remain deferred"),
+            0,
+        );
+        assert_eq!(
+            exact_int_sidecars_for_branch(&generic, branch_source),
+            (false, false),
+            "ordinary generic scalar sidecars must not be attached early",
+        );
+    }
+
+    #[test]
+    fn late_bound_exact_int_scalar_linearization_preserves_selected_region_atomically() {
+        fn nested_field_sources(
+            function: &BlockPyFunction<TypedBlockPyModuleShape>,
+            branch_source: InstrId,
+        ) -> Vec<InstrId> {
+            struct Collector {
+                sources: Vec<InstrId>,
+            }
+
+            impl Visit<InstrTyped> for Collector {
+                fn visit_instr(&mut self, expr: &InstrTyped) {
+                    if let InstrTyped::GetAttrTyped(op) = expr {
+                        self.sources.push(op.semantic_instr_id());
+                    }
+                    expr.visit_children(self);
+                }
+            }
+
+            let test = function
+                .blocks
+                .iter()
+                .find_map(|block| match &block.term {
+                    BlockTerm::IfTerm(if_term)
+                        if if_term.test.try_semantic_instr_id() == Some(branch_source) =>
+                    {
+                        Some(&if_term.test)
+                    }
+                    _ => None,
+                })
+                .expect("scalar linearization fixture must retain its planned branch");
+            let mut collector = Collector {
+                sources: Vec::new(),
+            };
+            collector.visit_instr(test);
+            collector.sources
+        }
+
+        let (mut guarded, guarded_branch) = late_bound_indexed_field_exact_int_sidecar_fixture(
+            "fixture",
+            "Record",
+            "value",
+            LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+            false,
+        );
+        let original_sources = nested_field_sources(&guarded, guarded_branch);
+        assert_eq!(original_sources.len(), 1);
+        linearize_typed_function_expressions(&mut guarded)
+            .expect("selected late-owner scalar tree should linearize");
+        assert_eq!(
+            nested_field_sources(&guarded, guarded_branch),
+            original_sources,
+            "the selected late-owner scalar branch must keep its getter and comparison inside one atomically guarded expression",
+        );
+        assert!(
+            guarded.blocks.iter().all(|block| {
+                block.body.iter().all(|instr| {
+                    !matches!(
+                        instr,
+                        InstrTyped::Store(store)
+                            if matches!(
+                                store.value.as_ref(),
+                                InstrTyped::GetAttrTyped(op)
+                                    if original_sources.contains(&op.semantic_instr_id())
+                            )
+                    )
+                })
+            }),
+            "the selected late-owner getter must not be materialized before scalar-region guards",
+        );
+
+        for indexed_guard in [false, true] {
+            let (mut unrelated, branch_source, field_source) =
+                indexed_field_exact_int_sidecar_fixture(indexed_guard);
+            let stats = linearize_typed_function_expressions(&mut unrelated)
+                .expect("unrelated exact-int and generic trees should retain normal linearization");
+            assert!(stats.lifted_nested_exprs > 0);
+            assert!(
+                nested_field_sources(&unrelated, branch_source).is_empty(),
+                "an exact-int tree without a matching late-owner field must still be linearized",
+            );
+            assert!(
+                unrelated.blocks.iter().any(|block| {
+                    block.body.iter().any(|instr| {
+                        matches!(
+                            instr,
+                            InstrTyped::Store(store)
+                                if matches!(
+                                    store.value.as_ref(),
+                                    InstrTyped::GetAttrTyped(op)
+                                        if op.semantic_instr_id() == field_source
+                                )
+                        )
+                    })
+                }),
+                "unrelated generic/indexed getters must preserve their existing temporary",
+            );
+        }
+
+        for (description, storage, foreign_runtime_module) in [
+            (
+                "mismatched split-key index",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 1 },
+                false,
+            ),
+            (
+                "foreign runtime module",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+                true,
+            ),
+        ] {
+            let (mut mismatched, branch_source) =
+                late_bound_indexed_field_exact_int_sidecar_fixture(
+                    "fixture",
+                    "Record",
+                    "value",
+                    storage,
+                    foreign_runtime_module,
+                );
+            let stats = linearize_typed_function_expressions(&mut mismatched)
+                .expect("mismatched late-owner scalar tree should linearize normally");
+            assert!(stats.lifted_nested_exprs > 0, "{description}");
+            assert!(
+                nested_field_sources(&mismatched, branch_source).is_empty(),
+                "{description} must not preserve an unmatched scalar expression atomically",
             );
         }
     }

@@ -40,7 +40,7 @@ use soac_ir_typed::plan_v3::{
     IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
     IndexedGlobalSpecializationPlan, LateBoundOwnerFieldSpecializationPlan,
     LateBoundOwnerFieldStorage, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic,
-    RegionId,
+    RegionId, RegionInputSource, RegionPlan, Rep,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -320,6 +320,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     let owner_field_sites =
         late_bound_owner_field_site_catalog(lowered_module, module_identity.module_name.as_str());
     let mut late_bound_owner_fields_by_function = Vec::new();
+    let mut hot_field_accesses_by_function = Vec::new();
     for function in &lowered_module.callable_defs {
         let attempts = if function_uses_generator_resume_state(function) {
             Vec::new()
@@ -411,6 +412,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
                 })
                 .collect::<Vec<_>>(),
         );
+        hot_field_accesses_by_function.push(evidence.hot_field_accesses.clone());
         functions.push(FunctionPlanRequest {
             function: function_plan_identity_v3(function),
             regions: region_requests,
@@ -432,21 +434,95 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             functions,
         },
     );
-    for (((function, diagnostics), exact_float_expressions), late_bound_owner_fields) in plan
+    for (
+        (((function, diagnostics), exact_float_expressions), late_bound_owner_fields),
+        hot_fields,
+    ) in plan
         .functions
         .iter_mut()
         .zip(diagnostics_by_function)
         .zip(exact_float_expressions_by_function)
         .zip(late_bound_owner_fields_by_function)
+        .zip(hot_field_accesses_by_function)
     {
         function.diagnostics.extend(diagnostics);
         function.exact_float_expressions = exact_float_expressions;
         function.late_bound_owner_fields = late_bound_owner_fields;
+        let scalar_fields = late_bound_split_owner_scalar_field_plans(
+            function,
+            &hot_fields,
+            owner_field_sites.as_slice(),
+        );
+        function.late_bound_owner_fields.extend(scalar_fields);
     }
     validate_module_plan_v3_against_lowered_module(&plan, lowered_module)
         .map_err(ExactIntBranchV3Error::Emit)?;
     let emission = emit_mechanical_plan_v3(&plan).map_err(ExactIntBranchV3Error::Emit)?;
     Ok(ExactIntBranchV3Artifacts { plan, emission })
+}
+
+fn late_bound_split_owner_scalar_field_plans(
+    function: &FunctionOptimizationPlanV3,
+    hot_fields: &HashMap<InstrId, u64>,
+    owner_field_sites: &[(RuntimeFunctionId, LateBoundOwnerFieldSpecializationPlan)],
+) -> Vec<LateBoundOwnerFieldSpecializationPlan> {
+    let mut selected_sources = function
+        .late_bound_owner_fields
+        .iter()
+        .map(|plan| plan.source)
+        .collect::<HashSet<_>>();
+    let mut selected = Vec::new();
+
+    for RegionPlan { inputs, .. } in &function.regions {
+        for input in inputs {
+            if input.value.rep != Rep::PyObjectBorrowed {
+                continue;
+            }
+            let RegionInputSource::IndexedField {
+                source,
+                owner_type,
+                attr_name,
+                expected_index,
+                ..
+            } = &input.source
+            else {
+                continue;
+            };
+            if selected_sources.contains(source)
+                || hot_fields.get(source).copied().unwrap_or_default() < 8
+            {
+                continue;
+            }
+            let Some(anchor) = owner_field_sites
+                .iter()
+                .map(|(_, site)| site)
+                .filter(|site| {
+                    site.owner_type == *owner_type
+                        && site.attr_name == *attr_name
+                        && matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+                })
+                .min_by_key(|site| site.cell_index)
+            else {
+                continue;
+            };
+            selected_sources.insert(*source);
+            selected.push(LateBoundOwnerFieldSpecializationPlan {
+                source: *source,
+                access: IndexedFieldAccessKind::Load,
+                owner_type: owner_type.clone(),
+                attr_name: attr_name.clone(),
+                storage: LateBoundOwnerFieldStorage::SplitDict {
+                    expected_index: *expected_index,
+                },
+                cell_index: anchor.cell_index,
+                reason:
+                    "profiled scalar region reuses a same-owner split-field late-binding guard cell"
+                        .to_string(),
+            });
+        }
+    }
+
+    selected
 }
 
 fn function_uses_generator_resume_state(function: &BlockPyFunction<BlockPyModuleShape>) -> bool {
@@ -2690,6 +2766,197 @@ def make_dynamic():
             "decorated, inherited, and dynamic owner bindings must not be selected: {actual:?}",
         );
     }
+
+    #[test]
+    fn late_bound_scalar_regions_reuse_existing_split_owner_constructor_cells() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+class Record:
+    def __init__(self, value):
+        self.first = 0
+        self.second = 0
+        self.value = value
+
+def branch(record):
+    if record.value < 10:
+        return 1
+    return 0
+
+class Handler:
+    def branch(self, record):
+        if record.value < 10:
+            return 1
+        return 0
+"#,
+        )
+        .expect("non-self scalar owner fixture should lower")
+        .blockpy_module;
+        let owner_sites = late_bound_owner_field_site_catalog(&lowered, "pkg.mod");
+        let anchor = owner_sites
+            .iter()
+            .find(|(_, site)| {
+                site.owner_type.qualname == "Record"
+                    && site.attr_name == "value"
+                    && site.access == IndexedFieldAccessKind::Store
+                    && matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+            })
+            .map(|(_, site)| site)
+            .expect("the Record constructor should already own a reusable split-field cell");
+
+        #[derive(Default)]
+        struct ConsumerSites {
+            field: Option<InstrId>,
+            comparison: Option<InstrId>,
+        }
+
+        impl Visit<InstrBlockPy> for ConsumerSites {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
+            where
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
+            {
+                match expr {
+                    InstrBlockPy::GetAttr(op) => self.field = Some(op.semantic_instr_id()),
+                    InstrBlockPy::BinOp(op) if op.kind == BinOpKind::Lt => {
+                        self.comparison = Some(op.semantic_instr_id());
+                    }
+                    _ => {}
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let consumers = lowered
+            .callable_defs
+            .iter()
+            .filter(|function| {
+                matches!(
+                    function.names.qualname.as_str(),
+                    "branch" | "Handler.branch"
+                )
+            })
+            .map(|function| {
+                let mut sites = ConsumerSites::default();
+                sites.visit_fn(function);
+                (
+                    function,
+                    sites.field.expect("consumer should contain a field load"),
+                    sites
+                        .comparison
+                        .expect("consumer should contain an exact-int comparison"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(consumers.len(), 2);
+
+        let mut rows = Vec::new();
+        for (function, field_source, comparison_source) in &consumers {
+            let mut field = row(
+                "field_access",
+                function.function_id,
+                *field_source,
+                16,
+                None,
+            );
+            field.branch_values = vec![soac_core::profile::CounterDumpBranchValue {
+                branch: "generic_getattr".to_string(),
+                value: 16,
+            }];
+            rows.push(field);
+            rows.push(row(
+                "operator_hot_shapes",
+                function.function_id,
+                *comparison_source,
+                16,
+                Some(pack_binary_shape(ExactTypeTag::Int, ExactTypeTag::Int)),
+            ));
+        }
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows,
+            module_keys: Vec::new(),
+            type_keys: vec![CounterDumpTypeKeyLayout {
+                owner_type_id: 44,
+                key: "value".to_string(),
+                index: 2,
+            }],
+            type_table: vec![CounterDumpTypeTableEntry {
+                type_id: 44,
+                key: CounterDumpTypeKey {
+                    module_name: "pkg.mod".to_string(),
+                    qualname: "Record".to_string(),
+                },
+            }],
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+
+        let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+            &AlternativeCatalog::default_v3(),
+            module_identity(),
+            &lowered,
+            &evidence_store,
+        )
+        .expect("the profiled non-self scalar fixture should plan and emit");
+
+        for (consumer, field_source, _) in consumers {
+            let function = artifacts
+                .plan
+                .functions
+                .iter()
+                .find(|function| {
+                    function.function.debug_name.as_deref()
+                        == Some(consumer.names.qualname.as_str())
+                })
+                .expect("consumer should have a v3 function plan");
+            assert!(
+                function.regions.iter().any(|region| {
+                    region.inputs.iter().any(|input| {
+                        matches!(
+                            &input.source,
+                            soac_ir_typed::plan_v3::RegionInputSource::IndexedField {
+                                source,
+                                owner_type,
+                                attr_name,
+                                expected_index,
+                                ..
+                            } if *source == field_source
+                                && owner_type.module_name == "pkg.mod"
+                                && owner_type.qualname == "Record"
+                                && attr_name == "value"
+                                && *expected_index == 2
+                                && input.value.rep == soac_ir_typed::plan_v3::Rep::PyObjectBorrowed
+                        )
+                    })
+                }),
+                "{} should have an actual profiled borrowed scalar field input: {:?}",
+                consumer.names.qualname,
+                function.regions,
+            );
+            let late_plan = function
+                .late_bound_owner_fields
+                .iter()
+                .find(|plan| plan.source == field_source)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} must reuse Record.value's existing constructor owner cell for its non-self scalar input; selected plans: {:?}",
+                        consumer.names.qualname, function.late_bound_owner_fields,
+                    )
+                });
+            assert_eq!(late_plan.owner_type, anchor.owner_type);
+            assert_eq!(late_plan.attr_name, anchor.attr_name);
+            assert_eq!(late_plan.cell_index, anchor.cell_index);
+            assert_eq!(late_plan.access, IndexedFieldAccessKind::Load);
+            assert_eq!(
+                late_plan.storage,
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 2 },
+            );
+        }
+    }
+
     use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
     use crate::region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::literal::{LiteralValue, StringLiteral};

@@ -1596,3 +1596,12 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   improvements `1.117x` / `1.040x`, with `float` median `1.280x`. Repeated
   affected-workload median improvement `1.066x`; `comprehensions` and
   `richards` regress, and generated native code grows `2.757%`.
+
+## 2026-08-19 - Recover guarded late-owner scalar regions
+
+- jj change id: `nzlwkyzw`
+- summary: reuse existing weak owner-field guards in selected scalar regions
+  while preserving inlined original-source specialization counters.
+- eight-workload paired stock score `0.484x`; previous-SOAC robust median
+  improvement `1.009x`. Three-round affected-workload robust improvement
+  `1.037x`; generated native code shrinks `0.247%`.

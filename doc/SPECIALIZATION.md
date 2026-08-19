@@ -598,6 +598,95 @@ nodeids across 84 batches / 8 workers**, plus **553 JIT**, **53 typed-IR**,
 `work/logs/late-owner-fields-test-all.log`. The measured subset remains below
 stock CPython, and the full-pyperformance **1.10x** target remains unmet.
 
+### Late-Bound Guarded Scalar Regions
+
+The eager owner-field change alone does not recover selected exact-int scalar
+regions whose receivers are arbitrary locals: top-level `chain_test` /
+`projection_test` and non-`self` richards accesses have no class-method
+owner-field sidecar at their original instruction. A post-planning pass now
+considers **only already-selected borrowed `RegionInputSource::IndexedField`
+inputs** with hot generic-field profile evidence. For a unique exact
+same-module owner, attribute, and index, it reuses an existing published
+`SplitDict` constructor/method owner cell; it does not expand the owner
+catalog, publish additional cells, add global state, support slots, or relax
+virtual-object trust. Existing ordinary indexed-field plans retain precedence.
+
+The existing public `soac_ir_typed::TypedLateBoundOwnerFieldPlan` now exposes
+the public `owner_type` and `attr_name` fields so original and inlined
+instructions can validate the exact same owner/attribute independently of
+the anchor's source instruction. The selected borrowed source, owner module,
+owner class, attribute, expected index, and existing dense owner-cell index
+must agree. A private source-keyed late-owner guard map supplements, rather
+than replaces, the ordinary indexed-field map; foreign modules, ambiguous or
+mismatched anchors, slots, and missing evidence remain generic.
+
+Scalar input emission reuses the exact existing weak-owner/exact-receiver,
+nonzero type-version, valid split inline-values/capacity, and current
+`ht_cached_keys` split-kind/index/interned-key guards. Guard validity lasts
+only for the individual guarded execution and only while all those live
+conditions remain true. Owner death/rebinding, subclass hooks, class-property
+mutation, dictionary materialization/promotion/deletion, or an unseeded
+shared-key first insertion take the full original scalar-region fallback.
+
+The selected entire `Truthy`/comparison/getter subtree is attached before
+expression linearization and retained atomically; otherwise a hoisted getter
+could run before its guard and a miss would invoke observable subclass or
+descriptor hooks twice. One exact-match seeded/remapped-plan helper handles
+original and same-module-inlined instructions, continuation clones, and
+fixpoint/remap/late phases; unrelated generic and ordinary indexed trees keep
+their normal linearization. Same-module inlining preserves callee module and
+original instruction identity.
+
+Constructor continuation cloning can retain ordinary indexed fields at new
+instruction IDs while their counters remain defined at the original callee
+sources. The private regular indexed-field counter map therefore credits hit,
+miss, no-specialization, and fallback to the existing typed original counter
+source: the observed continuation clones `#40` / `#43` correctly map to
+original `#6` / `#9`. This counter repair introduces no new public API and
+does not change existing constructor virtualization.
+
+Focused evidence includes actual transformed top-level and genuinely inlined
+Profile→Verify→Apply scalar consumers, exactly-once subclass/property hooks,
+deleted/materialized/promoted dictionaries, owner rebinding, unseeded first
+insertion, and the preexisting indexed-field counter regression. All **67
+selected transformed-runtime tests pass in 35.04 seconds** (**7 deselected**);
+full Rust libraries pass **53 typed-IR + 208 optimizer + 557 JIT = 818**,
+the combined test-target check passes in **3.75 seconds**, and scoped
+format/check gates pass. The broad monolithic pytest process can leak handled
+exception state across files; authoritative `just test-all` instead uses the
+file-isolated batches in `scripts/run_pytest_parallel.py`. Aligning
+`PYO3_PYTHON` / `PYO3_PYTHON_REAL` between Cargo and Just recipes avoids
+unnecessary PyO3 rebuilds.
+
+Normally profiled runs recover all four target functions (six branch regions)
+in deltablue and richards. A debug-single profile with just one observation
+misses a
+`projection_test` source: originals `#114` / `#126` each have one smoke
+observation versus eight in the normal profile, while `#365` is an
+unprofiled continuation-cloned instruction whose original source is not
+asserted. The three-round repeat recovers all four target functions (six
+branch regions) in every one of **30 measured Apply workers per affected
+workload**. Full-eight robust previous-SOAC
+improvement is **1.00948x**; the repeated affected-subset robust improvement
+is **1.03673x**, with `chaos` **1.06100x**, statistically neutral
+`deltablue` **1.01251x** (approximate interval **0.97–1.046x**), and
+`richards` **1.03725x**. Prior richards outliers distort arithmetic means,
+so the apparent **1.296x** mean is not a performance claim.
+
+Native code shrinks **23,417,280 → 23,359,400 bytes (-0.247%)** and machine
+blocks shrink **1,553,260 → 1,549,290 (-0.256%)**, with typed IR unchanged
+at **3,069 blocks / 218 functions**. The full-eight paired stock score is
+only **0.48444263615875466x** and the repeated-subset stock score is
+**0.462392x**; the prior **0.5127524704981717x** stock result comes from a
+different paired cohort, and neither subset establishes full-suite stock
+parity or the **1.10x** acceptance goal. The optimization is retained, and
+the authoritative `just test-all` correctness gate **passes 1,218 Python
+nodeids across 85 file-local batches / 8 workers**, with **85 / 85 batches
+passing**, plus Rust **557 JIT**, **53 typed-IR**, **371 lowering**,
+**208 optimizer**, and **8 PyO3** tests. The test phase takes **171.606
+seconds**; see `work/logs/late-owner-scalar-test-all.log`. The full-suite
+stock-performance target remains unmet.
+
 ### Limitations / Soundness / Extensions
 
 - The owner guard is exact-type today; it is sound but does not yet keep
