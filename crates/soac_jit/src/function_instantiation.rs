@@ -275,20 +275,22 @@ fn update_function_metadata(
     annotate_fn: &Bound<'_, PyAny>,
     has_prepared_code_metadata: bool,
 ) -> PyResult<()> {
-    ignore_attr_or_type_error(py, func.setattr("__qualname__", qualname))?;
-    ignore_attr_or_type_error(py, func.setattr("__name__", name))?;
-    if !has_prepared_code_metadata && func.cast::<PyFunction>().is_ok() {
-        let code = func.getattr("__code__")?;
-        let has_matching_name = code.getattr("co_name")?.eq(name)?;
-        let has_matching_qualname = code.getattr("co_qualname")?.eq(qualname)?;
-        if !has_matching_name || !has_matching_qualname {
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("co_name", name)?;
-            kwargs.set_item("co_qualname", qualname)?;
-            if let Some(replaced) =
-                ignore_attr_or_value_error(py, code.call_method("replace", (), Some(&kwargs)))?
-            {
-                ignore_attr_or_type_error(py, func.setattr("__code__", replaced))?;
+    if !has_prepared_code_metadata {
+        ignore_attr_or_type_error(py, func.setattr("__qualname__", qualname))?;
+        ignore_attr_or_type_error(py, func.setattr("__name__", name))?;
+        if func.cast::<PyFunction>().is_ok() {
+            let code = func.getattr("__code__")?;
+            let has_matching_name = code.getattr("co_name")?.eq(name)?;
+            let has_matching_qualname = code.getattr("co_qualname")?.eq(qualname)?;
+            if !has_matching_name || !has_matching_qualname {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("co_name", name)?;
+                kwargs.set_item("co_qualname", qualname)?;
+                if let Some(replaced) =
+                    ignore_attr_or_value_error(py, code.call_method("replace", (), Some(&kwargs)))?
+                {
+                    ignore_attr_or_type_error(py, func.setattr("__code__", replaced))?;
+                }
             }
         }
     }
@@ -667,12 +669,14 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
         }
     }
     let closure = tuple_from_owned_objects(py, closure_cells)?;
-    let qualname = PyString::new(py, qualname);
+    let qualname = (!has_prepared_code_metadata).then(|| PyString::new(py, qualname));
     let func = unsafe {
         let ptr = ffi::PyFunction_NewWithQualName(
             code.as_ptr(),
             module_globals.as_ptr(),
-            qualname.as_ptr(),
+            qualname
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |value| value.as_ptr()),
         );
         if ptr.is_null() {
             return Err(PyErr::fetch(py));
