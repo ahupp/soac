@@ -608,6 +608,8 @@ struct InstantiatedEntry<'py> {
 
 pub(crate) struct PreparedSyntheticCode {
     runtime_module: usize,
+    runtime_owner_type: usize,
+    runtime_owner_type_version: u32,
     code_factory: Py<PyAny>,
     code: Py<PyAny>,
 }
@@ -731,6 +733,104 @@ fn canonical_bootstrap_code_factory(
     }
 }
 
+fn prepared_synthetic_runtime_owner_guard(
+    py: Python<'_>,
+    runtime: &Bound<'_, PyModule>,
+    lookup_keys: &PreparedRuntimeLookupKeys,
+) -> (usize, u32) {
+    unsafe {
+        let owner = ffi::Py_TYPE(runtime.as_ptr());
+        if owner.is_null() || (*owner).tp_base != std::ptr::addr_of_mut!(ffi::PyModule_Type) {
+            return (0, 0);
+        }
+        let Some(actual_getattr) = (*owner).tp_getattro else {
+            return (0, 0);
+        };
+        let Some(module_getattr) = ffi::PyModule_Type.tp_getattro else {
+            return (0, 0);
+        };
+        if !std::ptr::fn_addr_eq(actual_getattr, module_getattr) {
+            return (0, 0);
+        }
+
+        let Ok(canonical_owner) = crate::module_type::indexed_module_type_for_python(py) else {
+            return (0, 0);
+        };
+        if owner != canonical_owner.as_ptr().cast::<ffi::PyTypeObject>() {
+            return (0, 0);
+        }
+
+        // Static builtin types keep their per-interpreter dictionaries outside tp_dict. This
+        // exact heap type directly inherits the immutable module/object hierarchy, whose static
+        // dictionaries do not define code_with_freevars, so only its own dict can add a binding.
+        let class_dict = (*owner).tp_dict;
+        if class_dict.is_null() || ffi::PyDict_CheckExact(class_dict) == 0 {
+            return (0, 0);
+        }
+        let keys = (*class_dict.cast::<ffi::PyDictObject>())
+            .ma_keys
+            .cast::<RawPyDictKeysPrefix>();
+        if keys.is_null() || (*keys).dk_kind == 0 {
+            return (0, 0);
+        }
+        if !ffi::PyDict_GetItem(class_dict, lookup_keys.code_factory.bind(py).as_ptr()).is_null() {
+            return (0, 0);
+        }
+
+        if (*owner).tp_version_tag == 0 && crate::PyUnstable_Type_AssignVersionTag(owner) == 0 {
+            return (0, 0);
+        }
+        let version = (*owner).tp_version_tag;
+        if version == 0 {
+            return (0, 0);
+        }
+        (owner as usize, version)
+    }
+}
+
+fn synthetic_runtime_code_factory<'py>(
+    py: Python<'py>,
+    runtime: &Bound<'py, PyModule>,
+    function_template: &FunctionInstantiationTemplate,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(prepared) = function_template.prepared_synthetic_code.get()
+        && let Some(lookup_keys) = function_template.prepared_runtime_lookup_keys.get()
+        && prepared.runtime_module == runtime.as_ptr() as usize
+        && prepared.runtime_owner_type != 0
+    {
+        unsafe {
+            let owner = ffi::Py_TYPE(runtime.as_ptr());
+            if owner as usize == prepared.runtime_owner_type
+                && (*owner).tp_version_tag == prepared.runtime_owner_type_version
+                && (*owner).tp_version_tag != 0
+                && (*owner).tp_getattro.is_some_and(|getattr| {
+                    ffi::PyModule_Type
+                        .tp_getattro
+                        .is_some_and(|module_getattr| std::ptr::fn_addr_eq(getattr, module_getattr))
+                })
+            {
+                let globals = ffi::PyModule_GetDict(runtime.as_ptr());
+                if !globals.is_null() && ffi::PyDict_CheckExact(globals) != 0 {
+                    let keys = (*globals.cast::<ffi::PyDictObject>())
+                        .ma_keys
+                        .cast::<RawPyDictKeysPrefix>();
+                    if !keys.is_null() && (*keys).dk_kind != 0 {
+                        let factory = ffi::PyDict_GetItem(
+                            globals,
+                            lookup_keys.code_factory.bind(py).as_ptr(),
+                        );
+                        if !factory.is_null() {
+                            return Ok(Bound::from_borrowed_ptr(py, factory));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    runtime.getattr("code_with_freevars")
+}
+
 fn synthetic_code_for_template<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
@@ -738,7 +838,7 @@ fn synthetic_code_for_template<'py>(
     function_template: &FunctionInstantiationTemplate,
     captured_names: &[String],
 ) -> PyResult<(Bound<'py, PyAny>, bool)> {
-    let factory = dp.getattr("code_with_freevars")?;
+    let factory = synthetic_runtime_code_factory(py, dp, function_template)?;
     let (is_async, is_generator) = match function.lowered_kind() {
         FunctionKind::Function => (false, false),
         FunctionKind::Coroutine => (true, false),
@@ -780,8 +880,14 @@ fn synthetic_code_for_template<'py>(
     kwargs.set_item("co_qualname", function.names.qualname.as_str())?;
     let code = code.call_method("replace", (), Some(&kwargs))?;
     let code_factory_ptr = factory.as_ptr();
+    // Factory invocation and code replacement can run arbitrary audit callbacks. Capture the
+    // exact module owner only after they finish, without holding the template initialization lock.
+    let (runtime_owner_type, runtime_owner_type_version) =
+        prepared_synthetic_runtime_owner_guard(py, dp, lookup_keys);
     let prepared = PreparedSyntheticCode {
         runtime_module: dp.as_ptr() as usize,
+        runtime_owner_type,
+        runtime_owner_type_version,
         code_factory: factory.unbind(),
         code: code.clone().unbind(),
     };
@@ -1576,11 +1682,514 @@ mod tests {
         canonical_bootstrap_code_factory, code_freevars_match_names, import_dp_module,
         keep_source_generator_vectorcall, keep_source_runtime_helper_vectorcall,
         make_lazy_clif_entry, prepared_runtime_lookup_keys, runtime_lookup_dict_item,
+        synthetic_code_for_template, synthetic_runtime_code_factory,
     };
     use pyo3::ffi;
     use pyo3::prelude::*;
     use pyo3::types::{PyDict, PyModule};
     use soac_core::block_py::FunctionKind;
+    use std::ffi::c_void;
+
+    #[test]
+    fn synthetic_code_caches_the_exact_indexed_runtime_module_attribute_guard() {
+        unsafe extern "C" {
+            fn _PyDict_NewIndexedKeySet(keys: *mut ffi::PyObject) -> *mut c_void;
+            fn _PyDict_NewWithIndexedKeySet(keys: *mut c_void) -> *mut ffi::PyObject;
+            fn _PyDictKeys_DecRef(keys: *mut c_void);
+        }
+
+        #[repr(C)]
+        struct RawPyDictIndexedValuesForTest {
+            capacity: ffi::Py_ssize_t,
+            order_size: ffi::Py_ssize_t,
+            values: [*mut ffi::PyObject; 1],
+        }
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+                "def outer(offset):\n    return [offset + value for value in (1, 2)]\n",
+            )
+            .expect("synthetic runtime-attribute fixture should lower")
+            .blockpy_module;
+            let function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname.contains("_dp_listcomp"))
+                .expect(
+                    "runtime-attribute fixture should contain its actual lowered comprehension",
+                );
+            let template = crate::FunctionInstantiationTemplate::from_function(function)
+                .expect("runtime-attribute fixture should prepare its actual function template");
+            let lookup_keys = prepared_runtime_lookup_keys(py, &template)
+                .expect("runtime-attribute fixture should prepare its existing interned keys");
+
+            let owner_type = crate::module_type::indexed_module_type_for_python(py)
+                .expect("runtime-attribute fixture should obtain SOAC's actual module heap type");
+            let runtime = owner_type
+                .bind(py)
+                .call1(("synthetic_runtime_attribute_fixture",))
+                .and_then(|module| module.cast_into::<PyModule>().map_err(Into::into))
+                .expect("runtime-attribute fixture should allocate an actual IndexedModuleType");
+            assert_eq!(
+                unsafe { ffi::Py_TYPE(runtime.as_ptr()) },
+                owner_type.as_ptr().cast()
+            );
+
+            let key_names = [
+                c"__name__",
+                c"__doc__",
+                c"__package__",
+                c"__loader__",
+                c"__spec__",
+                c"code_with_freevars",
+                c"__getattr__",
+            ];
+            let indexed_name_tuple =
+                unsafe { ffi::PyTuple_New(key_names.len() as ffi::Py_ssize_t) };
+            assert!(!indexed_name_tuple.is_null());
+            let indexed_name_tuple =
+                unsafe { Bound::<PyAny>::from_owned_ptr(py, indexed_name_tuple) };
+            for (index, name) in key_names.iter().enumerate() {
+                let key = unsafe { ffi::PyUnicode_InternFromString(name.as_ptr()) };
+                assert!(!key.is_null());
+                assert_eq!(
+                    unsafe {
+                        ffi::PyTuple_SetItem(
+                            indexed_name_tuple.as_ptr(),
+                            index as ffi::Py_ssize_t,
+                            key,
+                        )
+                    },
+                    0
+                );
+            }
+
+            let indexed_keys = unsafe { _PyDict_NewIndexedKeySet(indexed_name_tuple.as_ptr()) };
+            assert!(!indexed_keys.is_null());
+            let indexed_dict = unsafe { _PyDict_NewWithIndexedKeySet(indexed_keys) };
+            unsafe { _PyDictKeys_DecRef(indexed_keys) };
+            assert!(!indexed_dict.is_null());
+            let indexed_dict = unsafe { Bound::<PyAny>::from_owned_ptr(py, indexed_dict) };
+            let previous_dict = unsafe { ffi::PyModule_GetDict(runtime.as_ptr()) };
+            assert!(!previous_dict.is_null());
+            assert_eq!(
+                unsafe { ffi::PyDict_Update(indexed_dict.as_ptr(), previous_dict) },
+                0
+            );
+            let owner = unsafe { ffi::Py_TYPE(runtime.as_ptr()) };
+            let dict_offset = unsafe { (*owner).tp_dictoffset };
+            assert!(dict_offset > 0);
+            let dict_slot = unsafe {
+                runtime
+                    .as_ptr()
+                    .cast::<u8>()
+                    .offset(dict_offset as isize)
+                    .cast::<*mut ffi::PyObject>()
+            };
+            assert_eq!(unsafe { *dict_slot }, previous_dict);
+            unsafe {
+                ffi::Py_INCREF(indexed_dict.as_ptr());
+                *dict_slot = indexed_dict.as_ptr();
+                ffi::Py_DECREF(previous_dict);
+            }
+            let actual_keys =
+                unsafe { (*indexed_dict.as_ptr().cast::<ffi::PyDictObject>()).ma_keys }
+                    .cast::<RawPyDictKeysPrefix>();
+            assert_eq!(
+                unsafe { (*actual_keys).dk_kind },
+                3,
+                "the production-path fixture must use SOAC's actual custom indexed dictionary"
+            );
+
+            let namespace = PyDict::new(py);
+            namespace
+                .set_item("cached_name", lookup_keys.code_factory.bind(py))
+                .expect("runtime-attribute fixture should expose its existing interned name");
+            py.import("builtins")
+                .and_then(|builtins| builtins.getattr("exec"))
+                .and_then(|exec| {
+                    exec.call1((
+                        r#"
+import types
+
+calls = []
+missing_name_identities = []
+subclass_name_identities = []
+class_name_identities = []
+property_events = []
+collision_identities = []
+
+def code_with_freevars(names, is_async, is_generator):
+    calls.append(tuple(names))
+    def placeholder():
+        return None
+    return placeholder.__code__
+
+def replacement_factory(names, is_async, is_generator):
+    return code_with_freevars(names, is_async, is_generator)
+
+def missing_getattr(name):
+    missing_name_identities.append(name is cached_name)
+    return replacement_factory
+
+class ObservedModule(types.ModuleType):
+    def __getattribute__(self, name):
+        if name == "code_with_freevars":
+            subclass_name_identities.append(name is cached_name)
+        return types.ModuleType.__getattribute__(self, name)
+
+def observed_getattribute(self, name):
+    if name == "code_with_freevars":
+        class_name_identities.append(name is cached_name)
+    return types.ModuleType.__getattribute__(self, name)
+
+def observed_property(self):
+    property_events.append("property")
+    return replacement_factory
+
+class CollisionKey:
+    raise_error = False
+
+    def __hash__(self):
+        return hash(cached_name)
+
+    def __eq__(self, other):
+        collision_identities.append(other is cached_name)
+        if self.raise_error:
+            raise RuntimeError("runtime module attribute collision")
+        return False
+"#,
+                        &namespace,
+                    ))
+                })
+                .expect("runtime-attribute fixture should define a real code-producing factory");
+            let factory = namespace
+                .get_item(lookup_keys.code_factory.bind(py))
+                .expect("fixture factory lookup should succeed")
+                .expect("fixture factory should exist");
+            runtime
+                .setattr("code_with_freevars", &factory)
+                .expect("actual indexed runtime dictionary should accept its factory");
+
+            let bootstrap = PyModule::new(py, "synthetic_runtime_attribute_bootstrap")
+                .expect("canonical bootstrap fixture should allocate");
+            bootstrap
+                .setattr("code_with_freevars", &factory)
+                .expect("canonical bootstrap fixture should expose the same factory");
+            let modules = py
+                .import("sys")
+                .and_then(|sys| sys.getattr("modules"))
+                .and_then(|modules| modules.cast_into::<PyDict>().map_err(Into::into))
+                .expect("fixture should access the real module dictionary");
+            let original_bootstrap = modules
+                .get_item("soac.bootstrap")
+                .expect("original bootstrap lookup should succeed");
+
+            let actual = (|| -> PyResult<(usize, usize, usize, u32, Vec<Vec<String>>)> {
+                modules.set_item("soac.bootstrap", &bootstrap)?;
+                let (first, first_prepared) = synthetic_code_for_template(
+                    py,
+                    &runtime,
+                    function,
+                    &template,
+                    template.capture_names(),
+                )?;
+                let (second, second_prepared) = synthetic_code_for_template(
+                    py,
+                    &runtime,
+                    function,
+                    &template,
+                    template.capture_names(),
+                )?;
+                assert!(first_prepared && second_prepared);
+                let prepared = template
+                    .prepared_synthetic_code
+                    .get()
+                    .expect("actual production synthetic-code creation should prepare its cache");
+                let calls = namespace
+                    .get_item("calls")?
+                    .expect("fixture factory calls should exist")
+                    .extract::<Vec<Vec<String>>>()?;
+                Ok((
+                    first.as_ptr() as usize,
+                    second.as_ptr() as usize,
+                    prepared.runtime_owner_type,
+                    prepared.runtime_owner_type_version,
+                    calls,
+                ))
+            })();
+            match original_bootstrap {
+                Some(original_bootstrap) => modules
+                    .set_item("soac.bootstrap", original_bootstrap)
+                    .expect("the original bootstrap module should restore before assertions"),
+                None => modules
+                    .del_item("soac.bootstrap")
+                    .expect("the temporary bootstrap module should remove before assertions"),
+            }
+
+            let (first, second, actual_owner, owner_version, calls) =
+                actual.expect("both actual production synthetic-code requests should succeed");
+            assert_eq!(
+                first, second,
+                "the existing prepared code must remain shared"
+            );
+            assert_eq!(calls, vec![template.capture_names().to_vec()]);
+            assert_eq!(
+                actual_owner,
+                owner_type.as_ptr() as usize,
+                "the actual synthetic-code cache must guard the exact canonical indexed module type"
+            );
+            assert_ne!(
+                owner_version, 0,
+                "the cached canonical module owner must retain a live nonzero type version"
+            );
+
+            let direct_refcount = unsafe { ffi::Py_REFCNT(factory.as_ptr()) };
+            let direct = synthetic_runtime_code_factory(py, &runtime, &template)
+                .expect("the canonical indexed runtime should use its prepared factory");
+            assert_eq!(direct.as_ptr(), factory.as_ptr());
+            assert_eq!(
+                unsafe { ffi::Py_REFCNT(factory.as_ptr()) },
+                direct_refcount + 1,
+                "the borrowed indexed dictionary value must become one owned lookup result"
+            );
+            drop(direct);
+            assert_eq!(unsafe { ffi::Py_REFCNT(factory.as_ptr()) }, direct_refcount);
+
+            let replacement = namespace
+                .get_item("replacement_factory")
+                .expect("replacement factory lookup should succeed")
+                .expect("replacement factory should exist");
+            let dict = unsafe { &*indexed_dict.as_ptr().cast::<ffi::PyDictObject>() };
+            let values = dict.ma_values.cast::<RawPyDictIndexedValuesForTest>();
+            assert!(!values.is_null());
+            let factory_index = unsafe {
+                crate::_PyDict_IndexedKeyIndex(
+                    indexed_dict.as_ptr(),
+                    lookup_keys.code_factory.bind(py).as_ptr(),
+                )
+            };
+            assert!(factory_index >= 0);
+            let factory_slot = unsafe {
+                (&raw mut (*values).values)
+                    .cast::<*mut ffi::PyObject>()
+                    .add(factory_index as usize)
+            };
+            assert_eq!(unsafe { *factory_slot }, factory.as_ptr());
+            let original_used = dict.ma_used;
+            unsafe {
+                ffi::Py_INCREF(replacement.as_ptr());
+                *factory_slot = replacement.as_ptr();
+                ffi::Py_DECREF(factory.as_ptr());
+            }
+            let live_replacement = synthetic_runtime_code_factory(py, &runtime, &template)
+                .expect("a watcher-free indexed value replacement must remain observable");
+            let replacement_ptr = live_replacement.as_ptr();
+            drop(live_replacement);
+            unsafe {
+                ffi::Py_INCREF(factory.as_ptr());
+                *factory_slot = factory.as_ptr();
+                ffi::Py_DECREF(replacement.as_ptr());
+            }
+            assert_eq!(replacement_ptr, replacement.as_ptr());
+            assert_eq!(dict.ma_used, original_used);
+            assert_eq!(unsafe { (*owner).tp_version_tag }, owner_version);
+
+            let missing_hook = namespace
+                .get_item("missing_getattr")
+                .expect("missing attribute hook lookup should succeed")
+                .expect("missing attribute hook should exist");
+            runtime
+                .setattr("__getattr__", &missing_hook)
+                .expect("the actual indexed runtime should install its module-level hook");
+            runtime
+                .delattr("code_with_freevars")
+                .expect("the indexed runtime should delete its factory value");
+            let missing = synthetic_runtime_code_factory(py, &runtime, &template);
+            runtime
+                .setattr("code_with_freevars", &factory)
+                .expect("the canonical runtime factory should restore");
+            runtime
+                .delattr("__getattr__")
+                .expect("the module-level fallback hook should restore");
+            assert_eq!(
+                missing
+                    .expect("missing indexed values must use module __getattr__")
+                    .as_ptr(),
+                replacement.as_ptr()
+            );
+            assert_eq!(
+                namespace
+                    .get_item("missing_name_identities")
+                    .expect("missing-name observations lookup should succeed")
+                    .expect("missing-name observations should exist")
+                    .extract::<Vec<bool>>()
+                    .expect("missing-name observations should extract"),
+                vec![false],
+                "module __getattr__ must receive the original fresh Python attribute name"
+            );
+
+            let custom_type = namespace
+                .get_item("ObservedModule")
+                .expect("custom module subclass lookup should succeed")
+                .expect("custom module subclass should exist");
+            let custom_runtime = custom_type
+                .call1(("custom_runtime_attribute_fixture",))
+                .and_then(|module| module.cast_into::<PyModule>().map_err(Into::into))
+                .expect("custom module subclass fixture should instantiate");
+            custom_runtime
+                .setattr("code_with_freevars", &factory)
+                .expect("custom module subclass should accept its factory");
+            assert_eq!(
+                synthetic_runtime_code_factory(py, &custom_runtime, &template)
+                    .expect("user-created module subclasses must keep ordinary getattr")
+                    .as_ptr(),
+                factory.as_ptr()
+            );
+            assert_eq!(
+                namespace
+                    .get_item("subclass_name_identities")
+                    .expect("subclass-name observations lookup should succeed")
+                    .expect("subclass-name observations should exist")
+                    .extract::<Vec<bool>>()
+                    .expect("subclass-name observations should extract"),
+                vec![false],
+                "a custom module __getattribute__ must receive its original fresh name"
+            );
+
+            let collision = namespace
+                .get_item("CollisionKey")
+                .expect("collision-key class lookup should succeed")
+                .expect("collision-key class should exist")
+                .call0()
+                .expect("collision-key instance should allocate");
+            let general_dict = PyDict::new(py);
+            general_dict
+                .set_item(&collision, py.None())
+                .expect("the adversarial non-Unicode collision should force a GENERAL dict");
+            general_dict
+                .call_method1("update", (&indexed_dict,))
+                .expect("the GENERAL module dictionary should retain all current values");
+            namespace
+                .get_item("collision_identities")
+                .expect("collision observations lookup should succeed")
+                .expect("collision observations should exist")
+                .call_method0("clear")
+                .expect("collision setup observations should clear");
+            let general_keys = unsafe {
+                (*general_dict.as_ptr().cast::<ffi::PyDictObject>())
+                    .ma_keys
+                    .cast::<RawPyDictKeysPrefix>()
+            };
+            assert_eq!(unsafe { (*general_keys).dk_kind }, 0);
+            unsafe {
+                ffi::Py_INCREF(general_dict.as_ptr());
+                *dict_slot = general_dict.as_ptr();
+                ffi::Py_DECREF(indexed_dict.as_ptr());
+            }
+            let general = synthetic_runtime_code_factory(py, &runtime, &template);
+            collision
+                .setattr("raise_error", true)
+                .expect("the collision key should enable its raising equality hook");
+            let general_error = synthetic_runtime_code_factory(py, &runtime, &template);
+            unsafe {
+                ffi::Py_INCREF(indexed_dict.as_ptr());
+                *dict_slot = indexed_dict.as_ptr();
+                ffi::Py_DECREF(general_dict.as_ptr());
+            }
+            assert_eq!(
+                general
+                    .expect("GENERAL dictionaries must retain the original module lookup")
+                    .as_ptr(),
+                factory.as_ptr()
+            );
+            assert!(
+                general_error
+                    .expect_err("module attribute lookup must propagate a raising equality hook")
+                    .to_string()
+                    .contains("runtime module attribute collision")
+            );
+            assert_eq!(
+                namespace
+                    .get_item("collision_identities")
+                    .expect("collision observations lookup should succeed")
+                    .expect("collision observations should exist")
+                    .extract::<Vec<bool>>()
+                    .expect("collision observations should extract"),
+                vec![false, false],
+                "GENERAL module dictionaries must keep both original fresh attribute names"
+            );
+
+            let property_descriptor = py
+                .import("builtins")
+                .and_then(|builtins| builtins.getattr("property"))
+                .and_then(|property| {
+                    property.call1((namespace
+                        .get_item("observed_property")?
+                        .expect("property callback should exist"),))
+                })
+                .expect("the canonical heap-type property should allocate");
+            owner_type
+                .bind(py)
+                .setattr("code_with_freevars", &property_descriptor)
+                .expect("the mutable canonical heap type should accept its data descriptor");
+            let invalidated_version = unsafe { (*owner).tp_version_tag };
+            let property_result = synthetic_runtime_code_factory(py, &runtime, &template);
+            owner_type
+                .bind(py)
+                .delattr("code_with_freevars")
+                .expect("the GLOBAL canonical heap type must restore before assertions");
+            assert_ne!(invalidated_version, owner_version);
+            assert_eq!(
+                property_result
+                    .expect("a canonical heap-type data descriptor must execute")
+                    .as_ptr(),
+                replacement.as_ptr()
+            );
+            assert_eq!(
+                namespace
+                    .get_item("property_events")
+                    .expect("property observations lookup should succeed")
+                    .expect("property observations should exist")
+                    .extract::<Vec<String>>()
+                    .expect("property observations should extract"),
+                vec!["property"]
+            );
+
+            let custom_getattribute = namespace
+                .get_item("observed_getattribute")
+                .expect("canonical heap-type hook lookup should succeed")
+                .expect("canonical heap-type hook should exist");
+            owner_type
+                .bind(py)
+                .setattr("__getattribute__", &custom_getattribute)
+                .expect("the mutable canonical heap type should accept __getattribute__");
+            let class_result = synthetic_runtime_code_factory(py, &runtime, &template);
+            owner_type
+                .bind(py)
+                .delattr("__getattribute__")
+                .expect("the GLOBAL canonical heap type must restore before assertions");
+            assert_eq!(
+                class_result
+                    .expect("a canonical heap-type __getattribute__ must execute")
+                    .as_ptr(),
+                factory.as_ptr()
+            );
+            assert_eq!(
+                namespace
+                    .get_item("class_name_identities")
+                    .expect("heap-type name observations lookup should succeed")
+                    .expect("heap-type name observations should exist")
+                    .extract::<Vec<bool>>()
+                    .expect("heap-type name observations should extract"),
+                vec![false],
+                "a mutated canonical __getattribute__ must receive its fresh original name"
+            );
+        });
+    }
 
     #[test]
     fn runtime_module_lookup_reuses_interned_template_keys_without_retaining_modules() {

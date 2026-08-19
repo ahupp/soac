@@ -1679,3 +1679,12 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 - eight-workload stock score `0.602845x` versus prior `0.578205x`;
   previous-SOAC improvement `1.02674x`. Repeated `comprehensions`
   improves `1.035x`; generated native code remains exactly `23,293,040 B`.
+
+## 2026-08-19 - Guard indexed runtime factory lookups
+
+- jj change id: `zwkrytkq`
+- summary: read live indexed runtime-factory slots under exact module and
+  mutable-type guards while retaining observable attribute fallbacks.
+- eight-workload stock score declines `0.602845x` to `0.588346x`;
+  previous-SOAC ratio `0.996949x`. Repeated `comprehensions` improves
+  `1.053x` and `chaos` `1.048x`; native code remains `23,293,040 B`.

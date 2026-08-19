@@ -970,6 +970,62 @@ across 90 / 90 isolated batches**, with **567 JIT**, **212 optimizer**,
 and the full test phase **147.071 seconds**. The full-suite **1.10x stock**
 target remains unmet.
 
+### Guarded Indexed Runtime Factory Lookup
+
+Synthetic-code instantiation can reuse its existing `PreparedSyntheticCode`
+and interned factory key after the original factory lookup, audit, and
+reentry behavior complete. The actual runtime module is a mutable heap
+`_soac_ext.IndexedModuleType`, not exact `PyModule_Type`. Its cached proof
+requires the exact canonical module type, unchanged nonzero type version,
+direct immutable `PyModule_Type` base, inherited module getter, and no
+factory-name descriptor in the heap owner's own class dictionary. Static
+base-type `tp_dict` cannot be used for this proof because pinned CPython
+stores static builtin dictionaries outside those type objects.
+
+Every invocation revalidates module identity, exact owner/type version,
+getter, and current exact non-GENERAL dictionary. For the runtime's custom
+indexed **`dk_kind == 3`** dictionary, an existing present live slot and
+interned key permit a direct borrowed read followed by the required
+`INCREF`. Missing keys, GENERAL dictionaries, custom module subclasses,
+module `__getattr__`, class properties or `__getattribute__`, type-version
+changes, factory/module replacement, and watcher-free raw slot mutation
+retain the original fresh-name `dp.getattr(...)` fallback and propagated
+exceptions. No public API, global state, runtime helper, or IR change is
+added. All **80 fixed-eight Apply workers** preserve exactly
+**23,293,040 native bytes / 1,533,550 machine blocks** and
+**2,866 typed blocks / 204 functions**.
+
+A genuine actual-production regression turns RED-to-GREEN on a lowered
+comprehension, canonical heap module, custom indexed dictionary, real
+cached owner/nonzero version, and single factory invocation. Its
+adversarial controls prove raw-slot replacement with balanced references,
+fresh-name module/subclass hooks, GENERAL-key collision identity and
+propagated errors, and mutable canonical heap-class property/getter
+invalidation. Complete JIT library and all test targets each pass
+**568 / 568**, broad transformed compatibility passes **33 / 33 in 34.20
+seconds**, and scoped formatting/all-target checks pass. Normal fixed-eight
+stock score declines **0.6028454470x -> 0.5883463026x**, with official
+previous-SOAC geometry **0.9969491582x**; the apparent float regression
+cannot execute this optimization. A matched three-round comparison instead
+finds significant comprehensions improvement
+**1.0528748x [1.022367, 1.074919]** and chaos improvement
+**1.0482367x [1.026554, 1.065812]**, with delta/richards paired-neutral
+and subset robust geometry **1.0403375x / 1.0307875x stock-adjusted**.
+
+Matched zero-loss comprehensions profiles contain **707 -> 618 samples**;
+synthetic-code factory ancestry decreases **3.2516% -> 1.7809%**, while
+fresh Unicode-name allocation **1.415% -> 0%** and module getter ancestry
+**1.1306% -> 0%** disappear. Descendant shares overlap their parent and
+are not additive; changing GC share **17.97% -> 14.40%** confounds
+diagnostic replay. The retained optimization passes the authoritative full
+`just test-all` gate with **1,227 Python nodeids / 90 isolated batches /
+8 workers / 0 failed**, plus **568 JIT**, **212 optimizer**, **54
+typed-IR**, **371 lowering**, and **8 PyO3** Rust tests; see
+`work/logs/guarded-indexed-runtime-factory-test-all.log`. Cargo takes
+**61.431 seconds**, pytest **76.810 seconds inner / 76.825 seconds
+outer**, and the complete test phase **138.270 seconds**. The full-suite
+**1.10x stock** target remains unmet.
+
 ### Interned Trusted Runtime Lookup Keys
 
 An existing source-backed function-instantiation template may lazily own
