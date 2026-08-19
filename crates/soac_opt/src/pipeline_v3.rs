@@ -517,6 +517,13 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             owner_field_sites.as_slice(),
         );
         function.late_bound_owner_fields.extend(scalar_fields);
+        let nonself_fields = late_bound_split_owner_nonself_field_plans(
+            function,
+            &hot_fields,
+            owner_field_sites.as_slice(),
+            module_identity.module_name.as_str(),
+        );
+        function.late_bound_owner_fields.extend(nonself_fields);
     }
     validate_module_plan_v3_against_lowered_module(&plan, lowered_module)
         .map_err(ExactIntBranchV3Error::Emit)?;
@@ -586,6 +593,72 @@ fn late_bound_split_owner_scalar_field_plans(
     }
 
     selected
+}
+
+fn late_bound_split_owner_nonself_field_plans(
+    function: &FunctionOptimizationPlanV3,
+    hot_fields: &HashMap<InstrId, u64>,
+    owner_field_sites: &[(RuntimeFunctionId, LateBoundOwnerFieldSpecializationPlan)],
+    module_name: &str,
+) -> Vec<LateBoundOwnerFieldSpecializationPlan> {
+    const MAX_NONSELF_FIELDS_PER_FUNCTION: usize = 8;
+
+    let mut layouts_by_source = HashMap::new();
+    for field in &function.indexed_fields {
+        *layouts_by_source
+            .entry((field.source, field.access))
+            .or_insert(0_usize) += 1;
+    }
+    let selected_sources = function
+        .late_bound_owner_fields
+        .iter()
+        .map(|plan| plan.source)
+        .collect::<HashSet<_>>();
+    let mut candidates = Vec::new();
+
+    for field in &function.indexed_fields {
+        let hot_count = hot_fields.get(&field.source).copied().unwrap_or_default();
+        if hot_count < 8
+            || selected_sources.contains(&field.source)
+            || field.owner_type.module_name != module_name
+            || layouts_by_source.get(&(field.source, field.access)) != Some(&1)
+        {
+            continue;
+        }
+        let Some(anchor) = owner_field_sites
+            .iter()
+            .map(|(_, site)| site)
+            .filter(|site| {
+                site.owner_type == field.owner_type
+                    && site.attr_name == field.attr_name
+                    && matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+            })
+            .min_by_key(|site| site.cell_index)
+        else {
+            continue;
+        };
+
+        candidates.push((
+            hot_count,
+            LateBoundOwnerFieldSpecializationPlan {
+                source: field.source,
+                access: field.access,
+                owner_type: field.owner_type.clone(),
+                attr_name: field.attr_name.clone(),
+                storage: LateBoundOwnerFieldStorage::SplitDict {
+                    expected_index: field.expected_index,
+                },
+                cell_index: anchor.cell_index,
+                reason: "profiled unique-owner field reuses an existing split-field late-binding guard cell"
+                    .to_string(),
+            },
+        ));
+    }
+
+    candidates
+        .sort_by_key(|(hot_count, plan)| (std::cmp::Reverse(*hot_count), plan.source, plan.access));
+    candidates.truncate(MAX_NONSELF_FIELDS_PER_FUNCTION);
+    candidates.into_iter().map(|(_, plan)| plan).collect()
 }
 
 fn function_uses_generator_resume_state(function: &BlockPyFunction<BlockPyModuleShape>) -> bool {
@@ -3195,6 +3268,342 @@ class SlottedChild(SlottedRoot):
             "unprofiled classes must not consume the bound and an existing profiled lexical owner must never be displaced"
         );
         assert!(plans.iter().all(|plan| plan.source == field_source));
+    }
+
+    #[test]
+    fn hot_nonself_split_fields_reuse_unique_owner_cells_with_bounded_sources() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+class Record:
+    def __init__(self, value):
+        self.padding = None
+        self.other = None
+        self.payload = value
+        self.external = value
+
+    def read_self(self):
+        return self.payload
+
+class Left:
+    def __init__(self, value):
+        self.shared = value
+
+class Right:
+    def __init__(self, value):
+        self.padding = None
+        self.shared = value
+
+class Slotted:
+    __slots__ = ("slotted",)
+
+    def __init__(self, value):
+        self.slotted = value
+
+def read_other(record):
+    return record.payload
+
+def write_other(record, value):
+    record.payload = value
+
+def cold_other(record):
+    return record.payload
+
+def ambiguous_other(record):
+    return record.shared
+
+def cross_module_other(record):
+    return record.external
+
+def slotted_other(record):
+    return record.slotted
+
+def unanchored_other(record):
+    return record.missing
+
+def capped_other(record):
+    return (
+        record.payload, record.payload, record.payload, record.payload,
+        record.payload, record.payload, record.payload, record.payload,
+        record.payload, record.payload,
+    )
+
+def scalar_other(record):
+    if record.payload < 10:
+        return 1
+    return 0
+"#,
+        )
+        .expect("non-self split-field fixture should lower")
+        .blockpy_module;
+        let owner_sites = late_bound_owner_field_site_catalog(&lowered, "pkg.mod");
+        let initial_catalog_size = owner_sites.len();
+        let anchor = owner_sites
+            .iter()
+            .map(|(_, site)| site)
+            .filter(|site| {
+                site.owner_type.qualname == "Record"
+                    && site.attr_name == "payload"
+                    && matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+            })
+            .min_by_key(|site| site.cell_index)
+            .expect("Record.payload should have an existing split-owner anchor");
+
+        struct FieldSources<'a> {
+            module: &'a BlockPyModule<BlockPyModuleShape>,
+            fields: Vec<(InstrId, IndexedFieldAccessKind, String)>,
+            comparisons: Vec<InstrId>,
+        }
+
+        impl Visit<InstrBlockPy> for FieldSources<'_> {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
+            where
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
+            {
+                match expr {
+                    InstrBlockPy::GetAttr(op) => {
+                        if let Some(attr) =
+                            codegen_constant_string_value_v3(self.module, op.attr.as_ref())
+                        {
+                            self.fields.push((
+                                op.semantic_instr_id(),
+                                IndexedFieldAccessKind::Load,
+                                attr.to_string(),
+                            ));
+                        }
+                    }
+                    InstrBlockPy::SetAttr(op) => {
+                        if let Some(attr) =
+                            codegen_constant_string_value_v3(self.module, op.attr.as_ref())
+                        {
+                            self.fields.push((
+                                op.semantic_instr_id(),
+                                IndexedFieldAccessKind::Store,
+                                attr.to_string(),
+                            ));
+                        }
+                    }
+                    InstrBlockPy::BinOp(op) if op.kind == BinOpKind::Lt => {
+                        self.comparisons.push(op.semantic_instr_id());
+                    }
+                    _ => {}
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut fields_by_function = HashMap::new();
+        let mut source_counts = HashMap::new();
+        for function in &lowered.callable_defs {
+            let name = function.names.qualname.as_str();
+            if !matches!(
+                name,
+                "Record.read_self"
+                    | "read_other"
+                    | "write_other"
+                    | "cold_other"
+                    | "ambiguous_other"
+                    | "cross_module_other"
+                    | "slotted_other"
+                    | "unanchored_other"
+                    | "capped_other"
+                    | "scalar_other"
+            ) {
+                continue;
+            }
+            let mut sources = FieldSources {
+                module: &lowered,
+                fields: Vec::new(),
+                comparisons: Vec::new(),
+            };
+            sources.visit_fn(function);
+            for (index, (source, access, _)) in sources.fields.iter().enumerate() {
+                let count = if name == "cold_other" {
+                    7
+                } else if name == "capped_other" {
+                    20 + index as u64
+                } else {
+                    32
+                };
+                let mut field = row("field_access", function.function_id, *source, count, None);
+                field.branch_values = vec![soac_core::profile::CounterDumpBranchValue {
+                    branch: match access {
+                        IndexedFieldAccessKind::Load => "generic_getattr".to_string(),
+                        IndexedFieldAccessKind::Store => "generic_setattr".to_string(),
+                    },
+                    value: count,
+                }];
+                rows.push(field);
+                if name == "capped_other" {
+                    source_counts.insert(*source, count);
+                }
+            }
+            for source in sources.comparisons {
+                rows.push(row(
+                    "operator_hot_shapes",
+                    function.function_id,
+                    source,
+                    32,
+                    Some(pack_binary_shape(ExactTypeTag::Int, ExactTypeTag::Int)),
+                ));
+            }
+            fields_by_function.insert(name.to_string(), sources.fields);
+        }
+
+        let owners = [
+            (44, "pkg.mod", "Record"),
+            (45, "pkg.mod", "Left"),
+            (46, "pkg.mod", "Right"),
+            (47, "pkg.mod", "Slotted"),
+            (48, "pkg.mod", "Missing"),
+            (49, "pkg.foreign", "External"),
+        ];
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows,
+            module_keys: Vec::new(),
+            type_table: owners
+                .iter()
+                .map(|(id, module_name, name)| CounterDumpTypeTableEntry {
+                    type_id: *id,
+                    key: CounterDumpTypeKey {
+                        module_name: (*module_name).to_string(),
+                        qualname: (*name).to_string(),
+                    },
+                })
+                .collect(),
+            type_keys: vec![
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 44,
+                    key: "payload".to_string(),
+                    index: 2,
+                },
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 45,
+                    key: "shared".to_string(),
+                    index: 0,
+                },
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 46,
+                    key: "shared".to_string(),
+                    index: 1,
+                },
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 47,
+                    key: "slotted".to_string(),
+                    index: 0,
+                },
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 48,
+                    key: "missing".to_string(),
+                    index: 0,
+                },
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 44,
+                    key: "external".to_string(),
+                    index: 3,
+                },
+                CounterDumpTypeKeyLayout {
+                    owner_type_id: 49,
+                    key: "external".to_string(),
+                    index: 0,
+                },
+            ],
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+
+        let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+            &AlternativeCatalog::default_v3(),
+            module_identity(),
+            &lowered,
+            &evidence_store,
+        )
+        .expect("hot non-self split-field fixture should plan and emit");
+        let planned = |name: &str| {
+            artifacts
+                .plan
+                .functions
+                .iter()
+                .find(|function| function.function.debug_name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing function plan for {name}"))
+        };
+
+        for (name, access) in [
+            ("read_other", IndexedFieldAccessKind::Load),
+            ("write_other", IndexedFieldAccessKind::Store),
+        ] {
+            let source = fields_by_function[name][0].0;
+            let selected = planned(name)
+                .late_bound_owner_fields
+                .iter()
+                .find(|plan| plan.source == source)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "hot non-self {access:?} at {source} should reuse existing Record.payload cell"
+                    )
+                });
+            assert_eq!(selected.access, access);
+            assert_eq!(selected.owner_type, anchor.owner_type);
+            assert_eq!(selected.attr_name, "payload");
+            assert_eq!(selected.cell_index, anchor.cell_index);
+            assert_eq!(
+                selected.storage,
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 2 },
+            );
+        }
+
+        for name in [
+            "cold_other",
+            "ambiguous_other",
+            "cross_module_other",
+            "slotted_other",
+            "unanchored_other",
+        ] {
+            assert!(
+                planned(name).late_bound_owner_fields.is_empty(),
+                "{name} must retain generic attribute access"
+            );
+        }
+
+        let scalar = &planned("scalar_other").late_bound_owner_fields;
+        assert_eq!(scalar.len(), 1);
+        assert!(scalar[0].reason.contains("scalar region"));
+        assert!(
+            planned("Record.read_self")
+                .late_bound_owner_fields
+                .iter()
+                .any(|plan| plan.attr_name == "payload"),
+            "preexisting lexical-owner selection must remain intact"
+        );
+
+        let capped = &planned("capped_other").late_bound_owner_fields;
+        assert_eq!(capped.len(), 8);
+        let mut expected = fields_by_function["capped_other"]
+            .iter()
+            .map(|(source, access, _)| (*source, *access))
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|(source, access)| {
+            (std::cmp::Reverse(source_counts[source]), *source, *access)
+        });
+        expected.truncate(8);
+        assert_eq!(
+            capped
+                .iter()
+                .map(|plan| (plan.source, plan.access))
+                .collect::<Vec<_>>(),
+            expected,
+            "only the deterministically ordered eight hottest non-self sites should be selected"
+        );
+        assert_eq!(
+            late_bound_owner_field_site_catalog(&lowered, "pkg.mod").len(),
+            initial_catalog_size,
+            "general non-self selection must reuse existing owner cells"
+        );
     }
 
     #[test]

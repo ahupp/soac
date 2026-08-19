@@ -1642,3 +1642,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   previous-SOAC improvement `1.05714x`, targeted robust `1.05567x`.
   `deltablue` improves `3.750 ms` to `3.529 ms` and `richards` `33.959 ms`
   to `31.815 ms`; generated native code remains unchanged.
+
+## 2026-08-19 - Specialize hot non-self instance fields
+
+- jj change id: `mztqqkor`
+- summary: reuse existing exact-owner constructor cells for hot non-self
+  loads and stores.
+- eight-workload stock score `0.559460x` versus prior `0.548217x`;
+  previous-SOAC robust improvement `1.003x`, three-round targeted `1.037x`.
+  `deltablue` improves `1.057x` and `richards` `1.072x`; `comprehensions`
+  regresses `3.34%` and generated native code grows `2.79%`.

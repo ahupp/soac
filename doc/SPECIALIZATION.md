@@ -676,6 +676,75 @@ seconds**, inner / outer pytest **93.990 / 94.003 seconds**, and the full
 test phase **166.374 seconds**; the existing counter-dump batch takes
 **93.06 seconds**. The full-suite stock **1.10x** objective remains unmet.
 
+### Hot Non-Self Instance Fields
+
+Existing same-module `SplitDict` constructor cells can also specialize hot
+ordinary receiver fields outside a method's first `self` parameter.
+Existing Profile `generic_getattr` / getter evidence must record at least
+**eight observations**, and the field's global profile must identify
+**exactly one concrete same-module owner**. Because attribute-owner
+observations are not source-specific, a second profiled owner—including a
+foreign-module owner—rejects the site rather than guessing which owner a
+particular source used.
+
+The optimizer reuses the minimum existing matching constructor-cell index
+for the exact owner, attribute, `SplitDict` storage index, original
+instruction source, and load/store access kind. Existing scalar, `self`,
+and polymorphic inherited decisions run first and retain precedence. At
+most **eight additional non-self fields per function** are selected in
+deterministic hottest-first order. No new owner cell, publication path,
+runtime helper, public API, or global state is introduced.
+
+Each selected access mechanically reuses the existing exact weak-owner,
+current nonzero type-version, safe hook/MRO/descriptor, shared-key identity,
+inline capacity, and field-index/value guards. Receiver evaluation and
+ordinary generic fallback remain singular and unchanged. Ambiguous owners,
+cross-module ownership, missing anchors, cold fields, slots, deleted or
+materialized/promoted dictionaries, class replacement, subclass callbacks,
+descriptors, and reentrant finalizers remain guarded or generic as before.
+Loads and stores through top-level locals, unrelated methods, compound
+receivers, and nested eager comprehensions are admitted only with the same
+validated exact owner and existing cell.
+
+A genuine structured production-path regression turns RED-to-GREEN,
+covering exact source/index/access, unique-owner minimum-cell reuse,
+cross-module ambiguity, the eight-entry cap, and existing scalar/self
+precedence. The independent transformed Profile→Verify→Apply integration
+also turns **1 failed / 4.43 seconds → 1 passed / 4.50 seconds**. Full
+optimizer and JIT libraries pass **211 / 211** and **563 / 563**;
+transformed compatibility guardrails pass **26 / 26 in 34.30 seconds**;
+combined optimizer/JIT test-target checking and scoped optimizer formatting
+check pass. Production changes exactly one existing optimizer file.
+Normally sampled fixed-eight paired stock score improves
+**0.5482172650503208x → 0.5594598880789836x**; previous-SOAC arithmetic
+improvement is **1.0148678728309706x**, robust **1.00314x**, or
+**1.01321x** stock-adjusted. Matched 60-versus-60 three-round robust subset
+improvement is **1.03730284x**, or **1.04940010x** stock-adjusted: `chaos`
+**1.056477x (95% 1.02991–1.08743x)**, `deltablue`
+**1.057278x (1.01003–1.11517x)**, and `richards`
+**1.072304x (1.03668–1.12246x)**. There is also a reproducible
+`comprehensions` regression **0.966618x (0.94899–0.99361x)** in every
+round, approximately **3.34%**; its cause is unproven. Generated native
+code grows **24,353,560 → 25,033,800 bytes (+2.7932%)**; existing
+virtualization is preserved.
+
+Matched zero-loss `deltablue` profiles contain **365 → 354 samples** and
+reduce generic lookup ancestry **17.534% / 4.658% → 9.603% / 2.260%**
+(inclusive / self); matched `richards` profiles contain **526 → 469
+samples** and reduce generic ancestry **18.632% / 6.466% → 15.989% /
+3.839%**. Nested shares overlap and lazy compilation remains present. The
+available `comprehensions` profile compares an older direct-generator
+revision rather than the exact parent, and different compile/GC shares make
+its faster diagnostic replay unsuitable for explaining or dismissing the
+actual regression. The optimization is **retained**, and the authoritative
+full `just test-all` gate passes **1,222 Python nodeids across 89 / 89
+isolated file batches and eight workers**, plus JIT **563**, optimizer
+**211**, typed IR **54**, lowering **371**, and PyO3 **8**; see
+`work/logs/hot-nonself-fields-test-all.log`. Cargo tests take **66.743
+seconds**, inner / outer pytest **94.592 / 94.607 seconds**, and the full
+test phase **161.366 seconds**; the known counter-dump batch takes
+**93.80 seconds**. The full-suite stock **1.10x** goal remains unmet.
+
 ### Late-Bound Guarded Scalar Regions
 
 The eager owner-field change alone does not recover selected exact-int scalar
