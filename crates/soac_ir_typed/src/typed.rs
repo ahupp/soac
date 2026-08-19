@@ -1202,6 +1202,7 @@ pub enum TypedAttrAccessPlan {
         guards: Vec<TypedIndexedFieldGuard>,
     },
     LateBoundOwnerField(TypedLateBoundOwnerFieldPlan),
+    PolymorphicLateBoundOwnerFields(Vec<TypedLateBoundOwnerFieldPlan>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

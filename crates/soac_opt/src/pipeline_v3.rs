@@ -319,6 +319,13 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     let mut exact_float_expressions_by_function = Vec::new();
     let owner_field_sites =
         late_bound_owner_field_site_catalog(lowered_module, module_identity.module_name.as_str());
+    let split_owner_names = owner_field_sites
+        .iter()
+        .filter(|(_, site)| matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. }))
+        .map(|(_, site)| site.owner_type.qualname.clone())
+        .collect::<HashSet<_>>();
+    let inherited_split_owners =
+        literal_same_module_class_ancestors(lowered_module, &split_owner_names);
     let mut late_bound_owner_fields_by_function = Vec::new();
     let mut hot_field_accesses_by_function = Vec::new();
     for function in &lowered_module.callable_defs {
@@ -382,36 +389,92 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
         exact_float_expressions_by_function.push(
             exact_float_expression_plans_from_profile_evidence_v3(function, &evidence),
         );
-        late_bound_owner_fields_by_function.push(
-            owner_field_sites
+        let lexical_owner = function
+            .names
+            .qualname
+            .rsplit_once('.')
+            .map(|(owner, _)| owner);
+        let mut selected_owner_fields = Vec::new();
+        for (_, site) in owner_field_sites.iter().filter(|(function_id, site)| {
+            *function_id == function.function_id
+                && lexical_owner == Some(site.owner_type.qualname.as_str())
+                && evidence
+                    .hot_field_accesses
+                    .get(&site.source)
+                    .copied()
+                    .unwrap_or_default()
+                    >= 8
+        }) {
+            if !matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. }) {
+                selected_owner_fields.push(site.clone());
+                continue;
+            }
+
+            let Some(layouts) =
+                evidence_store.field_index_specializations_for_attr(site.attr_name.as_str())
+            else {
+                continue;
+            };
+            let mut owners = owner_field_sites
                 .iter()
-                .filter(|(function_id, site)| {
-                    *function_id == function.function_id
-                        && evidence
-                            .hot_field_accesses
-                            .get(&site.source)
-                            .copied()
-                            .unwrap_or_default()
-                            >= 8
+                .filter(|(_, anchor)| {
+                    anchor.attr_name == site.attr_name
+                        && matches!(anchor.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+                        && (anchor.owner_type == site.owner_type
+                            || inherited_split_owners
+                                .get(anchor.owner_type.qualname.as_str())
+                                .is_some_and(|ancestors| {
+                                    ancestors.contains(site.owner_type.qualname.as_str())
+                                }))
                 })
-                .filter_map(|(_, site)| {
-                    let mut site = site.clone();
-                    if matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. }) {
-                        let layout = evidence_store
-                            .field_index_specializations_for_attr(site.attr_name.as_str())?
-                            .iter()
-                            .find(|layout| {
-                                layout.owner_type.module_name == site.owner_type.module_name
-                                    && layout.owner_type.qualname == site.owner_type.qualname
-                            })?;
-                        site.storage = LateBoundOwnerFieldStorage::SplitDict {
-                            expected_index: layout.expected_index,
-                        };
-                    }
-                    Some(site)
+                .collect::<Vec<_>>();
+            owners.sort_by_key(|(_, anchor)| {
+                (
+                    anchor.owner_type == site.owner_type,
+                    anchor.owner_type.qualname.as_str(),
+                    anchor.cell_index,
+                )
+            });
+            owners.dedup_by(|left, right| left.1.owner_type == right.1.owner_type);
+            owners.retain(|(_, anchor)| {
+                layouts.iter().any(|layout| {
+                    layout.owner_type.module_name == anchor.owner_type.module_name
+                        && layout.owner_type.qualname == anchor.owner_type.qualname
                 })
-                .collect::<Vec<_>>(),
-        );
+            });
+            if owners.len() > 8 {
+                let lexical = owners
+                    .iter()
+                    .position(|(_, anchor)| anchor.owner_type == site.owner_type)
+                    .map(|index| owners.remove(index));
+                owners.truncate(if lexical.is_some() { 7 } else { 8 });
+                if let Some(lexical) = lexical {
+                    owners.push(lexical);
+                }
+            }
+
+            for (_, anchor) in owners {
+                let Some(layout) = layouts.iter().find(|layout| {
+                    layout.owner_type.module_name == anchor.owner_type.module_name
+                        && layout.owner_type.qualname == anchor.owner_type.qualname
+                }) else {
+                    continue;
+                };
+                let mut selected = site.clone();
+                selected.owner_type = anchor.owner_type.clone();
+                selected.storage = LateBoundOwnerFieldStorage::SplitDict {
+                    expected_index: layout.expected_index,
+                };
+                selected.cell_index = anchor.cell_index;
+                if selected.owner_type != site.owner_type {
+                    selected.reason =
+                        "profiled inherited receiver uses an exact concrete split-field owner"
+                            .to_string();
+                }
+                selected_owner_fields.push(selected);
+            }
+        }
+        late_bound_owner_fields_by_function.push(selected_owner_fields);
         hot_field_accesses_by_function.push(evidence.hot_field_accesses.clone());
         functions.push(FunctionPlanRequest {
             function: function_plan_identity_v3(function),
@@ -542,6 +605,88 @@ fn function_uses_generator_resume_state(function: &BlockPyFunction<BlockPyModule
     })
 }
 
+fn literal_same_module_class_ancestors(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    known_owners: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    struct Collector<'a> {
+        module: &'a BlockPyModule<BlockPyModuleShape>,
+        known_owners: &'a HashSet<String>,
+        parents: HashMap<String, Vec<String>>,
+        ambiguous: HashSet<String>,
+    }
+
+    impl Visit<InstrBlockPy> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
+        where
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
+        {
+            if let InstrBlockPy::Store(store) = expr
+                && self.known_owners.contains(store.name.id_str())
+                && let InstrBlockPy::Call(call) = store.value.as_ref()
+                && let InstrBlockPy::Load(helper) = call.func.as_ref()
+                && helper.name.id_str() == format!("_dp_define_class_{}", store.name.id_str())
+                && call.keywords.is_empty()
+                && call.args.len() == 4
+                && let CallArgPositional::Positional(InstrBlockPy::Tuple(bases)) = &call.args[2]
+                && let CallArgPositional::Positional(prepare) = &call.args[3]
+                && codegen_runtime_name_value_v3(self.module, prepare) == Some(RuntimeName::None)
+            {
+                let parents = bases
+                    .values
+                    .iter()
+                    .map(|base| {
+                        let InstrBlockPy::Load(base) = base else {
+                            return None;
+                        };
+                        self.known_owners
+                            .contains(base.name.id_str())
+                            .then(|| base.name.id_str().to_string())
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(parents) = parents {
+                    let owner = store.name.id_str().to_string();
+                    if self.parents.insert(owner.clone(), parents).is_some() {
+                        self.ambiguous.insert(owner);
+                    }
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module,
+        known_owners,
+        parents: HashMap::new(),
+        ambiguous: HashSet::new(),
+    };
+    for function in &module.callable_defs {
+        if function.scope.scope_kind == CallableScopeKind::Module {
+            collector.visit_fn(function);
+        }
+    }
+    for owner in collector.ambiguous {
+        collector.parents.remove(&owner);
+    }
+
+    let mut ancestry = HashMap::new();
+    for owner in collector.parents.keys() {
+        let mut ancestors = HashSet::new();
+        let mut pending = collector.parents.get(owner).cloned().unwrap_or_default();
+        while let Some(parent) = pending.pop() {
+            if parent == *owner || !ancestors.insert(parent.clone()) {
+                continue;
+            }
+            if let Some(next) = collector.parents.get(&parent) {
+                pending.extend(next.iter().cloned());
+            }
+        }
+        ancestry.insert(owner.clone(), ancestors);
+    }
+    ancestry
+}
+
 /// Deterministically enumerates structurally proven class-method field sites.
 ///
 /// The same immutable catalog is used when selecting profiled plans and when
@@ -662,6 +807,7 @@ pub fn late_bound_owner_field_site_catalog(
         .map(|function| (function.function_id, function))
         .collect::<HashMap<_, _>>();
     let mut owners_by_function = HashMap::new();
+    let mut owners_by_qualname = HashMap::new();
     for class_function in &module.callable_defs {
         if class_function.scope.scope_kind != CallableScopeKind::Class {
             continue;
@@ -699,6 +845,7 @@ pub fn late_bound_owner_field_site_catalog(
             Some(None) => continue,
             None => None,
         };
+        owners_by_qualname.insert(owner_qualname.clone(), declared_slots.clone());
         for (method_name, function_id) in collector.methods {
             let Some(function) = functions_by_id.get(&function_id) else {
                 continue;
@@ -812,14 +959,66 @@ pub fn late_bound_owner_field_site_catalog(
         collector.visit_fn(function);
         sites.extend(collector.sites);
     }
+    let split_owners = owners_by_qualname
+        .iter()
+        .filter(|(_, slots)| slots.is_none())
+        .map(|(owner, _)| owner.clone())
+        .collect::<HashSet<_>>();
+    let ancestry = literal_same_module_class_ancestors(module, &split_owners);
+    let written_fields = sites
+        .iter()
+        .filter(|(_, site)| {
+            site.access == IndexedFieldAccessKind::Store
+                && matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+        })
+        .map(|(_, site)| (site.owner_type.qualname.clone(), site.attr_name.clone()))
+        .collect::<HashSet<_>>();
+    let mut existing_anchors = sites
+        .iter()
+        .filter(|(_, site)| matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. }))
+        .map(|(_, site)| (site.owner_type.qualname.clone(), site.attr_name.clone()))
+        .collect::<HashSet<_>>();
+    let mut inherited = Vec::new();
+    let mut descendants = ancestry.keys().collect::<Vec<_>>();
+    descendants.sort_unstable();
+    for descendant in descendants {
+        let ancestors = &ancestry[descendant];
+        for (function_id, site) in &sites {
+            if !matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+                || !ancestors.contains(site.owner_type.qualname.as_str())
+                || !written_fields.iter().any(|(owner, attr)| {
+                    attr == &site.attr_name
+                        && (owner == descendant || ancestors.contains(owner.as_str()))
+                })
+                || !existing_anchors.insert((descendant.clone(), site.attr_name.clone()))
+            {
+                continue;
+            }
+            let mut anchor = site.clone();
+            anchor.owner_type.qualname = descendant.clone();
+            anchor.reason =
+                "literal same-module split descendant reuses one inherited owner-field cell"
+                    .to_string();
+            inherited.push((*function_id, anchor));
+        }
+    }
+    sites.extend(inherited);
     sites.sort_by_key(|(function_id, site)| {
         (
             function_id.local_function_id().as_u32(),
             site.source,
             site.access,
+            site.owner_type.qualname.clone(),
+            site.attr_name.clone(),
         )
     });
-    sites.dedup_by(|left, right| left.0 == right.0 && left.1.source == right.1.source);
+    sites.dedup_by(|left, right| {
+        left.0 == right.0
+            && left.1.source == right.1.source
+            && left.1.access == right.1.access
+            && left.1.owner_type == right.1.owner_type
+            && left.1.attr_name == right.1.attr_name
+    });
     for (index, (_, site)) in sites.iter_mut().enumerate() {
         site.cell_index = u32::try_from(index).expect("too many late-bound owner-field sites");
     }
@@ -2765,6 +2964,237 @@ def make_dynamic():
             }),
             "decorated, inherited, and dynamic owner bindings must not be selected: {actual:?}",
         );
+    }
+
+    #[test]
+    fn inherited_split_owner_catalog_reuses_one_anchor_per_concrete_owner_and_field() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+class Root:
+    def __init__(self, value):
+        self.direction = True
+        self.value = value
+
+    def read(self):
+        return self.value
+
+    def read_again(self):
+        return self.value
+
+    def write(self, value):
+        self.value = value
+
+class Left(Root):
+    pass
+
+class Right(Root):
+    def __init__(self, value):
+        self.padding = 0
+        Root.__init__(self, value)
+
+class Grandchild(Right):
+    pass
+
+class SlottedRoot:
+    __slots__ = ("value",)
+
+    def read(self):
+        return self.value
+
+class SlottedChild(SlottedRoot):
+    __slots__ = ()
+"#,
+        )
+        .expect("literal inherited split-owner fixture should lower")
+        .blockpy_module;
+
+        let catalog = late_bound_owner_field_site_catalog(&lowered, "pkg.mod");
+        let mut inherited_anchors = catalog
+            .iter()
+            .filter(|(_, plan)| {
+                matches!(
+                    plan.owner_type.qualname.as_str(),
+                    "Left" | "Right" | "Grandchild"
+                ) && matches!(plan.attr_name.as_str(), "value" | "direction")
+            })
+            .map(|(_, plan)| {
+                (
+                    plan.owner_type.qualname.as_str(),
+                    plan.attr_name.as_str(),
+                    plan.cell_index,
+                )
+            })
+            .collect::<Vec<_>>();
+        inherited_anchors.sort_unstable();
+        let expected = [
+            ("Grandchild", "direction"),
+            ("Grandchild", "value"),
+            ("Left", "direction"),
+            ("Left", "value"),
+            ("Right", "direction"),
+            ("Right", "value"),
+        ];
+        assert_eq!(
+            inherited_anchors
+                .iter()
+                .map(|(owner, attr, _)| (*owner, *attr))
+                .collect::<Vec<_>>(),
+            expected,
+            "every literal same-module split descendant should share one stable owner/field anchor across inherited reads and writes"
+        );
+        assert!(
+            catalog
+                .iter()
+                .enumerate()
+                .all(|(index, (_, plan))| plan.cell_index == index as u32),
+            "inherited anchors must preserve deterministic, dense catalog indices"
+        );
+        assert!(
+            catalog
+                .iter()
+                .all(|(_, plan)| plan.owner_type.qualname != "SlottedChild"),
+            "inherited object slots must remain outside split-owner specialization"
+        );
+    }
+
+    #[test]
+    fn inherited_split_owner_plans_cap_profiled_descendants_and_preserve_lexical_owner() {
+        let mut source = String::from(
+            "class Root:\n    def __init__(self, value):\n        self.value = value\n    def read(self):\n        return self.value\n\nclass AUnprofiled(Root):\n    pass\n",
+        );
+        for index in 0..10 {
+            source.push_str(&format!("\nclass Child{index:02}(Root):\n    pass\n"));
+        }
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+            .expect("bounded polymorphic owner fixture should lower")
+            .blockpy_module;
+        let reader = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "Root.read")
+            .expect("bounded polymorphic fixture should contain Root.read");
+
+        struct FieldSource(Option<InstrId>);
+
+        impl Visit<InstrBlockPy> for FieldSource {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
+            where
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
+            {
+                if let InstrBlockPy::GetAttr(getattr) = expr {
+                    self.0 = Some(getattr.semantic_instr_id());
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut field = FieldSource(None);
+        field.visit_fn(reader);
+        let field_source = field.0.expect("Root.read should access its receiver field");
+        let mut field_row = row("field_access", reader.function_id, field_source, 64, None);
+        field_row.branch_values = vec![soac_core::profile::CounterDumpBranchValue {
+            branch: "generic_getattr".to_string(),
+            value: 64,
+        }];
+
+        let mut owners = vec!["Root".to_string()];
+        owners.extend((0..10).map(|index| format!("Child{index:02}")));
+        let type_table = owners
+            .iter()
+            .enumerate()
+            .map(|(index, owner)| CounterDumpTypeTableEntry {
+                type_id: (index + 1) as u64,
+                key: CounterDumpTypeKey {
+                    module_name: "pkg.mod".to_string(),
+                    qualname: owner.clone(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let type_keys = owners
+            .iter()
+            .enumerate()
+            .map(|(index, _)| CounterDumpTypeKeyLayout {
+                owner_type_id: (index + 1) as u64,
+                key: "value".to_string(),
+                index: index as u32,
+            })
+            .collect::<Vec<_>>();
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: vec![field_row],
+            module_keys: Vec::new(),
+            type_keys,
+            type_table,
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+
+        let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+            &AlternativeCatalog::default_v3(),
+            module_identity(),
+            &lowered,
+            &evidence_store,
+        )
+        .expect("profiled polymorphic owner fixture should plan and emit");
+        let plans = &artifacts
+            .plan
+            .functions
+            .iter()
+            .find(|function| function.function.debug_name.as_deref() == Some("Root.read"))
+            .expect("Root.read should receive a function plan")
+            .late_bound_owner_fields;
+
+        assert_eq!(
+            plans.len(),
+            8,
+            "exact concrete owners must have a bounded guard chain"
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| (plan.owner_type.qualname.as_str(), plan.storage))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Child00",
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index: 1 }
+                ),
+                (
+                    "Child01",
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index: 2 }
+                ),
+                (
+                    "Child02",
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index: 3 }
+                ),
+                (
+                    "Child03",
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index: 4 }
+                ),
+                (
+                    "Child04",
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index: 5 }
+                ),
+                (
+                    "Child05",
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index: 6 }
+                ),
+                (
+                    "Child06",
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index: 7 }
+                ),
+                (
+                    "Root",
+                    LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 }
+                ),
+            ],
+            "unprofiled classes must not consume the bound and an existing profiled lexical owner must never be displaced"
+        );
+        assert!(plans.iter().all(|plan| plan.source == field_source));
     }
 
     #[test]

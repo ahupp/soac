@@ -1651,12 +1651,34 @@ fn validate_late_bound_owner_field_plans(
     errors: &mut Vec<String>,
 ) {
     let mut seen = HashSet::new();
+    let mut accesses_by_source = HashMap::new();
     for field in &function.late_bound_owner_fields {
-        if !seen.insert((field.source, field.access)) {
+        if !seen.insert((field.source, field.access, field.owner_type.clone())) {
             errors.push(format!(
-                "function {} has duplicate late-bound owner-field {:?} at {}",
-                function.function.function, field.access, field.source
+                "function {} has duplicate late-bound owner-field {:?} owner {}.{} at {}",
+                function.function.function,
+                field.access,
+                field.owner_type.module_name,
+                field.owner_type.qualname,
+                field.source
             ));
+        }
+        if let Some((attr_name, previous_storage)) = accesses_by_source.insert(
+            (field.source, field.access),
+            (&field.attr_name, field.storage),
+        ) {
+            if attr_name != &field.attr_name
+                || !matches!(
+                    previous_storage,
+                    LateBoundOwnerFieldStorage::SplitDict { .. }
+                )
+                || !matches!(field.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+            {
+                errors.push(format!(
+                    "function {} polymorphic late-bound owner-field {:?} at {} must share one split-dictionary attribute",
+                    function.function.function, field.access, field.source
+                ));
+            }
         }
         if field.owner_type.module_name.is_empty()
             || field.owner_type.qualname.is_empty()
@@ -3402,6 +3424,39 @@ mod tests {
         ]);
 
         validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn validates_distinct_exact_split_owners_at_one_inherited_field_source() {
+        let plan = module_with_late_bound_owner_fields(vec![
+            LateBoundOwnerFieldSpecializationPlan {
+                source: instr_id(7),
+                access: IndexedFieldAccessKind::Load,
+                owner_type: IndexedFieldOwnerType {
+                    module_name: "pkg.model".to_string(),
+                    qualname: "Left".to_string(),
+                },
+                attr_name: "value".to_string(),
+                storage: LateBoundOwnerFieldStorage::SplitDict { expected_index: 1 },
+                cell_index: 3,
+                reason: "profiled inherited split-field owner Left".to_string(),
+            },
+            LateBoundOwnerFieldSpecializationPlan {
+                source: instr_id(7),
+                access: IndexedFieldAccessKind::Load,
+                owner_type: IndexedFieldOwnerType {
+                    module_name: "pkg.model".to_string(),
+                    qualname: "Right".to_string(),
+                },
+                attr_name: "value".to_string(),
+                storage: LateBoundOwnerFieldStorage::SplitDict { expected_index: 4 },
+                cell_index: 8,
+                reason: "profiled inherited split-field owner Right".to_string(),
+            },
+        ]);
+
+        validate_module_plan_v3(&plan)
+            .expect("one inherited source may have independently guarded exact split owners");
     }
 
     #[test]

@@ -598,6 +598,84 @@ nodeids across 84 batches / 8 workers**, plus **553 JIT**, **53 typed-IR**,
 `work/logs/late-owner-fields-test-all.log`. The measured subset remains below
 stock CPython, and the full-pyperformance **1.10x** target remains unmet.
 
+### Polymorphic Inherited Class-Owned Fields
+
+An inherited method's lexical class does not determine the concrete
+receiver's split-dictionary layout. The optimizer therefore catalogs only
+literal, same-module, transitively inherited split-dictionary classes and
+self-written concrete-owner / attribute anchors. Existing Profile evidence
+must identify an exact concrete owner and its observed attribute index with
+at least **eight observations**; object slots, unknown/dynamic owners,
+cross-module provenance, and unsupported descriptors or hooks are excluded.
+Plans remain explicit and validated through the existing public
+`TypedAttrAccessPlan` enum, which adds the
+**`PolymorphicLateBoundOwnerFields`** variant.
+
+Polymorphic groups reuse deterministic owner-plus-attribute cells and admit
+at most **eight exact owners** per source. Actual owner-specific profiled
+layouts are filtered before capping; when the lexical owner is also
+profiled, it is explicitly reserved after at most **seven profiled
+descendants**. An unprofiled class cannot displace a real observed owner.
+The typed validator permits distinct exact owners for the same field source
+but rejects duplicate owners, mixed attributes/storage, and invalid cells.
+Polymorphic groups cannot be reused as exact-single-owner scalar guards.
+
+Inherited-owner publication scans the complete concrete receiver MRO for the
+original registered base function, including subclasses whose `__init__`
+overrides or delegates. It publishes existing descendant cells without
+expanding the global function-owner watcher/weakref registry: the declaring
+base is already registered and pinned CPython `PyType_Modified` recursively
+invalidates descendant type versions. Every guarded case still requires a
+live weak owner, exact receiver-type identity, unchanged nonzero owner type
+version, safe generic hooks/descriptors, and the correct live split-key
+table, interned attribute name, field index, inline capacity, and value
+presence. The receiver is evaluated once; misses take the complete original
+generic getter or setter and preserve source counters and reference counts.
+
+The genuine transformed Profile→Verify→Apply regression preserves **32
+existing lexical-owner hits** while converting **128 descendant fallbacks**
+into hits, for **160 indexed hits across five exact owners per field
+source**. It also proves two inherited Delta descendants with unequal
+indices, both reads and writes, property/hook/base/MRO mutation,
+deleted/promoted/growing dictionaries, finalizer ordering, unsupported
+slots, and existing scalar optimizations. Complete affected Rust libraries
+pass **54 typed-IR + 210 optimizer + 561 JIT = 825 / 825 tests**; full JIT
+test targets pass **561 / 561**, package-scoped formatting/checks pass, and
+grouped transformed guardrails pass **78 / 78 tests in 29.41 seconds**
+(**7 deselected across 10 files**).
+
+Normally sampled fixed-eight stock score improves **0.509970x → 0.520917x**,
+with robust previous-SOAC improvement **1.015700x**. Three affected/control
+rounds confirm `deltablue` median **4.171529 → 3.750207 ms (1.112346x)**,
+clustered 95% interval **1.097582–1.152915x**, and `richards` median
+**39.759100 → 33.958922 ms (1.170800x)**, interval
+**1.135034–1.219269x**; `chaos` / `comprehensions` controls are neutral.
+Robust subset improvement is **1.067058x**, or **1.071040x** after
+paired-stock adjustment. This benefit has a material code-size cost:
+generated native code grows **23,359,400 → 24,353,560 bytes (+4.256%)**,
+including **+7.835%** in `deltablue` and **+19.669%** in `richards`; typed
+coverage remains **3,069 blocks / 218 functions**.
+
+Matched zero-loss `deltablue` native profiles contain **434 baseline / 390
+candidate samples across 400 replay loops**. Inclusive `PyObject_GetAttr`
+falls **20.736% → 16.664%**, `GenericGetAttrWithDict` **14.288% → 9.999%**,
+and inherited generic input/output ancestry falls **2.766% / 0.922% →
+zero**, while `choose_method` falls **1.614% → 0.256%**. Matched `richards`
+profiles contain **599 baseline / 522 candidate samples across 70 loops**;
+`PyObject_GetAttr` falls **27.714% → 18.392%**,
+`GenericGetAttrWithDict` **23.707% → 16.857%**, and inherited generic
+holding/waiting ancestry **4.341% / 1.002% → zero**. Profile ancestry
+overlaps; cold compiler frames remain present and attached replay timings
+are diagnostic rather than headline benchmark results. The change is
+**retained** and the authoritative `just test-all` gate passes **1,221
+Python nodeids across 88 / 88 isolated file batches and eight workers**,
+plus workspace Rust JIT **561**, typed IR **54**, optimizer **210**,
+lowering **371**, and PyO3 **8**; see
+`work/logs/inherited-owner-test-all.log`. Cargo tests take **72.359
+seconds**, inner / outer pytest **93.990 / 94.003 seconds**, and the full
+test phase **166.374 seconds**; the existing counter-dump batch takes
+**93.06 seconds**. The full-suite stock **1.10x** objective remains unmet.
+
 ### Late-Bound Guarded Scalar Regions
 
 The eager owner-field change alone does not recover selected exact-int scalar

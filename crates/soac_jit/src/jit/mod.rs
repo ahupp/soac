@@ -10866,6 +10866,16 @@ fn typed_indexed_field_counter_ref(
         .or_else(|| local_counters.get(&instr_id).copied())
 }
 
+fn typed_late_bound_owner_access_plans(
+    access: &TypedAttrAccessPlan,
+) -> Option<&[TypedLateBoundOwnerFieldPlan]> {
+    match access {
+        TypedAttrAccessPlan::LateBoundOwnerField(plan) => Some(std::slice::from_ref(plan)),
+        TypedAttrAccessPlan::PolymorphicLateBoundOwnerFields(plans) => Some(plans.as_slice()),
+        TypedAttrAccessPlan::Generic | TypedAttrAccessPlan::IndexedField { .. } => None,
+    }
+}
+
 fn emit_late_bound_owner_guard(
     fb: &mut FunctionBuilder<'_>,
     receiver: ir::Value,
@@ -11044,16 +11054,27 @@ fn emit_late_bound_split_key_guard(
 fn emit_typed_late_bound_owner_getattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedGetAttr<InstrTyped>,
-    plan: &TypedLateBoundOwnerFieldPlan,
+    plans: &[TypedLateBoundOwnerFieldPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<SoacValue>, String> {
+    let Some(plan) = plans.first() else {
+        return Ok(None);
+    };
     if plan.counter_source.function_id.runtime_module_id()
         != emit_ctx.function_id.runtime_module_id()
     {
         return Ok(None);
+    }
+    if plans.iter().skip(1).any(|other| {
+        other.counter_source != plan.counter_source
+            || other.attr_name != plan.attr_name
+            || !matches!(other.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+            || !matches!(plan.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+    }) {
+        return Err("polymorphic late-bound getattr has incompatible owner guards".to_string());
     }
     let instr_id = op.semantic_instr_id();
     let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
@@ -11096,49 +11117,60 @@ fn emit_typed_late_bound_owner_getattr(
     fb.set_cold_block(fallback_block);
     let direct_block = fb.create_block();
     fb.append_block_param(direct_block, ptr_ty);
-    let (owner_type, cell) =
-        emit_late_bound_owner_guard(fb, receiver, plan, fallback_block, emit_ctx)?;
+    for (index, candidate) in plans.iter().enumerate() {
+        let next_owner = if index + 1 == plans.len() {
+            fallback_block
+        } else {
+            fb.create_block()
+        };
+        let (owner_type, cell) =
+            emit_late_bound_owner_guard(fb, receiver, candidate, next_owner, emit_ctx)?;
 
-    match plan.storage {
-        LateBoundOwnerFieldStorage::SplitDict { expected_index } => {
-            emit_late_bound_split_key_guard(
-                fb,
-                owner_type,
-                attr,
-                expected_index,
-                fallback_block,
-                emit_ctx,
-            )?;
-            emit_trusted_inline_values_field_probe(
-                fb,
-                receiver,
-                owner_type,
-                expected_index,
-                direct_block,
-                fallback_block,
-                emit_ctx,
-            )?;
+        match candidate.storage {
+            LateBoundOwnerFieldStorage::SplitDict { expected_index } => {
+                emit_late_bound_split_key_guard(
+                    fb,
+                    owner_type,
+                    attr,
+                    expected_index,
+                    fallback_block,
+                    emit_ctx,
+                )?;
+                emit_trusted_inline_values_field_probe(
+                    fb,
+                    receiver,
+                    owner_type,
+                    expected_index,
+                    direct_block,
+                    fallback_block,
+                    emit_ctx,
+                )?;
+            }
+            LateBoundOwnerFieldStorage::ObjectSlot => {
+                let offset = fb.ins().load(
+                    ptr_ty,
+                    ir::MemFlags::trusted(),
+                    cell,
+                    LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET,
+                );
+                let slot = fb.ins().iadd(receiver, offset);
+                let value = fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot, 0);
+                let null_ptr = fb.ins().iconst(ptr_ty, 0);
+                let present = fb
+                    .ins()
+                    .icmp(ir::condcodes::IntCC::NotEqual, value, null_ptr);
+                fb.ins().brif(
+                    present,
+                    direct_block,
+                    &[ir::BlockArg::Value(value)],
+                    fallback_block,
+                    &[],
+                );
+            }
         }
-        LateBoundOwnerFieldStorage::ObjectSlot => {
-            let offset = fb.ins().load(
-                ptr_ty,
-                ir::MemFlags::trusted(),
-                cell,
-                LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET,
-            );
-            let slot = fb.ins().iadd(receiver, offset);
-            let value = fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot, 0);
-            let null_ptr = fb.ins().iconst(ptr_ty, 0);
-            let present = fb
-                .ins()
-                .icmp(ir::condcodes::IntCC::NotEqual, value, null_ptr);
-            fb.ins().brif(
-                present,
-                direct_block,
-                &[ir::BlockArg::Value(value)],
-                fallback_block,
-                &[],
-            );
+
+        if index + 1 < plans.len() {
+            fb.switch_to_block(next_owner);
         }
     }
 
@@ -11184,17 +11216,28 @@ fn emit_typed_late_bound_owner_getattr(
 fn emit_typed_late_bound_owner_setattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedSetAttr<InstrTyped>,
-    plan: &TypedLateBoundOwnerFieldPlan,
+    plans: &[TypedLateBoundOwnerFieldPlan],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
+    let Some(plan) = plans.first() else {
+        return Ok(None);
+    };
     if plan.counter_source.function_id.runtime_module_id()
         != emit_ctx.function_id.runtime_module_id()
     {
         return Ok(None);
+    }
+    if plans.iter().skip(1).any(|other| {
+        other.counter_source != plan.counter_source
+            || other.attr_name != plan.attr_name
+            || !matches!(other.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+            || !matches!(plan.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+    }) {
+        return Err("polymorphic late-bound setattr has incompatible owner guards".to_string());
     }
     let result_needs_pyobject = match demand {
         ResultDemand::EffectOnly => false,
@@ -11258,65 +11301,76 @@ fn emit_typed_late_bound_owner_setattr(
     let fallback_block = fb.create_block();
     fb.set_cold_block(fallback_block);
     let direct_block = fb.create_block();
-    let (owner_type, cell) =
-        emit_late_bound_owner_guard(fb, receiver, plan, fallback_block, emit_ctx)?;
+    for (index, candidate) in plans.iter().enumerate() {
+        let next_owner = if index + 1 == plans.len() {
+            fallback_block
+        } else {
+            fb.create_block()
+        };
+        let (owner_type, cell) =
+            emit_late_bound_owner_guard(fb, receiver, candidate, next_owner, emit_ctx)?;
 
-    match plan.storage {
-        LateBoundOwnerFieldStorage::SplitDict { expected_index } => {
-            emit_late_bound_split_key_guard(
-                fb,
-                owner_type,
-                attr,
-                expected_index,
-                fallback_block,
-                emit_ctx,
-            )?;
-            emit_trusted_inline_values_field_store(
-                fb,
-                receiver,
-                owner_type,
-                expected_index,
-                replacement,
-                replacement_is_borrowed,
-                direct_block,
-                fallback_block,
-                emit_ctx,
-            )?;
-        }
-        LateBoundOwnerFieldStorage::ObjectSlot => {
-            let offset = fb.ins().load(
-                ptr_ty,
-                ir::MemFlags::trusted(),
-                cell,
-                LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET,
-            );
-            let slot = fb.ins().iadd(receiver, offset);
-            let old_value = fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot, 0);
-            if replacement_is_borrowed {
-                emit_ctx.emit_incref_for_family(
+        match candidate.storage {
+            LateBoundOwnerFieldStorage::SplitDict { expected_index } => {
+                emit_late_bound_split_key_guard(
                     fb,
+                    owner_type,
+                    attr,
+                    expected_index,
+                    fallback_block,
+                    emit_ctx,
+                )?;
+                emit_trusted_inline_values_field_store(
+                    fb,
+                    receiver,
+                    owner_type,
+                    expected_index,
                     replacement,
-                    Some(PyObjFacts::unknown().with_non_null_ref()),
-                    RefcountFamily::ContainerStoreClone,
-                );
+                    replacement_is_borrowed,
+                    direct_block,
+                    fallback_block,
+                    emit_ctx,
+                )?;
             }
-            fb.ins()
-                .store(ir::MemFlags::trusted(), replacement, slot, 0);
-            let null_ptr = fb.ins().iconst(ptr_ty, 0);
-            let old_is_null = fb
-                .ins()
-                .icmp(ir::condcodes::IntCC::Equal, old_value, null_ptr);
-            let release_old_block = fb.create_block();
-            fb.ins()
-                .brif(old_is_null, direct_block, &[], release_old_block, &[]);
-            fb.switch_to_block(release_old_block);
-            emit_ctx.emit_decref_for_family(
-                fb,
-                old_value,
-                Some(PyObjFacts::unknown().with_non_null_ref()),
-                RefcountFamily::ContainerOverwriteRelease,
-            );
-            fb.ins().jump(direct_block, &[]);
+            LateBoundOwnerFieldStorage::ObjectSlot => {
+                let offset = fb.ins().load(
+                    ptr_ty,
+                    ir::MemFlags::trusted(),
+                    cell,
+                    LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET,
+                );
+                let slot = fb.ins().iadd(receiver, offset);
+                let old_value = fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot, 0);
+                if replacement_is_borrowed {
+                    emit_ctx.emit_incref_for_family(
+                        fb,
+                        replacement,
+                        Some(PyObjFacts::unknown().with_non_null_ref()),
+                        RefcountFamily::ContainerStoreClone,
+                    );
+                }
+                fb.ins()
+                    .store(ir::MemFlags::trusted(), replacement, slot, 0);
+                let null_ptr = fb.ins().iconst(ptr_ty, 0);
+                let old_is_null = fb
+                    .ins()
+                    .icmp(ir::condcodes::IntCC::Equal, old_value, null_ptr);
+                let release_old_block = fb.create_block();
+                fb.ins()
+                    .brif(old_is_null, direct_block, &[], release_old_block, &[]);
+                fb.switch_to_block(release_old_block);
+                emit_ctx.emit_decref_for_family(
+                    fb,
+                    old_value,
+                    Some(PyObjFacts::unknown().with_non_null_ref()),
+                    RefcountFamily::ContainerOverwriteRelease,
+                );
+                fb.ins().jump(direct_block, &[]);
+            }
+        }
+
+        if index + 1 < plans.len() {
+            fb.switch_to_block(next_owner);
         }
     }
 
@@ -12179,11 +12233,11 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::GetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::LateBoundOwnerField(plan) = &op.access
+        && let Some(plans) = typed_late_bound_owner_access_plans(&op.access)
         && let Some(value) = emit_typed_late_bound_owner_getattr(
             fb,
             op,
-            plan,
+            plans,
             local_env,
             emit_ctx,
             codegen_env,
@@ -12217,11 +12271,11 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::SetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::LateBoundOwnerField(plan) = &op.access
+        && let Some(plans) = typed_late_bound_owner_access_plans(&op.access)
         && let Some(result) = emit_typed_late_bound_owner_setattr(
             fb,
             op,
-            plan,
+            plans,
             local_env,
             emit_ctx,
             ResultDemand::PYOBJECT_OWNED,
@@ -17737,12 +17791,23 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             TypedAttrAccessPlan::LateBoundOwnerField(plan) => emit_typed_late_bound_owner_getattr(
                 fb,
                 op,
-                plan,
+                std::slice::from_ref(plan),
                 local_env,
                 emit_ctx,
                 codegen_env,
                 func_imports,
             )?,
+            TypedAttrAccessPlan::PolymorphicLateBoundOwnerFields(plans) => {
+                emit_typed_late_bound_owner_getattr(
+                    fb,
+                    op,
+                    plans,
+                    local_env,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                )?
+            }
             TypedAttrAccessPlan::IndexedField {
                 source,
                 counter_source,
@@ -17793,11 +17858,11 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         });
     }
     if let InstrTyped::SetAttrTyped(op) = expr {
-        if let TypedAttrAccessPlan::LateBoundOwnerField(plan) = &op.access
+        if let Some(plans) = typed_late_bound_owner_access_plans(&op.access)
             && let Some(result) = emit_typed_late_bound_owner_setattr(
                 fb,
                 op,
-                plan,
+                plans,
                 local_env,
                 emit_ctx,
                 demand,

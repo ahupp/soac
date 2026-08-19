@@ -3506,7 +3506,10 @@ pub(super) fn annotate_typed_late_bound_owner_fields(
     }
     struct Annotator<'a> {
         function_id: RuntimeFunctionId,
-        plans: HashMap<InstrId, &'a soac_ir_typed::plan_v3::LateBoundOwnerFieldSpecializationPlan>,
+        plans: HashMap<
+            InstrId,
+            Vec<&'a soac_ir_typed::plan_v3::LateBoundOwnerFieldSpecializationPlan>,
+        >,
         used: HashSet<InstrId>,
         error: Option<String>,
     }
@@ -3532,24 +3535,34 @@ pub(super) fn annotate_typed_late_bound_owner_fields(
                     return;
                 }
             };
-            if let Some(plan) = self.plans.get(&source) {
-                if plan.access != access {
+            if let Some(plans) = self.plans.get(&source) {
+                if plans.iter().any(|plan| plan.access != access) {
                     self.error = Some(format!(
-                        "optimizer v3 late-bound owner-field at {source} selected {:?}, but typed access is {:?}",
-                        plan.access, access
+                        "optimizer v3 late-bound owner-field at {source} selected an incompatible typed access {:?}",
+                        access
                     ));
                     return;
                 }
-                *target = TypedAttrAccessPlan::LateBoundOwnerField(TypedLateBoundOwnerFieldPlan {
-                    counter_source: TypedIndexedFieldCounterSource {
-                        function_id: self.function_id,
-                        instr_id: source,
-                    },
-                    owner_type: plan.owner_type.clone(),
-                    attr_name: plan.attr_name.clone(),
-                    storage: plan.storage,
-                    cell_index: plan.cell_index,
-                });
+                let mut selected = plans
+                    .iter()
+                    .map(|plan| TypedLateBoundOwnerFieldPlan {
+                        counter_source: TypedIndexedFieldCounterSource {
+                            function_id: self.function_id,
+                            instr_id: source,
+                        },
+                        owner_type: plan.owner_type.clone(),
+                        attr_name: plan.attr_name.clone(),
+                        storage: plan.storage,
+                        cell_index: plan.cell_index,
+                    })
+                    .collect::<Vec<_>>();
+                *target = if selected.len() == 1 {
+                    TypedAttrAccessPlan::LateBoundOwnerField(
+                        selected.pop().expect("single late owner plan exists"),
+                    )
+                } else {
+                    TypedAttrAccessPlan::PolymorphicLateBoundOwnerFields(selected)
+                };
                 self.used.insert(source);
             }
             expr.visit_children_mut(self);
@@ -3557,12 +3570,12 @@ pub(super) fn annotate_typed_late_bound_owner_fields(
     }
 
     let live_instr_ids = collect_typed_semantic_instr_ids(function);
-    let plans = emitted_function
-        .late_bound_owner_fields
-        .iter()
-        .filter(|plan| live_instr_ids.contains(&plan.source))
-        .map(|plan| (plan.source, plan))
-        .collect::<HashMap<_, _>>();
+    let mut plans = HashMap::<InstrId, Vec<_>>::new();
+    for plan in &emitted_function.late_bound_owner_fields {
+        if live_instr_ids.contains(&plan.source) {
+            plans.entry(plan.source).or_default().push(plan);
+        }
+    }
     let mut annotator = Annotator {
         function_id: function.function_id,
         plans,
@@ -22653,6 +22666,62 @@ def large(x):\n{large_body}"
             exact_int_sidecars_for_branch(&function, branch_source),
             (true, true),
             "a matching late-bound split-owner guard should preserve both scalar regions",
+        );
+    }
+
+    #[test]
+    fn exact_int_scalar_regions_do_not_consume_polymorphic_late_bound_owner_guards() {
+        let (mut function, branch_source, field_source) =
+            indexed_field_exact_int_sidecar_fixture(false);
+        let function_id = function.function_id;
+
+        struct PolymorphicGuard {
+            function_id: RuntimeFunctionId,
+            field_source: InstrId,
+        }
+
+        impl VisitMut<InstrTyped> for PolymorphicGuard {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::GetAttrTyped(op) = expr {
+                    op.access = TypedAttrAccessPlan::PolymorphicLateBoundOwnerFields(
+                        [("Left", 1), ("Right", 4)]
+                            .into_iter()
+                            .enumerate()
+                            .map(
+                                |(index, (owner, expected_index))| TypedLateBoundOwnerFieldPlan {
+                                    counter_source: TypedIndexedFieldCounterSource {
+                                        function_id: self.function_id,
+                                        instr_id: self.field_source,
+                                    },
+                                    owner_type: soac_ir_typed::plan_v3::IndexedFieldOwnerType {
+                                        module_name: "fixture".to_string(),
+                                        qualname: owner.to_string(),
+                                    },
+                                    attr_name: "value".to_string(),
+                                    storage: LateBoundOwnerFieldStorage::SplitDict {
+                                        expected_index,
+                                    },
+                                    cell_index: index as u32,
+                                },
+                            )
+                            .collect(),
+                    );
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        PolymorphicGuard {
+            function_id,
+            field_source,
+        }
+        .visit_fn_mut(&mut function);
+
+        assert_eq!(invalidate_unguarded_exact_int_selections(&mut function), 2);
+        assert_eq!(
+            exact_int_sidecars_for_branch(&function, branch_source),
+            (false, false),
+            "a polymorphic owner chain must not be mistaken for one exact-owner scalar-region guard"
         );
     }
 

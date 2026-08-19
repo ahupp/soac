@@ -1688,6 +1688,83 @@ unsafe fn publish_late_bound_owner_fields_for_function(
     result
 }
 
+unsafe fn publish_inherited_late_bound_owner_fields(
+    owner_type: *mut ffi::PyTypeObject,
+    shared_state: &module_type::SharedModuleState,
+) -> Result<(), ()> {
+    if !owner_type_has_generic_attribute_hooks(owner_type) {
+        return Ok(());
+    }
+    let mro = (*owner_type).tp_mro;
+    if mro.is_null() || ffi::PyTuple_CheckExact(mro) == 0 {
+        return Ok(());
+    }
+
+    let owner_qualname = ffi::PyType_GetQualName(owner_type);
+    if owner_qualname.is_null() {
+        return Err(());
+    }
+    let mut length = 0;
+    let utf8 = ffi::PyUnicode_AsUTF8AndSize(owner_qualname, &mut length);
+    if utf8.is_null() {
+        ffi::Py_DECREF(owner_qualname);
+        return Err(());
+    }
+    let owner_name = std::slice::from_raw_parts(utf8.cast::<u8>(), length as usize);
+    let function_ids = shared_state
+        .late_bound_owner_fields
+        .sites
+        .iter()
+        .filter(|(_, site)| {
+            site.owner_type.qualname.as_bytes() == owner_name
+                && matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+        })
+        .map(|(function_id, _)| *function_id)
+        .collect::<HashSet<_>>();
+    ffi::Py_DECREF(owner_qualname);
+    if function_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut published_functions = HashSet::new();
+    for index in 1..ffi::PyTuple_GET_SIZE(mro) {
+        let base = ffi::PyTuple_GET_ITEM(mro, index).cast::<ffi::PyTypeObject>();
+        if base.is_null() {
+            continue;
+        }
+        let dict = ffi::PyType_GetDict(base);
+        if dict.is_null() {
+            return Err(());
+        }
+        let result = (|| {
+            let mut position: ffi::Py_ssize_t = 0;
+            let mut key = ptr::null_mut();
+            let mut value = ptr::null_mut();
+            while ffi::PyDict_Next(dict, &mut position, &mut key, &mut value) != 0 {
+                if ffi::PyFunction_Check(value) == 0 || !published_functions.insert(value as usize)
+                {
+                    continue;
+                }
+                let metadata = PyFunction_GetSoacMetadata(value);
+                if metadata.is_null() {
+                    continue;
+                }
+                let metadata = &*(metadata as *const PyFunctionJitExtra);
+                if !ptr::eq(Arc::as_ptr(&metadata.module_state), shared_state)
+                    || !function_ids.contains(&metadata.function_id)
+                {
+                    continue;
+                }
+                publish_late_bound_owner_fields_for_function(value, owner_type, shared_state)?;
+            }
+            Ok(())
+        })();
+        ffi::Py_DECREF(dict);
+        result?;
+    }
+    Ok(())
+}
+
 unsafe fn register_owner_types_from_type(
     owner_type: *mut ffi::PyTypeObject,
     module_name: *mut ffi::PyObject,
@@ -1747,6 +1824,9 @@ unsafe fn register_owner_types_from_type(
                 module_runtime,
             )?;
         }
+    }
+    if let Some(shared_state) = shared_state {
+        publish_inherited_late_bound_owner_fields(owner_type, shared_state)?;
     }
     if let Some(function_id) = constructor_function_id
         && owner_type_supports_direct_constructor_entry(owner_type)

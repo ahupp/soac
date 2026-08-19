@@ -1624,3 +1624,12 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 - eight-workload stock score `0.510x`; previous-SOAC robust improvement
   `1.006x`. Repeated `comprehensions` improves `66.40 us` to `62.13 us`
   (`1.069x`); generated native code remains unchanged.
+
+## 2026-08-19 - Specialize polymorphic inherited instance fields
+
+- jj change id: `nvvlrumm`
+- summary: guard inherited split-dictionary fields by exact profiled owner
+  and preserve existing lexical-owner specializations.
+- eight-workload stock score `0.521x`; previous-SOAC robust improvement
+  `1.016x`. Three-round robust improvement `1.067x`, led by `deltablue`
+  `1.112x` and `richards` `1.171x`; generated native code grows `4.256%`.
