@@ -110,7 +110,6 @@ unsafe extern "C" {
         metadata: *mut c_void,
         destructor: Option<unsafe extern "C" fn(*mut c_void)>,
     ) -> i32;
-    #[cfg(test)]
     fn PyType_GetSoacMetadata(type_obj: *mut ffi::PyObject) -> *mut c_void;
     fn PyType_GetSoacFunctionId(type_obj: *mut ffi::PyObject) -> u64;
     fn PyFunction_AddWatcher(callback: PyFunctionWatchCallback) -> i32;
@@ -479,6 +478,7 @@ pub(crate) struct FunctionInstantiationTemplate {
     prepared_direct_entry: OnceLock<PreparedDirectEntry>,
     prepared_vectorcall_trampoline: OnceLock<PreparedVectorcallTrampoline>,
     prepared_generator_factory: OnceLock<PreparedGeneratorFactory>,
+    prepared_generator_builtin_consumer: OnceLock<PreparedGeneratorBuiltinConsumer>,
     prepared_stop_iteration_matcher: OnceLock<PreparedStopIterationMatcher>,
 }
 
@@ -504,6 +504,31 @@ struct PreparedStopIterationMatcher {
     builtin_keys: usize,
     runtime_entries: [PreparedStopIterationDictionaryEntry; 7],
     builtin_entries: [PreparedStopIterationDictionaryEntry; 4],
+}
+
+#[derive(Clone, Copy)]
+struct PreparedGeneratorConsumerMethod {
+    function: usize,
+    code: usize,
+    function_id: RuntimeFunctionId,
+}
+
+struct PreparedGeneratorBuiltinConsumer {
+    compile_session_id: CompileSessionId,
+    constructor_function_id: RuntimeFunctionId,
+    owner_type: usize,
+    owner_type_version: u32,
+    runtime_globals: usize,
+    runtime_keys: usize,
+    runtime_values: usize,
+    builtins: usize,
+    builtin_keys: usize,
+    runtime_entries: [PreparedStopIterationDictionaryEntry; 9],
+    builtin_entries: [PreparedStopIterationDictionaryEntry; 5],
+    methods: [PreparedGeneratorConsumerMethod; 5],
+    resume_function_offset: usize,
+    preserved_values_offset: usize,
+    closed_slot_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -580,6 +605,7 @@ impl FunctionInstantiationTemplate {
             prepared_direct_entry: OnceLock::new(),
             prepared_vectorcall_trampoline: OnceLock::new(),
             prepared_generator_factory: OnceLock::new(),
+            prepared_generator_builtin_consumer: OnceLock::new(),
             prepared_stop_iteration_matcher: OnceLock::new(),
         })
     }

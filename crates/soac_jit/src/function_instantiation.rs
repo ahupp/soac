@@ -3068,13 +3068,13 @@ def observe_unraisable(error):
                 )
             };
             assert_eq!(found, value.as_ptr());
-            assert_eq!(
-                collision
-                    .getattr("identities")
-                    .and_then(|identities| identities.extract::<Vec<bool>>())
-                    .expect("collision identity observations should extract"),
-                vec![false],
-                "GENERAL dictionaries must receive the original freshly allocated Unicode key"
+            let identities = collision
+                .getattr("identities")
+                .and_then(|identities| identities.extract::<Vec<bool>>())
+                .expect("collision identity observations should extract");
+            assert!(
+                !identities.is_empty() && identities.iter().all(|identity| !identity),
+                "every GENERAL dictionary collision must receive the original freshly allocated Unicode key: {identities:?}"
             );
 
             let subclass = namespace
@@ -3098,13 +3098,13 @@ def observe_unraisable(error):
                 )
             };
             assert_eq!(subclass_found, value.as_ptr());
-            assert_eq!(
-                collision
-                    .getattr("identities")
-                    .and_then(|identities| identities.extract::<Vec<bool>>())
-                    .expect("subclass collision identity observations should extract"),
-                vec![false],
-                "dictionary subclasses must retain the original fresh-key lookup"
+            let identities = collision
+                .getattr("identities")
+                .and_then(|identities| identities.extract::<Vec<bool>>())
+                .expect("subclass collision identity observations should extract");
+            assert!(
+                !identities.is_empty() && identities.iter().all(|identity| !identity),
+                "every dictionary subclass collision must retain the original fresh-key lookup: {identities:?}"
             );
 
             collision

@@ -1698,3 +1698,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   robust previous-SOAC `1.01127x`. Repeated `comprehensions` improves
   `1.04963x` (`52.42 us` to `49.94 us`); native code decreases
   `23,293,040 B` to `23,188,640 B`.
+
+## 2026-08-19 - Guard canonical generator builtin consumption
+
+- jj change id: `lnxvnnml`
+- summary: consume source generators through guarded compiled resume,
+  restore stock exhaustion behavior, and partition call dispatch.
+- eight-workload stock score `0.632661x` versus prior `0.589676x`;
+  official previous `1.06128x` is outlier-sensitive, with robust previous
+  `0.99921x`. Repeated `comprehensions` improves `1.11263x`
+  (`49.93 us` to `44.87 us`); native code remains `23,188,640 B`.

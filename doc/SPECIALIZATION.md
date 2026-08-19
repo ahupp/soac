@@ -1002,6 +1002,114 @@ stock-parity integration passes in **9.10 seconds**; the known 28-test
 counter-dump batch takes **80.81 seconds**. The full-suite **1.10x stock**
 target remains unmet.
 
+### Guarded Builtin Consumption of Source Generators
+
+Canonical exact `METH_O` builtins `any` and `all` can consume a compiler-
+owned source generator through its already compiled resume entry while
+retaining the real source-generator `PyFunction`, its watcher CREATE
+event, closure cells, laziness, and the actual Python generator object.
+An existing constructor template prepares its canonical-owner guard once,
+using the running pinned CPython's existing SOAC type-metadata accessor;
+no public API, global state, runtime helper, IR concept, or new
+generated-native shape is introduced.
+
+Eligibility rechecks the canonical builtin, indexed live runtime/global
+dictionaries, generator owner/type, current class/method/helper code,
+local/global monitoring, tracing/profiling, reentry, and interpreted
+fallback conditions. Existing vectorcall selectors first partition once
+by their already-proven argument shape: `next` is considered only for
+**one or two arguments**, exact `StopIteration` only for **two**, and
+canonical `any` / `all` only for **one**, with null keyword arguments
+and a nonnull argument buffer. Original `nargsf`, selector priority, and
+ordinary fallback remain unchanged; unrelated calls skip the new
+consumer selector. The iterator is acquired exactly once and its
+effective next operation captured once. The existing direct compiled
+resume keeps strong owned references to its three live Python arguments:
+the resume function, preserved-state capsule, and mutable runtime
+`NO_DEFAULT`. An existing length-checked preserved-state loader handles
+shorter valid replacement capsules; on a non-`StopIteration` body error,
+the current error helper is reloaded from live globals/builtins after
+possible dictionary promotion, without resuming the generator twice.
+Truthiness, yielded-value ownership/DECREF, short-circuiting, exceptions,
+finalizers, class/method changes, and unsupported shapes retain their
+existing CPython or conservative fallback behavior.
+
+Exact normal `StopIteration` avoids the old artificial asyncio
+cancellation check: stock and candidate now both produce no cancellation
+callbacks, with `any=False` and `all=True`. A genuine unchanged-
+production transformed stock-parity regression and an actual exported
+vectorcall structured regression both turn RED-to-GREEN. Existing
+limitations remain unchanged: source-parent local `PY_START` monitoring
+may not fire, post-load rebinding of statically resolved builtin names is
+not observed, and the previous short-circuit terminal-item retention is
+preserved. Explicit dynamic consumer calls, actual runtime helper
+monitoring, and at-most-once finalization remain covered.
+
+The final frozen **705-line** transformed Profile / Verify / Apply
+integration passes **1 / 1 in 5.57 seconds** after package formatting,
+including live replacement of all three resume arguments, a genuine
+zero-length preserved-state capsule, and runtime-globals promotion with
+replacement error-helper dispatch. The full JIT library passes
+**569 / 569**, broader transformed generator/runtime compatibility passes
+**71 / 71 in 35.48 seconds**, package-scoped formatting and its check
+pass, and the JIT test-target type check passes in **10.05 seconds**.
+After argument-shape refinement, actual exported-vectorcall structured
+coverage passes **1 / 1**, the new stock-parity regression plus five
+retained StopIteration tests pass **6 / 6 in 11.34 seconds**, and the
+final scoped format / test-target check passes in **2.76 seconds**.
+The **26.46-second debug-extension restage** is workflow setup, not a
+performance measurement.
+
+Normal fixed-eight stock score is **0.6326613107877241x**, versus
+retained **0.5896760656259606x**. Official previous-SOAC **1.061278x**
+is outlier-sensitive; robust fixed-eight geometry is **0.999207x raw /
+1.008631x stock-adjusted**. The uncontended three-round target improves
+**49.926194 -> 44.872185 us (1.112631x; 95% interval
+[1.096347, 1.139781])**, or **1.123761x stock-adjusted
+[1.105023, 1.153696]**. Four-workload robust geometry is **1.028280x /
+1.033141x stock-adjusted**. Richards recovers **1.020050x
+[1.004693, 1.028789]** versus the unpartitioned candidate; versus
+retained production its raw result is neutral, with a disclosed
+**0.986296x stock-adjusted [0.967541, 0.993720]** residual decline.
+Deltablue and chaos are paired-neutral. All **80 normal** and **120
+targeted Apply workers** retain exact function rows and zero errors:
+full-eight native coverage remains **23,188,640 bytes / 1,527,950
+machine blocks / 2,866 typed blocks / 204 functions**, and targeted
+per-round coverage remains **18,255,240 bytes / 1,201,600 machine
+blocks / 2,265 typed blocks / 183 functions**.
+
+Matched zero-loss comprehensions profiles contain **692 retained / 547
+unpartitioned / 570 final samples**: old builtin `any` and iterator
+frames disappear, the source-generator body remains, and canonical
+guard inclusive/self decreases **3.656% / 1.462% -> 1.579% / 0.527%**
+after argument partitioning. Immediate matched Richards profiles contain
+**432 -> 568 samples**, with vectorcall inclusive/self
+**13.89% / 5.09% -> 10.56% / 3.35%**; nested samples overlap and
+inlined frames limit attribution. The first full-gate attempt encounters
+one preexisting brittle Rust collision-identity test: legitimate
+CPython open-address probing produces `[false, false]` rather than the
+test's exact `[false]`; its shared test mutex then causes **112
+secondary failures, 113 total**. A narrow `#[cfg(test)]`-only correction
+in existing `crates/soac_jit/src/function_instantiation.rs` now requires
+nonempty, exclusively false identities for both GENERAL dictionaries and
+dictionary subclasses, retaining fresh-key identity and exception
+checks. The exact focused test passes **1 / 1**, and package formatting
+passes. This is a third existing Rust file for **tests only**; the two
+generator runtime production files are unchanged. The corrected
+authoritative full `just test-all` retry **exits zero**: **1,229 Python
+nodeids across 92 / 92 isolated batches on eight workers**, with zero
+failed batches, plus **569 JIT**, **213 optimizer**, **371 lowering**,
+**54 typed-IR**, and **8 PyO3** Rust tests. Runtime build takes
+**32.538 seconds**, Cargo tests **72.456 seconds**, pytest
+**89.188 seconds inner / 89.206 seconds outer**, and the complete test
+phase **161.678 seconds**. The new actual generator parity integration
+passes in **7.28 seconds**; the known 28-test counter-dump batch takes
+**88.28 seconds**. See
+`work/logs/guarded-generator-builtin-consumption-test-all.log`. The
+optimization is **LANDED CANDIDATE / RETAIN**; the fixed-eight stock
+score **0.6326613107877241x** remains below the full-suite **1.10x
+stock** goal.
+
 ### Template-Aware Function Registration
 
 Source-backed function instantiation already owns an immutable
