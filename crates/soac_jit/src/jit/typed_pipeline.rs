@@ -10,11 +10,11 @@ use crate::session::SharedTypedModulePlanCacheKey;
 use soac_config::SoacEnvConfig;
 use soac_config::SpecializationMode;
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
-    CallableScopeKind, CellLocation, ChildVisitable, ConstantExpr, CounterSite, FunctionKind,
-    HasMeta, HasSemanticInstrId, InstrId, InstrLocationMap, Literal, LocalLocation, NameLike,
-    NameLocation, PreservedLocation, ResolvedName, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
-    WithMeta, current_instr_locations,
+    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
+    CallArgPositional, CallableScopeKind, CellLocation, ChildVisitable, ConstantExpr, CounterSite,
+    FunctionKind, HasMeta, HasSemanticInstrId, InstrId, InstrLocationMap, Literal, LocalLocation,
+    NameLike, NameLocation, PreservedLocation, ResolvedName, RuntimeFunctionId, RuntimeName, Visit,
+    VisitMut, WithMeta, current_instr_locations,
 };
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_entry_function_id_for_init,
@@ -36,8 +36,8 @@ use soac_ir_typed::{
     TypedExactFloatExpressionPlan, TypedExactIntBranchPlan, TypedExactIntPlanSource,
     TypedExactIntReturnPlan, TypedExactListItemAccessPlan, TypedExactListItemCounterSource,
     TypedExactListItemPlanSource, TypedGeneratorInstancePlan, TypedGeneratorResumePlan,
-    TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
-    TypedIndexedGlobalPlanSource, TypedLateBoundOwnerFieldPlan,
+    TypedGuardedMethodCall, TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource,
+    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource, TypedLateBoundOwnerFieldPlan,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -163,6 +163,479 @@ type RemappedTypedCallEmissions = HashMap<RuntimeFunctionId, TypedCallEmissionPl
 type LoweredGeneratorPreservedLocals = HashMap<InstrId, HashMap<PreservedLocation, ResolvedName>>;
 type RemappedTypedGeneratorInstancePlans =
     HashMap<RuntimeFunctionId, HashMap<InstrId, TypedGeneratorInstancePlan>>;
+
+#[derive(Clone, Debug)]
+struct ImmediateMethodCallSource {
+    getter_source: InstrId,
+    method_name: String,
+}
+
+type ImmediateMethodCallSources = HashMap<InstrId, ImmediateMethodCallSource>;
+
+const MAX_IMMEDIATE_METHOD_POSITIONAL_ARGS: usize = 2;
+
+fn immediate_method_call_arguments_are_supported(
+    call: &TypedCall<InstrTyped>,
+    receiver: &InstrTyped,
+) -> bool {
+    if !call.keywords.is_empty() || call.args.len() > MAX_IMMEDIATE_METHOD_POSITIONAL_ARGS {
+        return false;
+    }
+    if call.args.is_empty() {
+        return true;
+    }
+    let InstrTyped::Load(receiver) = receiver else {
+        return false;
+    };
+    matches!(
+        receiver.name.location,
+        NameLocation::Local(_) | NameLocation::Cell(_) | NameLocation::Preserved(_)
+    ) && call
+        .args
+        .iter()
+        .all(|arg| matches!(arg, CallArgPositional::Positional(InstrTyped::Load(_))))
+}
+
+fn immediate_method_receiver_is_super(
+    receiver: &InstrTyped,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    let InstrTyped::CallTyped(call) = receiver else {
+        return false;
+    };
+    matches!(
+        typed_expr_runtime_name_provenance(call.func.as_ref(), module_constants),
+        Some(RuntimeName::CallSuper | RuntimeName::CallSuperNoargs)
+    )
+}
+
+fn immediate_method_call_sources(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> ImmediateMethodCallSources {
+    struct Collector<'a> {
+        module_constants: &'a [ConstantExpr],
+        sources: ImmediateMethodCallSources,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && matches!(call.access, soac_ir_typed::TypedCallAccessPlan::Generic)
+                && call.extra.generator_instance_plan().is_none()
+                && let Some(call_source) = call.try_semantic_instr_id()
+                && let InstrTyped::GetAttrTyped(getter) = call.func.as_ref()
+                && matches!(getter.access, TypedAttrAccessPlan::Generic)
+                && immediate_method_call_arguments_are_supported(call, getter.value.as_ref())
+                && let Some(getter_source) = getter.try_semantic_instr_id()
+                && let Some(method_name) =
+                    typed_constant_string(getter.attr.as_ref(), self.module_constants)
+                && !immediate_method_receiver_is_super(getter.value.as_ref(), self.module_constants)
+            {
+                self.sources.insert(
+                    call_source,
+                    ImmediateMethodCallSource {
+                        getter_source,
+                        method_name: method_name.to_string(),
+                    },
+                );
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module_constants,
+        sources: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.sources
+}
+
+fn source_resolved_immediate_method_call(
+    call: &TypedCall<InstrTyped>,
+    getter: &InstrTyped,
+    sources: &ImmediateMethodCallSources,
+) -> Option<InstrTyped> {
+    let source = sources.get(&call.try_semantic_instr_id()?)?;
+    source_resolved_immediate_method_call_for_source(call, getter, source, true)
+}
+
+fn source_resolved_immediate_method_call_for_source(
+    call: &TypedCall<InstrTyped>,
+    getter: &InstrTyped,
+    source: &ImmediateMethodCallSource,
+    require_original_getter: bool,
+) -> Option<InstrTyped> {
+    if !matches!(call.access, soac_ir_typed::TypedCallAccessPlan::Generic)
+        || call.extra.generator_instance_plan().is_some()
+    {
+        return None;
+    }
+    let InstrTyped::GetAttrTyped(getter_op) = getter else {
+        return None;
+    };
+    if !matches!(getter_op.access, TypedAttrAccessPlan::Generic)
+        || !immediate_method_call_arguments_are_supported(call, getter_op.value.as_ref())
+        || (require_original_getter
+            && getter_op.try_semantic_instr_id() != Some(source.getter_source))
+    {
+        return None;
+    }
+    let mut call = call.clone();
+    call.func = Box::new(getter.clone());
+    Some(InstrTyped::GuardedMethodCallTyped(
+        TypedGuardedMethodCall::from_typed_call(call, source.method_name.clone(), Vec::new()),
+    ))
+}
+
+#[derive(Default)]
+struct ImmediateMethodBindingUses {
+    stores: usize,
+    loads: usize,
+    deletes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImmediateMethodBindingSignature {
+    receiver: ResolvedName,
+    attr: ResolvedName,
+    args: Vec<ResolvedName>,
+}
+
+fn immediate_method_binding_signature(
+    call: &TypedCall<InstrTyped>,
+    getter: &InstrTyped,
+) -> Option<ImmediateMethodBindingSignature> {
+    let InstrTyped::GetAttrTyped(getter) = getter else {
+        return None;
+    };
+    let InstrTyped::Load(receiver) = getter.value.as_ref() else {
+        return None;
+    };
+    if !matches!(
+        receiver.name.location,
+        NameLocation::Local(_) | NameLocation::Cell(_) | NameLocation::Preserved(_)
+    ) {
+        return None;
+    }
+    let InstrTyped::Load(attr) = getter.attr.as_ref() else {
+        return None;
+    };
+    if !matches!(attr.name.location, NameLocation::Constant(_)) {
+        return None;
+    }
+    let args = call
+        .args
+        .iter()
+        .map(|arg| {
+            let CallArgPositional::Positional(InstrTyped::Load(value)) = arg else {
+                return None;
+            };
+            Some(value.name.clone())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ImmediateMethodBindingSignature {
+        receiver: receiver.name.clone(),
+        attr: attr.name.clone(),
+        args,
+    })
+}
+
+fn recover_source_resolved_immediate_method_calls(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    sources: &ImmediateMethodCallSources,
+) -> usize {
+    if sources.is_empty() {
+        return 0;
+    }
+
+    struct DirectRewriter<'a> {
+        sources: &'a ImmediateMethodCallSources,
+        count: usize,
+    }
+
+    impl VisitMut<InstrTyped> for DirectRewriter<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            expr.visit_children_mut(self);
+            if let InstrTyped::CallTyped(call) = expr
+                && let Some(resolved) =
+                    source_resolved_immediate_method_call(call, call.func.as_ref(), self.sources)
+            {
+                *expr = resolved;
+                self.count += 1;
+            }
+        }
+    }
+
+    let mut direct = DirectRewriter { sources, count: 0 };
+    direct.visit_fn_mut(function);
+    let mut recovered = direct.count;
+
+    struct BindingUseCollector {
+        by_name: HashMap<ResolvedName, ImmediateMethodBindingUses>,
+        edge_names: HashSet<String>,
+    }
+
+    impl Visit<InstrTyped> for BindingUseCollector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            match expr {
+                InstrTyped::Store(store) if store.name.local_location().is_some() => {
+                    self.by_name.entry(store.name.clone()).or_default().stores += 1;
+                }
+                InstrTyped::Load(load) if load.name.local_location().is_some() => {
+                    self.by_name.entry(load.name.clone()).or_default().loads += 1;
+                }
+                InstrTyped::Del(delete) if delete.name.local_location().is_some() => {
+                    self.by_name.entry(delete.name.clone()).or_default().deletes += 1;
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+
+        fn visit_block_arg(&mut self, arg: &BlockArg) {
+            if let BlockArg::Name(name) = arg {
+                self.edge_names.insert(name.clone());
+            }
+        }
+    }
+
+    let mut uses = BindingUseCollector {
+        by_name: HashMap::new(),
+        edge_names: HashSet::new(),
+    };
+    uses.visit_fn(function);
+
+    fn root_call(expr: &InstrTyped) -> Option<&TypedCall<InstrTyped>> {
+        match expr {
+            InstrTyped::CallTyped(call) => Some(call),
+            InstrTyped::Store(store) => match store.value.as_ref() {
+                InstrTyped::CallTyped(call) => Some(call),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn replace_root_call(expr: &mut InstrTyped, replacement: InstrTyped) -> bool {
+        match expr {
+            InstrTyped::CallTyped(_) => {
+                *expr = replacement;
+                true
+            }
+            InstrTyped::Store(store)
+                if matches!(store.value.as_ref(), InstrTyped::CallTyped(_)) =>
+            {
+                store.value = Box::new(replacement);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[derive(Clone)]
+    struct BindingCandidate {
+        block_index: usize,
+        getter_index: usize,
+        call_index: usize,
+        is_term: bool,
+        delete_index: Option<usize>,
+        call: TypedCall<InstrTyped>,
+        getter: InstrTyped,
+        signature: Option<ImmediateMethodBindingSignature>,
+        anchored_source: Option<ImmediateMethodCallSource>,
+    }
+
+    let mut candidates_by_name = HashMap::<ResolvedName, Vec<BindingCandidate>>::new();
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        for (getter_index, expr) in block.body.iter().enumerate() {
+            let InstrTyped::Store(store) = expr else {
+                continue;
+            };
+            if !store
+                .name
+                .id
+                .as_str()
+                .starts_with("_dp_typed_linearized_expr_")
+                || uses.edge_names.contains(store.name.id.as_str())
+            {
+                continue;
+            }
+            let next_index = getter_index + 1;
+            let (call, is_term) = if let Some(next_expr) = block.body.get(next_index) {
+                let Some(call) = root_call(next_expr) else {
+                    continue;
+                };
+                (call, false)
+            } else if let BlockTerm::Return(value) = &block.term {
+                let Some(call) = root_call(value) else {
+                    continue;
+                };
+                (call, true)
+            } else {
+                continue;
+            };
+            let InstrTyped::Load(callable) = call.func.as_ref() else {
+                continue;
+            };
+            if callable.name != store.name {
+                continue;
+            }
+            let InstrTyped::GetAttrTyped(getter) = store.value.as_ref() else {
+                continue;
+            };
+            if !matches!(call.access, soac_ir_typed::TypedCallAccessPlan::Generic)
+                || call.extra.generator_instance_plan().is_some()
+                || !matches!(getter.access, TypedAttrAccessPlan::Generic)
+                || !immediate_method_call_arguments_are_supported(call, getter.value.as_ref())
+            {
+                continue;
+            }
+            let mut delete_indices =
+                block
+                    .body
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, candidate)| {
+                        matches!(candidate, InstrTyped::Del(delete) if delete.name == store.name)
+                            .then_some(index)
+                    });
+            let delete_index = delete_indices.next();
+            if delete_indices.next().is_some() {
+                continue;
+            }
+            if delete_index.is_some_and(|index| index <= next_index) {
+                continue;
+            }
+            let anchored_source = call
+                .try_semantic_instr_id()
+                .and_then(|call_source| sources.get(&call_source))
+                .filter(|source| getter.try_semantic_instr_id() == Some(source.getter_source))
+                .cloned();
+            candidates_by_name
+                .entry(store.name.clone())
+                .or_default()
+                .push(BindingCandidate {
+                    block_index,
+                    getter_index,
+                    call_index: next_index,
+                    is_term,
+                    delete_index,
+                    call: call.clone(),
+                    getter: (*store.value).clone(),
+                    signature: immediate_method_binding_signature(call, store.value.as_ref()),
+                    anchored_source,
+                });
+        }
+    }
+
+    let mut replacements_by_block = HashMap::<usize, Vec<(BindingCandidate, InstrTyped)>>::new();
+    for (name, candidates) in candidates_by_name {
+        let Some(binding_uses) = uses.by_name.get(&name) else {
+            continue;
+        };
+        let candidate_count = candidates.len();
+        if binding_uses.stores != candidate_count
+            || binding_uses.loads != candidate_count
+            || binding_uses.deletes
+                != candidates
+                    .iter()
+                    .filter(|candidate| candidate.delete_index.is_some())
+                    .count()
+        {
+            continue;
+        }
+        let mut candidate_blocks = HashSet::new();
+        if candidates
+            .iter()
+            .any(|candidate| !candidate_blocks.insert(candidate.block_index))
+        {
+            continue;
+        }
+        let mut anchors = candidates
+            .iter()
+            .filter(|candidate| candidate.anchored_source.is_some());
+        let Some(anchor) = anchors.next() else {
+            continue;
+        };
+        if anchors.next().is_some() {
+            continue;
+        }
+        let source = anchor
+            .anchored_source
+            .as_ref()
+            .expect("the selected original candidate must retain its source");
+        if candidate_count > 1 {
+            let Some(signature) = anchor.signature.as_ref() else {
+                continue;
+            };
+            if candidates
+                .iter()
+                .any(|candidate| candidate.signature.as_ref() != Some(signature))
+            {
+                continue;
+            }
+        }
+
+        let mut replacements = Vec::with_capacity(candidate_count);
+        for candidate in &candidates {
+            let Some(replacement) = source_resolved_immediate_method_call_for_source(
+                &candidate.call,
+                &candidate.getter,
+                source,
+                candidate.anchored_source.is_some(),
+            ) else {
+                replacements.clear();
+                break;
+            };
+            replacements.push((candidate.clone(), replacement));
+        }
+        if replacements.len() != candidate_count {
+            continue;
+        }
+        for (candidate, replacement) in replacements {
+            replacements_by_block
+                .entry(candidate.block_index)
+                .or_default()
+                .push((candidate, replacement));
+        }
+    }
+
+    for (block_index, block) in function.blocks.iter_mut().enumerate() {
+        let Some(replacements) = replacements_by_block.remove(&block_index) else {
+            continue;
+        };
+        let mut remove_indices = HashSet::new();
+        for (candidate, replacement) in replacements {
+            remove_indices.insert(candidate.getter_index);
+            if let Some(delete_index) = candidate.delete_index {
+                remove_indices.insert(delete_index);
+            }
+            let replaced = if candidate.is_term {
+                if let BlockTerm::Return(value) = &mut block.term {
+                    replace_root_call(value, replacement)
+                } else {
+                    false
+                }
+            } else {
+                replace_root_call(&mut block.body[candidate.call_index], replacement)
+            };
+            debug_assert!(replaced, "validated immediate-method call root changed");
+            recovered += usize::from(replaced);
+        }
+        if !remove_indices.is_empty() {
+            let mut index = 0;
+            block.body.retain(|_| {
+                let keep = !remove_indices.contains(&index);
+                index += 1;
+                keep
+            });
+        }
+    }
+
+    recovered
+}
 
 #[derive(Clone)]
 struct StaticDirectCallTarget {
@@ -10111,6 +10584,16 @@ fn optimize_blockpy_with_external_inline_callees(
             for function in &mut typed_module.callable_defs {
                 assign_missing_typed_function_instr_ids(function);
             }
+            let immediate_method_sources = typed_module
+                .callable_defs
+                .iter()
+                .map(|function| {
+                    (
+                        function.function_id,
+                        immediate_method_call_sources(function, &typed_module.module_constants),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
             let static_generator_instances =
                 static_generator_instance_plans_for_module(typed_module, &static_targets);
             for function in &mut typed_module.callable_defs {
@@ -10142,6 +10625,11 @@ fn optimize_blockpy_with_external_inline_callees(
                     &static_targets,
                     &static_direct_calls,
                 )?;
+            }
+            for function in &mut typed_module.callable_defs {
+                if let Some(sources) = immediate_method_sources.get(&function.function_id) {
+                    recover_source_resolved_immediate_method_calls(function, sources);
+                }
             }
             Ok(())
         },
@@ -12995,6 +13483,239 @@ mod tests {
         lower_typed_function_call_access_plan_instrs, merge_trusted_owner_states,
         remap_trusted_owner_state_for_edge, trusted_owner_block_predecessor_edges,
     };
+
+    #[test]
+    fn immediate_zero_arg_method_calls_retain_resolved_dispatch_after_typed_rewrites() {
+        let source = r#"
+class Base:
+    def observe(self, *args, **kwargs):
+        return args, kwargs
+
+class Child(Base):
+    def through_super(self):
+        return super().observe()
+
+def immediate(owner):
+    return owner.observe()
+
+def temporary():
+    return Child().observe()
+
+def stored(owner):
+    bound = owner.observe
+    return bound()
+
+def positional(owner, value):
+    return owner.observe(value)
+
+def two_positional(owner, first, second):
+    return owner.observe(first, second)
+
+def builtin_positional(mapping, value):
+    return mapping.get(value)
+
+def captured_positional(owner, value):
+    def inner(argument):
+        return owner.observe(argument)
+    return inner(value)
+
+def captured_comprehension(mapping, key):
+    return [mapping.get(value) for value in (key,)][0]
+
+def too_many_positional(owner, first, second, third):
+    return owner.observe(first, second, third)
+
+def effectful_positional(owner, value):
+    return owner.observe(positional(owner, value))
+
+def global_receiver(owner):
+    return Base.observe(owner)
+
+def starred(owner, values):
+    return owner.observe(*values)
+
+def keyword(owner, value):
+    return owner.observe(value=value)
+"#;
+        let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("immediate-method dispatch source should lower")
+            .blockpy_module;
+        let counter_config =
+            SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Profile));
+        let mut counter_module = lower_blockpy_module_to_typed(lowered.clone());
+        soac_instrument::define_typed_module_counter_defs(
+            &mut counter_module,
+            &soac_instrument::InstrumentationConfig::from_env_config(&counter_config),
+        )
+        .expect("immediate-method counters should use original semantic instruction IDs");
+        lowered.counter_defs = counter_module.counter_defs;
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        #[derive(Default)]
+        struct MethodCalls {
+            resolved: Vec<(String, usize, InstrId)>,
+            ordinary_getattrs: usize,
+        }
+
+        impl Visit<InstrTyped> for MethodCalls {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                match expr {
+                    InstrTyped::GuardedMethodCallTyped(call) => {
+                        let InstrTyped::GetAttrTyped(getattr) = call.func.as_ref() else {
+                            panic!("resolved immediate method must retain its original getter");
+                        };
+                        self.resolved.push((
+                            call.method_name.clone(),
+                            call.method_guards.len(),
+                            getattr.semantic_instr_id(),
+                        ));
+                    }
+                    InstrTyped::GetAttrTyped(_) => self.ordinary_getattrs += 1,
+                    _ => {}
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        for mode in [
+            SpecializationMode::Profile,
+            SpecializationMode::Verify,
+            SpecializationMode::Apply,
+        ] {
+            let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
+            let plan = optimize_blockpy_with_external_inline_callees(
+                &lowered,
+                Some(&profile),
+                &config,
+                HashMap::new(),
+                StaticDirectCallTargets::default(),
+            )
+            .expect("the real typed planning pipeline should preserve immediate method calls");
+
+            let captured_comprehension_qualname = plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| {
+                    function
+                        .names
+                        .qualname
+                        .starts_with("captured_comprehension.<locals>._dp_listcomp_")
+                })
+                .map(|function| function.names.qualname.as_str())
+                .expect("captured comprehension should retain its actual nested callable");
+
+            for qualname in [
+                "immediate",
+                "temporary",
+                "positional",
+                "two_positional",
+                "builtin_positional",
+                "captured_positional.<locals>.inner",
+                captured_comprehension_qualname,
+            ] {
+                let function = plan
+                    .module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.qualname == qualname)
+                    .expect("immediate-method fixture should retain its target function");
+                let mut calls = MethodCalls::default();
+                calls.visit_fn(function);
+                let expected_calls = if qualname == captured_comprehension_qualname
+                    && mode != SpecializationMode::Profile
+                {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    calls.resolved.len(),
+                    expected_calls,
+                    "{mode:?} {qualname} must preserve each compiler-resolved immediate method"
+                );
+                assert_eq!(
+                    calls.resolved[0].0,
+                    if qualname == "builtin_positional"
+                        || qualname == captured_comprehension_qualname
+                    {
+                        "get"
+                    } else {
+                        "observe"
+                    }
+                );
+                assert_eq!(calls.resolved[0].1, 0);
+                assert!(
+                    plan.module.counter_defs.iter().any(|counter| {
+                        counter.kind == "field_access"
+                            && matches!(
+                                counter.site,
+                                CounterSite::Runtime {
+                                    function_id: Some(function_id),
+                                    instr_id: Some(instr_id),
+                                } if function_id == function.function_id
+                                    && instr_id == calls.resolved[0].2
+                            )
+                    }),
+                    "{mode:?} {qualname} must retain its original generic getter counter"
+                );
+                assert!(
+                    plan.module.counter_defs.iter().any(|counter| {
+                        counter.kind == "call_hot_targets"
+                            && matches!(
+                                counter.site,
+                                CounterSite::Runtime {
+                                    function_id: Some(function_id),
+                                    ..
+                                } if function_id == function.function_id
+                            )
+                    }),
+                    "{mode:?} {qualname} must retain its original call-target counter"
+                );
+            }
+
+            for qualname in [
+                "stored",
+                "too_many_positional",
+                "effectful_positional",
+                "global_receiver",
+                "starred",
+                "keyword",
+                "Child.through_super",
+            ] {
+                let function = plan
+                    .module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.qualname == qualname)
+                    .expect("immediate-method fixture should retain each fallback control");
+                let mut calls = MethodCalls::default();
+                calls.visit_fn(function);
+                assert!(
+                    calls.resolved.is_empty(),
+                    "{mode:?} {qualname} must preserve its ordinary escaped/argument/super path"
+                );
+                if qualname == "stored" {
+                    assert_ne!(
+                        calls.ordinary_getattrs, 0,
+                        "an escaped bound method must remain a materialized ordinary getter"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn profile_mode_preserves_countered_hot_loop_ids_while_apply_can_split() {

@@ -331,6 +331,11 @@ pub(super) static DP_JIT_PYOBJECT_GETATTR_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+pub(super) static PYOBJECT_GETMETHOD_IMPORT: ImportSpec = ImportSpec::new(
+    "_PyObject_GetMethod",
+    &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
+    &[SigType::I32],
+);
 pub(super) static DP_JIT_PYOBJECT_SETATTR_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_pyobject_setattr",
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
@@ -583,6 +588,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
     &DP_JIT_PYOBJECT_GETATTR_IMPORT,
+    &PYOBJECT_GETMETHOD_IMPORT,
     &DP_JIT_PYOBJECT_SETATTR_IMPORT,
     &DP_JIT_PYOBJECT_GETITEM_IMPORT,
     &DP_JIT_PYOBJECT_SETITEM_IMPORT,

@@ -1465,6 +1465,135 @@ receiver-method plans are intentionally disabled for now; if such plans appear
 in v3 plan/emission data, specialization-input preparation rejects them because
 their owner/type guard payload is not yet a static mechanical JIT input.
 
+### Immediate Zero-Argument and Positional Method Dispatch
+
+An immediate source method invocation can use pinned CPython's existing
+`_PyObject_GetMethod` protocol without allocating the visible, GC-tracked
+bound-method wrapper produced by ordinary generic attribute lookup. This
+fixes a real CPython-visible difference: inside inherited `Child.observe()`,
+stock sees no live bound `MethodType`, while the prior transformed path
+observed its unnecessary wrapper through GC referrers. A separately stored
+bound method remains visible and is never elided.
+
+Before existing typed rewrites and linearization, a private source-grounded
+sidecar records each original getter / immediate-call instruction pair and
+preserves their original field/getter and call instrumentation-counter IDs.
+After optimization, the typed pipeline recovers only a proven same-block
+method invocation with **zero or at most two simple `Load` positional
+arguments**, a uniquely defined/consumed temporary, and an existing
+`Local`, closure `Cell`, or `Preserved` receiver. Escaped aliases,
+standalone stored methods, multiple uses, cross-block values, global/class
+receivers, more than two arguments, effectful argument expressions,
+keywords, starred arguments, and source `super` paths remain on their
+original path. Pinned
+CPython 3.15 does not support the earlier host-interpreter assumption that
+`super` must expose a wrapper; only its original result and behavior are
+preserved.
+
+Profile-driven hot-continuation cloning can preserve the same private
+compiler temporary while assigning new getter / call instruction IDs. The
+final recovery therefore groups candidates by the exact full compiler-private
+`ResolvedName`, rejects any CFG `BlockArg` transport, and requires every
+store / load / delete of that name to belong to isolated, adjacent
+same-block getter / call pairs. Exactly one pair must retain both original
+source instruction IDs. Every continuation clone must match the anchored
+receiver, constant attribute, ordered simple positional arguments, and
+`Generic` access; recovery is all-or-none for the complete group and
+removes only its proven per-block store / delete. Original and cloned getter
+and call counter IDs remain correct. Aliases, block-edge transport,
+unmatched arguments, and all prior receiver / ownership exclusions remain
+on the ordinary path.
+
+An admitted pair uses the already-existing typed `GuardedMethodCall`
+operation with **empty guards**; it does not enable currently disabled
+runtime-guarded receiver-method plans or add a new public IR variant. JIT
+emission mechanically imports the existing pinned-CPython
+`_PyObject_GetMethod` symbol and follows its actual method/non-method/null
+result ABI. CPython remains responsible for inherited lookup, live class /
+MRO mutation, instance shadows, properties, data/non-data descriptors,
+custom `__getattribute__` / `__getattr__`, `staticmethod`, `classmethod`,
+missing attributes, and raised errors. Existing getter branch and call
+counters, single receiver evaluation, owned callable / receiver references,
+and method lookup **before positional argument evaluation** preserve
+original CPython order. The ordinary non-method descriptor branch releases
+its owned receiver before evaluating arguments; argument-prefix errors
+clean up **previous owned arguments → conditionally owned receiver → owned
+callable**, preserving the original exception. Finalizers, branch/call
+counters, and fallback semantics remain unchanged. No public API, runtime
+helper, global mutable state, or new IR operation is introduced.
+
+Both zero-argument regressions turn RED-to-GREEN, then expanded genuine
+same-strategy positional regressions independently turn RED-to-GREEN: the
+whole-production typed-pipeline / source-counter test verifies zero,
+one, and two arguments plus builtin/captured receivers across
+**Profile / Verify / Apply**; frozen transformed four-way stock parity
+passes **1 / 1 in 4.82 seconds**, preserving stored wrappers, descriptors,
+MRO/shadows, `super`, lookup-before-unbound-error, finalizers, counters,
+and native controls. A first complete positional JIT run exposed one
+preexisting brittle GENERAL-dictionary collision assertion; legal
+randomized hash probing caused approximately **111** secondary failures
+through its poisoned shared Python test mutex. The durable correction
+changes only an existing **`#[cfg(test)]`** assertion in
+`function_instantiation.rs` to require multiple observations that are all
+fresh identities; this is a fourth **test-only** path, while production
+remains exactly three existing files.
+
+An actual captured-cell nested comprehension then exposed an Apply-only
+continuation-clone correctness gap: stock and Profile observed no wrapper,
+while the previous Apply implementation observed one. Both genuine
+regressions turn RED-to-GREEN after the bounded, same-file clone recovery:
+the whole-production structured test proves exactly **one** selected node
+in Profile and **two** original-plus-clone nodes in Verify and Apply;
+the frozen real transformed stock-parity regression passes **1 / 1 in
+7.78 seconds**, preserving every existing descriptor, evaluation, finalizer,
+counter, and native-body control.
+
+Fresh final **post-clone** Rust JIT **572 / 572**, optimizer **213 / 213**, and typed IR
+**54 / 54** suites pass; grouped transformed checks pass **15 / 15**, and
+package-scoped formatting / format check plus JIT `--tests` Cargo check
+pass. The earlier zero-argument-only three-round deltablue result
+**1.077933x [1.057344, 1.095900]** is valid for that historical
+implementation only; its fixed-eight comparison **155216** is permanently
+discarded because broad external contention corrupts unchanged controls.
+The pre-clone positional comprehensions result was a genuine **0.93660x
+[0.91529, 0.95561] regression**. Final post-clone release smoke and all
+**30** repeated comprehensions workers confirm the actual nested hot Apply
+body changes **12,552 bytes / 816 blocks → 12,644 / 823** while every
+source function and hidden trampoline remains present. Nevertheless, clean
+three-round comprehensions remains **neutral: 0.998325x [0.987093,
+1.019031]**; an apparent **1.081145x** stock-adjusted result merely
+coincides with **8.30%** stock drift and is not a causal gain.
+
+The same clean comparison improves deltablue **2.92860 → 2.61845 ms**,
+**1.118447x [1.09207, 1.13869]** versus retained SOAC and a further
+**1.037585x [1.01464, 1.05759]** versus the already-improved zero-argument
+implementation. Richards is **1.019530x [1.00573, 1.03815]**, subject to
+paired-stock drift; chaos is neutral after adjustment. Final fixed-eight
+ordinary native code decreases **23,188,640 → 23,163,480 bytes** with
+unchanged **365,000 bytes** of hidden trampolines. Its official previous
+score **0.9683515036210124x** is corrupted by host outliers; the clean
+four-workload official score is **1.0194276621869476x** previous /
+**0.49747399350945193x** stock. Matched zero-loss comprehensions profiles
+(**292 → 292** samples) show builtin-wrapper union **3.7663% → 2.7402%**,
+offset by `_PyObject_GetMethod` **3.0825%** inclusive / **1.0278%** self;
+overlapping inclusive ancestry is not additive. Deltablue wrapper union
+declines **3.1698% → 0.4067%**, with **199 → 99 Hz** sampling precision
+caveat; small richards profiles do not prove wrapper elimination. Multiple
+actual CPython-visible parity fixes and repeated deltablue improvement
+support **LANDED CANDIDATE / RETAIN**. The authoritative full
+**`just test-all` gate exits zero**, passing **1,232 Python nodeids across
+95 / 95 isolated batches and eight workers**, with **zero failures**.
+Rust suites pass JIT **572**, optimizer **213**, lowering **371**, typed
+IR **54**, and PyO3 **8**. Runtime build takes **1.951 seconds**, Cargo
+**89.061 seconds**, pytest **80.428 inner / 80.445 outer seconds**, and
+the full test phase **169.519 seconds**; the known 28-node counter batch
+takes **80.52 seconds**, and the method-parity integration passes in
+**6.03 seconds**. See
+`work/logs/immediate-method-call-dispatch-test-all.log`. The optimization
+changes exactly three existing production runtime paths plus one existing
+**`#[cfg(test)]`-only** collision assertion; the full-suite stock
+**1.10x** goal remains unmet and full-suite performance is unmeasured.
+
 ### Exact Positional Argument Binding
 
 The existing immutable `DirectArgBindingPlan` can directly bind a fully

@@ -314,17 +314,17 @@ use imports::{
     DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
     PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT,
     PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT,
-    PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
-    SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_JIT_RESUME_GENERATOR_IMPORT,
-    SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT,
-    SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
-    SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
-    SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
-    SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT, SOAC_RUNTIME_TUPLE_NEW_IMPORT,
-    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SOAC_RUNTIME_UNPACK_FIXED_IMPORT, SigType,
-    predeclare_specialization_type_imports,
+    PYNUMBER_XOR_IMPORT, PYOBJECT_GETMETHOD_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT,
+    PYUNICODE_COMPARE_IMPORT, SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
+    SOAC_JIT_RESUME_GENERATOR_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
+    SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
+    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
+    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
+    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
+    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT,
+    SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT,
+    SOAC_RUNTIME_UNPACK_FIXED_IMPORT, SigType, predeclare_specialization_type_imports,
 };
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
@@ -16693,6 +16693,17 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
         call.method_name.as_str(),
     );
     if direct_method_specializations.is_empty() {
+        if call.method_guards.is_empty() {
+            return emit_typed_source_resolved_immediate_method_call_result_with_local_env(
+                fb,
+                call,
+                local_env,
+                emit_ctx,
+                demand,
+                codegen_env,
+                func_imports,
+            );
+        }
         let result = emit_typed_generic_positional_call_result_with_local_env(
             fb,
             call.func.as_ref(),
@@ -16910,6 +16921,271 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
         codegen_env,
         func_imports,
     )
+}
+
+fn emit_typed_source_resolved_immediate_method_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedGuardedMethodCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let InstrTyped::GetAttrTyped(getter) = call.func.as_ref() else {
+        return Err("source-resolved immediate method requires its original getter".to_string());
+    };
+    let arg_refs = typed_simple_positional_arg_refs(
+        call.args.as_slice(),
+        call.keywords.as_slice(),
+        "source-resolved immediate method",
+    )?;
+    if arg_refs.len() > 2
+        || arg_refs
+            .iter()
+            .any(|arg| !matches!(arg, InstrTyped::Load(_)))
+    {
+        return Err(
+            "source-resolved immediate method requires at most two simple load arguments"
+                .to_string(),
+        );
+    }
+
+    let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+        fb,
+        getter.value.as_ref(),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+        "source-resolved immediate method receiver",
+    )?;
+    let (attr, attr_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+        fb,
+        getter.attr.as_ref(),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+        "source-resolved immediate method name",
+    )?;
+    if let Some(counter_id) = emit_ctx
+        .field_generic_getattr_counter_ids
+        .get(&getter.semantic_instr_id())
+        .copied()
+    {
+        emit_increment_counter_ref(fb, counter_id, emit_ctx);
+    }
+
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let output_slot = fb.create_sized_stack_slot(ir::StackSlotData::new(
+        ir::StackSlotKind::ExplicitSlot,
+        std::mem::size_of::<usize>() as u32,
+        0,
+    ));
+    fb.ins().stack_store(null_ptr, output_slot, 0);
+    let output_ptr = fb.ins().stack_addr(ptr_ty, output_slot, 0);
+    let getmethod_ref = func_imports.get(codegen_env, &mut fb.func, &PYOBJECT_GETMETHOD_IMPORT)?;
+    let getmethod_inst = fb.ins().call(getmethod_ref, &[receiver, attr, output_ptr]);
+    let method_flag = fb.inst_results(getmethod_inst)[0];
+    let callable = fb.ins().stack_load(ptr_ty, output_slot, 0);
+    if !attr_is_borrowed {
+        emit_release_owned_inputs(fb, emit_ctx, &[attr]);
+    }
+
+    let lookup_failed = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
+    let lookup_error_block = fb.create_block();
+    let lookup_ok_block = fb.create_block();
+    fb.ins()
+        .brif(lookup_failed, lookup_error_block, &[], lookup_ok_block, &[]);
+    fb.switch_to_block(lookup_error_block);
+    if !receiver_is_borrowed {
+        emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
+    }
+    fb.ins().jump(
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+    );
+    fb.switch_to_block(lookup_ok_block);
+
+    let is_method = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, method_flag, 0);
+    if !receiver_is_borrowed {
+        let owned_method_block = fb.create_block();
+        let release_regular_receiver_block = fb.create_block();
+        let receiver_ready_block = fb.create_block();
+        fb.ins().brif(
+            is_method,
+            owned_method_block,
+            &[],
+            release_regular_receiver_block,
+            &[],
+        );
+        fb.switch_to_block(owned_method_block);
+        fb.ins().jump(receiver_ready_block, &[]);
+        fb.switch_to_block(release_regular_receiver_block);
+        emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
+        fb.ins().jump(receiver_ready_block, &[]);
+        fb.switch_to_block(receiver_ready_block);
+    }
+
+    if let Some(counter_id) = call
+        .try_semantic_instr_id()
+        .and_then(|instr_id| emit_ctx.call_target_counter_ids.get(&instr_id))
+        .copied()
+    {
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+        emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+    }
+
+    let mut arg_values = Vec::<ir::Value>::with_capacity(arg_refs.len());
+    let mut arg_borrowed = Vec::<bool>::with_capacity(arg_refs.len());
+    for arg in arg_refs {
+        let argument_error_block = fb.create_block();
+        fb.set_cold_block(argument_error_block);
+        let argument_emit_ctx = emit_ctx.with_step_null_target(argument_error_block, Vec::new());
+        let (value, borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg,
+            local_env,
+            &argument_emit_ctx,
+            codegen_env,
+            func_imports,
+            "source-resolved immediate method positional argument",
+        )?;
+        let argument_ready_block = fb.create_block();
+        fb.ins().jump(argument_ready_block, &[]);
+
+        fb.switch_to_block(argument_error_block);
+        for (&previous_value, &previously_borrowed) in
+            arg_values.iter().zip(arg_borrowed.iter()).rev()
+        {
+            if !previously_borrowed {
+                emit_release_owned_inputs(fb, emit_ctx, &[previous_value]);
+            }
+        }
+        if !receiver_is_borrowed {
+            let release_owned_receiver_block = fb.create_block();
+            let receiver_released_block = fb.create_block();
+            fb.ins().brif(
+                is_method,
+                release_owned_receiver_block,
+                &[],
+                receiver_released_block,
+                &[],
+            );
+            fb.switch_to_block(release_owned_receiver_block);
+            emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
+            fb.ins().jump(receiver_released_block, &[]);
+            fb.switch_to_block(receiver_released_block);
+        }
+        emit_release_owned_inputs(fb, emit_ctx, &[callable]);
+        fb.ins().jump(
+            emit_ctx.consts.step_null_block,
+            &step_null_block_args(emit_ctx),
+        );
+
+        fb.switch_to_block(argument_ready_block);
+        arg_values.push(value);
+        arg_borrowed.push(borrowed);
+    }
+
+    let method_block = fb.create_block();
+    let regular_block = fb.create_block();
+    let result_block = fb.create_block();
+    let result_has_value = demand != ResultDemand::EffectOnly;
+    if result_has_value {
+        fb.append_block_param(result_block, ptr_ty);
+    }
+    fb.ins()
+        .brif(is_method, method_block, &[], regular_block, &[]);
+
+    fb.switch_to_block(method_block);
+    let mut method_arg_values = Vec::with_capacity(arg_values.len() + 1);
+    let mut method_arg_borrowed = Vec::with_capacity(arg_borrowed.len() + 1);
+    method_arg_values.push(receiver);
+    method_arg_borrowed.push(receiver_is_borrowed);
+    method_arg_values.extend(arg_values.iter().copied());
+    method_arg_borrowed.extend(arg_borrowed.iter().copied());
+    let method_result = if result_has_value {
+        emit_positional_vectorcall_result_with_arg_values(
+            fb,
+            callable,
+            false,
+            method_arg_values,
+            method_arg_borrowed,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        )
+    } else {
+        emit_positional_call_three_result_with_arg_values(
+            fb,
+            callable,
+            false,
+            method_arg_values,
+            method_arg_borrowed,
+            emit_ctx,
+            ResultDemand::EffectOnly,
+        )
+    };
+    if result_has_value {
+        let (value, ownership, _) =
+            method_result.expect_pyobject("source-resolved immediate method result");
+        debug_assert!(ownership.is_owned());
+        fb.ins().jump(result_block, &[ir::BlockArg::Value(value)]);
+    } else {
+        fb.ins().jump(result_block, &[]);
+    }
+
+    fb.switch_to_block(regular_block);
+    let regular_result = if result_has_value {
+        emit_positional_vectorcall_result_with_arg_values(
+            fb,
+            callable,
+            false,
+            arg_values,
+            arg_borrowed,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        )
+    } else {
+        emit_positional_call_three_result_with_arg_values(
+            fb,
+            callable,
+            false,
+            arg_values,
+            arg_borrowed,
+            emit_ctx,
+            ResultDemand::EffectOnly,
+        )
+    };
+    if result_has_value {
+        let (value, ownership, _) =
+            regular_result.expect_pyobject("source-resolved immediate regular callable result");
+        debug_assert!(ownership.is_owned());
+        fb.ins().jump(result_block, &[ir::BlockArg::Value(value)]);
+    } else {
+        fb.ins().jump(result_block, &[]);
+    }
+
+    fb.switch_to_block(result_block);
+    if result_has_value {
+        emit_owned_pyobject_result_for_demand_with_codegen_imports(
+            fb,
+            fb.block_params(result_block)[0],
+            PyObjFacts::unknown(),
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )
+    } else {
+        Ok(EmitResult::no_value())
+    }
 }
 
 fn emit_typed_codegen_direct_callable_call_result_with_local_env(

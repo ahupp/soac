@@ -1729,3 +1729,14 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   previous-SOAC `1.00037x`. Repeated `comprehensions` is neutral
   `0.99829x` (`44.92 us` to `45.00 us`); ordinary native and hidden
   trampoline code remain unchanged.
+
+## 2026-08-19 - Resolve immediate method calls without visible wrappers
+
+- jj change id: `zkwnlurq`
+- summary: preserve CPython method-wrapper visibility for source-anchored
+  zero/positional calls and cloned hot continuations.
+- eight-workload stock score `0.627357x` versus prior `0.624929x`;
+  official previous `0.96835x` is host-outlier-contaminated. Clean repeated
+  `deltablue` improves `1.11845x` (`2.929 ms` to `2.618 ms`), with
+  `comprehensions` neutral `0.99833x`; native code decreases
+  `23,188,640 B` to `23,163,480 B`.

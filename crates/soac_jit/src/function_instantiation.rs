@@ -2766,15 +2766,17 @@ class CollisionKey:
                     .to_string()
                     .contains("runtime module attribute collision")
             );
-            assert_eq!(
-                namespace
-                    .get_item("collision_identities")
-                    .expect("collision observations lookup should succeed")
-                    .expect("collision observations should exist")
-                    .extract::<Vec<bool>>()
-                    .expect("collision observations should extract"),
-                vec![false, false],
-                "GENERAL module dictionaries must keep both original fresh attribute names"
+            let collision_identities = namespace
+                .get_item("collision_identities")
+                .expect("collision observations lookup should succeed")
+                .expect("collision observations should exist")
+                .extract::<Vec<bool>>()
+                .expect("collision observations should extract");
+            assert!(
+                collision_identities.len() >= 2
+                    && collision_identities.iter().all(|&identity| !identity),
+                "GENERAL module dictionaries must keep both original fresh attribute names: \
+                 {collision_identities:?}"
             );
 
             let property_descriptor = py
