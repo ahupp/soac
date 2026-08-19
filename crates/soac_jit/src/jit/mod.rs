@@ -319,7 +319,8 @@ use imports::{
     SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
     SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
     SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT, SOAC_RUNTIME_TUPLE_NEW_IMPORT,
-    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType, predeclare_specialization_type_imports,
+    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SOAC_RUNTIME_UNPACK_FIXED_IMPORT, SigType,
+    predeclare_specialization_type_imports,
 };
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
@@ -14080,6 +14081,9 @@ fn runtime_primitive_import_spec(desc: &DirectCallableDesc) -> &'static ImportSp
         }
         DirectEntry::RuntimeSymbol(direct_abi::SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL) => {
             &SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT
+        }
+        DirectEntry::RuntimeSymbol(direct_abi::SOAC_RUNTIME_UNPACK_FIXED_SYMBOL) => {
+            &SOAC_RUNTIME_UNPACK_FIXED_IMPORT
         }
         DirectEntry::RuntimeSymbol(direct_abi::SOAC_JIT_RESUME_GENERATOR_SYMBOL) => {
             &SOAC_JIT_RESUME_GENERATOR_IMPORT

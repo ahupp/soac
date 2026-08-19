@@ -362,6 +362,7 @@ define_runtime_names! {
     AwaitIterWrapper => "_AwaitIterWrapper",
     DynamicCallee => "__dp_dynamic_callee",
     MakeGeneratorInstance => "make_generator_instance",
+    UnpackFixed => "unpack_fixed",
 }
 
 #[derive(

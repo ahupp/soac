@@ -1,5 +1,6 @@
 use super::backend::{compile_prepared_function_bytes_with_isa, define_prepared_function};
 use super::codegen_env::JitCodegenEnv;
+use super::direct_abi::SOAC_RUNTIME_UNPACK_FIXED_SYMBOL;
 use super::inspection::clif_refcount_family_from_source_loc_bits;
 use super::precompiled_object::{ElfSymbolBinding, ObjectFunctionDefinition};
 use super::symbols::{
@@ -8,6 +9,7 @@ use super::symbols::{
     SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_SYMBOL,
     SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_SYMBOL,
     SOAC_RUNTIME_TUPLE_NEW_SYMBOL, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
+    cpython_type_symbol_from_name,
 };
 use crate::SOAC_JIT_RUNTIME_CLIF;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -69,6 +71,7 @@ impl RuntimeSupportInliner {
                     | SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL
                     | SOAC_RUNTIME_TUPLE_NEW_SYMBOL
                     | SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL
+                    | SOAC_RUNTIME_UNPACK_FIXED_SYMBOL
             ) {
                 continue;
             }
@@ -334,6 +337,7 @@ fn runtime_clif_for_reader(clif_text: &str) -> Cow<'_, str> {
 mod runtime_clif_reader_tests {
     use super::{inline_runtime_support_calls, runtime_clif_for_reader};
     use crate::jit::codegen_env::declare_local_fn;
+    use crate::jit::direct_abi::SOAC_RUNTIME_UNPACK_FIXED_SYMBOL;
     use crate::jit::new_jit_module;
     use crate::jit::symbols::SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL;
     use cranelift_codegen::ir::{self, InstBuilder};
@@ -430,6 +434,92 @@ mod runtime_clif_reader_tests {
             actual_names.contains(&expected_name),
             "inlined runtime tombstone must retain the caller's exact external-data namespace/id: {actual_names:?}"
         );
+    }
+
+    #[test]
+    fn inlined_fixed_unpack_preserves_writable_cpython_type_import_identity() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test JIT module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+        let mut signature = jit_module.make_signature();
+        signature.params.extend([
+            ir::AbiParam::new(ptr_ty),
+            ir::AbiParam::new(ptr_ty),
+            ir::AbiParam::new(ir::types::I64),
+        ]);
+        signature.returns.push(ir::AbiParam::new(ptr_ty));
+        let helper_id = declare_local_fn(
+            &mut jit_module,
+            SOAC_RUNTIME_UNPACK_FIXED_SYMBOL,
+            &signature,
+        )
+        .expect("fixed-unpack runtime helper should declare");
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "fixed_unpack_external_type_identity_wrapper",
+            &signature,
+        )
+        .expect("fixed-unpack wrapper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = signature;
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+            let helper_ref = jit_module.declare_func_in_func(helper_id, &mut fb.func);
+            let args = fb.block_params(entry).to_vec();
+            let result = fb.ins().call(helper_ref, &args);
+            let result = fb.inst_results(result)[0];
+            fb.ins().return_(&[result]);
+            fb.finalize();
+        }
+
+        let expected_names = ["PyTuple_Type", "PyList_Type"]
+            .into_iter()
+            .map(|symbol| {
+                let data_id = jit_module
+                    .declare_data(symbol, Linkage::Import, true, false)
+                    .expect("CPython type data import should preserve canonical writable flags");
+                ir::UserExternalName::new(1, data_id.as_u32())
+            })
+            .collect::<Vec<_>>();
+
+        let inlined = inline_runtime_support_calls(
+            &mut jit_module,
+            &SoacEnvConfig::default(),
+            &mut ctx,
+            "fixed-unpack exact-type helper should inline",
+        )
+        .expect("fixed-unpack helper inlining should preserve writable type imports");
+        assert!(
+            inlined,
+            "fixed-unpack exact-type guards must remain inlined"
+        );
+
+        let actual_names = ctx
+            .func
+            .global_values
+            .values()
+            .filter_map(|data| match data {
+                ir::GlobalValueData::Symbol {
+                    name: ir::ExternalName::User(name_ref),
+                    ..
+                } => Some(ctx.func.params.user_named_funcs()[*name_ref].clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for expected_name in expected_names {
+            assert!(
+                actual_names.contains(&expected_name),
+                "inlined fixed unpack must preserve each writable CPython type namespace/id: {actual_names:?}"
+            );
+        }
     }
 }
 
@@ -671,7 +761,12 @@ fn remap_runtime_clif_extern_user_names(
             *import_id
         } else {
             let import_id = codegen_env
-                .codegen_declare_data(symbol, Linkage::Import, false, false)
+                .codegen_declare_data(
+                    symbol,
+                    Linkage::Import,
+                    cpython_type_symbol_from_name(symbol).is_some(),
+                    false,
+                )
                 .map_err(|err| {
                     format!("failed to declare runtime CLIF extern data symbol {symbol}: {err}")
                 })?;

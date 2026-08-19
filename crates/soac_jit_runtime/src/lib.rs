@@ -294,6 +294,7 @@ unsafe extern "C" {
     fn PyObject_GetIter(obj: *mut c_void) -> *mut c_void;
     fn PyObject_Size(obj: *mut c_void) -> isize;
     fn PyTuple_New(size: isize) -> *mut c_void;
+    fn PyList_AsTuple(list: *mut c_void) -> *mut c_void;
     fn PyLong_AsLongLong(obj: *mut c_void) -> i64;
     fn PyLong_AsLongLongAndOverflow(obj: *mut c_void, overflow: *mut c_int) -> i64;
     fn memcmp(lhs: *const c_void, rhs: *const c_void, n: usize) -> c_int;
@@ -310,12 +311,19 @@ unsafe extern "C" {
         slot_index: i64,
         value: *mut c_void,
     ) -> *mut c_void;
+    fn dp_jit_unpack_fixed_slow(
+        tstate: *mut c_void,
+        iterable: *mut c_void,
+        arity: i64,
+    ) -> *mut c_void;
     static mut PyExc_TypeError: *mut c_void;
     static mut PyExc_ValueError: *mut c_void;
     static mut _PyDict_IndexedValueTombstone: c_void;
     static mut PyBytes_Type: c_void;
     static mut PyByteArray_Type: c_void;
     static mut PyUnicode_Type: c_void;
+    static mut PyTuple_Type: c_void;
+    static mut PyList_Type: c_void;
 }
 
 const PY_TPFLAGS_MANAGED_DICT: usize = 1 << 4;
@@ -649,6 +657,32 @@ pub unsafe extern "C" fn soac_runtime_builtin_iter_object(
 ) -> *mut c_void {
     debug_assert!(!obj.is_null());
     unsafe { PyObject_GetIter(obj) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_unpack_fixed(
+    tstate: *mut c_void,
+    iterable: *mut c_void,
+    arity: i64,
+) -> *mut c_void {
+    debug_assert!(!tstate.is_null());
+    debug_assert!(!iterable.is_null());
+
+    let object = iterable.cast::<RawPyObject>();
+    let object_type = unsafe { (*object).ob_type };
+    if object_type == core::ptr::addr_of_mut!(PyTuple_Type).cast()
+        && unsafe { (*iterable.cast::<RawPyVarObject>()).ob_size } as i64 == arity
+    {
+        unsafe { incref_impl(object) };
+        return iterable;
+    }
+    if object_type == core::ptr::addr_of_mut!(PyList_Type).cast()
+        && unsafe { (*iterable.cast::<RawPyVarObject>()).ob_size } as i64 == arity
+    {
+        return unsafe { PyList_AsTuple(iterable) };
+    }
+
+    unsafe { dp_jit_unpack_fixed_slow(tstate, iterable, arity) }
 }
 
 #[unsafe(no_mangle)]

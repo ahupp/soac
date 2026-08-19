@@ -229,16 +229,24 @@ where
         }
     }
 
-    let spec_expr = make_tuple(spec_elts);
-    let unpack_meta = spec_expr.meta();
+    let arity = elts.len();
+    let (helper_name, unpack_argument) = if starred_seen {
+        ("unpack", make_tuple(spec_elts))
+    } else {
+        (
+            "unpack_fixed",
+            py_expr!("{arity:literal}", arity = arity as i64),
+        )
+    };
+    let unpack_meta = unpack_argument.meta();
     let unpacked_name = context.fresh("unpack");
     let unpacked_value = E::helper_call(
         unpack_meta.node_index,
         unpack_meta.range,
-        "unpack",
+        helper_name,
         vec![
             value,
-            E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(spec_expr)),
+            E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(unpack_argument)),
         ],
     );
     let unpacked_temp = bind_temp(out, unpacked_name.clone(), unpacked_value);
@@ -427,12 +435,21 @@ where
         }
     }
 
-    out.push(py_stmt!(
-        "{tmp:id} = __soac__.unpack({value:expr}, {spec:expr})",
-        tmp = unpacked_name.as_str(),
-        value = value,
-        spec = make_tuple(spec_elts),
-    ));
+    if starred_seen {
+        out.push(py_stmt!(
+            "{tmp:id} = __soac__.unpack({value:expr}, {spec:expr})",
+            tmp = unpacked_name.as_str(),
+            value = value,
+            spec = make_tuple(spec_elts),
+        ));
+    } else {
+        out.push(py_stmt!(
+            "{tmp:id} = __soac__.unpack_fixed({value:expr}, {arity:literal})",
+            tmp = unpacked_name.as_str(),
+            value = value,
+            arity = elts.len() as i64,
+        ));
+    }
 
     let starred_index = elts.iter().position(|elt| matches!(elt, Expr::Starred(_)));
     for (idx, elt) in elts.into_iter().enumerate() {

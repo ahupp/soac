@@ -46,6 +46,7 @@ soac_runtime_example_offset_known_value
 soac_runtime_builtin_ord_i64
 soac_runtime_builtin_len_i64
 soac_runtime_builtin_iter_object
+soac_runtime_unpack_fixed
 soac_runtime_builtin_chr_i64
 soac_runtime_pylong_as_i64
 soac_runtime_pylong_as_i64_saturating
@@ -61,6 +62,16 @@ soac_runtime_probe_field_indexed_inline_values
 soac_runtime_store_field_indexed_inline_values
 soac_runtime_compare_compact_ascii_unicode
 ```
+
+`soac_runtime_unpack_fixed(tstate, iterable, arity)` implements the resolved,
+compiler-owned fixed-length assignment-unpack operation. Its direct ABI
+borrows the iterable, accepts an unboxed integer target count, and returns an
+owned tuple or null with the current Python exception set. An exact tuple of
+the required length is returned with a new reference; an exact list of the
+required length is snapshotted with `PyList_AsTuple`. Wrong-length values,
+tuple/list subclasses, and other iterables use the registered
+`dp_jit_unpack_fixed_slow` helper below. Ordinary user calls and starred
+assignment unpacking retain the existing Python-visible `unpack` behavior.
 
 `soac_runtime_load_global(globals, builtins, name, expected_index)` receives
 the current function's captured builtins mapping explicitly, rather than
@@ -118,6 +129,23 @@ dp_jit_dict_set_item
 dp_jit_is_true
 dp_jit_raise_i64_overflow
 ```
+
+Registered Rust-owned cold helper:
+
+```text
+dp_jit_unpack_fixed_slow
+```
+
+`dp_jit_unpack_fixed_slow(tstate, iterable, arity)` delegates generic
+fixed-length extraction to CPython's `_PyEval_UnpackIterableStackRef`. Its
+independent Rust-owned stack-reference buffer preserves iterator callbacks,
+exact CPython arity diagnostics, and cleanup without exposing a partially
+initialized, GC-tracked Python tuple to arbitrary iterator code. CPython
+writes stack references in reverse order; the helper restores item order and
+uses `_PyTuple_FromStackRefStealOnSuccess` to publish the owned result. Failed
+tuple construction releases still-owned tagged stack references exactly once.
+The same cold operation serves native guard misses and the entry/deopt
+interpreter; the registered symbol is not a Python runtime API.
 
 Perf-frame toggle helper pairs:
 
@@ -266,6 +294,7 @@ class_lookup_global
 _validate_exception_type
 exception_matches
 exceptiongroup_split
+unpack_fixed
 unpack
 call_super
 call_super_noargs

@@ -250,6 +250,11 @@ pub(super) static SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT: ImportSpec = ImportSp
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+pub(super) static SOAC_RUNTIME_UNPACK_FIXED_IMPORT: ImportSpec = ImportSpec::local(
+    direct_abi::SOAC_RUNTIME_UNPACK_FIXED_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
 pub(super) static SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL,
     &[SigType::Pointer, SigType::Pointer],
@@ -563,6 +568,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
     &SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
     &SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT,
+    &SOAC_RUNTIME_UNPACK_FIXED_IMPORT,
     &SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
     &DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
     &DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,

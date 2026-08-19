@@ -1563,3 +1563,15 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   significant; four-workload median geometric improvement `1.053x`. The
   mean-based comparison is `1.006x` after a large `chaos` outlier; the
   candidate remains `0.274x` stock CPython across the measured subset.
+
+## 2026-08-18 - Use compiler-owned fixed-length sequence unpacking
+
+- jj change id: `oqprxors`
+- summary: replace compiler-generated fixed-arity Python unpack calls with a
+  guarded native language operation while preserving generic iteration and
+  mutable user-visible helpers.
+- eight-workload previous-SOAC geometric improvement `1.757x`; paired stock
+  score `0.281x` to `0.460x`. `nbody` improves `885.5 ms` to `70.3 ms`
+  (`12.60x`) and `spectral_norm` `484.4 ms` to `56.2 ms` (`8.62x`).
+  Repeated `comprehensions`, `deltablue`, and `fannkuch` regressions remain
+  unresolved.

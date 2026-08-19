@@ -1443,6 +1443,39 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             return Ok(unsafe { self.entry_globals_owned() });
         }
 
+        if keyword_args.is_empty()
+            && let [
+                CallArgPositional::Positional(value_expr),
+                CallArgPositional::Positional(arity_expr),
+            ] = positional_args
+            && is_runtime_name_load(callable_expr, RuntimeName::UnpackFixed)
+        {
+            let value = unsafe { self.execute_expr_owned(value_expr)? };
+            if value.is_null() {
+                return Ok(ptr::null_mut());
+            }
+            let arity_obj = unsafe { self.execute_expr_owned(arity_expr)? };
+            if arity_obj.is_null() {
+                unsafe { ffi::Py_DECREF(value.cast::<ffi::PyObject>()) };
+                return Ok(ptr::null_mut());
+            }
+            let arity = unsafe { ffi::PyLong_AsLongLong(arity_obj.cast::<ffi::PyObject>()) };
+            unsafe { ffi::Py_DECREF(arity_obj.cast::<ffi::PyObject>()) };
+            if arity == -1 && !unsafe { ffi::PyErr_Occurred() }.is_null() {
+                unsafe { ffi::Py_DECREF(value.cast::<ffi::PyObject>()) };
+                return Ok(ptr::null_mut());
+            }
+            let result = unsafe {
+                super::specialized_helpers::dp_jit_unpack_fixed_slow(
+                    ffi::PyThreadState_Get().cast(),
+                    value,
+                    arity,
+                )
+            };
+            unsafe { ffi::Py_DECREF(value.cast::<ffi::PyObject>()) };
+            return Ok(result);
+        }
+
         let callable = unsafe { self.execute_expr_owned(callable_expr)? };
         if callable.is_null() {
             return Ok(ptr::null_mut());

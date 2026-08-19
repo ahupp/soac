@@ -39,6 +39,17 @@ unsafe extern "C" {
         key: *mut ffi::PyObject,
         result: *mut *mut ffi::PyObject,
     ) -> libc::c_int;
+    fn _PyEval_UnpackIterableStackRef(
+        tstate: *mut ffi::PyThreadState,
+        value: *mut ffi::PyObject,
+        count: libc::c_int,
+        count_after: libc::c_int,
+        stack_pointer: *mut usize,
+    ) -> libc::c_int;
+    fn _PyTuple_FromStackRefStealOnSuccess(
+        stack_refs: *const usize,
+        count: ffi::Py_ssize_t,
+    ) -> *mut ffi::PyObject;
 }
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
@@ -51,6 +62,67 @@ unsafe extern "C" {
 }
 
 pub type ObjPtr = *mut c_void;
+
+#[cold]
+pub(super) unsafe extern "C" fn dp_jit_unpack_fixed_slow(
+    tstate: ObjPtr,
+    iterable: ObjPtr,
+    arity: i64,
+) -> ObjPtr {
+    let Ok(count) = libc::c_int::try_from(arity) else {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_OverflowError,
+                c"fixed unpack target count is outside CPython's supported range".as_ptr(),
+            );
+        }
+        return ptr::null_mut();
+    };
+    if count < 0 {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_ValueError,
+                c"fixed unpack target count cannot be negative".as_ptr(),
+            );
+        }
+        return ptr::null_mut();
+    }
+
+    let count = count as usize;
+    let mut stack_refs = Vec::<usize>::new();
+    if stack_refs.try_reserve_exact(count).is_err() {
+        unsafe { ffi::PyErr_NoMemory() };
+        return ptr::null_mut();
+    }
+    stack_refs.resize(count, 0);
+
+    let success = unsafe {
+        _PyEval_UnpackIterableStackRef(
+            tstate.cast(),
+            iterable.cast(),
+            count as libc::c_int,
+            -1,
+            stack_refs.as_mut_ptr().add(count),
+        )
+    };
+    if success == 0 {
+        return ptr::null_mut();
+    }
+
+    stack_refs.reverse();
+    let tuple = unsafe {
+        _PyTuple_FromStackRefStealOnSuccess(stack_refs.as_ptr(), count as ffi::Py_ssize_t)
+    };
+    if tuple.is_null() {
+        let saved_error = unsafe { ffi::PyErr_GetRaisedException() };
+        for stack_ref in stack_refs {
+            let object = (stack_ref & !1usize) as *mut ffi::PyObject;
+            unsafe { ffi::Py_DECREF(object) };
+        }
+        unsafe { ffi::PyErr_SetRaisedException(saved_error) };
+    }
+    tuple.cast()
+}
 
 unsafe fn owned_none_hook() -> ObjPtr {
     let none = unsafe { ffi::Py_None() };
@@ -1523,6 +1595,10 @@ fn chosen_helper_symbol(fast: *const u8, with_frame: *const u8) -> *const u8 {
 }
 
 pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
+    builder.symbol(
+        "dp_jit_unpack_fixed_slow",
+        dp_jit_unpack_fixed_slow as *const u8,
+    );
     builder.symbol(
         "PyFunction_Type",
         std::ptr::addr_of_mut!(PyFunction_Type) as *const u8,

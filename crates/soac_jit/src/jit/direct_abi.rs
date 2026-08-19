@@ -11,6 +11,7 @@ pub(super) const SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL: &str = "soac_runtime_built
 pub(super) const SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL: &str = "soac_runtime_builtin_chr_i64";
 pub(super) const SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL: &str = "soac_runtime_builtin_len_i64";
 pub(super) const SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL: &str = "soac_runtime_builtin_iter_object";
+pub(super) const SOAC_RUNTIME_UNPACK_FIXED_SYMBOL: &str = "soac_runtime_unpack_fixed";
 pub(super) const SOAC_JIT_RESUME_GENERATOR_SYMBOL: &str = "soac_jit_resume_generator";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -25,6 +26,7 @@ pub(super) enum RuntimePrimitiveId {
     BuiltinChrI64,
     BuiltinLenI64,
     BuiltinIterObject,
+    UnpackFixed,
     ResumeGenerator,
 }
 
@@ -114,6 +116,14 @@ const ORD_PARAMS: &[ParamAbi] = &[ParamAbi::PyObject {
 }];
 const LEN_PARAMS: &[ParamAbi] = ORD_PARAMS;
 const ITER_PARAMS: &[ParamAbi] = ORD_PARAMS;
+const UNPACK_FIXED_PARAMS: &[ParamAbi] = &[
+    ParamAbi::PyObject {
+        ownership: ArgOwnership::BorrowedOk,
+    },
+    ParamAbi::I64 {
+        py_long_coercion: None,
+    },
+];
 const RESUME_GENERATOR_PARAMS: &[ParamAbi] = &[ParamAbi::PyObject {
     ownership: ArgOwnership::BorrowedOk,
 }; 5];
@@ -175,6 +185,21 @@ pub(super) const BUILTIN_ITER_OBJECT_DESC: DirectCallableDesc = DirectCallableDe
     cost: DirectCallCost::new(8, 4),
 };
 
+pub(super) const UNPACK_FIXED_DESC: DirectCallableDesc = DirectCallableDesc {
+    target: DirectTargetId::RuntimePrimitive(RuntimePrimitiveId::UnpackFixed),
+    entry: DirectEntry::RuntimeSymbol(SOAC_RUNTIME_UNPACK_FIXED_SYMBOL),
+    abi: DirectCallAbi {
+        hidden_args: TSTATE_HIDDEN_ARGS,
+        params: UNPACK_FIXED_PARAMS,
+        result: ResultAbi::PyObject {
+            ownership: ValueOwnership::Owned,
+            exact_type: None,
+        },
+        error: ErrorAbi::CurrentException,
+    },
+    cost: DirectCallCost::new(6, 8),
+};
+
 pub(super) const RESUME_GENERATOR_DESC: DirectCallableDesc = DirectCallableDesc {
     target: DirectTargetId::RuntimePrimitive(RuntimePrimitiveId::ResumeGenerator),
     entry: DirectEntry::RuntimeSymbol(SOAC_JIT_RESUME_GENERATOR_SYMBOL),
@@ -196,6 +221,7 @@ pub(super) fn runtime_primitive_desc(primitive: RuntimePrimitiveId) -> &'static 
         RuntimePrimitiveId::BuiltinChrI64 => &BUILTIN_CHR_I64_DESC,
         RuntimePrimitiveId::BuiltinLenI64 => &BUILTIN_LEN_I64_DESC,
         RuntimePrimitiveId::BuiltinIterObject => &BUILTIN_ITER_OBJECT_DESC,
+        RuntimePrimitiveId::UnpackFixed => &UNPACK_FIXED_DESC,
         RuntimePrimitiveId::ResumeGenerator => &RESUME_GENERATOR_DESC,
     }
 }
@@ -209,6 +235,9 @@ pub(super) fn runtime_primitive_for_builtin_name_and_arity(
         ("chr", 1) => Some(RuntimePrimitiveId::BuiltinChrI64),
         ("len", 1) => Some(RuntimePrimitiveId::BuiltinLenI64),
         ("iter", 1) => Some(RuntimePrimitiveId::BuiltinIterObject),
+        (name, 2) if name == RuntimeName::UnpackFixed.name() => {
+            Some(RuntimePrimitiveId::UnpackFixed)
+        }
         (name, 5) if name == RuntimeName::ResumeGenerator.name() => {
             Some(RuntimePrimitiveId::ResumeGenerator)
         }
@@ -223,8 +252,8 @@ mod tests {
         ArgOwnership, DirectEntry, ErrorAbi, HiddenArgAbi, ParamAbi, PyLongI64Coercion, ResultAbi,
         RuntimePrimitiveId, SOAC_JIT_RESUME_GENERATOR_SYMBOL, SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL,
         SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL, SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL,
-        SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL, runtime_primitive_desc,
-        runtime_primitive_for_builtin_name_and_arity,
+        SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL, SOAC_RUNTIME_UNPACK_FIXED_SYMBOL,
+        runtime_primitive_desc, runtime_primitive_for_builtin_name_and_arity,
     };
     use soac_core::block_py::RuntimeName;
     use soac_ir_typed::PyExactType;
@@ -314,6 +343,35 @@ mod tests {
     }
 
     #[test]
+    fn fixed_unpack_descriptor_accepts_borrowed_object_and_unboxed_arity() {
+        let desc = runtime_primitive_desc(RuntimePrimitiveId::UnpackFixed);
+        assert_eq!(
+            desc.entry,
+            DirectEntry::RuntimeSymbol(SOAC_RUNTIME_UNPACK_FIXED_SYMBOL)
+        );
+        assert_eq!(desc.abi.hidden_args, &[HiddenArgAbi::ThreadState]);
+        assert_eq!(
+            desc.abi.params,
+            &[
+                ParamAbi::PyObject {
+                    ownership: ArgOwnership::BorrowedOk,
+                },
+                ParamAbi::I64 {
+                    py_long_coercion: None,
+                },
+            ]
+        );
+        assert_eq!(
+            desc.abi.result,
+            ResultAbi::PyObject {
+                ownership: ValueOwnership::Owned,
+                exact_type: None,
+            }
+        );
+        assert_eq!(desc.abi.error, ErrorAbi::CurrentException);
+    }
+
+    #[test]
     fn generator_resume_descriptor_preserves_borrowed_inputs_and_owned_result() {
         let desc = runtime_primitive_desc(RuntimePrimitiveId::ResumeGenerator);
 
@@ -355,6 +413,14 @@ mod tests {
         assert_eq!(
             runtime_primitive_for_builtin_name_and_arity("iter", 1),
             Some(RuntimePrimitiveId::BuiltinIterObject)
+        );
+        assert_eq!(
+            runtime_primitive_for_builtin_name_and_arity(RuntimeName::UnpackFixed.name(), 2),
+            Some(RuntimePrimitiveId::UnpackFixed)
+        );
+        assert_eq!(
+            runtime_primitive_for_builtin_name_and_arity(RuntimeName::UnpackFixed.name(), 1),
+            None
         );
         assert_eq!(
             runtime_primitive_for_builtin_name_and_arity(RuntimeName::ResumeGenerator.name(), 5,),

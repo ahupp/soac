@@ -1311,6 +1311,75 @@ paths; unplanned item access goes through the CPython item APIs.
     encode directly
 
 
+## Compiler-Owned Fixed-Length Sequence Unpacking
+
+### Counted Input
+
+- Fixed-length assignment unpacking is a Python language operation, not a
+  profiled call to a mutable runtime function. No `call_hot_targets`, type
+  observation, workload name, or other profile evidence is required.
+- Lowering selects the append-only `RuntimeName::UnpackFixed` plus an immutable
+  literal target count for compiler-generated, nonstarred assignment and
+  `with` targets. Starred targets keep the existing `RuntimeName::Unpack`
+  operation.
+- Only an explicitly resolved runtime-name location or validated runtime-name
+  constant qualifies. Same-named user globals and ordinary source calls to
+  Python runtime helpers are never treated as compiler-owned primitives.
+
+### Codegen
+
+- Profile, verify, and apply-mode JIT code can consume the explicit
+  `RuntimeName::UnpackFixed(value, arity)` operation through its direct C ABI:
+  `soac_runtime_unpack_fixed(tstate, borrowed_value, unboxed_arity)` returns
+  an owned Python tuple or null with the current Python exception preserved.
+- The raw helper is eligible for the existing bounded local-runtime inliner;
+  its current shared admission limit is 128 Cranelift instructions.
+- Imported CPython type symbols retain their canonical writable-data flags
+  during inlining; unrelated external data keeps its existing declarations.
+- The local raw runtime checks exact type and target count. A matching exact
+  tuple receives a new owned reference; a matching exact list is snapshotted
+  into an owned tuple before assignment-target side effects can mutate it.
+  These guards are checked on every invocation; no mutable object, type,
+  runtime-helper binding, or source-module value is cached across calls.
+- Wrong arity, tuple/list subclasses, and arbitrary iterables use one
+  registered Rust cold helper, `dp_jit_unpack_fixed_slow`. It invokes the
+  linked CPython fixed-unpack implementation with an independently owned
+  stack-reference buffer, reverses the resulting stack order, and publishes
+  the result through CPython's steal-on-success tuple constructor.
+- Name binding preserves `UnpackFixed` as an explicit intrinsic, like
+  `RuntimeName::Globals`, instead of materializing it as a module constant or
+  rewriting it to a module global. This also avoids recursively loading a
+  not-yet-defined runtime attribute during transformed-runtime bootstrap.
+- The entry/deoptimization interpreter recognizes the same trusted
+  `RuntimeName::UnpackFixed` operation directly and uses the shared cold
+  helper without invoking a mutable Python runtime attribute.
+
+### Limitations / Soundness / Extensions
+
+- Exact-type guards never bypass tuple/list subclass overrides. Generic
+  iteration preserves CPython's callback order, exact underflow/overflow
+  errors, exception propagation, and partial-item cleanup.
+- A Python tuple is never used as temporary unpack scratch: arbitrary
+  iterator callbacks could observe or collect its partially initialized,
+  GC-tracked state. Tagged stack references remain privately owned until
+  successful tuple publication; allocation failure releases each item once.
+- Starred unpacking and explicit Python calls to `soac.runtime.unpack` keep
+  their existing mutable behavior. Rebinding or replacing Python helper code
+  does not change compiler-owned language unpacking.
+- The complete lowerer suite, structured direct-ABI/provenance/writable-type
+  tests, compiler-bootstrap and `with`-target lowering tests, and strengthened
+  Profile/Apply/forced-entry behavior pass. The integration additionally
+  verifies context-manager exit, reentrant garbage collection, immediate
+  partial-item cleanup, and publicly observable `unpack_fixed` rebinding.
+  A broader 28-case transformed-runtime regression selection also passes;
+  combined workspace/raw-runtime checks and scoped formatting also pass.
+  An eight-workload comparison improves previous-SOAC geometric throughput
+  1.757x, led by 12.60x `nbody` and 8.62x `spectral_norm`; three separately
+  reproduced significant `comprehensions`, `deltablue`, and `fannkuch`
+  regressions remain unexplained. Full-suite stock parity is not achieved,
+  while the full `just test-all` correctness gate passes.
+
+
 ## Compiler-Owned Iterator Exhaustion Exceptions
 
 Compiler-generated synchronous and asynchronous iteration handlers bind their

@@ -373,6 +373,10 @@ def exceptiongroup_split(exc, exc_type):
     return None, exc
 
 
+def unpack_fixed(iterable, arity):
+    return unpack(iterable, (True,) * arity)
+
+
 def unpack(iterable, spec):
     try:
         iterator = iter(iterable)
