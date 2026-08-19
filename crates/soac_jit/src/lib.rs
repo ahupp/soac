@@ -36,6 +36,7 @@ use soac_core::block_py::{
     PreservedSlotStorage, RuntimeFunctionId, RuntimeName,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_typed::plan_v3::{IndexedFieldAccessKind, LateBoundOwnerFieldStorage};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
 use std::ffi::{CString, c_char, c_void};
@@ -328,6 +329,7 @@ struct FunctionEnvAbiHeader {
     deopt_table_ptr: *const c_void,
     globals_obj: *mut ffi::PyObject,
     builtins_obj: *mut ffi::PyObject,
+    late_bound_owner_cells: *const module_type::LateBoundOwnerFieldCell,
 }
 
 struct FunctionEnv {
@@ -532,6 +534,7 @@ impl FunctionEnv {
     unsafe fn new(
         globals_obj: *mut ffi::PyObject,
         builtins_obj: *mut ffi::PyObject,
+        late_bound_owner_cells: *const module_type::LateBoundOwnerFieldCell,
         mut runtime_object_values: Box<[*mut ffi::PyObject]>,
     ) -> Result<Self, ()> {
         if globals_obj.is_null() || builtins_obj.is_null() {
@@ -557,6 +560,7 @@ impl FunctionEnv {
                 deopt_table_ptr: ptr::null(),
                 globals_obj,
                 builtins_obj,
+                late_bound_owner_cells,
             });
             let runtime_objects =
                 raw.add(Self::runtime_objects_offset()) as *mut *mut ffi::PyObject;
@@ -1095,6 +1099,11 @@ unsafe fn make_clif_function_data(
         Box::new(FunctionEnv::new(
             module_runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
             (*raw_function).func_builtins,
+            module_runtime
+                .shared_module_state_owner
+                .late_bound_owner_fields
+                .cells
+                .as_ptr(),
             runtime_object_values,
         )?)
     };
@@ -1440,6 +1449,210 @@ unsafe fn owner_type_supports_direct_constructor_entry(owner_type: *mut ffi::PyT
     ptr::fn_addr_eq(owner_tp_new, base_object_tp_new)
 }
 
+unsafe fn owner_type_has_generic_attribute_hooks(owner_type: *mut ffi::PyTypeObject) -> bool {
+    let has_generic_getattr = (*owner_type).tp_getattro.is_some_and(|getattr| {
+        ptr::fn_addr_eq(
+            getattr,
+            ffi::PyObject_GenericGetAttr
+                as unsafe extern "C" fn(
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                ) -> *mut ffi::PyObject,
+        )
+    });
+    let has_generic_setattr = (*owner_type).tp_setattro.is_some_and(|setattr| {
+        ptr::fn_addr_eq(
+            setattr,
+            ffi::PyObject_GenericSetAttr
+                as unsafe extern "C" fn(
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                ) -> i32,
+        )
+    });
+    has_generic_getattr && has_generic_setattr
+}
+
+unsafe fn owner_type_has_any_class_binding(
+    owner_type: *mut ffi::PyTypeObject,
+    attr_name: &CString,
+) -> bool {
+    let mro = (*owner_type).tp_mro;
+    if mro.is_null() || ffi::PyTuple_CheckExact(mro) == 0 {
+        return true;
+    }
+    for index in 0..ffi::PyTuple_GET_SIZE(mro) {
+        let base = ffi::PyTuple_GET_ITEM(mro, index).cast::<ffi::PyTypeObject>();
+        if base.is_null() {
+            return true;
+        }
+        // Static builtins keep their per-interpreter dictionaries outside
+        // PyTypeObject, so tp_dict is not a valid general MRO dictionary accessor.
+        let dict = ffi::PyType_GetDict(base);
+        if dict.is_null() {
+            if !ffi::PyErr_Occurred().is_null() {
+                ffi::PyErr_Clear();
+            }
+            return true;
+        }
+        let found = !ffi::PyDict_GetItemString(dict, attr_name.as_ptr()).is_null();
+        let failed = !ffi::PyErr_Occurred().is_null();
+        ffi::Py_DECREF(dict);
+        if found || failed {
+            ffi::PyErr_Clear();
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn late_bound_slot_offset_for_owner(
+    owner_type: *mut ffi::PyTypeObject,
+    attr_name: &CString,
+    access: IndexedFieldAccessKind,
+) -> Option<usize> {
+    if (*owner_type).tp_itemsize != 0 || (*owner_type).tp_dict.is_null() {
+        return None;
+    }
+    let descriptor = ffi::PyDict_GetItemString((*owner_type).tp_dict, attr_name.as_ptr());
+    if descriptor.is_null()
+        || ffi::Py_TYPE(descriptor) != ptr::addr_of_mut!(ffi::PyMemberDescr_Type)
+    {
+        if !ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_Clear();
+        }
+        return None;
+    }
+    let descriptor = descriptor.cast::<ffi::PyMemberDescrObject>();
+    if (*descriptor).d_common.d_type != owner_type {
+        return None;
+    }
+    let member = (*descriptor).d_member;
+    if member.is_null() || (*member).name.is_null() {
+        return None;
+    }
+    if (*member).type_code != ffi::Py_T_OBJECT_EX {
+        return None;
+    }
+    let flags = (*member).flags;
+    let allowed_flags = if access == IndexedFieldAccessKind::Load {
+        ffi::Py_READONLY
+    } else {
+        0
+    };
+    if (flags & !allowed_flags) != 0 {
+        return None;
+    }
+    let offset = usize::try_from((*member).offset).ok()?;
+    let basicsize = usize::try_from((*owner_type).tp_basicsize).ok()?;
+    if offset == 0
+        || offset % mem::align_of::<*mut ffi::PyObject>() != 0
+        || offset.checked_add(mem::size_of::<*mut ffi::PyObject>())? > basicsize
+    {
+        return None;
+    }
+    Some(offset)
+}
+
+unsafe fn publish_late_bound_owner_fields_for_function(
+    function: *mut ffi::PyObject,
+    owner_type: *mut ffi::PyTypeObject,
+    shared_state: &module_type::SharedModuleState,
+) -> Result<(), ()> {
+    if !owner_type_has_generic_attribute_hooks(owner_type) {
+        return Ok(());
+    }
+    let metadata = PyFunction_GetSoacMetadata(function);
+    if metadata.is_null() {
+        return Ok(());
+    }
+    let metadata = &*(metadata as *const PyFunctionJitExtra);
+    if !ptr::eq(Arc::as_ptr(&metadata.module_state), shared_state) {
+        return Ok(());
+    }
+    let owner_qualname = ffi::PyType_GetQualName(owner_type);
+    if owner_qualname.is_null() {
+        return Err(());
+    }
+    let mut length = 0;
+    let qualname_utf8 = ffi::PyUnicode_AsUTF8AndSize(owner_qualname, &mut length);
+    if qualname_utf8.is_null() {
+        ffi::Py_DECREF(owner_qualname);
+        return Err(());
+    }
+    let qualname_bytes = std::slice::from_raw_parts(qualname_utf8.cast::<u8>(), length as usize);
+    let result = (|| {
+        for (function_id, site) in &shared_state.late_bound_owner_fields.sites {
+            if *function_id != metadata.function_id
+                || site.owner_type.qualname.as_bytes() != qualname_bytes
+            {
+                continue;
+            }
+            let Some(cell) = shared_state
+                .late_bound_owner_fields
+                .cells
+                .get(site.cell_index as usize)
+            else {
+                continue;
+            };
+            if cell.owner_weakref.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            let Ok(attr_name) = CString::new(site.attr_name.as_str()) else {
+                continue;
+            };
+            let slot_offset = match site.storage {
+                LateBoundOwnerFieldStorage::ObjectSlot => {
+                    let Some(offset) =
+                        late_bound_slot_offset_for_owner(owner_type, &attr_name, site.access)
+                    else {
+                        continue;
+                    };
+                    offset
+                }
+                LateBoundOwnerFieldStorage::SplitDict { .. } => {
+                    if owner_type_has_any_class_binding(owner_type, &attr_name) {
+                        continue;
+                    }
+                    0
+                }
+            };
+            if (*owner_type).tp_version_tag == 0 {
+                let _ = PyUnstable_Type_AssignVersionTag(owner_type);
+            }
+            let version = (*owner_type).tp_version_tag;
+            if version == 0 {
+                continue;
+            }
+            let weakref = PyWeakref_NewRef(owner_type.cast(), ptr::null_mut());
+            if weakref.is_null() {
+                return Err(());
+            }
+            let py = Python::assume_attached();
+            let weakref_owner = Bound::<PyAny>::from_owned_ptr(py, weakref).unbind();
+            let mut owners = shared_state
+                .late_bound_owner_fields
+                .owner_weakrefs
+                .lock()
+                .map_err(|_| {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        c"late-bound owner weakref registry lock poisoned".as_ptr(),
+                    );
+                })?;
+            owners.push(weakref_owner);
+            cell.slot_offset.store(slot_offset, Ordering::Release);
+            cell.type_version.store(version as usize, Ordering::Release);
+            cell.owner_weakref
+                .store(weakref as usize, Ordering::Release);
+        }
+        Ok(())
+    })();
+    ffi::Py_DECREF(owner_qualname);
+    result
+}
+
 unsafe fn register_owner_types_from_type(
     owner_type: *mut ffi::PyTypeObject,
     module_name: *mut ffi::PyObject,
@@ -1487,6 +1700,9 @@ unsafe fn register_owner_types_from_type(
             let compiler_owned_runtime =
                 shared_state.is_some_and(|state| state.module_name == "soac.runtime");
             register_owner_type_for_function(value, owner_type, !compiler_owned_runtime)?;
+            if let Some(shared_state) = shared_state {
+                publish_late_bound_owner_fields_for_function(value, owner_type, shared_state)?;
+            }
         } else if ffi::PyType_Check(value) != 0 {
             register_owner_types_from_type(
                 value as *mut ffi::PyTypeObject,

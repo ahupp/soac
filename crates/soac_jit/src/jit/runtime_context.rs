@@ -100,6 +100,12 @@ struct RawPyCodeVersionPrefix {
     co_version: u32,
 }
 
+#[repr(C)]
+struct RawPyWeakRefForJit {
+    ob_base: ffi::PyObject,
+    wr_object: *mut ffi::PyObject,
+}
+
 pub struct ModuleRuntimeContext {
     pub mod_ctx: ModuleJitContext,
     pub compile_session: Arc<CompileSession>,
@@ -132,6 +138,17 @@ pub const FUNCTION_ENV_GLOBALS_OBJ_OFFSET: i32 =
     offset_of!(crate::FunctionEnvAbiHeader, globals_obj) as i32;
 pub const FUNCTION_ENV_BUILTINS_OBJ_OFFSET: i32 =
     offset_of!(crate::FunctionEnvAbiHeader, builtins_obj) as i32;
+pub const FUNCTION_ENV_LATE_BOUND_OWNER_CELLS_OFFSET: i32 =
+    offset_of!(crate::FunctionEnvAbiHeader, late_bound_owner_cells) as i32;
+pub const LATE_BOUND_OWNER_FIELD_CELL_SIZE: i32 =
+    size_of::<crate::module_type::LateBoundOwnerFieldCell>() as i32;
+pub const LATE_BOUND_OWNER_FIELD_WEAKREF_OFFSET: i32 =
+    offset_of!(crate::module_type::LateBoundOwnerFieldCell, owner_weakref) as i32;
+pub const LATE_BOUND_OWNER_FIELD_TYPE_VERSION_OFFSET: i32 =
+    offset_of!(crate::module_type::LateBoundOwnerFieldCell, type_version) as i32;
+pub const LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET: i32 =
+    offset_of!(crate::module_type::LateBoundOwnerFieldCell, slot_offset) as i32;
+pub const RAW_PY_WEAKREF_OBJECT_OFFSET: i32 = offset_of!(RawPyWeakRefForJit, wr_object) as i32;
 pub const FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET: i32 =
     size_of::<crate::FunctionEnvAbiHeader>() as i32;
 pub const PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET: i32 =

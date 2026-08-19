@@ -23,11 +23,11 @@ use anyhow::Result;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
     BinOpKind, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional,
-    ChildVisitable, ConstantExpr, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId,
-    LocalFunctionId, LocalLocation, ModuleContentId, NameLike, NameLocation, ParamKind,
-    PersistentFunctionId, ResolvedName, RuntimeName, SerializedFunctionDebugName,
-    SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
-    Tuple, Visit,
+    CallableScopeKind, ChildVisitable, ConstantExpr, FunctionExecutionMode, FunctionKind,
+    HasSemanticInstrId, InstrId, LocalFunctionId, LocalLocation, ModuleContentId, NameLike,
+    NameLocation, ParamKind, PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeName,
+    SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+    SerializedModuleId, SerializedModuleIdentity, Tuple, Visit,
 };
 use soac_ir_blockpy::is_constructor_entry_function;
 use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
@@ -38,10 +38,11 @@ use soac_ir_typed::plan_v3::{
     ExactListItemAccessKind, ExactListItemShape, ExactListItemSpecializationPlan,
     FunctionOptimizationPlanV3, FunctionPlanIdentity, IndexedFieldAccessKind,
     IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
-    IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic,
+    IndexedGlobalSpecializationPlan, LateBoundOwnerFieldSpecializationPlan,
+    LateBoundOwnerFieldStorage, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic,
     RegionId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,6 +317,9 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     let mut functions = Vec::new();
     let mut diagnostics_by_function = Vec::new();
     let mut exact_float_expressions_by_function = Vec::new();
+    let owner_field_sites =
+        late_bound_owner_field_site_catalog(lowered_module, module_identity.module_name.as_str());
+    let mut late_bound_owner_fields_by_function = Vec::new();
     for function in &lowered_module.callable_defs {
         let attempts = if function_uses_generator_resume_state(function) {
             Vec::new()
@@ -377,6 +381,36 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
         exact_float_expressions_by_function.push(
             exact_float_expression_plans_from_profile_evidence_v3(function, &evidence),
         );
+        late_bound_owner_fields_by_function.push(
+            owner_field_sites
+                .iter()
+                .filter(|(function_id, site)| {
+                    *function_id == function.function_id
+                        && evidence
+                            .hot_field_accesses
+                            .get(&site.source)
+                            .copied()
+                            .unwrap_or_default()
+                            >= 8
+                })
+                .filter_map(|(_, site)| {
+                    let mut site = site.clone();
+                    if matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. }) {
+                        let layout = evidence_store
+                            .field_index_specializations_for_attr(site.attr_name.as_str())?
+                            .iter()
+                            .find(|layout| {
+                                layout.owner_type.module_name == site.owner_type.module_name
+                                    && layout.owner_type.qualname == site.owner_type.qualname
+                            })?;
+                        site.storage = LateBoundOwnerFieldStorage::SplitDict {
+                            expected_index: layout.expected_index,
+                        };
+                    }
+                    Some(site)
+                })
+                .collect::<Vec<_>>(),
+        );
         functions.push(FunctionPlanRequest {
             function: function_plan_identity_v3(function),
             regions: region_requests,
@@ -398,14 +432,16 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             functions,
         },
     );
-    for ((function, diagnostics), exact_float_expressions) in plan
+    for (((function, diagnostics), exact_float_expressions), late_bound_owner_fields) in plan
         .functions
         .iter_mut()
         .zip(diagnostics_by_function)
         .zip(exact_float_expressions_by_function)
+        .zip(late_bound_owner_fields_by_function)
     {
         function.diagnostics.extend(diagnostics);
         function.exact_float_expressions = exact_float_expressions;
+        function.late_bound_owner_fields = late_bound_owner_fields;
     }
     validate_module_plan_v3_against_lowered_module(&plan, lowered_module)
         .map_err(ExactIntBranchV3Error::Emit)?;
@@ -428,6 +464,290 @@ fn function_uses_generator_resume_state(function: &BlockPyFunction<BlockPyModule
                 .iter()
                 .any(|slot| slot.logical_name == "_dp_pc")
     })
+}
+
+/// Deterministically enumerates structurally proven class-method field sites.
+///
+/// The same immutable catalog is used when selecting profiled plans and when
+/// allocating module-owned late-binding cells, so precompiled code never embeds
+/// a process-local owner address or depends on profile enumeration order.
+pub fn late_bound_owner_field_site_catalog(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    module_name: &str,
+) -> Vec<(RuntimeFunctionId, LateBoundOwnerFieldSpecializationPlan)> {
+    #[derive(Clone)]
+    struct OwnerShape {
+        qualname: String,
+        declared_slots: Option<HashSet<String>>,
+    }
+
+    struct ClassCollector<'a> {
+        module: &'a BlockPyModule<BlockPyModuleShape>,
+        namespace_name: &'a str,
+        constant_locals: HashMap<LocalLocation, String>,
+        methods: HashMap<String, RuntimeFunctionId>,
+        declared_slots: Option<Option<HashSet<String>>>,
+        qualname: Option<String>,
+    }
+
+    impl ClassCollector<'_> {
+        fn constant_string<'a>(&'a self, expr: &InstrBlockPy) -> Option<&'a str> {
+            if let Some(value) = codegen_constant_string_value_v3(self.module, expr) {
+                return Some(value);
+            }
+            let InstrBlockPy::Load(load) = expr else {
+                return None;
+            };
+            let NameLocation::Local(location) = load.name.location else {
+                return None;
+            };
+            self.constant_locals.get(&location).map(String::as_str)
+        }
+    }
+
+    impl Visit<InstrBlockPy> for ClassCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
+        where
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
+        {
+            if let InstrBlockPy::SetItem(op) = expr
+                && let InstrBlockPy::Load(namespace) = op.value.as_ref()
+                && matches!(namespace.name.location, NameLocation::Local(_))
+                && namespace.name.id_str() == self.namespace_name
+                && let Some(name) = self.constant_string(&op.index).map(str::to_string)
+            {
+                if name == "__qualname__" {
+                    self.qualname = self
+                        .constant_string(op.replacement.as_ref())
+                        .map(str::to_string);
+                } else if name == "__slots__" {
+                    let slots = match op.replacement.as_ref() {
+                        InstrBlockPy::Tuple(tuple) => tuple
+                            .values
+                            .iter()
+                            .map(|value| self.constant_string(value).map(str::to_string))
+                            .collect::<Option<HashSet<_>>>(),
+                        value => self
+                            .constant_string(value)
+                            .map(|value| HashSet::from([value.to_string()])),
+                    };
+                    if self.declared_slots.is_none() {
+                        self.declared_slots = Some(slots);
+                    } else {
+                        self.declared_slots = Some(None);
+                    }
+                } else {
+                    let method = match op.replacement.as_ref() {
+                        InstrBlockPy::MakeFunctionWithClosure(function) => {
+                            Some(function.function_id())
+                        }
+                        _ => None,
+                    };
+                    if let Some(function_id) = method {
+                        self.methods.insert(name.to_string(), function_id);
+                    }
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    struct ClassConstantCollector<'a> {
+        module: &'a BlockPyModule<BlockPyModuleShape>,
+        values: HashMap<LocalLocation, Option<String>>,
+    }
+
+    impl Visit<InstrBlockPy> for ClassConstantCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
+        where
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
+        {
+            if let InstrBlockPy::Store(store) = expr
+                && let NameLocation::Local(location) = store.name.location
+            {
+                let value =
+                    codegen_constant_string_value_v3(self.module, &store.value).map(str::to_string);
+                match self.values.entry(location) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(value);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let functions_by_id = module
+        .callable_defs
+        .iter()
+        .map(|function| (function.function_id, function))
+        .collect::<HashMap<_, _>>();
+    let mut owners_by_function = HashMap::new();
+    for class_function in &module.callable_defs {
+        if class_function.scope.scope_kind != CallableScopeKind::Class {
+            continue;
+        }
+        let Some(&namespace_index) = class_function.params.positional_param_indices().first()
+        else {
+            continue;
+        };
+        let mut constants = ClassConstantCollector {
+            module,
+            values: HashMap::new(),
+        };
+        constants.visit_fn(class_function);
+        let mut collector = ClassCollector {
+            module,
+            namespace_name: class_function.params.params[namespace_index].name.as_str(),
+            constant_locals: constants
+                .values
+                .into_iter()
+                .filter_map(|(location, value)| value.map(|value| (location, value)))
+                .collect(),
+            methods: HashMap::new(),
+            declared_slots: None,
+            qualname: None,
+        };
+        collector.visit_fn(class_function);
+        let Some(owner_qualname) = collector.qualname else {
+            continue;
+        };
+        if owner_qualname.is_empty() || owner_qualname.contains("<locals>") {
+            continue;
+        }
+        let declared_slots = match collector.declared_slots {
+            Some(Some(slots)) => Some(slots),
+            Some(None) => continue,
+            None => None,
+        };
+        for (method_name, function_id) in collector.methods {
+            let Some(function) = functions_by_id.get(&function_id) else {
+                continue;
+            };
+            if function.names.qualname != format!("{owner_qualname}.{method_name}") {
+                continue;
+            }
+            owners_by_function.insert(
+                function_id,
+                OwnerShape {
+                    qualname: owner_qualname.clone(),
+                    declared_slots: declared_slots.clone(),
+                },
+            );
+        }
+    }
+
+    struct AccessCollector<'a> {
+        module: &'a BlockPyModule<BlockPyModuleShape>,
+        module_name: &'a str,
+        function_id: RuntimeFunctionId,
+        receiver_name: &'a str,
+        owner: &'a OwnerShape,
+        sites: Vec<(RuntimeFunctionId, LateBoundOwnerFieldSpecializationPlan)>,
+    }
+
+    impl AccessCollector<'_> {
+        fn collect(
+            &mut self,
+            source: InstrId,
+            access: IndexedFieldAccessKind,
+            receiver: &InstrBlockPy,
+            attr: &InstrBlockPy,
+        ) {
+            let InstrBlockPy::Load(receiver) = receiver else {
+                return;
+            };
+            if !matches!(receiver.name.location, NameLocation::Local(_))
+                || receiver.name.id_str() != self.receiver_name
+            {
+                return;
+            }
+            let Some(attr_name) = codegen_constant_string_value_v3(self.module, attr) else {
+                return;
+            };
+            let storage = match &self.owner.declared_slots {
+                Some(slots) if slots.contains(attr_name) => LateBoundOwnerFieldStorage::ObjectSlot,
+                Some(_) => return,
+                None => LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+            };
+            self.sites.push((
+                self.function_id,
+                LateBoundOwnerFieldSpecializationPlan {
+                    source,
+                    access,
+                    owner_type: IndexedFieldOwnerType {
+                        module_name: self.module_name.to_string(),
+                        qualname: self.owner.qualname.clone(),
+                    },
+                    attr_name: attr_name.to_string(),
+                    storage,
+                    cell_index: 0,
+                    reason: "profiled class-method receiver uses a late-bound owner field"
+                        .to_string(),
+                },
+            ));
+        }
+    }
+
+    impl Visit<InstrBlockPy> for AccessCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
+        where
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
+        {
+            match expr {
+                InstrBlockPy::GetAttr(op) => self.collect(
+                    op.semantic_instr_id(),
+                    IndexedFieldAccessKind::Load,
+                    &op.value,
+                    &op.attr,
+                ),
+                InstrBlockPy::SetAttr(op) => self.collect(
+                    op.semantic_instr_id(),
+                    IndexedFieldAccessKind::Store,
+                    &op.value,
+                    &op.attr,
+                ),
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut sites = Vec::new();
+    for function in &module.callable_defs {
+        let Some(owner) = owners_by_function.get(&function.function_id) else {
+            continue;
+        };
+        let Some(&parameter_index) = function.params.positional_param_indices().first() else {
+            continue;
+        };
+        let receiver_name = function.params.params[parameter_index].name.as_str();
+        let mut collector = AccessCollector {
+            module,
+            module_name,
+            function_id: function.function_id,
+            receiver_name,
+            owner,
+            sites: Vec::new(),
+        };
+        collector.visit_fn(function);
+        sites.extend(collector.sites);
+    }
+    sites.sort_by_key(|(function_id, site)| {
+        (
+            function_id.local_function_id().as_u32(),
+            site.source,
+            site.access,
+        )
+    });
+    sites.dedup_by(|left, right| left.0 == right.0 && left.1.source == right.1.source);
+    for (index, (_, site)) in sites.iter_mut().enumerate() {
+        site.cell_index = u32::try_from(index).expect("too many late-bound owner-field sites");
+    }
+    sites
 }
 
 pub fn plan_and_emit_extracted_exact_int_branches_v3(
@@ -559,6 +879,24 @@ fn validate_function_plan_v3_against_lowered_function(
                 lowered_function,
                 &lowered_accesses,
             )?;
+        }
+    }
+    if !planned_function.late_bound_owner_fields.is_empty() {
+        let lowered_accesses =
+            lowered_field_accesses_by_instr_v3(lowered_module, lowered_function)?;
+        for selected in &planned_function.late_bound_owner_fields {
+            let Some(lowered) = lowered_accesses.get(&selected.source) else {
+                return Err(MechanicalEmitError::EmissionMismatch(format!(
+                    "function {} late-bound owner-field at {} has no lowered attribute access",
+                    planned_function.function.function, selected.source
+                )));
+            };
+            if lowered.access != selected.access || lowered.attr_name != selected.attr_name {
+                return Err(MechanicalEmitError::EmissionMismatch(format!(
+                    "function {} late-bound owner-field at {} does not match lowered access or attribute",
+                    planned_function.function.function, selected.source
+                )));
+            }
         }
     }
     if !planned_function.indexed_globals.is_empty() {
@@ -2259,6 +2597,99 @@ fn counter_evidence_matches_module_v3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_bound_owner_field_catalog_finds_static_slot_and_split_methods() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+class Point:
+    __slots__ = ("value",)
+
+    def read(self):
+        return self.value
+
+    def write(self, value):
+        self.value = value
+
+class Record:
+    def read(self):
+        return self.value
+
+    def write(self, value):
+        self.value = value
+
+class Decorated:
+    @staticmethod
+    def read(instance):
+        return instance.value
+
+class Inherited(Point):
+    __slots__ = ()
+
+    def read(self):
+        return self.value
+
+def make_dynamic():
+    class Dynamic:
+        def read(self):
+            return self.value
+
+    return Dynamic
+"#,
+        )
+        .expect("class owner-field fixture should lower")
+        .blockpy_module;
+        let catalog = late_bound_owner_field_site_catalog(&lowered, "pkg.mod");
+        let actual = catalog
+            .iter()
+            .map(|(_, plan)| (plan.owner_type.qualname.as_str(), plan.access, plan.storage))
+            .collect::<Vec<_>>();
+        assert!(
+            actual.contains(&(
+                "Point",
+                IndexedFieldAccessKind::Load,
+                LateBoundOwnerFieldStorage::ObjectSlot,
+            )),
+            "slot owner read was not selected: {actual:?}"
+        );
+        assert!(
+            actual.contains(&(
+                "Point",
+                IndexedFieldAccessKind::Store,
+                LateBoundOwnerFieldStorage::ObjectSlot,
+            )),
+            "slot owner write was not selected: {actual:?}"
+        );
+        assert!(
+            actual.contains(&(
+                "Record",
+                IndexedFieldAccessKind::Load,
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+            )),
+            "split owner read was not selected: {actual:?}"
+        );
+        assert!(
+            actual.contains(&(
+                "Record",
+                IndexedFieldAccessKind::Store,
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+            )),
+            "split owner write was not selected: {actual:?}"
+        );
+        assert!(
+            catalog
+                .iter()
+                .enumerate()
+                .all(|(index, (_, plan))| plan.cell_index == index as u32),
+            "owner cells must have stable dense catalog indices",
+        );
+        assert!(
+            actual.iter().all(|(owner, _, _)| {
+                !matches!(*owner, "Decorated" | "Inherited") && !owner.contains("<locals>")
+            }),
+            "decorated, inherited, and dynamic owner bindings must not be selected: {actual:?}",
+        );
+    }
     use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
     use crate::region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::literal::{LiteralValue, StringLiteral};

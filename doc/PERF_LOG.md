@@ -1586,3 +1586,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   eligible-workload geometric improvement `1.059x`. The noisy eight-workload
   mean/median ratios are `0.904x` / `0.996x`; paired stock score moves from
   `0.460x` to `0.468x`.
+
+## 2026-08-19 - Specialize late-bound profiled instance fields
+
+- jj change id: `zssttuox`
+- summary: guard exact slotted and split-dictionary instance fields through
+  weak, versioned owner cells populated after class creation.
+- eight-workload stock score `0.468x` to `0.513x`; previous-SOAC mean/median
+  improvements `1.117x` / `1.040x`, with `float` median `1.280x`. Repeated
+  affected-workload median improvement `1.066x`; `comprehensions` and
+  `richards` regress, and generated native code grows `2.757%`.

@@ -1728,6 +1728,7 @@ mod tests {
                 direct_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
+                late_bound_owner_fields: Vec::new(),
                 indexed_globals: Vec::new(),
                 opaque_fused_iterations: Vec::new(),
                 exact_float_expressions: Vec::new(),

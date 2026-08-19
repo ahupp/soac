@@ -33,6 +33,7 @@ pub struct FunctionOptimizationPlanV3 {
     pub exact_float_expressions: Vec<ExactFloatExpressionSpecializationPlan>,
     pub exact_list_items: Vec<ExactListItemSpecializationPlan>,
     pub indexed_fields: Vec<IndexedFieldSpecializationPlan>,
+    pub late_bound_owner_fields: Vec<LateBoundOwnerFieldSpecializationPlan>,
     pub indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
     pub deopt_points: Vec<PlannedDeoptPoint>,
     pub ownership: FunctionOwnershipPlan,
@@ -388,6 +389,23 @@ pub struct IndexedFieldSpecializationPlan {
     pub guard: IndexedFieldGuardPlan,
     pub fallback: IndexedFieldFallbackPlan,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct LateBoundOwnerFieldSpecializationPlan {
+    pub source: InstrId,
+    pub access: IndexedFieldAccessKind,
+    pub owner_type: IndexedFieldOwnerType,
+    pub attr_name: String,
+    pub storage: LateBoundOwnerFieldStorage,
+    pub cell_index: u32,
+    pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum LateBoundOwnerFieldStorage {
+    SplitDict { expected_index: u32 },
+    ObjectSlot,
 }
 
 #[derive(
@@ -1039,6 +1057,7 @@ fn validate_function_plan(
     validate_exact_float_expression_plans(function, errors);
     validate_exact_list_item_plans(function, errors);
     validate_indexed_field_plans(function, errors);
+    validate_late_bound_owner_field_plans(function, errors);
     validate_indexed_global_plans(function, errors);
     for action in &function.ownership.actions {
         if action.reason.is_empty() {
@@ -1622,6 +1641,31 @@ fn validate_indexed_field_plans(function: &FunctionOptimizationPlanV3, errors: &
             errors.push(format!(
                 "function {} indexed-field at {} has empty reason",
                 function.function.function, indexed_field.source
+            ));
+        }
+    }
+}
+
+fn validate_late_bound_owner_field_plans(
+    function: &FunctionOptimizationPlanV3,
+    errors: &mut Vec<String>,
+) {
+    let mut seen = HashSet::new();
+    for field in &function.late_bound_owner_fields {
+        if !seen.insert((field.source, field.access)) {
+            errors.push(format!(
+                "function {} has duplicate late-bound owner-field {:?} at {}",
+                function.function.function, field.access, field.source
+            ));
+        }
+        if field.owner_type.module_name.is_empty()
+            || field.owner_type.qualname.is_empty()
+            || field.attr_name.is_empty()
+            || field.reason.is_empty()
+        {
+            errors.push(format!(
+                "function {} late-bound owner-field at {} has incomplete owner, attribute, or reason",
+                function.function.function, field.source
             ));
         }
     }
@@ -2702,6 +2746,7 @@ mod tests {
                 exact_float_expressions: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
+                late_bound_owner_fields: Vec::new(),
                 indexed_globals: Vec::new(),
                 deopt_points: vec![PlannedDeoptPoint {
                     id: DeoptPointId(0),
@@ -3008,6 +3053,14 @@ mod tests {
     ) -> ModuleOptimizationPlanV3 {
         let mut module = module_with_regions(Vec::new());
         module.functions[0].indexed_fields = indexed_fields;
+        module
+    }
+
+    fn module_with_late_bound_owner_fields(
+        late_bound_owner_fields: Vec<LateBoundOwnerFieldSpecializationPlan>,
+    ) -> ModuleOptimizationPlanV3 {
+        let mut module = module_with_regions(Vec::new());
+        module.functions[0].late_bound_owner_fields = late_bound_owner_fields;
         module
     }
 
@@ -3319,6 +3372,79 @@ mod tests {
 
         let err = validate_module_plan_v3(&plan).unwrap_err();
         assert!(err.to_string().contains("duplicate indexed-field"));
+    }
+
+    #[test]
+    fn validates_late_bound_slot_and_split_owner_field_selections() {
+        let owner_type = IndexedFieldOwnerType {
+            module_name: "pkg.model".to_string(),
+            qualname: "Record".to_string(),
+        };
+        let plan = module_with_late_bound_owner_fields(vec![
+            LateBoundOwnerFieldSpecializationPlan {
+                source: instr_id(7),
+                access: IndexedFieldAccessKind::Load,
+                owner_type: owner_type.clone(),
+                attr_name: "value".to_string(),
+                storage: LateBoundOwnerFieldStorage::ObjectSlot,
+                cell_index: 0,
+                reason: "profiled class-method slot load".to_string(),
+            },
+            LateBoundOwnerFieldSpecializationPlan {
+                source: instr_id(9),
+                access: IndexedFieldAccessKind::Store,
+                owner_type,
+                attr_name: "value".to_string(),
+                storage: LateBoundOwnerFieldStorage::SplitDict { expected_index: 2 },
+                cell_index: 1,
+                reason: "profiled class-method split-dict store".to_string(),
+            },
+        ]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_late_bound_owner_field_selections() {
+        let field = LateBoundOwnerFieldSpecializationPlan {
+            source: instr_id(7),
+            access: IndexedFieldAccessKind::Load,
+            owner_type: IndexedFieldOwnerType {
+                module_name: "pkg.model".to_string(),
+                qualname: "Record".to_string(),
+            },
+            attr_name: "value".to_string(),
+            storage: LateBoundOwnerFieldStorage::ObjectSlot,
+            cell_index: 0,
+            reason: "profiled class-method slot load".to_string(),
+        };
+        let plan = module_with_late_bound_owner_fields(vec![field.clone(), field]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(err.to_string().contains("duplicate late-bound owner-field"));
+    }
+
+    #[test]
+    fn rejects_incomplete_late_bound_owner_field_identity() {
+        let plan =
+            module_with_late_bound_owner_fields(vec![LateBoundOwnerFieldSpecializationPlan {
+                source: instr_id(7),
+                access: IndexedFieldAccessKind::Load,
+                owner_type: IndexedFieldOwnerType {
+                    module_name: "pkg.model".to_string(),
+                    qualname: String::new(),
+                },
+                attr_name: "value".to_string(),
+                storage: LateBoundOwnerFieldStorage::ObjectSlot,
+                cell_index: 0,
+                reason: "profiled class-method slot load".to_string(),
+            }]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("incomplete owner, attribute, or reason")
+        );
     }
 
     #[test]

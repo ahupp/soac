@@ -19,6 +19,8 @@ use soac_core::profile::{
 };
 use soac_instrument::InstrumentationConfig;
 use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_typed::plan_v3::LateBoundOwnerFieldSpecializationPlan;
+use soac_opt::pipeline_v3::late_bound_owner_field_site_catalog;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
@@ -51,6 +53,7 @@ pub struct ModuleInfo {
 }
 
 pub struct SharedModuleState {
+    pub(crate) late_bound_owner_fields: LateBoundOwnerFieldRuntime,
     pub lowered_module: BlockPyModule<BlockPyModuleShape>,
     pub module_name: String,
     pub package_name: String,
@@ -71,6 +74,39 @@ pub struct SharedModuleState {
     counter_dump_flush_tracker: Mutex<CounterDumpFlushTracker>,
     pub(crate) precompiled_module_runtime:
         OnceLock<Result<Arc<crate::jit::PrecompiledModuleRuntime>, String>>,
+}
+
+#[repr(C)]
+pub(crate) struct LateBoundOwnerFieldCell {
+    pub(crate) owner_weakref: AtomicUsize,
+    pub(crate) type_version: AtomicUsize,
+    pub(crate) slot_offset: AtomicUsize,
+}
+
+pub(crate) struct LateBoundOwnerFieldRuntime {
+    pub(crate) sites: Box<[(RuntimeFunctionId, LateBoundOwnerFieldSpecializationPlan)]>,
+    pub(crate) cells: Box<[LateBoundOwnerFieldCell]>,
+    pub(crate) owner_weakrefs: Mutex<Vec<Py<PyAny>>>,
+}
+
+impl LateBoundOwnerFieldRuntime {
+    fn for_module(module: &BlockPyModule<BlockPyModuleShape>, module_name: &str) -> Self {
+        let sites = late_bound_owner_field_site_catalog(module, module_name).into_boxed_slice();
+        let cells = sites
+            .iter()
+            .map(|_| LateBoundOwnerFieldCell {
+                owner_weakref: AtomicUsize::new(0),
+                type_version: AtomicUsize::new(0),
+                slot_offset: AtomicUsize::new(0),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            sites,
+            cells,
+            owner_weakrefs: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1050,6 +1086,10 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         .map(|_| py.None())
         .collect::<Vec<_>>();
     Ok(Arc::new(SharedModuleState {
+        late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
+            &lowered_module,
+            module_name,
+        ),
         lowered_module,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
@@ -1088,6 +1128,10 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
         .map(|_| py.None())
         .collect::<Vec<_>>();
     Ok(Arc::new(SharedModuleState {
+        late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
+            &lowered_module,
+            module_name,
+        ),
         lowered_module,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
@@ -1162,6 +1206,10 @@ pub fn build_shared_state_for_inspection_with_original_code_and_source_hash(
     let module_constant_objs =
         build_module_constant_objects(py, &codegen_constants, module_name, source_hash)?;
     Ok(Arc::new(SharedModuleState {
+        late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
+            &lowered_module,
+            module_name,
+        ),
         lowered_module,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
@@ -1246,6 +1294,10 @@ impl SoacExtModuleState {
             source_hash,
         )?;
         let shared_state = Arc::new(SharedModuleState {
+            late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
+                &lowered_module,
+                module_name.as_str(),
+            ),
             lowered_module,
             module_name,
             package_name,
@@ -2137,6 +2189,10 @@ def f():
         let entry_label_text = entry_label.to_string();
 
         let shared_state = SharedModuleState {
+            late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
+                &lowered,
+                "counter_test",
+            ),
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
@@ -2213,6 +2269,10 @@ def f(x):
         });
 
         let shared_state = SharedModuleState {
+            late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
+                &lowered,
+                "counter_test",
+            ),
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
@@ -2420,6 +2480,10 @@ def f():
         define_module_block_entry_counters(&mut lowered);
 
         let shared_state = SharedModuleState {
+            late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
+                &lowered,
+                "counter_test",
+            ),
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
@@ -2478,6 +2542,10 @@ def f():
         define_module_block_entry_counters(&mut lowered);
 
         let shared_state = SharedModuleState {
+            late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
+                &lowered,
+                "counter_flush_test",
+            ),
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),

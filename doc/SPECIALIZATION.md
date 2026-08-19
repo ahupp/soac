@@ -259,8 +259,9 @@ Verify-mode indexed-storage counters are scalar per-site counters:
 
 - `field_indexed_hit` / `field_indexed_fallback`
   - Instrumented for `GetAttr`/`SetAttr`.
-  - Count whether a type-key specialization loaded the instance
-    split-dict value directly or fell back to CPython attribute access.
+  - Count whether a guarded instance-field specialization accessed an
+    inline split-dictionary value or exact object slot directly, or fell back
+    to the original CPython attribute operation.
 
 Verify-mode refcount counters are scalar per-function counters:
 
@@ -441,6 +442,12 @@ apply/verify mode:
 
 - Source layout input is `type_keys`, recorded from CPython split-key
   insertion events.
+- Eager class-owned fields additionally consume existing `field_access`
+  `generic_getattr` / `generic_setattr` Profile branch counts. A site requires
+  at least eight generic observations; no new counter-dump schema is added.
+  Ordinary dictionary fields still require matching owner-specific
+  `type_keys`, while literal `__slots__` fields do not fabricate or require
+  split-dictionary type records.
 - In v3 planning, the optimizer consumes raw
   `type_keys` plus lowered constant-attribute `GetAttr`/`SetAttr` sites and
   emits matching indexed-field selections into the v3 plan.
@@ -516,6 +523,80 @@ apply/verify mode:
   when the receiver, attribute key, and replacement operands are safe to
   replay. Otherwise codegen keeps the local CPython attribute-set
   fallback.
+
+### Eager Class-Owned Fields
+
+Normal eager module compilation runs before its classes exist, so resolving
+an owner type immediately would discard otherwise valid profiled methods. The
+optimizer instead derives same-module owner provenance from the actual lowered
+class namespace, its literal `__qualname__`, `MakeFunctionWithClosure` method
+identity, the first local receiver, and optional literal `__slots__`.
+Single-definition immutable local string constants are propagated without
+name-based heuristics. Staticmethods/decorated methods, dynamic local classes,
+inherited slots, unresolved owners, and cross-module operations are rejected.
+
+The explicit public APIs are
+`soac_opt::pipeline_v3::late_bound_owner_field_site_catalog`,
+`soac_ir_typed::plan_v3::{LateBoundOwnerFieldSpecializationPlan,
+LateBoundOwnerFieldStorage}`, and the crate-root
+`soac_ir_typed::TypedLateBoundOwnerFieldPlan`. Validated plans distinguish
+`SplitDict { expected_index }` from `ObjectSlot`, preserve original
+function/instruction identity across same-module inlining, and assign stable,
+dense module-local cell indices. Existing resolved indexed-field plans retain
+precedence so previously guarded scalar regions remain valid.
+
+`SharedModuleState` owns the stable cell array and weak-reference objects;
+the real `FunctionEnvAbiHeader` contains one pointer to that array. Compiled
+code reaches cells by index through the active function environment rather
+than embedding process-local owner addresses or duplicating the ABI layout,
+preserving precompiled-code portability. Class-created publication validates
+same-module function provenance, exact generic attribute hooks, the precise
+object-slot descriptor or absence of conflicting MRO bindings, and a nonzero
+assigned type version. Static builtin bases in the pinned CPython can have a
+null `tp_dict`, so MRO dictionaries are read through owned
+`PyType_GetDict(base)` references. Depending on verified pinned CPython
+layouts is intentional; because PyO3's weakref declaration is `repr(Rust)`,
+generated code uses an explicit minimal C-layout `RawPyWeakRefForJit` prefix
+instead. No user callbacks or user-defined descriptor invocations are used to
+prime a cell.
+
+**Guard lifetime:** every access remains valid only while the owner weakref
+still points to the receiver's exact live class and its current nonzero
+`tp_version_tag` equals the published version. Dead CPython weakrefs contain
+`Py_None` and fail exact-owner identity. Slot loads additionally require a
+non-null current slot. Split fields additionally require an unmaterialized
+dictionary, valid inline storage, and a current owner `ht_cached_keys` table
+of split kind whose expected index is below both inline capacity and
+`dk_nentries`; the current shared-key entry must be the exact expected
+interned attribute-name object. Loads also require a present value. Because
+late-bound classes are intentionally not primed, an absent or mismatched
+shared key falls back to the original generic store so CPython can register a
+constructor's first insertion before later direct accesses. Type/property/hook
+mutations, owner death or redefinition,
+slot deletion, dictionary materialization/promotion, and invalid layouts
+immediately take the original generic `PyObject_GetAttr` /
+`PyObject_SetAttr` path. There is no timer, process-global guard table, or
+strong reference extending owner lifetime.
+
+Slot stores own the replacement before publishing it and only then decrement
+the old value, so a reentrant finalizer observes the new field. Dictionary
+stores reuse the existing guarded inline-values store and insertion-order
+handling. Verify mode preserves original-source indexed-hit/fallback counters,
+and the strengthened Profile→Verify→Apply regression covers slot/split
+reads and writes, subclasses, deleted/reinserted fields, materialized/promoted
+dictionaries, property replacement, finalizer ordering, weak class lifetime,
+and unseeded constructor first insertion with `__static_attributes__ = ()`.
+The live shared-key guard also restores actual release Apply correctness for
+`deltablue` and `richards`; their single-shot cold-JIT timings are not
+steady-state throughput evidence. Normally sampled fixed-eight and repeated
+five-workload median geometric improvements are **1.040x** and **1.066x**;
+`float` improves but `comprehensions` and `richards` regress, generated native
+code grows **2.757%**, and existing scalar-region invalidations remain
+unchanged. The complete `just test-all` correctness gate passes **1,217 Python
+nodeids across 84 batches / 8 workers**, plus **553 JIT**, **53 typed-IR**,
+**371 lowering**, **207 optimizer**, and **8 PyO3** tests; see
+`work/logs/late-owner-fields-test-all.log`. The measured subset remains below
+stock CPython, and the full-pyperformance **1.10x** target remains unmet.
 
 ### Limitations / Soundness / Extensions
 

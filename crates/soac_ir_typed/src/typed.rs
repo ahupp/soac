@@ -1185,6 +1185,13 @@ pub struct TypedIndexedFieldCounterSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedLateBoundOwnerFieldPlan {
+    pub counter_source: TypedIndexedFieldCounterSource,
+    pub storage: crate::plan_v3::LateBoundOwnerFieldStorage,
+    pub cell_index: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedAttrAccessPlan {
     Generic,
     IndexedField {
@@ -1192,6 +1199,7 @@ pub enum TypedAttrAccessPlan {
         counter_source: Option<TypedIndexedFieldCounterSource>,
         guards: Vec<TypedIndexedFieldGuard>,
     },
+    LateBoundOwnerField(TypedLateBoundOwnerFieldPlan),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

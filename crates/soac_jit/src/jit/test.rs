@@ -60,6 +60,7 @@ mod tests {
     use super::super::typed_pipeline::{
         annotate_typed_attr_accesses, annotate_typed_exact_float_expressions,
         annotate_typed_exact_int_selections, annotate_typed_indexed_global_accesses,
+        annotate_typed_late_bound_owner_fields,
     };
     use super::super::{
         BlockParamFacts, BlockPyBlock, ClifBlockDisplayAnnotations,
@@ -444,6 +445,49 @@ mod tests {
     unsafe extern "C" {
         fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
     }
+
+    #[test]
+    fn late_bound_owner_field_abi_is_state_relative_and_c_layout() {
+        use super::super::runtime_context::{
+            FUNCTION_ENV_LATE_BOUND_OWNER_CELLS_OFFSET, FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET,
+            LATE_BOUND_OWNER_FIELD_CELL_SIZE, LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET,
+            LATE_BOUND_OWNER_FIELD_TYPE_VERSION_OFFSET, LATE_BOUND_OWNER_FIELD_WEAKREF_OFFSET,
+            RAW_PY_WEAKREF_OBJECT_OFFSET,
+        };
+
+        assert_eq!(
+            FUNCTION_ENV_LATE_BOUND_OWNER_CELLS_OFFSET as usize,
+            std::mem::offset_of!(crate::FunctionEnvAbiHeader, late_bound_owner_cells),
+            "generated owner cells must be loaded from the portable function environment",
+        );
+        assert_eq!(
+            FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET as usize,
+            std::mem::size_of::<crate::FunctionEnvAbiHeader>(),
+            "adding state-local owner cells must keep trailing runtime objects ABI-aligned",
+        );
+        assert_eq!(
+            LATE_BOUND_OWNER_FIELD_CELL_SIZE as usize,
+            std::mem::size_of::<crate::module_type::LateBoundOwnerFieldCell>(),
+        );
+        assert_eq!(
+            LATE_BOUND_OWNER_FIELD_WEAKREF_OFFSET as usize,
+            std::mem::offset_of!(crate::module_type::LateBoundOwnerFieldCell, owner_weakref),
+        );
+        assert_eq!(
+            LATE_BOUND_OWNER_FIELD_TYPE_VERSION_OFFSET as usize,
+            std::mem::offset_of!(crate::module_type::LateBoundOwnerFieldCell, type_version),
+        );
+        assert_eq!(
+            LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET as usize,
+            std::mem::offset_of!(crate::module_type::LateBoundOwnerFieldCell, slot_offset),
+        );
+        assert_eq!(
+            RAW_PY_WEAKREF_OBJECT_OFFSET as usize,
+            std::mem::size_of::<ffi::PyObject>(),
+            "the pinned CPython weak-reference object starts with PyObject_HEAD",
+        );
+    }
+
     #[test]
     fn cranelift_function_name_is_stable_from_logical_name() {
         assert_eq!(
@@ -3813,6 +3857,7 @@ def build(values):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
@@ -3829,6 +3874,7 @@ def build(values):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
@@ -8552,6 +8598,7 @@ def read_point(point):
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
+                late_bound_owner_cells: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -8735,6 +8782,7 @@ def write_point(point, value):
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
+                late_bound_owner_cells: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -16989,6 +17037,7 @@ def f(x):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
@@ -17005,6 +17054,7 @@ def f(x):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
@@ -17084,6 +17134,7 @@ def f(x):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
@@ -17109,6 +17160,7 @@ def f(x):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
@@ -17215,6 +17267,7 @@ def f(x):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
@@ -17240,6 +17293,7 @@ def f(x):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
@@ -17390,6 +17444,7 @@ def f(x):
                                 .to_string(),
                         },
                     ],
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
@@ -17437,6 +17492,7 @@ def f(x):
                                 .to_string(),
                         },
                     ],
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
@@ -17545,6 +17601,7 @@ def f(x):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: vec![
                         IndexedGlobalSpecializationPlan {
                             source: load_source,
@@ -17584,6 +17641,7 @@ def f(x):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: vec![
                         soac_ir_typed::emit_v3::MechanicalIndexedGlobalEmission {
                             source: load_source,
@@ -18295,6 +18353,154 @@ def read_point(point):
     }
 
     #[test]
+    fn late_bound_owner_field_typed_plans_preserve_sources_and_existing_indexed_precedence() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function_in_module(&module_name_gen, "read_and_write");
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "obj".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "value".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let store_source = InstrId::new(7);
+        let load_source = InstrId::new(9);
+        let block_label = function.name_gen.next_block_name();
+        function.blocks = vec![BlockPyBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                op_expr(SetAttr::new(
+                    name_expr(test_name("obj")),
+                    constants.string_expr("x"),
+                    name_expr(test_name("value")),
+                )),
+                store_source,
+            )],
+            term: ret_term(with_instr_id(
+                op_expr(GetAttr::new(
+                    name_expr(test_name("obj")),
+                    constants.string_expr("x"),
+                )),
+                load_source,
+            )),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut function, &["obj", "value"]);
+        let function_id = function.function_id;
+        let mut artifacts =
+            test_empty_v3_artifacts_for_function("pkg.model", 1, "cache", 0, &function);
+        let owner_type = IndexedFieldOwnerType {
+            module_name: "pkg.model".to_string(),
+            qualname: "Point".to_string(),
+        };
+        let selected = vec![
+            soac_ir_typed::plan_v3::LateBoundOwnerFieldSpecializationPlan {
+                source: store_source,
+                access: IndexedFieldAccessKind::Store,
+                owner_type: owner_type.clone(),
+                attr_name: "x".to_string(),
+                storage: soac_ir_typed::plan_v3::LateBoundOwnerFieldStorage::ObjectSlot,
+                cell_index: 3,
+                reason: "profiled class-method slot store".to_string(),
+            },
+            soac_ir_typed::plan_v3::LateBoundOwnerFieldSpecializationPlan {
+                source: load_source,
+                access: IndexedFieldAccessKind::Load,
+                owner_type,
+                attr_name: "x".to_string(),
+                storage: soac_ir_typed::plan_v3::LateBoundOwnerFieldStorage::SplitDict {
+                    expected_index: 2,
+                },
+                cell_index: 4,
+                reason: "profiled class-method split-dict load".to_string(),
+            },
+        ];
+        artifacts.plan.functions[0].late_bound_owner_fields = selected.clone();
+        artifacts.emission.functions[0].late_bound_owner_fields = selected;
+
+        let mut typed_function =
+            lower_typed_function_if_tests_to_truthy(lower_blockpy_function_to_typed(function));
+        assert_eq!(
+            annotate_typed_late_bound_owner_fields(&mut typed_function, &artifacts)
+                .expect("validated owner-field plans should attach to their typed sites"),
+            2,
+        );
+        let InstrTyped::SetAttrTyped(store) = &typed_function.blocks[0].body[0] else {
+            panic!("test function body should contain typed SetAttr");
+        };
+        let TypedAttrAccessPlan::LateBoundOwnerField(store_plan) = &store.access else {
+            panic!("slot owner store should retain its late-bound typed plan");
+        };
+        assert_eq!(store_plan.counter_source.function_id, function_id);
+        assert_eq!(store_plan.counter_source.instr_id, store_source);
+        assert_eq!(store_plan.cell_index, 3);
+        assert_eq!(
+            store_plan.storage,
+            soac_ir_typed::plan_v3::LateBoundOwnerFieldStorage::ObjectSlot,
+        );
+        let BlockTerm::Return(InstrTyped::GetAttrTyped(load)) = &typed_function.blocks[0].term
+        else {
+            panic!("test function should return a typed GetAttr");
+        };
+        let TypedAttrAccessPlan::LateBoundOwnerField(load_plan) = &load.access else {
+            panic!("split owner load should retain its late-bound typed plan");
+        };
+        assert_eq!(load_plan.counter_source.function_id, function_id);
+        assert_eq!(load_plan.counter_source.instr_id, load_source);
+        assert_eq!(load_plan.cell_index, 4);
+        assert_eq!(
+            load_plan.storage,
+            soac_ir_typed::plan_v3::LateBoundOwnerFieldStorage::SplitDict { expected_index: 2 },
+        );
+
+        let existing_indexed_fields = HashMap::from([(
+            load_source,
+            vec![OptV3ResolvedIndexedFieldAccess {
+                access: IndexedFieldAccessKind::Load,
+                attr_name: "x".to_string(),
+                guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                specialization: FieldIndexSpecialization {
+                    expected_index: 2,
+                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
+                        module_name: "pkg.model".to_string(),
+                        qualname: "Point".to_string(),
+                    }),
+                    type_version: 1,
+                },
+            }],
+        )]);
+        assert_eq!(
+            annotate_typed_attr_accesses(
+                &mut typed_function,
+                &existing_indexed_fields,
+                &HashMap::new(),
+                true,
+            )
+            .expect("already-resolved indexed owners should retain their existing scalar path"),
+            1,
+        );
+        let BlockTerm::Return(InstrTyped::GetAttrTyped(load)) = &typed_function.blocks[0].term
+        else {
+            panic!("test function should return a typed GetAttr");
+        };
+        assert!(
+            matches!(load.access, TypedAttrAccessPlan::IndexedField { .. }),
+            "existing resolved split-field plans must take precedence over late binding",
+        );
+    }
+
+    #[test]
     fn v3_indexed_field_annotation_trusts_prevalidated_plan() {
         let module_name_gen = ModuleNameGen::new(0);
         let mut constants = TestConstantPool::default();
@@ -18404,6 +18610,7 @@ def read_point(point):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
@@ -18420,6 +18627,7 @@ def read_point(point):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
@@ -18498,6 +18706,7 @@ def read_point(point):
                         },
                         reason: "profiled type_keys selected this indexed-field layout".to_string(),
                     }],
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
@@ -18514,6 +18723,7 @@ def read_point(point):
                     exact_float_expressions: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
+                    late_bound_owner_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
@@ -23863,6 +24073,7 @@ class Point:
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
+                late_bound_owner_cells: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -24208,6 +24419,7 @@ class Point:
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
+                late_bound_owner_cells: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -24339,6 +24551,7 @@ class Point:
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
+                late_bound_owner_cells: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -24595,6 +24808,7 @@ class Point:
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
+                late_bound_owner_cells: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -24760,6 +24974,7 @@ class Point:
                 deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
                 globals_obj: globals.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
+                late_bound_owner_cells: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);

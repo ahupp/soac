@@ -6,12 +6,12 @@ use crate::plan_v3::{
     IndexedFieldFallbackPlan, IndexedFieldGuardKind, IndexedFieldOwnerType,
     IndexedFieldReceiverSource, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
     IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
-    MaterializeKind, ModuleOptimizationPlanV3, OpaqueFusedAlgorithmPlan,
-    OpaqueFusedCompatibilityMode, OpaqueFusedEntryGuardPlan, OpaqueFusedFallbackPlan,
-    OpaqueFusedProducerStagePlan, OpaqueFusedSinkPlan, OpaqueFusedStageId, OperationNode,
-    PlanNodeId, PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp,
-    RegionExitKind, RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
-    validate_module_plan_v3,
+    LateBoundOwnerFieldSpecializationPlan, MaterializeKind, ModuleOptimizationPlanV3,
+    OpaqueFusedAlgorithmPlan, OpaqueFusedCompatibilityMode, OpaqueFusedEntryGuardPlan,
+    OpaqueFusedFallbackPlan, OpaqueFusedProducerStagePlan, OpaqueFusedSinkPlan, OpaqueFusedStageId,
+    OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant,
+    PlannedOp, RegionExitKind, RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep,
+    RichCompareOp, validate_module_plan_v3,
 };
 #[cfg(test)]
 use crate::plan_v3::{
@@ -38,6 +38,7 @@ pub struct MechanicalFunctionEmission {
     pub exact_float_expressions: Vec<ExactFloatExpressionSpecializationPlan>,
     pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
+    pub late_bound_owner_fields: Vec<LateBoundOwnerFieldSpecializationPlan>,
     pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
     pub regions: Vec<MechanicalRegionEmission>,
 }
@@ -901,6 +902,7 @@ fn emit_function(
             .iter()
             .map(emit_indexed_field)
             .collect(),
+        late_bound_owner_fields: function.late_bound_owner_fields.clone(),
         indexed_globals: function
             .indexed_globals
             .iter()
@@ -1936,6 +1938,7 @@ mod tests {
                 exact_float_expressions: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
+                late_bound_owner_fields: Vec::new(),
                 indexed_globals: Vec::new(),
                 deopt_points: Vec::new(),
                 ownership: FunctionOwnershipPlan::default(),
@@ -2504,6 +2507,53 @@ mod tests {
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn emits_and_validates_late_bound_owner_field_decisions_mechanically() {
+        let mut plan = test_plan(true);
+        let owner_type = IndexedFieldOwnerType {
+            module_name: "pkg.model".to_string(),
+            qualname: "Record".to_string(),
+        };
+        plan.functions[0].late_bound_owner_fields = vec![
+            crate::plan_v3::LateBoundOwnerFieldSpecializationPlan {
+                source: InstrId::new(7),
+                access: IndexedFieldAccessKind::Load,
+                owner_type: owner_type.clone(),
+                attr_name: "value".to_string(),
+                storage: crate::plan_v3::LateBoundOwnerFieldStorage::ObjectSlot,
+                cell_index: 3,
+                reason: "profiled class-method slot load".to_string(),
+            },
+            crate::plan_v3::LateBoundOwnerFieldSpecializationPlan {
+                source: InstrId::new(9),
+                access: IndexedFieldAccessKind::Store,
+                owner_type,
+                attr_name: "value".to_string(),
+                storage: crate::plan_v3::LateBoundOwnerFieldStorage::SplitDict {
+                    expected_index: 2,
+                },
+                cell_index: 4,
+                reason: "profiled class-method split-dict store".to_string(),
+            },
+        ];
+
+        let mut emission = emit_mechanical_plan_v3(&plan).unwrap();
+        assert_eq!(
+            emission.functions[0].late_bound_owner_fields,
+            plan.functions[0].late_bound_owner_fields,
+            "mechanical owner-field emission must preserve source, owner, storage, and cell",
+        );
+
+        emission.functions[0].late_bound_owner_fields[0].cell_index += 1;
+        assert!(
+            matches!(
+                validate_mechanical_emission_matches_plan_v3(&plan, &emission),
+                Err(MechanicalEmitError::EmissionMismatch(_))
+            ),
+            "mechanical owner-field emission must reject a mismatched state-local cell",
         );
     }
 

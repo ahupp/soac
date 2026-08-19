@@ -37,7 +37,8 @@ use soac_ir_typed::{
     TypedExactIntReturnPlan, TypedExactListItemAccessPlan, TypedExactListItemCounterSource,
     TypedExactListItemPlanSource, TypedGeneratorInstancePlan, TypedGeneratorResumePlan,
     TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
-    TypedIndexedGlobalPlanSource, assign_missing_typed_function_instr_ids,
+    TypedIndexedGlobalPlanSource, TypedLateBoundOwnerFieldPlan,
+    assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -3489,6 +3490,89 @@ pub(super) fn annotate_typed_exact_float_expressions(
             "optimizer v3 exact-float expression plans were not attached to typed roots"
                 .to_string(),
         );
+    }
+    Ok(annotator.used.len())
+}
+
+pub(super) fn annotate_typed_late_bound_owner_fields(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    artifacts: &ExactIntBranchV3Artifacts,
+) -> Result<usize, String> {
+    let Some(emitted_function) = artifacts.emission.functions.first() else {
+        return Ok(0);
+    };
+    if emitted_function.late_bound_owner_fields.is_empty() {
+        return Ok(0);
+    }
+    struct Annotator<'a> {
+        function_id: RuntimeFunctionId,
+        plans: HashMap<InstrId, &'a soac_ir_typed::plan_v3::LateBoundOwnerFieldSpecializationPlan>,
+        used: HashSet<InstrId>,
+        error: Option<String>,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            let (source, access, target) = match expr {
+                InstrTyped::GetAttrTyped(op) => (
+                    op.semantic_instr_id(),
+                    PlanV3IndexedFieldAccessKind::Load,
+                    &mut op.access,
+                ),
+                InstrTyped::SetAttrTyped(op) => (
+                    op.semantic_instr_id(),
+                    PlanV3IndexedFieldAccessKind::Store,
+                    &mut op.access,
+                ),
+                _ => {
+                    expr.visit_children_mut(self);
+                    return;
+                }
+            };
+            if let Some(plan) = self.plans.get(&source) {
+                if plan.access != access {
+                    self.error = Some(format!(
+                        "optimizer v3 late-bound owner-field at {source} selected {:?}, but typed access is {:?}",
+                        plan.access, access
+                    ));
+                    return;
+                }
+                *target = TypedAttrAccessPlan::LateBoundOwnerField(TypedLateBoundOwnerFieldPlan {
+                    counter_source: TypedIndexedFieldCounterSource {
+                        function_id: self.function_id,
+                        instr_id: source,
+                    },
+                    storage: plan.storage,
+                    cell_index: plan.cell_index,
+                });
+                self.used.insert(source);
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let live_instr_ids = collect_typed_semantic_instr_ids(function);
+    let plans = emitted_function
+        .late_bound_owner_fields
+        .iter()
+        .filter(|plan| live_instr_ids.contains(&plan.source))
+        .map(|plan| (plan.source, plan))
+        .collect::<HashMap<_, _>>();
+    let mut annotator = Annotator {
+        function_id: function.function_id,
+        plans,
+        used: HashSet::new(),
+        error: None,
+    };
+    annotator.visit_fn_mut(function);
+    if let Some(error) = annotator.error {
+        return Err(error);
+    }
+    if annotator.used.len() != annotator.plans.len() {
+        return Err("optimizer v3 late-bound owner-field plans were not attached".to_string());
     }
     Ok(annotator.used.len())
 }
@@ -10285,6 +10369,12 @@ fn apply_typed_v3_module_rewrites(
     }
     for function in &mut module.callable_defs {
         assign_missing_typed_function_instr_ids(function);
+        if let Some(artifacts) = profile
+            .opt_v3_exact_int_branch_artifacts
+            .get(&function.function_id)
+        {
+            annotate_typed_late_bound_owner_fields(function, artifacts)?;
+        }
     }
 
     let callee_module = module.clone();

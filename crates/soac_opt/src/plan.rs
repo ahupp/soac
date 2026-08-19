@@ -14,6 +14,7 @@ pub struct FunctionProfileEvidence {
     pub operator_specializations: HashMap<InstrId, Vec<u64>>,
     pub getitem_specializations: HashMap<InstrId, Vec<u64>>,
     pub setitem_specializations: HashMap<InstrId, Vec<u64>>,
+    pub hot_field_accesses: HashMap<InstrId, u64>,
     pub branch_prefer_true: HashMap<InstrId, bool>,
 }
 
@@ -24,6 +25,7 @@ struct PersistentFunctionProfileEvidence {
     operator_specializations: HashMap<InstrId, Vec<u64>>,
     getitem_specializations: HashMap<InstrId, Vec<u64>>,
     setitem_specializations: HashMap<InstrId, Vec<u64>>,
+    hot_field_accesses: HashMap<InstrId, u64>,
     branch_prefer_true: HashMap<InstrId, bool>,
 }
 
@@ -191,6 +193,20 @@ impl ProfileEvidenceStore {
                             instr_id,
                             row.observed_value,
                         );
+                    }
+                    "field_access" => {
+                        let hot_count = row
+                            .branch_values
+                            .iter()
+                            .filter(|branch| {
+                                matches!(branch.branch, "generic_getattr" | "generic_setattr")
+                            })
+                            .fold(0_u64, |total, branch| total.saturating_add(branch.value));
+                        if hot_count != 0 {
+                            let function = store.functions.entry(function_id.clone()).or_default();
+                            let count = function.hot_field_accesses.entry(instr_id).or_default();
+                            *count = count.saturating_add(hot_count);
+                        }
                     }
                     "branch_outcomes" => {
                         let Some(slot) = row
@@ -387,6 +403,7 @@ impl ProfileEvidenceStore {
             operator_specializations: persistent.operator_specializations,
             getitem_specializations: persistent.getitem_specializations,
             setitem_specializations: persistent.setitem_specializations,
+            hot_field_accesses: persistent.hot_field_accesses,
             branch_prefer_true: persistent.branch_prefer_true,
         }
     }
@@ -487,11 +504,41 @@ mod tests {
     use super::*;
     use soac_core::block_py::InstrId;
     use soac_core::profile::{
-        CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
-        CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
+        CounterDumpBranchValue, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
+        CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn profile_evidence_preserves_hot_owner_field_sites_without_split_layout() {
+        let function_id = RuntimeFunctionId::from_raw_parts(7, 1);
+        let instr_id = InstrId::new(4);
+        let mut field_row = row("field_access", function_id, instr_id, 19, None);
+        field_row.branch_values = vec![CounterDumpBranchValue {
+            branch: "generic_getattr".to_string(),
+            value: 19,
+        }];
+        let record = CounterDumpRecord {
+            source_hash: 0x1234,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: vec![field_row],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_ne!(
+            store.evidence_for_runtime_function_v3("pkg.mod", 0x1234, function_id),
+            FunctionProfileEvidence::default(),
+            "a hot slot-backed owner field must remain visible without split-dict type_keys",
+        );
+    }
 
     #[test]
     fn profile_evidence_store_loads_counter_dump_once_into_function_views() {

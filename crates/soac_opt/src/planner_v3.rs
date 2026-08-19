@@ -231,6 +231,7 @@ pub fn plan_function_optimization_v3(
         exact_float_expressions: Vec::new(),
         exact_list_items,
         indexed_fields,
+        late_bound_owner_fields: Vec::new(),
         indexed_globals,
         deopt_points: Vec::new(),
         ownership: FunctionOwnershipPlan::default(),
