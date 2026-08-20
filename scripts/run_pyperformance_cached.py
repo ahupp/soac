@@ -7,13 +7,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import pyperf
 import pyperformance
 from pyperformance import cli
+from pyperformance._benchmark import Benchmark as PyperformanceBenchmark
 from pyperformance.venv import REQUIREMENTS_FILE, Requirements, VenvForBenchmarks
 
 
@@ -21,6 +23,72 @@ _CACHE_SCHEMA_VERSION = 1
 _CACHE_DIRECTORY = ".soac-pyperformance-ready-v1"
 _VOLATILE_ENVIRONMENT_PREFIXES = ("SOAC_",)
 _VOLATILE_ENVIRONMENT_NAMES = {"PYPERFORMANCE_RUNID"}
+_INSTALLER_ENVIRONMENT_NAMES = (
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_FIND_LINKS",
+    "PIP_NO_INDEX",
+    "PIP_TRUSTED_HOST",
+    "PIP_PROXY",
+    "PIP_CERT",
+    "PIP_CLIENT_CERT",
+    "PIP_CONFIG_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
+
+
+def _installer_environment_names(environment: Mapping[str, str]) -> list[str]:
+    extras = environment.get("PYPERFORMANCE_INHERIT_ENV_EXTRA", "")
+    extra_names = [name.strip() for name in extras.split(",") if name.strip()]
+    if any(_ENVIRONMENT_NAME.fullmatch(name) is None for name in extra_names):
+        raise ValueError("extra installer environment name is not permitted")
+
+    return list(
+        dict.fromkeys(
+            name
+            for name in (*_INSTALLER_ENVIRONMENT_NAMES, *extra_names)
+            if name in environment
+        )
+    )
+
+
+def _inherit_installer_environment(
+    arguments: list[str], environment: Mapping[str, str]
+) -> None:
+    installer_names = _installer_environment_names(environment)
+    if not installer_names:
+        return
+
+    for index, argument in enumerate(arguments[1:], start=1):
+        if argument == "--inherit-environ":
+            if index + 1 == len(arguments):
+                raise ValueError("--inherit-environ requires environment names")
+            value_index = index + 1
+            current = arguments[value_index]
+            prefix = ""
+        elif argument.startswith("--inherit-environ="):
+            value_index = index
+            current = argument.partition("=")[2]
+            prefix = "--inherit-environ="
+        else:
+            continue
+
+        inherited = dict.fromkeys(name for name in current.split(",") if name)
+        inherited.update(dict.fromkeys(installer_names))
+        arguments[value_index] = prefix + ",".join(inherited)
+        return
+
+    arguments.append("--inherit-environ=" + ",".join(installer_names))
 
 
 def _sha256(data: bytes) -> str:
@@ -296,8 +364,30 @@ def install_requirement_cache() -> None:
     VenvForBenchmarks.ensure_reqs = cached_ensure_reqs
 
 
+def install_benchmark_driver_provenance() -> None:
+    original = PyperformanceBenchmark.run
+    if getattr(original, "_soac_benchmark_driver_provenance", False):
+        return
+
+    def attributed_run(benchmark: PyperformanceBenchmark, *args: Any, **kwargs: Any) -> Any:
+        result = original(benchmark, *args, **kwargs)
+        results = (
+            result.get_benchmarks()
+            if isinstance(result, pyperf.BenchmarkSuite)
+            else (result,)
+        )
+        for measured in results:
+            measured.update_metadata({"soac_pyperformance_driver": benchmark.name})
+        return result
+
+    attributed_run._soac_benchmark_driver_provenance = True  # type: ignore[attr-defined]
+    PyperformanceBenchmark.run = attributed_run
+
+
 def main() -> Any:
+    _inherit_installer_environment(sys.argv, os.environ)
     install_requirement_cache()
+    install_benchmark_driver_provenance()
     return cli.main()
 
 

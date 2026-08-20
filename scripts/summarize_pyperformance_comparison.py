@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import statistics
 from pathlib import Path
 from typing import Any
 
 import pyperf
+from pyperf._collect_metadata import collect_python_metadata
+import pyperformance
+
+
+_DRIVER_METADATA = "soac_pyperformance_driver"
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,8 +22,9 @@ def parse_args() -> argparse.Namespace:
             "coverage, and report paired speedups plus transformed-module coverage."
         )
     )
-    parser.add_argument("comparison_dir", type=Path)
+    parser.add_argument("comparison_dir", type=Path, nargs="?")
     parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--preflight-baseline", type=Path)
     parser.add_argument("--json-out", type=Path)
     return parser.parse_args()
 
@@ -32,6 +39,17 @@ def _benchmark_elapsed(suite: pyperf.BenchmarkSuite) -> dict[str, float]:
     return {
         benchmark.get_name(): benchmark.mean() for benchmark in suite.get_benchmarks()
     }
+
+
+def _benchmark_drivers(suite: pyperf.BenchmarkSuite) -> dict[str, str]:
+    drivers = {}
+    for benchmark in suite.get_benchmarks():
+        name = benchmark.get_name()
+        driver = benchmark.get_metadata().get(_DRIVER_METADATA, name)
+        if not isinstance(driver, str) or not driver:
+            raise ValueError(f"benchmark {name} has invalid driver attribution")
+        drivers[name] = driver
+    return drivers
 
 
 def _require_benchmarks(
@@ -51,7 +69,7 @@ def _require_benchmarks(
 
 
 def _require_comparable_metadata(
-    suite: pyperf.BenchmarkSuite,
+    suite: pyperf.BenchmarkSuite | pyperf.Benchmark,
     expected_metadata: dict[str, Any],
     *,
     label: str,
@@ -70,6 +88,50 @@ def _require_comparable_metadata(
             raise ValueError(
                 f"{label} has incompatible {key}: {actual!r} != {expected!r}"
             )
+
+
+def _require_driver_attribution(
+    actual: dict[str, str], expected: dict[str, str], *, label: str
+) -> None:
+    mismatches = sorted(
+        name for name, driver in actual.items() if expected.get(name) != driver
+    )
+    if mismatches:
+        raise ValueError(
+            f"{label} has driver attribution mismatch: {', '.join(mismatches)}"
+        )
+
+
+def _require_comparable_benchmark_metadata(
+    suite: pyperf.BenchmarkSuite,
+    expected: dict[str, dict[str, Any]],
+    *,
+    label: str,
+) -> None:
+    for benchmark in suite.get_benchmarks():
+        metadata = expected.get(benchmark.get_name())
+        if metadata is not None:
+            _require_comparable_metadata(
+                benchmark,
+                metadata,
+                label=f"{label} benchmark {benchmark.get_name()}",
+            )
+
+
+def preflight_baseline(baseline: Path) -> None:
+    current = {
+        "platform": platform.platform(True, False),
+        "performance_version": pyperformance.__version__,
+    }
+    collect_python_metadata(current)
+    suite = _load_suite(baseline)
+    _require_comparable_metadata(suite, current, label=f"baseline {baseline}")
+    for benchmark in suite.get_benchmarks():
+        _require_comparable_metadata(
+            benchmark,
+            current,
+            label=f"baseline {baseline} benchmark {benchmark.get_name()}",
+        )
 
 
 def _merge_suites(paths: list[Path], output: Path) -> pyperf.BenchmarkSuite:
@@ -146,6 +208,7 @@ def _transformation_coverage(soac_paths: list[Path]) -> dict[str, Any]:
                 if row.get("record_type") == "pyperformance_worker_timing_v1"
                 and row.get("opt_mode") == "apply"
                 and isinstance(row.get("pid"), int)
+                and row.get("measured_batches") != 0
             ]
             apply_pids = {row["pid"] for row in apply_rows}
             if not apply_pids:
@@ -191,13 +254,17 @@ def _transformation_coverage(soac_paths: list[Path]) -> dict[str, Any]:
                         "project_modules": set(),
                         "stdlib_modules": set(),
                         "compiled_functions": set(),
-                        "worker_count": 0,
+                        "worker_pids": set(),
                     },
                 )
                 coverage["project_modules"].update(worker_project_modules)
                 coverage["stdlib_modules"].update(worker_stdlib_modules)
                 coverage["compiled_functions"].update(worker_functions)
-                coverage["worker_count"] += 1
+                coverage["worker_pids"].update(
+                    (worker_dir.resolve(), row["pid"])
+                    for row in apply_rows
+                    if row.get("pyperf_benchmark_name") == benchmark_name
+                )
 
             events_path = worker_dir / "events.jsonl"
             if not events_path.is_file():
@@ -245,7 +312,7 @@ def _transformation_coverage(soac_paths: list[Path]) -> dict[str, Any]:
                 "project_modules": sorted(coverage["project_modules"]),
                 "stdlib_modules": sorted(coverage["stdlib_modules"]),
                 "compiled_functions": sorted(coverage["compiled_functions"]),
-                "worker_count": coverage["worker_count"],
+                "worker_count": len(coverage["worker_pids"]),
             }
             for name, coverage in sorted(per_benchmark.items())
         },
@@ -262,6 +329,7 @@ def _baseline_elapsed(
     baseline: Path,
     expected: set[str],
     expected_metadata: dict[str, Any],
+    expected_benchmark_metadata: dict[str, dict[str, Any]],
 ) -> dict[str, float]:
     if baseline.is_dir():
         paths = sorted(baseline.glob("round-*-soac.json"))
@@ -279,6 +347,11 @@ def _baseline_elapsed(
         _require_comparable_metadata(
             suite,
             expected_metadata,
+            label=f"baseline {path}",
+        )
+        _require_comparable_benchmark_metadata(
+            suite,
+            expected_benchmark_metadata,
             label=f"baseline {path}",
         )
         elapsed = _benchmark_elapsed(suite)
@@ -300,17 +373,20 @@ def summarize_comparison(
     soac_samples: dict[str, list[float]] = {}
     speedup_samples: dict[str, list[float]] = {}
     reference_metadata: dict[str, Any] | None = None
+    reference_benchmark_metadata: dict[str, dict[str, Any]] | None = None
+    expected: set[str] | None = None
+    expected_drivers: dict[str, str] | None = None
     requested_path = comparison_dir / "requested-benchmarks.txt"
     if requested_path.is_file():
-        expected: set[str] | None = {
+        requested_drivers: set[str] | None = {
             line.removeprefix("- ").strip()
             for line in requested_path.read_text(encoding="utf-8").splitlines()
             if line.startswith("- ")
         }
-        if not expected:
+        if not requested_drivers:
             raise ValueError(f"requested benchmark list is empty: {requested_path}")
     else:
-        expected = None
+        requested_drivers = None
 
     for stock_path in stock_paths:
         soac_path = stock_path.with_name(
@@ -321,6 +397,10 @@ def summarize_comparison(
         soac_suite = _load_suite(soac_path)
         if reference_metadata is None:
             reference_metadata = stock_suite.get_metadata()
+            reference_benchmark_metadata = {
+                benchmark.get_name(): benchmark.get_metadata()
+                for benchmark in stock_suite.get_benchmarks()
+            }
         _require_comparable_metadata(
             stock_suite,
             reference_metadata,
@@ -331,14 +411,46 @@ def summarize_comparison(
             reference_metadata,
             label=str(soac_path),
         )
+        assert reference_benchmark_metadata is not None
+        _require_comparable_benchmark_metadata(
+            stock_suite,
+            reference_benchmark_metadata,
+            label=str(stock_path),
+        )
+        _require_comparable_benchmark_metadata(
+            soac_suite,
+            reference_benchmark_metadata,
+            label=str(soac_path),
+        )
         stock_elapsed = _benchmark_elapsed(stock_suite)
         soac_elapsed = _benchmark_elapsed(soac_suite)
+        stock_drivers = _benchmark_drivers(stock_suite)
+        soac_drivers = _benchmark_drivers(soac_suite)
+        if requested_drivers is not None:
+            _require_benchmarks(
+                dict.fromkeys(stock_drivers.values(), 0.0),
+                requested_drivers,
+                label=str(stock_path),
+            )
+            _require_benchmarks(
+                dict.fromkeys(soac_drivers.values(), 0.0),
+                requested_drivers,
+                label=str(soac_path),
+            )
         if expected is None:
             expected = set(stock_elapsed)
             if not expected:
                 raise ValueError(f"stock result contains no benchmarks: {stock_path}")
+            expected_drivers = stock_drivers
         _require_benchmarks(stock_elapsed, expected, label=str(stock_path))
         _require_benchmarks(soac_elapsed, expected, label=str(soac_path))
+        assert expected_drivers is not None
+        _require_driver_attribution(
+            stock_drivers, expected_drivers, label=str(stock_path)
+        )
+        _require_driver_attribution(
+            soac_drivers, expected_drivers, label=str(soac_path)
+        )
         for name in expected:
             stock_samples.setdefault(name, []).append(stock_elapsed[name])
             soac_samples.setdefault(name, []).append(soac_elapsed[name])
@@ -347,11 +459,18 @@ def summarize_comparison(
             )
 
     assert expected is not None
+    assert expected_drivers is not None
     assert reference_metadata is not None
+    assert reference_benchmark_metadata is not None
     _merge_suites(stock_paths, comparison_dir / "stock.json")
     _merge_suites(soac_paths, comparison_dir / "soac.json")
     baseline_elapsed = (
-        _baseline_elapsed(baseline, expected, reference_metadata)
+        _baseline_elapsed(
+            baseline,
+            expected,
+            reference_metadata,
+            reference_benchmark_metadata,
+        )
         if baseline is not None
         else None
     )
@@ -374,6 +493,11 @@ def summarize_comparison(
     summary: dict[str, Any] = {
         "comparison_dir": str(comparison_dir),
         "round_count": len(stock_paths),
+        "requested_driver_count": len(
+            requested_drivers
+            if requested_drivers is not None
+            else set(expected_drivers.values())
+        ),
         "benchmark_count": len(expected),
         "complete": True,
         "benchmarks": benchmark_results,
@@ -395,6 +519,10 @@ def render_summary(summary: dict[str, Any]) -> str:
     lines = [
         f"pyperformance comparison: {summary['comparison_dir']}",
         f"independent paired rounds: {summary['round_count']}",
+        (
+            "benchmark driver coverage: "
+            f"{summary['requested_driver_count']}/{summary['requested_driver_count']} complete"
+        ),
         f"benchmark coverage: {summary['benchmark_count']}/{summary['benchmark_count']} complete",
     ]
     for name, benchmark in summary["benchmarks"].items():
@@ -459,6 +587,14 @@ def render_summary(summary: dict[str, Any]) -> str:
 
 def main() -> int:
     args = parse_args()
+    if args.preflight_baseline is not None:
+        try:
+            preflight_baseline(args.preflight_baseline)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"pyperformance baseline preflight failed: {error}") from error
+        return 0
+    if args.comparison_dir is None:
+        raise SystemExit("pyperformance comparison directory is required")
     try:
         summary = summarize_comparison(args.comparison_dir, baseline=args.baseline)
     except (OSError, ValueError) as error:

@@ -461,7 +461,14 @@ another revision's cache.
   three rounds. Use the full pyperformance target set and at least three rounds
   for a final suite-wide performance claim. Pass a prior comparison directory
   or SOAC result JSON as `baseline` to also compare the changed SOAC revision
-  against its previous revision. Results live under `work/pyperformance/`.
+  against its previous revision; incompatible baseline platform, interpreter,
+  and pyperformance metadata are rejected before a result directory or
+  benchmark round is created. Requested pyperformance drivers can emit
+  multiple differently named measured results; comparison coverage validates
+  every requested driver, every emitted result, and consistent per-result
+  driver provenance across stock and SOAC rounds. Apply-worker coverage counts
+  distinct measured process IDs, not work-directory names. Results live under
+  `work/pyperformance/`.
   The comparison and its nested rounds use unchanged-environment freshness
   checks instead of recreating the repo venv, rebuilding a current release
   extension, or reinstalling unchanged benchmark-venv requirements each time.
@@ -495,8 +502,16 @@ another revision's cache.
   preparation, skipping repeated pip install/freeze work during unchanged
   profile/apply passes and comparison rounds. Missing environments or changed
   benchmark dependencies, interpreter, environment, or lock inputs fall back
-  to normal upstream setup; first-time benchmark dependency installation may
-  still require network access.
+  to normal upstream setup. Stock and SOAC modes both forward configured
+  package-index, proxy, and TLS-certificate settings into benchmark venvs;
+  first-time benchmark dependency installation may still require network
+  access. Lima guest commands do not inherit these settings from the host: use
+  `python3 scripts/run_lima_with_host_environment.py --instance ubuntu24
+  --workdir /home/adamh.guest/soac -- just pyperformance-compare all 1` from
+  the host to forward the allowlisted values through stdin and rewrite
+  host-loopback proxy URLs to `host.lima.internal`. Generic `ALL_PROXY` /
+  `all_proxy` settings require an explicit `PYPERFORMANCE_INHERIT_ENV_EXTRA`
+  opt-in because ambient SOCKS proxies can break local HTTP benchmarks.
   `benchmarks` is passed to pyperformance's `--benchmarks` option, and extra
   args are appended to `pyperformance run`. Stock runs, `soac-single`, and the
   SOAC apply pass default pyperf sampling to `--fast --min-time=0.05`; the SOAC
@@ -623,9 +638,14 @@ explicit ordinary
   `PYPERFORMANCE_INHERIT_ENV_EXTRA`
   `just pyperformance` maps `PYPERFORMANCE_AFFINITY` to pyperformance's
   `--affinity`, falls back to `BENCHMARK_CPU` when affinity is unset, maps
-  `PYPERFORMANCE_TIMEOUT` to `--timeout`, and appends
-  `PYPERFORMANCE_INHERIT_ENV_EXTRA` to the `--inherit-environ` list for SOAC
-  mode. Document any new pyperformance recipe knobs in README and here.
+  `PYPERFORMANCE_TIMEOUT` to `--timeout`, and appends explicitly named
+  `PYPERFORMANCE_INHERIT_ENV_EXTRA` variables to the `--inherit-environ` list
+  in both stock and SOAC modes. Standard package-index, proxy, and
+  TLS-certificate variables are included automatically. The Lima host helper
+  also forwards explicitly named extras into the guest. Generic `ALL_PROXY` /
+  `all_proxy` values are opt-in only because SOCKS proxies can interfere with
+  local HTTP benchmarks. Document any new pyperformance recipe knobs in README
+  and here.
 - `PERF_FREQUENCY`
   `just nqueens-slice-perf` defaults to `99` Hz so deep mixed JIT/CPython
   DWARF stacks do not generate excessive artifacts or lose samples during an

@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import platform
 
 import pyperf
 import pytest
@@ -26,6 +27,7 @@ def _write_suite(
     benchmarks: dict[str, float],
     *,
     metadata: dict[str, object] | None = None,
+    drivers: dict[str, str] | None = None,
 ) -> None:
     suite = pyperf.BenchmarkSuite(
         [
@@ -35,6 +37,11 @@ def _write_suite(
                         [elapsed, elapsed * 1.01],
                         metadata={
                             **(metadata or {}),
+                            **(
+                                {"soac_pyperformance_driver": drivers[name]}
+                                if drivers is not None
+                                else {}
+                            ),
                             "name": name,
                             "unit": "second",
                             "loops": 1,
@@ -56,10 +63,22 @@ def _write_round(
     stock: dict[str, float],
     soac: dict[str, float],
     metadata: dict[str, object] | None = None,
+    stock_drivers: dict[str, str] | None = None,
+    soac_drivers: dict[str, str] | None = None,
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    _write_suite(directory / f"round-{index:02d}-stock.json", stock, metadata=metadata)
-    _write_suite(directory / f"round-{index:02d}-soac.json", soac, metadata=metadata)
+    _write_suite(
+        directory / f"round-{index:02d}-stock.json",
+        stock,
+        metadata=metadata,
+        drivers=stock_drivers,
+    )
+    _write_suite(
+        directory / f"round-{index:02d}-soac.json",
+        soac,
+        metadata=metadata,
+        drivers=soac_drivers,
+    )
 
 
 def test_comparison_reports_paired_speedups_and_geometric_mean(tmp_path: Path) -> None:
@@ -120,6 +139,222 @@ def test_comparison_rejects_benchmarks_missing_from_the_fixed_target_set(
 
     with pytest.raises(ValueError, match="missing benchmarks: mixed_b"):
         comparison.summarize_comparison(tmp_path)
+
+
+def test_comparison_distinguishes_requested_drivers_from_emitted_results(
+    tmp_path: Path,
+) -> None:
+    comparison = _load_comparison_module()
+    drivers = {
+        "base64_small": "base64",
+        "base64_large": "base64",
+        "fastapi_http": "fastapi",
+    }
+    _write_round(
+        tmp_path,
+        1,
+        stock={"base64_small": 2.0, "base64_large": 4.0, "fastapi_http": 6.0},
+        soac={"base64_small": 1.0, "base64_large": 2.0, "fastapi_http": 3.0},
+        stock_drivers=drivers,
+        soac_drivers=drivers,
+    )
+    (tmp_path / "requested-benchmarks.txt").write_text(
+        "Selected benchmarks:\n- base64\n- fastapi\n", encoding="utf-8"
+    )
+
+    summary = comparison.summarize_comparison(tmp_path)
+
+    assert summary["requested_driver_count"] == 2
+    assert summary["benchmark_count"] == 3
+    assert set(summary["benchmarks"]) == set(drivers)
+    assert summary["complete"] is True
+
+
+def test_comparison_rejects_requested_driver_without_emitted_results(
+    tmp_path: Path,
+) -> None:
+    comparison = _load_comparison_module()
+    drivers = {"base64_small": "base64", "base64_large": "base64"}
+    _write_round(
+        tmp_path,
+        1,
+        stock={"base64_small": 2.0, "base64_large": 4.0},
+        soac={"base64_small": 1.0, "base64_large": 2.0},
+        stock_drivers=drivers,
+        soac_drivers=drivers,
+    )
+    (tmp_path / "requested-benchmarks.txt").write_text(
+        "Selected benchmarks:\n- base64\n- fastapi\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="missing benchmarks: fastapi"):
+        comparison.summarize_comparison(tmp_path)
+
+
+def test_comparison_rejects_missing_result_from_multi_result_driver(
+    tmp_path: Path,
+) -> None:
+    comparison = _load_comparison_module()
+    stock_drivers = {
+        "base64_small": "base64",
+        "base64_large": "base64",
+        "fastapi_http": "fastapi",
+    }
+    soac_drivers = {"base64_small": "base64", "fastapi_http": "fastapi"}
+    _write_round(
+        tmp_path,
+        1,
+        stock={"base64_small": 2.0, "base64_large": 4.0, "fastapi_http": 6.0},
+        soac={"base64_small": 1.0, "fastapi_http": 3.0},
+        stock_drivers=stock_drivers,
+        soac_drivers=soac_drivers,
+    )
+    (tmp_path / "requested-benchmarks.txt").write_text(
+        "Selected benchmarks:\n- base64\n- fastapi\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="missing benchmarks: base64_large"):
+        comparison.summarize_comparison(tmp_path)
+
+
+@pytest.mark.parametrize("drift_mode", ["stock", "soac"])
+def test_comparison_rejects_result_driver_mapping_drift_across_rounds(
+    tmp_path: Path,
+    drift_mode: str,
+) -> None:
+    comparison = _load_comparison_module()
+    drivers = {
+        "base64_small": "base64",
+        "base64_large": "base64",
+        "fastapi_http": "fastapi",
+    }
+    drifted_drivers = {
+        "base64_small": "fastapi",
+        "base64_large": "base64",
+        "fastapi_http": "base64",
+    }
+    results = {"base64_small": 2.0, "base64_large": 4.0, "fastapi_http": 6.0}
+    _write_round(
+        tmp_path,
+        1,
+        stock=results,
+        soac=results,
+        stock_drivers=drivers,
+        soac_drivers=drivers,
+    )
+    _write_round(
+        tmp_path,
+        2,
+        stock=results,
+        soac=results,
+        stock_drivers=drifted_drivers if drift_mode == "stock" else drivers,
+        soac_drivers=drifted_drivers if drift_mode == "soac" else drivers,
+    )
+    (tmp_path / "requested-benchmarks.txt").write_text(
+        "Selected benchmarks:\n- base64\n- fastapi\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="driver attribution mismatch"):
+        comparison.summarize_comparison(tmp_path)
+
+
+def test_baseline_preflight_rejects_incompatible_platform(tmp_path: Path) -> None:
+    comparison = _load_comparison_module()
+    baseline = tmp_path / "previous-soac.json"
+    _write_suite(
+        baseline,
+        {"mixed": 1.0},
+        metadata={"platform": "incompatible-prior-platform"},
+    )
+
+    with pytest.raises(ValueError, match="incompatible platform"):
+        comparison.preflight_baseline(baseline)
+
+
+def test_baseline_preflight_checks_individual_benchmark_python_metadata(
+    tmp_path: Path,
+) -> None:
+    comparison = _load_comparison_module()
+    baseline = tmp_path / "previous-soac.json"
+    _write_suite(
+        baseline,
+        {"startup": 1.0, "normal": 2.0},
+        metadata={"platform": platform.platform(True, False)},
+    )
+    suite = pyperf.BenchmarkSuite.load(str(baseline))
+    suite.get_benchmark("normal").update_metadata(
+        {"python_version": "incompatible-prior-python"}
+    )
+    suite.dump(str(baseline), replace=True)
+
+    assert "python_version" not in suite.get_metadata()
+    with pytest.raises(ValueError, match="incompatible python_version"):
+        comparison.preflight_baseline(baseline)
+
+
+@pytest.mark.parametrize(
+    "drifted_result",
+    ["round-01-soac.json", "round-02-stock.json", "round-02-soac.json"],
+)
+def test_comparison_rejects_per_result_python_drift_across_rounds(
+    tmp_path: Path,
+    drifted_result: str,
+) -> None:
+    comparison = _load_comparison_module()
+    for index in (1, 2):
+        _write_round(
+            tmp_path,
+            index,
+            stock={"startup": 2.0, "normal": 4.0},
+            soac={"startup": 1.0, "normal": 2.0},
+        )
+    for path in tmp_path.glob("round-*.json"):
+        suite = pyperf.BenchmarkSuite.load(str(path))
+        suite.get_benchmark("normal").update_metadata(
+            {
+                "python_version": (
+                    "incompatible-python"
+                    if path.name == drifted_result
+                    else "shared-python"
+                )
+            }
+        )
+        suite.dump(str(path), replace=True)
+        assert "python_version" not in suite.get_metadata()
+
+    with pytest.raises(ValueError, match="incompatible python_version"):
+        comparison.summarize_comparison(tmp_path)
+
+
+def test_comparison_rejects_baseline_per_result_python_drift(
+    tmp_path: Path,
+) -> None:
+    comparison = _load_comparison_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    for directory in (candidate, baseline):
+        _write_round(
+            directory,
+            1,
+            stock={"startup": 2.0, "normal": 4.0},
+            soac={"startup": 1.0, "normal": 2.0},
+        )
+        for path in directory.glob("round-*.json"):
+            suite = pyperf.BenchmarkSuite.load(str(path))
+            suite.get_benchmark("normal").update_metadata(
+                {
+                    "python_version": (
+                        "incompatible-python"
+                        if directory == baseline and "-soac" in path.name
+                        else "shared-python"
+                    )
+                }
+            )
+            suite.dump(str(path), replace=True)
+            assert "python_version" not in suite.get_metadata()
+
+    with pytest.raises(ValueError, match="incompatible python_version"):
+        comparison.summarize_comparison(candidate, baseline=baseline)
 
 
 def test_comparison_reports_speedup_against_prior_soac(tmp_path: Path) -> None:
@@ -336,3 +571,95 @@ def test_comparison_attributes_benchmark_variants_to_their_own_worker(
     assert coverage["pickle_dict"]["compiled_functions"] == ["run_pickle_dict"]
     assert summary["transformation"]["optimized_typed_ir_block_count"] == 9
     assert summary["transformation"]["native_code_bytes"] == 300
+
+
+def test_comparison_counts_distinct_apply_worker_processes(tmp_path: Path) -> None:
+    comparison = _load_comparison_module()
+    _write_round(tmp_path, 1, stock={"mixed": 2.0}, soac={"mixed": 1.0})
+    worker = tmp_path / "round-01-soac.soac-work" / "benchmarks" / "mixed-worker"
+    module_path = worker / "modules" / "project" / "benchmark_impl" / "mod.blockpy"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_bytes(b"cache")
+    (worker / "pyperformance-worker-timing.jsonl").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "pid": pid,
+                    "opt_mode": mode,
+                    "pyperf_benchmark_name": "mixed",
+                    "record_type": "pyperformance_worker_timing_v1",
+                    "measured_batches": measured_batches,
+                }
+            )
+            for pid, mode, measured_batches in (
+                (44, "apply", 1),
+                (44, "apply", 1),
+                (45, "apply", 1),
+                (77, "apply", 0),
+                (99, "profile", 1),
+            )
+        )
+        + "\n"
+    )
+    (worker / "jit-code-summary.jsonl").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "process_id": pid,
+                    "function_id": f"{pid}:1",
+                    "function_qualname": f"execute_{pid}",
+                    "code_size": size,
+                    "machine_block_count": 1,
+                }
+            )
+            for pid, size in ((44, 10), (45, 20), (77, 777), (99, 999))
+        )
+        + "\n"
+    )
+
+    summary = comparison.summarize_comparison(tmp_path)
+
+    assert summary["transformation"]["benchmark_coverage"]["mixed"]["worker_count"] == 2
+    assert summary["transformation"]["native_code_bytes"] == 30
+
+
+def test_comparison_distinguishes_reused_worker_pids_across_worker_directories(
+    tmp_path: Path,
+) -> None:
+    comparison = _load_comparison_module()
+    _write_round(tmp_path, 1, stock={"mixed": 2.0}, soac={"mixed": 1.0})
+    work_root = tmp_path / "round-01-soac.soac-work" / "benchmarks"
+    for index in (1, 2):
+        worker = work_root / f"mixed-worker-{index}"
+        module_path = worker / "modules" / "project" / "benchmark_impl" / "mod.blockpy"
+        module_path.parent.mkdir(parents=True)
+        module_path.write_bytes(b"cache")
+        (worker / "pyperformance-worker-timing.jsonl").write_text(
+            json.dumps(
+                {
+                    "pid": 44,
+                    "opt_mode": "apply",
+                    "pyperf_benchmark_name": "mixed",
+                    "record_type": "pyperformance_worker_timing_v1",
+                    "measured_batches": 1,
+                }
+            )
+            + "\n"
+        )
+        (worker / "jit-code-summary.jsonl").write_text(
+            json.dumps(
+                {
+                    "process_id": 44,
+                    "function_id": f"{index}:1",
+                    "function_qualname": f"execute_{index}",
+                    "code_size": index * 10,
+                    "machine_block_count": 1,
+                }
+            )
+            + "\n"
+        )
+
+    summary = comparison.summarize_comparison(tmp_path)
+
+    assert summary["transformation"]["benchmark_coverage"]["mixed"]["worker_count"] == 2
+    assert summary["transformation"]["native_code_bytes"] == 30

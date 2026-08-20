@@ -252,6 +252,25 @@ already available on the machine where those operations run. The pystone
 benchmark inside the Ubuntu guest requires `jj` to be installed in the guest,
 even when Jujutsu is already installed on the macOS host.
 
+Lima does not automatically copy host package-index credentials or proxy
+settings into guest commands. When benchmark dependencies need that host
+configuration, start the guest command from the host with:
+
+```bash
+python3 scripts/run_lima_with_host_environment.py \
+  --instance ubuntu24 \
+  --workdir /home/adamh.guest/soac \
+  -- just pyperformance-compare all 1
+```
+
+The helper passes only package-index, proxy, certificate, and explicitly
+requested `PYPERFORMANCE_INHERIT_ENV_EXTRA` settings over stdin. Host-loopback
+proxy addresses are rewritten to `host.lima.internal`; credential values never
+appear in guest command arguments, helper output, or temporary files. Generic
+`ALL_PROXY` / `all_proxy` settings are excluded by default because SOCKS proxies
+can interfere with benchmarks that issue local HTTP requests; explicitly opt
+them in with `PYPERFORMANCE_INHERIT_ENV_EXTRA` only when required.
+
 `setup-dev-env` reuses an already-installed nightly Rust toolchain and Cranelift
 codegen component rather than upgrading them on every run, because a nightly
 refresh forces rebuilds. It also installs the `ruff` command with uv. The repo
@@ -274,16 +293,17 @@ artifacts.
 ## Documentation Site
 
 The Markdown files under `doc/` can be rendered as a local Astro Starlight
-site:
+site. The machine running the recipes needs Node.js, npm, and `just`:
 
 ```
-$ just docs-install
 $ just docs-build
 $ just docs-serve
 ```
 
-`docs-install` installs the Node dependencies declared in `package.json`.
-`docs-build` writes the generated site to ignored `work/docs-site/`.
+`docs-build` always runs `docs-install` first to install the Node dependencies
+declared in `package.json` without rewriting `package-lock.json`, then writes
+the generated site to ignored `work/docs-site/`. Run `just docs-install`
+directly when you only want to install the dependencies.
 `docs-serve` serves it on `0.0.0.0:8001` by default; pass a port to override
 it, for example `just docs-serve 9000`.
 
@@ -641,9 +661,13 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   unchanged pip install/freeze work. The first encounter, a missing benchmark
   environment, or changed benchmark dependencies, interpreter, environment,
   or lock inputs still uses the normal upstream setup. Initial setup may
-  install benchmark-specific dependencies from PyPI even though SOAC's own
-  venv refresh runs offline; allow network access for that bootstrap or
-  populate the benchmark environments in advance.
+  install benchmark-specific dependencies even though SOAC's own venv refresh
+  runs offline. Stock and SOAC runs both pass the caller's configured package
+  indexes, proxies, and TLS certificates into pyperformance's isolated
+  benchmark environments. Allow network access for that bootstrap or populate
+  the benchmark environments in advance; when launching Lima from the host,
+  use `scripts/run_lima_with_host_environment.py` to bring those settings into
+  the guest first.
   When `benchmarks` is omitted, pyperformance uses its default suite selection;
   pass a comma-separated pyperformance benchmark list such as
   `json_dumps,chaos` for a narrower run. Stock runs, `soac-single`, and the
@@ -695,9 +719,15 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   The examples run the default comparison, the full suite, a comparison
   against a previous SOAC result, and a quick single-round smoke test,
   respectively; replace `<previous-comparison>` with an existing comparison
-  directory. Each generated `summary.txt` and `summary.json` reports
+  directory. A prior baseline's platform, interpreter, and pyperformance
+  metadata are checked before a comparison directory or benchmark round is
+  created. Benchmark drivers can emit multiple differently named pyperf
+  results; comparisons validate every requested driver, every emitted result,
+  and consistent driver-to-result attribution across stock and SOAC rounds.
+  Each generated `summary.txt` and `summary.json` reports
   benchmark-result-specific transformed project/dependency and standard-library
-  module coverage, compiled functions, pre-optimization serialized BlockPy
+  module coverage, distinct measured apply-worker process counts, compiled
+  functions, pre-optimization serialized BlockPy
   bytes, optimized typed-IR final basic-block counts, and apply-mode emitted
   native-code bytes and machine-block counts.
   Use the full fixed pyperformance benchmark selection for authoritative
@@ -766,9 +796,13 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `BENCHMARK_CPU` as the affinity list when that existing benchmark knob is set.
 
 - `PYPERFORMANCE_INHERIT_ENV_EXTRA=NAME[,NAME...]`
-  Adds environment variables to the `--inherit-environ` list used by
-  `just pyperformance mode=soac`. The recipe already inherits the SOAC runtime
-  variables needed by the transformed benchmark workers.
+  Adds explicitly named environment variables to pyperformance's isolated
+  environments in both stock and SOAC modes. Common package-index, proxy, and
+  TLS-certificate settings are inherited automatically. The Lima host helper
+  also forwards explicitly named extras into the guest. Generic `ALL_PROXY` /
+  `all_proxy` settings are not inherited unless explicitly named, because SOCKS
+  proxies can break local HTTP benchmarks. SOAC modes continue inheriting their
+  required transformed-runtime variables.
 
 - `BENCHMARK_CONSTANT_CLOCKS=0|1`
   In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),

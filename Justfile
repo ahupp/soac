@@ -533,9 +533,9 @@ docs-install:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  npm install
+  npm install --no-save
 
-docs-build:
+docs-build: docs-install
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
@@ -1770,10 +1770,6 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       SOAC_COMPILE_MODE
       SOAC_EXEC_TRACE
     )
-    if [[ -n "${PYPERFORMANCE_INHERIT_ENV_EXTRA:-}" ]]; then
-      IFS=',' read -r -a extra_inherit_env <<<"$PYPERFORMANCE_INHERIT_ENV_EXTRA"
-      inherit_env+=("${extra_inherit_env[@]}")
-    fi
   fi
   inherit_csv="$(IFS=,; echo "${inherit_env[*]}")"
 
@@ -1942,6 +1938,11 @@ pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure
   fi
 
   just ensure-venv-fast
+  if [[ -n "$BASELINE_JSON" ]]; then
+    "$VENV_DIR/bin/python" \
+      "$REPO_ROOT/scripts/summarize_pyperformance_comparison.py" \
+      --preflight-baseline "$BASELINE_JSON"
+  fi
   mkdir -p "$PYPERFORMANCE_RESULTS_DIR"
   RESULT_DIR="$(mktemp -d "$PYPERFORMANCE_RESULTS_DIR/comparison-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
   printf '%s\n' "${BENCHMARK_SELECTOR:-all}" > "$RESULT_DIR/benchmark-selector.txt"

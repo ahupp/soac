@@ -87,6 +87,144 @@ def _ensure(fixture):
     )
 
 
+@pytest.mark.parametrize("mode", ["stock", "soac"])
+@pytest.mark.parametrize("inherit_form", ["equals", "separate"])
+def test_pyperformance_runner_preserves_dependency_network_environment(
+    benchmark_cache,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    inherit_form: str,
+) -> None:
+    module = benchmark_cache.module
+    expected_values = {
+        "PIP_INDEX_URL": "https://fake-user:fake-password@packages.example.invalid/simple",
+        "HTTP_PROXY": "http://proxy.example.invalid:3128",
+        "CUSTOM_DEPENDENCY_CERT": "/fake/ca.pem",
+    }
+    for name, value in expected_values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PYPERFORMANCE_INHERIT_ENV_EXTRA", "CUSTOM_DEPENDENCY_CERT")
+    monkeypatch.setenv("UNRELATED_SECRET", "not-inherited")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/must-not-override-guest-defaults")
+    monkeypatch.setenv("ALL_PROXY", "socks5h://127.0.0.1:1080")
+    monkeypatch.setenv("all_proxy", "socks5h://127.0.0.1:1081")
+
+    inherited_names = ["PIP_CACHE_DIR", "PIP_DISABLE_PIP_VERSION_CHECK"]
+    if mode == "soac":
+        monkeypatch.setenv("SOAC_OPT_MODE", "apply")
+        inherited_names.append("SOAC_OPT_MODE")
+
+    inherited_csv = ",".join(inherited_names)
+    inherited_arguments = (
+        [f"--inherit-environ={inherited_csv}"]
+        if inherit_form == "equals"
+        else ["--inherit-environ", inherited_csv]
+    )
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        ["run_pyperformance_cached.py", "run", *inherited_arguments],
+    )
+    monkeypatch.setattr(module, "install_requirement_cache", lambda: None)
+    monkeypatch.setattr(module.cli, "is_installed", lambda: True)
+    monkeypatch.setattr(module.cli, "_benchmarks_from_options", lambda _options: [])
+
+    observed: dict[str, object] = {}
+
+    def capture_benchmark_environment(options, _benchmarks) -> None:
+        venv = module.VenvForBenchmarks(
+            str(benchmark_cache.root),
+            inherit_environ=options.inherit_environ,
+        )
+        environment = venv._env
+        observed["matches"] = {
+            name: environment.get(name) == value
+            for name, value in expected_values.items()
+        }
+        observed["names"] = set(environment)
+
+    monkeypatch.setattr(module.cli, "cmd_run", capture_benchmark_environment)
+
+    module.main()
+
+    assert observed["matches"] == {name: True for name in expected_values}
+    assert "UNRELATED_SECRET" not in observed["names"]
+    assert "XDG_CONFIG_HOME" not in observed["names"]
+    assert "ALL_PROXY" not in observed["names"]
+    assert "all_proxy" not in observed["names"]
+    assert ("SOAC_OPT_MODE" in observed["names"]) is (mode == "soac")
+    assert module.sys.argv[0] == "run_pyperformance_cached.py"
+
+
+@pytest.mark.parametrize("proxy_name", ["ALL_PROXY", "all_proxy"])
+def test_pyperformance_runner_preserves_explicit_all_proxy_opt_in(
+    benchmark_cache,
+    proxy_name: str,
+) -> None:
+    environment = {
+        "ALL_PROXY": "socks5h://127.0.0.1:1080",
+        "all_proxy": "socks5h://127.0.0.1:1081",
+        "PYPERFORMANCE_INHERIT_ENV_EXTRA": proxy_name,
+    }
+    arguments = [
+        "run_pyperformance_cached.py",
+        "run",
+        "--inherit-environ=PIP_CACHE_DIR",
+    ]
+
+    benchmark_cache.module._inherit_installer_environment(arguments, environment)
+
+    inherited = set(arguments[-1].partition("=")[2].split(","))
+    assert proxy_name in inherited
+    assert ({"ALL_PROXY", "all_proxy"} - {proxy_name}).isdisjoint(inherited)
+
+
+@pytest.mark.parametrize(
+    ("driver_name", "result_names"),
+    [
+        ("fastapi", ("fastapi_http",)),
+        ("base64", ("base64_small", "base64_large")),
+    ],
+)
+def test_pyperformance_runner_attributes_all_results_to_their_driver(
+    benchmark_cache,
+    monkeypatch: pytest.MonkeyPatch,
+    driver_name: str,
+    result_names: tuple[str, ...],
+) -> None:
+    module = benchmark_cache.module
+    suite = module.pyperf.BenchmarkSuite(
+        [
+            module.pyperf.Benchmark(
+                [
+                    module.pyperf.Run(
+                        [1.0],
+                        metadata={"name": result_name, "unit": "second", "loops": 1},
+                        collect_metadata=False,
+                    )
+                ]
+            )
+            for result_name in result_names
+        ]
+    )
+    driver = SimpleNamespace(name=driver_name)
+
+    def original_run(actual_driver, *_args, **_kwargs):
+        assert actual_driver is driver
+        return suite
+
+    monkeypatch.setattr(module.PyperformanceBenchmark, "run", original_run)
+    module.install_benchmark_driver_provenance()
+
+    result = module.PyperformanceBenchmark.run(driver, "/fake/python")
+
+    assert result is suite
+    assert {
+        benchmark.get_name(): benchmark.get_metadata()["soac_pyperformance_driver"]
+        for benchmark in result.get_benchmarks()
+    } == {result_name: driver_name for result_name in result_names}
+
+
 def test_benchmark_requirement_cache_reuses_validated_environment(
     benchmark_cache,
     capsys: pytest.CaptureFixture[str],
@@ -205,7 +343,10 @@ def test_benchmark_requirement_cache_invalidates_changed_environment(
     benchmark_cache,
 ) -> None:
     _ensure(benchmark_cache)
-    benchmark_cache.venv._env["PIP_INDEX_URL"] = "https://packages.example.invalid/simple"
+    fake_credential = "fake-credential-never-in-marker"
+    benchmark_cache.venv._env["PIP_INDEX_URL"] = (
+        f"https://fake-user:{fake_credential}@packages.example.invalid/simple"
+    )
     _ensure(benchmark_cache)
 
     assert len(benchmark_cache.calls) == 2
@@ -214,6 +355,7 @@ def test_benchmark_requirement_cache_invalidates_changed_environment(
     )
     assert len(markers) == 2
     assert all("packages.example.invalid" not in marker.read_text() for marker in markers)
+    assert all(fake_credential not in marker.read_text() for marker in markers)
 
 
 def test_benchmark_requirement_cache_invalidates_changed_installed_dependencies(
