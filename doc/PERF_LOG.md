@@ -1750,3 +1750,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   official previous `1.05325x` uses a noisy baseline. Clean repeated
   `richards` improves `1.05599x` (`27.15 ms` to `25.71 ms`); native code
   and hidden trampolines remain unchanged.
+
+## 2026-08-19 - Share layout-uniform polymorphic field probes
+
+- jj change id: `wrzzyrtx`
+- summary: reuse complete exact-owner cells for same-index polymorphic
+  field loads and share one validated inline dictionary probe.
+- eight-workload stock score `0.667236x` versus prior `0.634579x`;
+  previous-SOAC `1.076213x`. Repeated `richards` improves `1.0881x`
+  (`25.707 ms` to `23.626 ms`); targeted stock `0.513925x`, previous
+  `1.06542x`; native code shrinks `54,697,320 B` to `54,686,760 B`.

@@ -729,19 +729,23 @@ test phase **166.374 seconds**; the existing counter-dump batch takes
 Existing same-module `SplitDict` constructor cells can also specialize hot
 ordinary receiver fields outside a method's first `self` parameter.
 Existing Profile `generic_getattr` / getter evidence must record at least
-**eight observations**, and the field's global profile must identify
-**exactly one concrete same-module owner**. Because attribute-owner
-observations are not source-specific, a second profiled owner—including a
-foreign-module owner—rejects the site rather than guessing which owner a
-particular source used.
+**eight observations**. A unique concrete same-module owner supports
+existing guarded loads or stores. A polymorphic load is additionally
+eligible only when its complete profile identifies **two through five
+distinct exact same-module owners**, every owner has an existing matching
+constructor anchor, and all owners prove the same attribute and split-field
+index. Foreign owners, missing anchors, mixed indices, owner counts above
+five, and polymorphic stores remain on the original generic operation.
 
 The optimizer reuses the minimum existing matching constructor-cell index
 for the exact owner, attribute, `SplitDict` storage index, original
 instruction source, and load/store access kind. Existing scalar, `self`,
-and polymorphic inherited decisions run first and retain precedence. At
-most **eight additional non-self fields per function** are selected in
-deterministic hottest-first order. No new owner cell, publication path,
-runtime helper, public API, or global state is introduced.
+polymorphic inherited, and unique-owner decisions run first and retain
+precedence. At most **eight distinct additional non-self source sites per
+function** are selected in deterministic hottest-first order; one complete
+polymorphic owner group counts as one site and never replaces an existing
+unique-owner store. No new owner cell, publication path, runtime helper,
+public API, or global state is introduced.
 
 Each selected access mechanically reuses the existing exact weak-owner,
 current nonzero type-version, safe hook/MRO/descriptor, shared-key identity,
@@ -752,9 +756,14 @@ materialized/promoted dictionaries, class replacement, subclass callbacks,
 descriptors, and reentrant finalizers remain guarded or generic as before.
 Loads and stores through top-level locals, unrelated methods, compound
 receivers, and nested eager comprehensions are admitted only with the same
-validated exact owner and existing cell.
+validated exact owner and existing cell. For a complete same-index
+polymorphic load, every existing weak-owner/type-version guard remains
+independent, then successful owners converge through one matched-owner
+Cranelift block parameter into **one shared live split-key guard and one
+inline-values field probe** before the original generic fallback.
 
-A genuine structured production-path regression turns RED-to-GREEN,
+For the original unique-owner-only implementation, a genuine structured
+production-path regression turns RED-to-GREEN,
 covering exact source/index/access, unique-owner minimum-cell reuse,
 cross-module ambiguity, the eight-entry cap, and existing scalar/self
 precedence. The independent transformed Profile→Verify→Apply integration
@@ -792,6 +801,99 @@ isolated file batches and eight workers**, plus JIT **563**, optimizer
 seconds**, inner / outer pytest **94.592 / 94.607 seconds**, and the full
 test phase **161.366 seconds**; the known counter-dump batch takes
 **93.80 seconds**. The full-suite stock **1.10x** goal remains unmet.
+
+The subsequent layout-uniform polymorphic extension changes exactly two
+existing production files, `crates/soac_opt/src/pipeline_v3.rs` and
+`crates/soac_jit/src/jit/mod.rs`; the existing
+`crates/soac_jit/src/jit/test.rs` addition is strictly `#[cfg(test)]`-only.
+Three genuine independent regressions turn RED-to-GREEN: the real
+whole-production optimizer changes **0 → 5** independently anchored
+exact-owner plans (**1 passed / 213 filtered / 0.08 seconds**); the real
+emitted Cranelift CFG changes **5 → 1** live `ht_cached_keys` probes
+(**1 passed / 573 filtered / 0.10 seconds runtime / 0.49 seconds total**);
+and frozen actual stock/Profile→Verify→Apply transformed execution passes
+**1 test in 2.95 seconds** while verifying original-source indexed hits
+for all five owners, including an unrelated `Packet`. Existing
+unique/inherited decisions, mixed layouts, more than five owners, foreign
+owners, slots, hooks, MRO/property/dictionary mutations, finalizers, and
+untouched fallback remain covered; no baseline CPython-visible behavior
+bug is claimed.
+
+Post-format optimizer, JIT, and typed-IR libraries pass **214 / 214**,
+**574 / 574**, and **54 / 54** tests. Broad transformed compatibility
+passes **16 / 16 in 37.28 seconds**, combined optimizer/JIT test-target
+checking passes in **3.69 seconds**, and package-scoped formatting and
+format checks pass. The optimizer's **13.81-second rebuild**, JIT's
+**26.00-second compile**, and second debug-extension rebuild of
+**21.57 seconds** are workflow-only build overhead, not benchmark
+measurements. The dedicated new polymorphic fixture proves index **0**;
+a dedicated nonzero-index fixture remains pending. Changed real
+`Task.qpkt` and `Task.addPacket` / `Task.release` bodies expose `ident`
+index **1** and `priority` index **2**, but this source-body evidence is
+not per-site counter proof and indices **3 / 7** remain unaudited.
+
+All eight release-smoke workloads pass with identical transformed-source
+identities, **397 total JIT source rows, including adapters / 204 direct
+function bodies**, **2,866 typed blocks / 204 functions**, and
+**36,500 hidden trampoline bytes**; emitted native bytes change
+**2,238,468 → 2,238,412**.
+Normally sampled fixed-eight stock score is **0.6672361371916246x**
+versus retained **0.6345791409139968x**, with official previous-SOAC
+**1.076213366589749x**; all **80 actual Apply PIDs / 3,970 total JIT
+source rows, including adapters / 2,040 direct function bodies** retain
+exact sources and **365,000 hidden bytes**, while native bodies shrink
+**23,163,480 → 23,159,960 bytes**. Single-round richards raw
+**1.08277x** has an inconclusive paired-stock interval
+**0.97808–1.06599x** and is not alone a definitive win.
+
+Clean three-round comparison **`comparison-20260819-185725-iJQ74K`**
+establishes repeated richards improvement **25.707173 → 23.625606 ms**:
+raw **1.088106x (95% 1.069411–1.117355x)** and paired-stock-adjusted
+**1.070336x (1.043181–1.107330x)**, with all three independent raw
+(**1.108967x / 1.068209x / 1.081729x**) and paired
+(**1.103835x / 1.039361x / 1.076220x**) rounds improving. Deltablue is
+**NEUTRAL**, raw **1.007590x (0.989368–1.033818x)** / paired
+**0.974161x (0.946963–1.002748x)**; unchanged-code chaos movement is an
+environmental artifact, and comprehensions is neutral. Official fixed-four
+stock / previous-SOAC scores are **0.5139251222980681x /
+1.0654218950545014x**. All **120 actual Apply PIDs / 10,650 total JIT
+source rows, including adapters / 5,490 direct function bodies** retain
+exact sources, **2,265 typed blocks / 183 functions**, zero errors, and
+**746,520 hidden bytes**; native code decreases
+**54,697,320 → 54,686,760 bytes (-10,560)**, while machine blocks grow
+**3,594,960 → 3,596,430 (+1,470)**. Six deltablue bodies shrink
+**59,880 bytes**, ten richards bodies grow **49,320 bytes**, and chaos /
+comprehensions bodies remain identical.
+
+Matched zero-loss richards causal profiles contain **255 retained / 244
+candidate samples** for the same worker, **100 loops / 99 Hz / disabled
+block maps**. The disjoint four-symbol generic-attribute **leaf self**
+total falls **9.803255% → 4.099016% (-5.704239 percentage points)**:
+`_PyObject_TryGetInstanceAttribute` **5.098173% → 1.229705%**,
+`_PyObject_GenericGetAttrWithDict` **3.528812% → 2.869311%**,
+`PyObject_GetAttr` **0.784180% → 0%**, and its PLT **0.392090% → 0%**.
+Disjoint source partitions include `Richards.run`
+**4.706082% → 1.229705%**, `Task.runTask`
+**1.568361% → 0.819803%**, and `Task.release`
+**0.784180% → 0%**; `Task.qpkt` increases
+**0.392090% → 1.229705%**, while guard work moves into JIT bodies.
+Separate overlapping non-GetMethod generic ancestry changes
+**14.900427% → 9.017836% (-5.882591 percentage points)**; distinct
+`_PyObject_GetMethod` inclusive ancestry **7.841804% → 9.016836%**
+remains a separate bottleneck. These nested ancestry shares must not be
+added to disjoint leaf totals.
+
+The authoritative full **`just test-all` gate passes**, with evidence in
+**`work/logs/uniform-polymorphic-nonself-test-all.log`**: **1,234
+transformed Python nodeids / 97 isolated file batches / 8 workers / 97
+PASS / 0 failures**, plus Rust JIT **574**, optimizer **214**, typed IR
+**54**, lowering **371**, and PyO3 **8**. Cargo compilation takes
+**51.34 seconds**, Cargo tests **68.796 seconds**, inner / outer pytest
+**74.030 / 74.043 seconds**, and total test phase **142.853 seconds**.
+The new regression passes in **2.52 seconds**; the existing **28-node
+counter-dump batch dominates at 73.32 seconds**. The optimization is a
+fully validated **RETAIN / LANDING CANDIDATE**; the full-suite stock
+**1.10x** objective remains unmet.
 
 ### Late-Bound Guarded Scalar Regions
 

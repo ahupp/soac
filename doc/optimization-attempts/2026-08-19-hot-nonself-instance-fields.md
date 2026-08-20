@@ -4,9 +4,14 @@ title: "Hot Non-Self Instance Field Specialization"
 
 # Hot non-self instance field specialization
 
-- Status: **LANDED / RETAIN; THREE-ROUND GAINS, MATCHED ZERO-LOSS PROFILES,
-  AND FULL CORRECTNESS GATE VERIFIED; REPRODUCIBLE COMPREHENSIONS
-  REGRESSION AND NATIVE-CODE GROWTH DISCLOSED**.
+- Status: **ATTEMPT 2 RETAIN / VALIDATED LANDING CANDIDATE; ORIGINAL
+  ATTEMPT 1 REMAINS
+  LANDED / RETAINED WITH ALL HISTORICAL GAINS, DISCLOSED COMPREHENSIONS
+  REGRESSION, NATIVE-CODE GROWTH, AND VERIFIED FULL GATE PRESERVED;
+  ALL THREE GENUINE LAYOUT-UNIFORM TRANSFORMED / WHOLE-PRODUCTION
+  PLANNER / REAL EMITTED-CFG REDS TURN GREEN; CLEAN REPEATED RICHARDS
+  1.088106X / STOCK-PAIRED 1.070336X; TWO-FILE IMPLEMENTATION AND
+  AUTHORITATIVE FULL CORRECTNESS GATE GREEN**.
 - Pacific date: **2026-08-19 PDT**.
 - Baseline revision: integrated `main` change **`nnyqlvvy`**, commit
   **`70012945`**.
@@ -469,3 +474,430 @@ seconds**; the known counter-dump batch takes **93.80 seconds**.
 - Next action: integrate the validated retained change; future profitability
   work should investigate the unexplained repeated comprehensions
   regression, material native-code growth, and unmet stock **1.10x** goal.
+
+## Attempt 2: specialize layout-uniform polymorphic non-self instance fields
+
+- Current status: **RETAIN; fully validated landing candidate;
+  authoritative full correctness gate GREEN**. This is a chronological
+  reopening of
+  the already-retained strategy; **Attempt 1 and its complete historical
+  verdict, regressions, generated-code growth, measurements, and full gate
+  remain preserved above**.
+- Pacific date: **2026-08-19 PDT**.
+- Current integrated baseline: retained `main` change **`vosvuxuw`**,
+  commit **`9ad7d7dc`**.
+- Candidate: current change **`wrzzyrtx`**, initially observed at mutable
+  commit **`ef824f3b`**, described as **`Specialize layout-uniform
+  polymorphic non-self instance fields`**; snapshots can change the
+  commit ID.
+- No existing user-visible CPython behavior bug is claimed. Actual
+  unchanged-production stock/transformed **Profile → Verify → Apply**
+  semantic controls already pass; the genuine new transformed **RED** is
+  solely missing source-specific indexed hits. Three independent
+  unchanged-production transformed, whole-optimizer, and emitted-CFG
+  **REDs** were established before implementation. An optimizer
+  **RED → GREEN** was independently reported before the interruption,
+  and its actual post-interruption focused whole-production rerun is now
+  independently verified **GREEN: 1 passed / 213 filtered / 0.08
+  seconds**. The real emitted-CFG regression is also independently
+  verified **GREEN: 1 passed / 573 filtered**; the frozen genuine
+  stock/Profile → Verify → Apply transformed regression is now
+  independently verified **GREEN: 1 passed in 2.95 seconds**.
+
+### Current hypothesis and source-grounded evidence
+
+- Attempt 1 deliberately rejects globally ambiguous attribute ownership.
+  Some real workloads nevertheless visit a small, closed set of
+  same-module exact owners whose existing constructor anchors all prove
+  the **same attribute index**. Reusing those complete owner sets with
+  their existing exact runtime guards may safely convert currently generic
+  polymorphic loads without treating an attribute name alone as proof.
+- Current retained richards zero-loss profile contains **255 samples**.
+  The disjoint generic-attribute **leaf self** total is **9.803255%**;
+  source partitions include **`Richards.run` 4.706082%** and
+  **`Task.runTask` 1.568361%**. These partitions concern only the four
+  selected generic-lookup leaves; they are not whole-stack ancestry, a
+  speedup prediction, or proof that every access qualifies.
+- Actual decoded profile records approximately **81,634 generic schedule
+  `t.link` loads**. All five observed same-module concrete owners
+  **`DeviceTask`, `HandlerTask`, `IdleTask`, `Packet`, and `WorkTask`**
+  locate `.link` at exact split index **0**. The unrelated `Packet`
+  owner is part of the real observed set and must **not** be omitted for
+  convenience. All five similarly locate `.ident` at exact index **1**.
+- The four task descendants, excluding unrelated `Packet`, share matching
+  `.priority`, `.input`, and `.handle` indices **2 / 3 / 7**. Deltablue
+  exposes only `.my_output` / `.satisfied` across two same-index owners;
+  current chaos and comprehensions show **no corresponding opportunities**.
+  Do not promise their improvement.
+- Existing **`AmbiguousLeft` / `AmbiguousRight`** place the same attribute
+  at unequal indices **0 / 1**; this case remains genuinely ambiguous and
+  must stay on the original generic Python access. Foreign-module,
+  unanchored, slotted, descriptor-backed, hook-observed, missing, cold,
+  or incompletely observed owners must likewise remain generic.
+
+### Current implementation and compatibility boundaries
+
+- The current production implementation is present in **exactly two
+  existing files**:
+  **`crates/soac_opt/src/pipeline_v3.rs`** and
+  **`crates/soac_jit/src/jit/mod.rs`**. Root additionally authorizes only
+  a narrow **`#[cfg(test)]`-only** assertion in existing
+  **`crates/soac_jit/src/jit/test.rs`** to access its existing private
+  real Cranelift harness and prove one shared emitted live split probe.
+  This is a third Rust **test-only** path, not a third runtime production
+  file.
+- The implemented optimizer groups profile-derived indexed layouts by
+  original instruction source and access kind. Its new polymorphic case
+  admits only genuinely hot **LOAD** sites with **two through five exact
+  same-module owners**, one complete existing split-field constructor
+  anchor per distinct owner, one attribute name, and **identical expected
+  field indices**. Any foreign owner, repeated owner, missing anchor,
+  mixed index, polymorphic store, or owner count above five rejects the
+  complete candidate. The five-owner case includes unrelated `Packet`;
+  no partial owner group is retained.
+- The existing minimum **eight** profile observations remains in force.
+  Existing unique-owner candidates retain priority; the original cap of
+  **eight distinct additional non-self source sites per function** now
+  counts a complete polymorphic owner group as one source. Ties and
+  selected owners are ordered deterministically. Existing scalar, self,
+  inherited, unique-owner, store, instrumentation, and optimization-plan
+  precedence remains unchanged; no owner cell or layout fact is invented.
+- The implemented mechanical JIT first checks that all selected
+  polymorphic split owners have the same expected index. Every owner
+  retains its existing independent weak-owner identity and live
+  type-version guard. Successful exact-owner branches then converge into
+  **one matched-owner block parameter (phi)**; the selected owner alone
+  feeds **one shared live split-key guard and one shared inline-values
+  field probe**. Existing hook/descriptor safety, key/value/layout
+  validation, and untouched generic fallback remain in place. The
+  existing structured CFG regression counts real Cranelift loads of
+  `PyHeapTypeObject.ht_cached_keys`; its independently verified
+  post-interruption result is **1 passed / 573 filtered**, **0.10 seconds
+  test runtime / 0.49 seconds total**, with exactly **one** live shared
+  probe for all five independently guarded owners.
+- Preserve live class/MRO mutation, subclass/custom `__getattribute__`,
+  data descriptors, dictionary promotion / key changes, missing fields,
+  finalization, side effects, error propagation, and weak-owner lifetime.
+  Every unsupported or changed state takes the existing generic operation;
+  do not add a public API, exported runtime helper, mutable global, or
+  public IR operation.
+- New unchanged-production integration
+  **`tests/test_uniform_polymorphic_nonself_fields.py`** establishes a
+  genuine optimization-only transformed **RED: 1 failed in 2.79 seconds**
+  (**3.162 seconds outer pytest**). Actual stock and transformed
+  **Profile → Verify → Apply** observable semantics all pass. Profile
+  proves exactly five owners **`Left`, `Right`, `Third`, `Fourth`, and
+  `Packet`**, every `.link` at split index **0**. Existing
+  unique/inherited hits, mixed-index **`Left` / `Right` 0 / 1**,
+  six-owner rejection, cold sites, slots, unanchored owners, generic
+  stores, hooks/properties, MRO/class/dictionary mutations, finalizers,
+  and actual native direct bodies all pass.
+- The sole final specialization-counter assertion sees
+  **`Consumer.read '#0' = 0` instead of at least `160`** and
+  **`read_uniform '#0' = 0` instead of at least `320`**. This is a
+  genuine production-path indexed-hit RED, **not** a user-visible
+  CPython behavior mismatch.
+- The frozen real transformed integration has now turned that genuine
+  optimization-only counter failure **GREEN: 1 passed in 2.95 seconds**
+  (**2.92 seconds inner runtime**). Actual stock and transformed
+  Profile → Verify → Apply execution agrees, all five exact owners
+  including unrelated `Packet` retain the same proven index, and real
+  Verify counters record indexed hits at both original source sites.
+  Existing unique and inherited specializations, mixed indices, more
+  than five owners, foreign owners, slots, dynamic hooks, MRO/property
+  changes, dictionary mutations, and finalizers all preserve CPython
+  behavior. No baseline user-visible CPython bug is claimed.
+- The transformed check first required a one-time debug-extension build
+  of **26.92 seconds**. This is workflow/build setup overhead, not the
+  reported test runtime, an optimized-workload measurement, or a
+  performance result.
+- A second genuine unchanged-production whole-planner structured **RED**,
+  **`hot_nonself_uniform_split_fields_reuse_every_exact_owner_with_bounded_sources`**,
+  exercises real lowered Python plus an encoded counter profile and the
+  complete production optimization path. Existing unique / inherited
+  controls, mixed split indices **0 / 1**, foreign owners, missing anchors,
+  more than five owners, cold observations, and unchanged generic stores
+  all pass first. The sole intended final decision failure finds actual
+  **0** same-index owner plans instead of the required **5**.
+- An earlier tiny `HashSet::collect` type-inference mismatch was confined
+  to the draft test fixture and corrected **before** this genuine
+  assertion RED; it was not a production optimization failure.
+- The focused whole-production optimizer regression has now independently
+  turned its genuine **0 → 5** exact-owner decision failure **GREEN:
+  1 passed / 213 filtered / 0.08 seconds**. The current rerun verifies
+  all five existing exact owner anchors, the cap of eight distinct hot
+  source sites, retained unique/inherited decisions, and mixed-index,
+  foreign-owner, missing-anchor, over-cap, cold, and generic-store
+  negative controls. The 213 filtered tests are not a full optimizer
+  suite.
+- A third independent genuine unchanged-production structured emitted-CFG
+  **RED**,
+  **`uniform_polymorphic_late_owner_loads_share_one_live_split_key_probe`**,
+  now executes the actual specialized typed JIT builder with **five real
+  `TypedAttrAccessPlan` exact-owner guards**. In the existing
+  **`#[cfg(test)]`-only `crates/soac_jit/src/jit/test.rs`** harness, it
+  inspects actual Cranelift **`ir::Function` layout / DFG** and counts
+  **`Opcode::Load`** at
+  **`offset_of(PyHeapTypeObject, ht_cached_keys)`**. The real emitted
+  function has **5** live split-key probes instead of the required shared
+  **1**. This is structured production codegen evidence—not renderer
+  text, instrumentation, or a fabricated production stub.
+- The actual candidate emitted-CFG regression has now independently
+  turned that genuine **5 → 1** probe failure **GREEN: 1 passed / 573
+  filtered**, with **0.10 seconds** test runtime and **0.49 seconds**
+  total. The real five-owner typed plan emits exactly **one** live
+  `ht_cached_keys` probe; no broad JIT-suite result is implied by the
+  573 filtered tests.
+- Package-scoped formatting of **`soac_opt` and `soac_jit`** has
+  completed and its separate package-scoped format check is **GREEN**.
+  After formatting, the complete optimizer library passes **214 / 214
+  tests**, the complete JIT library passes **574 / 574 tests**, and the
+  complete typed-IR library passes **54 / 54 tests**; JIT test execution
+  takes **5.60 seconds**. Broad transformed compatibility passes
+  **16 / 16 in 37.28 seconds**, and combined optimizer/JIT test-target
+  checking passes in **3.69 seconds**. The optimizer's **13.81-second
+  rebuild**, JIT's **26.00-second compile**, and second debug-extension
+  rebuild of **21.57 seconds** are workflow/build setup costs, not
+  workload measurements or optimization performance evidence.
+- The new dedicated polymorphic fixture explicitly proves same-index
+  **0**. It does not yet contain a distinct dedicated nonzero-index
+  polymorphic regression. Real candidate richards direct bodies for
+  `Task.addPacket` / `Task.release` contain source-grounded `priority`
+  opportunities at index **2**, and `Task.qpkt` contains an `ident`
+  opportunity at index **1**. These are actual changed source-body
+  evidence, **not per-site specialization counters**; dedicated
+  nonzero-index fixture coverage and confirmation for indices **3 / 7**
+  remain **PENDING**.
+- Both approved production implementations and the existing
+  **`#[cfg(test)]`-only** CFG assertion are now visible in the working tree.
+  The post-interruption focused whole-production optimizer and actual JIT
+  CFG regressions and frozen real transformed Profile → Verify → Apply
+  regression are independently verified **GREEN**. Scoped formatting
+  and format checking, all optimizer/JIT/typed-IR libraries, broad
+  transformed compatibility, and combined Rust/test-target checking are
+  complete. Eight-workload mode-matched release smoke also passes. A
+  dedicated nonzero-index polymorphic fixture / complete actual richards
+  nonzero-index audit remains future follow-up; normally sampled and
+  clean repeated candidate performance are verified, and the
+  authoritative full correctness gate is **GREEN**.
+
+### Current benchmark protocol and retained baseline
+
+- Retained release smoke **174435** completes all eight benchmarks with
+  **2,238,468 native bytes / 147,712 blocks / 36,500 hidden trampoline
+  bytes**.
+- The completed candidate release debug-single smoke
+  **`comparison-20260819-185033-swtmUh`** passes all **eight** actual
+  Apply worker PIDs against that mode-matched retained **174435** result.
+  All **397 total JIT source rows, including adapters**, contain exactly
+  **204 direct-function-body rows**; source identities and optimized
+  typed coverage remain identical at **2,866 typed blocks / 204
+  functions**. No worker reports an error. Hidden trampoline bytes remain
+  exactly **36,500**. Total emitted native code changes
+  **2,238,468 → 2,238,412 bytes (-56 bytes)** and
+  **147,712 → 147,769 machine blocks (+57)**.
+- `chaos`, `comprehensions`, `fannkuch`, `float`, `nbody`, and
+  `spectral_norm` have byte-for-byte and block-for-block identical direct
+  bodies. `deltablue` changes **456,944 → 455,284 native bytes (-1,660)**
+  across five shrinking bodies. `richards` changes **347,408 → 349,012
+  bytes (+1,604)** and adds **154 machine blocks** across exactly ten
+  changed actual direct bodies: `schedule` **6,804 / 459 → 7,364 / 490
+  bytes / blocks**; `Richards.run` **180,128 / 12,595 → 180,888 /
+  12,641**; `Task.runTask` **10,308 / 615 → 8,880 / 547**;
+  `Packet.append_to` **3,332 → 4,268 bytes**; `Task.addPacket`
+  **8,864 → 7,788**; `Task.hold` **5,072 → 4,424**; `Task.release`
+  **2,632 → 2,608**; `Task.qpkt` **4,588 → 4,636**; `IdleTask.fn`
+  **11,848 → 12,416**; and `WorkTask.fn` **26,812 → 28,720**.
+- Cold debug-single richards values **34.16 versus 26.23 milliseconds**
+  are **explicitly invalid performance evidence**: this smoke verifies
+  release execution and generated-code coverage, not representative
+  speed, regression, or improvement. No candidate performance claim is
+  made before independent normally sampled and repeated comparisons.
+- Retained normally sampled fixed-eight comparison **174639** reports
+  stock **0.6345791409139968x** and previous SOAC
+  **1.0532525776372081x**. Actual Apply coverage is **23,163,480 native
+  bytes / 1,524,480 blocks / 365,000 hidden trampoline bytes**. The
+  earlier comparator carried noise; report worker-level confidence and
+  stock drift rather than treating its mean as a guarantee.
+- Candidate normally sampled fixed-eight comparison
+  **`comparison-20260819-185353-AwqE0f`**, against retained **174639**,
+  completes all eight workloads and all **80 actual Apply worker PIDs**.
+  Its official stock score is **0.6672361371916246x**, versus retained
+  **0.6345791409139968x**; official changed/previous SOAC improvement is
+  **1.076213366589749x**. Its **3,970 total JIT source rows, including
+  adapters**, contain exactly **2,040 direct-function-body rows**; every
+  worker preserves exact source identities/counts, **2,866 typed blocks /
+  204 functions**, and zero errors. Hidden trampolines remain exactly
+  **365,000 bytes**; emitted native code changes
+  **23,163,480 → 23,159,960 bytes (-3,520)** and
+  **1,524,480 → 1,524,970 machine blocks (+490)**.
+- All direct bodies in six unaffected fixed-eight workloads remain
+  byte-for-byte and block-for-block identical. Existing `deltablue`
+  native code changes **4,627,960 → 4,608,000 bytes (-19,960)** across
+  six existing direct bodies that shrink through the shared probe.
+  `richards` changes **3,954,720 → 3,971,160 bytes (+16,440)** across
+  ten actual direct bodies; representative changed functions include
+  `schedule` **7,364 → 7,820 bytes**, `Task.runTask`
+  **10,308 → 8,880 bytes**, and `Richards.run`
+  **184,212 → 185,116 bytes**. No generated function disappears and no
+  untransformed hot-path claim is inferred from completion alone.
+- Worker-robust `richards` latency changes **25.4559 → 23.5100 ms**,
+  raw **1.08277x** with **95% confidence interval 1.04273–1.11631x**;
+  however, the candidate's paired stock CPython is approximately **6%**
+  faster too, leaving stock-adjusted **1.01869x** with interval
+  **0.97808–1.06599x**. Because that interval includes parity, this is
+  **not a definitive richards improvement**. `deltablue` changes
+  **2.5413 → 2.3253 ms**, raw **1.09288x**
+  (**1.06488–1.17315x**), and stock-adjusted **1.15613x**
+  (**1.09567–1.22546x**). Raw apparent `chaos` and `comprehensions`
+  improvements occur despite byte/block-identical generated bodies and
+  are explicitly attributed to environmental drift, not the candidate.
+- Retained clean repeated four-workload comparison **175000** reports
+  stock **0.4865323207896451x** and previous SOAC
+  **1.023626052523357x**. Three-round Apply coverage is **54,697,320
+  native bytes / 3,594,960 blocks / 746,520 hidden trampoline bytes**.
+  The fixed subset remains **chaos, comprehensions, deltablue, and
+  richards**; richards is the primary source-backed target.
+- Completed candidate clean three-round fixed-four comparison
+  **`comparison-20260819-185725-iJQ74K`**, against retained **175000**,
+  reports official stock **0.5139251222980681x** and previous SOAC
+  **1.0654218950545014x**. All **120 actual Apply worker PIDs / 10,650
+  total JIT source rows, including adapters**, contain exactly **5,490
+  direct-function-body rows**, preserve exact source identities, report
+  zero errors, and retain **2,265 typed blocks / 183 functions**. Hidden
+  trampolines remain exactly **746,520 bytes**; native code changes
+  **54,697,320 → 54,686,760 bytes (-10,560)** and machine blocks change
+  **3,594,960 → 3,596,430 (+1,470)**. Six existing `deltablue` bodies
+  shrink by **59,880 bytes** in total while ten `richards` bodies grow by
+  **49,320 bytes**; every `chaos` and `comprehensions` body remains
+  exactly unchanged.
+- Definitive clean repeated `richards` latency improves
+  **25.707173 → 23.625606 ms**, raw **1.088106x** with **95% interval
+  1.069411–1.117355x** and paired-stock-adjusted **1.070336x** with
+  **95% interval 1.043181–1.107330x**. Every independently started
+  round improves: raw **1.108967x / 1.068209x / 1.081729x** and paired
+  **1.103835x / 1.039361x / 1.076220x**. This clean repeated result,
+  unlike the noisy normally sampled fixed-eight paired interval,
+  supports a real richards improvement.
+- Clean repeated `deltablue` changes **2.487616 → 2.468877 ms**, raw
+  **1.007590x (0.989368–1.033818x)** and paired-stock-adjusted
+  **0.974161x (0.946963–1.002748x)**. Both intervals include parity:
+  `deltablue` is **NEUTRAL**, and its stronger single-round normal
+  result must not be claimed as a reproducible improvement. Unchanged
+  `chaos` code nevertheless reports raw **1.038179x** / paired
+  **1.046299x**, an environmental artifact; `comprehensions` raw
+  **1.016239x** / paired **1.002620x** is **NEUTRAL**.
+- Baseline optimized coverage remains **2,866 typed blocks / 204
+  functions** for the fixed eight and **2,265 blocks / 183 functions** per
+  targeted round. Candidate smoke preserves fixed-eight typed coverage,
+  direct-source identities/counts, and hidden bytes; mode-matched native
+  bytes fall **56** while blocks rise **57**. Normally sampled fixed-eight
+  native bytes fall **3,520** while blocks rise **490**, with identical
+  typed/direct/hidden coverage. Clean three-round native bytes fall
+  **10,560** while blocks rise **1,470**, with all source identities,
+  typed coverage, and hidden trampolines unchanged. Workload-site
+  indexed counters and complete nonzero-index auditing remain pending.
+- Completed matched lossless richards causal profiling compares **255
+  retained / 244 candidate samples** from the same measured worker,
+  **100 replay loops / 99 Hz / `SOAC_JIT_BB_MAP=0`**, with **zero lost
+  samples**. The primary **disjoint four-symbol generic-attribute leaf
+  self** total falls **9.803255% → 4.099016% (-5.704239 percentage
+  points)**. Retained components are `_PyObject_TryGetInstanceAttribute`
+  **5.098173%**, `_PyObject_GenericGetAttrWithDict` **3.528812%**,
+  `PyObject_GetAttr` **0.784180%**, and its PLT **0.392090%**; candidate
+  components are respectively **1.229705% / 2.869311% / 0% / 0%**.
+- Correct disjoint source partitions of those same four leaves change
+  `Richards.run` **4.706082% → 1.229705%**, `Task.runTask`
+  **1.568361% → 0.819803%**, `Task.release` **0.784180% → 0%**,
+  `Task.addPacket` **0.392090% → 0%**, and `Task.qpkt`
+  **0.392090% → 1.229705%**. Lookup guard work moves into JIT direct
+  bodies; a rising individual source partition does not erase the net
+  disjoint reduction.
+- As a **separate overlapping whole-stack metric**, generic
+  `PyObject_GetAttr` ancestry excluding `_PyObject_GetMethod` changes
+  **14.900427% → 9.017836% (-5.882591 percentage points)**. Distinct
+  `_PyObject_GetMethod` inclusive ancestry changes **7.841804% →
+  9.016836%** and remains a different bottleneck. Do not add nested
+  inclusive ancestry to disjoint leaves or interpret the two measures as
+  independent gains.
+- The authoritative full `just test-all` gate is **GREEN**; evidence is
+  recorded in **`work/logs/uniform-polymorphic-nonself-test-all.log`**.
+  It passes **1,234 transformed Python nodeids / 97 isolated file
+  batches / 8 workers**, with **97 PASS / 0 failures**. Workspace Rust
+  libraries pass JIT **574**, optimizer **214**, typed IR **54**,
+  lowering **371**, and PyO3 **8**. Cargo compile takes **51.34
+  seconds**, the Cargo test phase **68.796 seconds**, pytest inner /
+  outer **74.030 / 74.043 seconds**, and total test phase **142.853
+  seconds**. The new transformed regression passes in **2.52 seconds**;
+  the preexisting **28-node counter-dump batch takes 73.32 seconds** and
+  dominates Python elapsed time. The implementation is a validated
+  **RETAIN / LANDING CANDIDATE**. The full pyperformance suite is
+  unmeasured and its stock **1.10x** objective remains unmet.
+
+| Attempt 2 metric | Current retained baseline | Candidate | Interpretation |
+| --- | --- | --- | --- |
+| Fixed-eight stock / previous score | 0.6345791409139968x / 1.0532525776372081x | 0.6672361371916246x stock / 1.076213366589749x previous SOAC | raw aggregate reflects material paired-stock/environment drift |
+| Clean repeated fixed-four stock / previous score | 0.4865323207896451x / 1.023626052523357x | 0.5139251222980681x stock / 1.0654218950545014x previous SOAC | richards improves in all three raw and paired rounds |
+| Mode-matched actual Apply release smoke / source coverage | 2,238,468 bytes / 147,712 blocks / 36,500 hidden bytes | GREEN 8 / 8; 2,238,412 bytes / 147,769 blocks / 36,500 hidden bytes | identical direct-source IDs/counts and 2,866 typed blocks / 204 functions; cold timings are invalid performance evidence |
+| Fixed-eight native bytes / blocks / hidden bytes | 23,163,480 / 1,524,480 / 365,000 | 23,159,960 / 1,524,970 / 365,000 | all 80 Apply PIDs preserve exact source IDs/counts and typed coverage |
+| Fixed-eight robust richards previous / stock-adjusted | 25.4559 ms retained SOAC | 23.5100 ms; raw 1.08277x [1.04273, 1.11631]; paired 1.01869x [0.97808, 1.06599] | paired interval includes parity; no definitive richards improvement |
+| Fixed-eight robust deltablue previous / stock-adjusted | 2.5413 ms retained SOAC | 2.3253 ms; raw 1.09288x [1.06488, 1.17315]; paired 1.15613x [1.09567, 1.22546] | single-round result is not reproduced in clean three-round evidence |
+| Clean repeated richards previous / stock-adjusted | 25.707173 ms retained SOAC | 23.625606 ms; raw 1.088106x [1.069411, 1.117355]; paired 1.070336x [1.043181, 1.107330] | all three independent raw and paired rounds improve |
+| Clean repeated deltablue previous / stock-adjusted | 2.487616 ms retained SOAC | 2.468877 ms; raw 1.007590x [0.989368, 1.033818]; paired 0.974161x [0.946963, 1.002748] | NEUTRAL; both intervals include parity |
+| Repeated native bytes / blocks / hidden bytes | 54,697,320 / 3,594,960 / 746,520 | 54,686,760 / 3,596,430 / 746,520 | all 120 Apply PIDs / 10,650 JIT source rows, including adapters / 5,490 direct bodies preserve typed coverage |
+| Matched lossless richards disjoint generic-attribute leaf self | 255 samples / 9.803255% | 244 samples / 4.099016%; -5.704239 percentage points | same worker / 100 loops / 99 Hz / no block maps / zero lost; do not add separate ancestry |
+| Matched separate non-GetMethod whole-stack generic ancestry | 14.900427% | 9.017836%; -5.882591 percentage points | overlapping inclusive metric; GetMethod ancestry 7.841804% → 9.016836% is distinct |
+| Actual schedule `t.link` generic loads | approximately 81,634; five exact owners all index 0 | pending | Packet must remain in complete owner set |
+| Baseline stock/transformed observable behavior | actual Profile/Verify/Apply semantics GREEN; no existing CPython mismatch | independently verified stock/Profile/Verify/Apply GREEN | transformed failure is specialization-only |
+| Real transformed polymorphic indexed-hit decision | genuine 1 failed / 2.79 s; Consumer.read 0 vs 160 and read_uniform 0 vs 320 | independently verified GREEN; 1 passed / 2.95 s, 2.92 s inner | five owners including Packet all index 0; actual source hits and all semantic controls pass |
+| Whole-production polymorphic optimizer decision | genuine structured RED; actual same-index owner plans 0 versus 5 | independently verified GREEN; 1 passed / 213 filtered / 0.08 s; all five owners and eight-site cap | real lowered Python/profile; unique/inherited/mixed/foreign/missing/>5/cold/store controls pass |
+| Actual shared-emitted-CFG decision | genuine real Cranelift structured RED; actual ht_cached_keys loads 5 versus 1 | independently verified GREEN; 1 passed / 573 filtered; 0.10 s runtime / 0.49 s total; exactly one live probe | existing cfg(test)-only JIT harness / five real typed owner plans; exactly two runtime production paths |
+| Post-format full optimizer / JIT / typed-IR libraries | retained baseline passed | GREEN 214 / 214 optimizer; 574 / 574 JIT, 5.60 s JIT execution; 54 / 54 typed IR | 13.81 s optimizer rebuild / 26.00 s JIT compile are workflow-only overhead |
+| Broad transformed compatibility / combined test-target check | retained baseline passed | GREEN 16 / 16 in 37.28 s; combined cargo check --tests GREEN 3.69 s | second 21.57 s debug-extension rebuild is workflow-only |
+| Scoped optimizer / JIT formatting and format check | retained baseline passed | both packages formatted and scoped format-check GREEN | no full-workspace formatting claim |
+| Dedicated nonzero-index polymorphic fixture / actual richards index audit | known actual richards indices 1 / 2 / 3 / 7 | changed direct bodies expose actual ident index 1 and priority index 2; dedicated fixture and indices 3 / 7 pending | source-body evidence is not per-site specialization-counter proof |
+| Full `just test-all` correctness gate | retained baseline passed | GREEN 1,234 nodeids / 97 PASS / 0 failed / 8 workers; JIT 574, optimizer 214, typed 54, lowering 371, PyO3 8 | total 142.853 s; new regression 2.52 s; existing 28-node batch 73.32 s |
+
+### Attempt 2 verdict and next action
+
+- Verdict: **RETAIN / VALIDATED LANDING CANDIDATE; original Attempt 1 remains
+  LANDED / RETAINED;
+  genuine unchanged-production transformed same-index polymorphic
+  optimization-only RED 1 / 2.79 seconds with all CPython semantics
+  passing; independent genuine whole-production optimizer RED 0 versus 5
+  owner plans independently verified GREEN 1 passed / 213 filtered /
+  0.08 seconds; independent genuine actual emitted-CFG RED 5 versus 1
+  live split-key probes independently verified GREEN 1 passed / 573
+  filtered, 0.10 seconds runtime / 0.49 seconds total; two-file runtime
+  implementation present; genuine frozen transformed optimization
+  RED → GREEN independently verified 1 passed / 2.95 seconds;
+  scoped formatting / format-check GREEN; full post-format optimizer /
+  JIT / typed-IR libraries GREEN 214 / 214, 574 / 574, and 54 / 54;
+  broad transformed compatibility GREEN 16 / 16 in 37.28 seconds;
+  combined test-target check GREEN 3.69 seconds; mode-matched release
+  smoke GREEN 8 / 8 with identical source identities and -56 native
+  bytes / +57 blocks; normally sampled fixed-eight GREEN 80 / 80 actual
+  Apply PIDs, stock 0.6672361371916246x and previous SOAC
+  1.076213366589749x, -3,520 native bytes / +490 blocks; deltablue
+  single-round stock-adjusted 1.15613x is NOT reproduced; noisy
+  single-round richards paired 1.01869x includes parity; definitive
+  targeted richards 25.707173 → 23.625606 ms, raw 1.088106x
+  [1.069411, 1.117355], paired 1.070336x [1.043181, 1.107330]; all
+  three raw and paired rounds improve; clean repeated deltablue /
+  comprehensions NEUTRAL; unchanged-code chaos movement is
+  environmental; fixed-four stock 0.5139251222980681x / previous SOAC
+  1.0654218950545014x, -10,560 native bytes / +1,470 blocks across
+  120 actual Apply PIDs; source-body evidence for nonzero indices
+  1 / 2; matched zero-loss causal richards 255 / 244 samples reduces
+  disjoint generic-attribute leaves 9.803255% → 4.099016%
+  (-5.704239 percentage points); authoritative full correctness gate
+  GREEN 1,234 nodeids / 97 isolated batches / 8 workers / 0 failures,
+  JIT 574 / optimizer 214 / typed 54 / lowering 371 / PyO3 8;
+  dedicated nonzero-index coverage / complete index audit remain future
+  follow-up; full-suite stock 1.10x remains unmet**.
+- Transferable lesson: owner ambiguity is not automatically unsafe when a
+  complete bounded set of same-module anchored exact owners proves one
+  identical layout index, but every owner—including unrelated concrete
+  classes—and all existing mutable-runtime guards remain mandatory.
+- Next action: integrate the fully validated retained change, then
+  continue toward the unmeasured full-suite stock **1.10x** objective.

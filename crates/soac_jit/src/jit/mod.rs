@@ -11117,60 +11117,119 @@ fn emit_typed_late_bound_owner_getattr(
     fb.set_cold_block(fallback_block);
     let direct_block = fb.create_block();
     fb.append_block_param(direct_block, ptr_ty);
-    for (index, candidate) in plans.iter().enumerate() {
-        let next_owner = if index + 1 == plans.len() {
-            fallback_block
-        } else {
-            fb.create_block()
-        };
-        let (owner_type, cell) =
-            emit_late_bound_owner_guard(fb, receiver, candidate, next_owner, emit_ctx)?;
-
-        match candidate.storage {
-            LateBoundOwnerFieldStorage::SplitDict { expected_index } => {
-                emit_late_bound_split_key_guard(
-                    fb,
-                    owner_type,
-                    attr,
-                    expected_index,
-                    fallback_block,
-                    emit_ctx,
-                )?;
-                emit_trusted_inline_values_field_probe(
-                    fb,
-                    receiver,
-                    owner_type,
-                    expected_index,
-                    direct_block,
-                    fallback_block,
-                    emit_ctx,
-                )?;
+    let uniform_split_index = if plans.len() > 1 {
+        match plan.storage {
+            LateBoundOwnerFieldStorage::SplitDict { expected_index }
+                if plans.iter().skip(1).all(|candidate| {
+                    matches!(
+                        candidate.storage,
+                        LateBoundOwnerFieldStorage::SplitDict {
+                            expected_index: candidate_index
+                        } if candidate_index == expected_index
+                    )
+                }) =>
+            {
+                Some(expected_index)
             }
-            LateBoundOwnerFieldStorage::ObjectSlot => {
-                let offset = fb.ins().load(
-                    ptr_ty,
-                    ir::MemFlags::trusted(),
-                    cell,
-                    LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET,
-                );
-                let slot = fb.ins().iadd(receiver, offset);
-                let value = fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot, 0);
-                let null_ptr = fb.ins().iconst(ptr_ty, 0);
-                let present = fb
-                    .ins()
-                    .icmp(ir::condcodes::IntCC::NotEqual, value, null_ptr);
-                fb.ins().brif(
-                    present,
-                    direct_block,
-                    &[ir::BlockArg::Value(value)],
-                    fallback_block,
-                    &[],
-                );
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(expected_index) = uniform_split_index {
+        let matched_owner_block = fb.create_block();
+        fb.append_block_param(matched_owner_block, ptr_ty);
+        for (index, candidate) in plans.iter().enumerate() {
+            let next_owner = if index + 1 == plans.len() {
+                fallback_block
+            } else {
+                fb.create_block()
+            };
+            let (owner_type, _) =
+                emit_late_bound_owner_guard(fb, receiver, candidate, next_owner, emit_ctx)?;
+            fb.ins()
+                .jump(matched_owner_block, &[ir::BlockArg::Value(owner_type)]);
+            if index + 1 < plans.len() {
+                fb.switch_to_block(next_owner);
             }
         }
 
-        if index + 1 < plans.len() {
-            fb.switch_to_block(next_owner);
+        fb.switch_to_block(matched_owner_block);
+        let owner_type = fb.block_params(matched_owner_block)[0];
+        emit_late_bound_split_key_guard(
+            fb,
+            owner_type,
+            attr,
+            expected_index,
+            fallback_block,
+            emit_ctx,
+        )?;
+        emit_trusted_inline_values_field_probe(
+            fb,
+            receiver,
+            owner_type,
+            expected_index,
+            direct_block,
+            fallback_block,
+            emit_ctx,
+        )?;
+    } else {
+        for (index, candidate) in plans.iter().enumerate() {
+            let next_owner = if index + 1 == plans.len() {
+                fallback_block
+            } else {
+                fb.create_block()
+            };
+            let (owner_type, cell) =
+                emit_late_bound_owner_guard(fb, receiver, candidate, next_owner, emit_ctx)?;
+
+            match candidate.storage {
+                LateBoundOwnerFieldStorage::SplitDict { expected_index } => {
+                    emit_late_bound_split_key_guard(
+                        fb,
+                        owner_type,
+                        attr,
+                        expected_index,
+                        fallback_block,
+                        emit_ctx,
+                    )?;
+                    emit_trusted_inline_values_field_probe(
+                        fb,
+                        receiver,
+                        owner_type,
+                        expected_index,
+                        direct_block,
+                        fallback_block,
+                        emit_ctx,
+                    )?;
+                }
+                LateBoundOwnerFieldStorage::ObjectSlot => {
+                    let offset = fb.ins().load(
+                        ptr_ty,
+                        ir::MemFlags::trusted(),
+                        cell,
+                        LATE_BOUND_OWNER_FIELD_SLOT_OFFSET_OFFSET,
+                    );
+                    let slot = fb.ins().iadd(receiver, offset);
+                    let value = fb.ins().load(ptr_ty, ir::MemFlags::trusted(), slot, 0);
+                    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+                    let present = fb
+                        .ins()
+                        .icmp(ir::condcodes::IntCC::NotEqual, value, null_ptr);
+                    fb.ins().brif(
+                        present,
+                        direct_block,
+                        &[ir::BlockArg::Value(value)],
+                        fallback_block,
+                        &[],
+                    );
+                }
+            }
+
+            if index + 1 < plans.len() {
+                fb.switch_to_block(next_owner);
+            }
         }
     }
 

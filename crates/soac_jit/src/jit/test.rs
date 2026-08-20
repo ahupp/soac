@@ -18353,6 +18353,99 @@ def read_point(point):
     }
 
     #[test]
+    fn uniform_polymorphic_late_owner_loads_share_one_live_split_key_probe() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function_in_module(&module_name_gen, "read_uniform");
+        function.params = ParamSpec {
+            params: vec![Param {
+                name: "owner".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            }],
+        };
+        let source = InstrId::new(9);
+        let block_label = function.name_gen.next_block_name();
+        function.blocks = vec![BlockPyBlock {
+            label: block_label,
+            body: Vec::new(),
+            term: ret_term(with_instr_id(
+                op_expr(GetAttr::new(
+                    name_expr(test_name("owner")),
+                    constants.string_expr("link"),
+                )),
+                source,
+            )),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut function, &["owner"]);
+        let mut module = test_module(module_name_gen, vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let mut typed_function = lower_blockpy_function_to_typed(function.clone());
+        let BlockTerm::Return(InstrTyped::GetAttrTyped(getattr)) =
+            &mut typed_function.blocks[0].term
+        else {
+            panic!("uniform owner fixture should return one typed attribute load");
+        };
+        getattr.access = TypedAttrAccessPlan::PolymorphicLateBoundOwnerFields(
+            ["Left", "Right", "Third", "Fourth", "Packet"]
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, owner)| soac_ir_typed::TypedLateBoundOwnerFieldPlan {
+                        counter_source: soac_ir_typed::TypedIndexedFieldCounterSource {
+                            function_id: function.function_id,
+                            instr_id: source,
+                        },
+                        owner_type: IndexedFieldOwnerType {
+                            module_name: "pkg.mod".to_string(),
+                            qualname: owner.to_string(),
+                        },
+                        attr_name: "link".to_string(),
+                        storage: soac_ir_typed::plan_v3::LateBoundOwnerFieldStorage::SplitDict {
+                            expected_index: 0,
+                        },
+                        cell_index: index as u32,
+                    },
+                )
+                .collect(),
+        );
+
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &[1usize as ObjPtr],
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(typed_function),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+        let split_keys_offset = std::mem::offset_of!(ffi::PyHeapTypeObject, ht_cached_keys) as i32;
+        let live_split_key_probes = built
+            .ctx
+            .func
+            .layout
+            .blocks()
+            .flat_map(|block| built.ctx.func.layout.block_insts(block))
+            .filter(|inst| {
+                let instruction = &built.ctx.func.dfg.insts[*inst];
+                instruction.opcode() == ir::Opcode::Load
+                    && instruction.load_store_offset() == Some(split_keys_offset)
+            })
+            .count();
+        assert_eq!(
+            live_split_key_probes, 1,
+            "five exact-owner guards sharing one field index must converge on one live split-key probe"
+        );
+    }
+
+    #[test]
     fn late_bound_owner_field_typed_plans_preserve_sources_and_existing_indexed_precedence() {
         let module_name_gen = ModuleNameGen::new(0);
         let mut constants = TestConstantPool::default();

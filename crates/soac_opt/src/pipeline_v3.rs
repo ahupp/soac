@@ -602,63 +602,119 @@ fn late_bound_split_owner_nonself_field_plans(
     module_name: &str,
 ) -> Vec<LateBoundOwnerFieldSpecializationPlan> {
     const MAX_NONSELF_FIELDS_PER_FUNCTION: usize = 8;
+    const MAX_UNIFORM_NONSELF_OWNERS_PER_FIELD: usize = 5;
 
     let mut layouts_by_source = HashMap::new();
     for field in &function.indexed_fields {
-        *layouts_by_source
+        layouts_by_source
             .entry((field.source, field.access))
-            .or_insert(0_usize) += 1;
+            .or_insert_with(Vec::new)
+            .push(field);
     }
     let selected_sources = function
         .late_bound_owner_fields
         .iter()
         .map(|plan| plan.source)
         .collect::<HashSet<_>>();
-    let mut candidates = Vec::new();
+    let mut unique_candidates = Vec::new();
+    let mut uniform_candidates = Vec::new();
 
-    for field in &function.indexed_fields {
+    for fields in layouts_by_source.values() {
+        let Some(field) = fields.first().copied() else {
+            continue;
+        };
         let hot_count = hot_fields.get(&field.source).copied().unwrap_or_default();
         if hot_count < 8
             || selected_sources.contains(&field.source)
             || field.owner_type.module_name != module_name
-            || layouts_by_source.get(&(field.source, field.access)) != Some(&1)
         {
             continue;
         }
-        let Some(anchor) = owner_field_sites
-            .iter()
-            .map(|(_, site)| site)
-            .filter(|site| {
-                site.owner_type == field.owner_type
-                    && site.attr_name == field.attr_name
-                    && matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
-            })
-            .min_by_key(|site| site.cell_index)
-        else {
-            continue;
-        };
 
-        candidates.push((
-            hot_count,
-            LateBoundOwnerFieldSpecializationPlan {
-                source: field.source,
-                access: field.access,
-                owner_type: field.owner_type.clone(),
-                attr_name: field.attr_name.clone(),
+        if fields.len() > 1
+            && (field.access != IndexedFieldAccessKind::Load
+                || fields.len() > MAX_UNIFORM_NONSELF_OWNERS_PER_FIELD
+                || fields.iter().any(|candidate| {
+                    candidate.owner_type.module_name != module_name
+                        || candidate.attr_name != field.attr_name
+                        || candidate.expected_index != field.expected_index
+                }))
+        {
+            continue;
+        }
+
+        let mut owners = HashSet::new();
+        let mut plans = Vec::with_capacity(fields.len());
+        for candidate in fields {
+            if !owners.insert(&candidate.owner_type) {
+                plans.clear();
+                break;
+            }
+            let Some(anchor) = owner_field_sites
+                .iter()
+                .map(|(_, site)| site)
+                .filter(|site| {
+                    site.owner_type == candidate.owner_type
+                        && site.attr_name == candidate.attr_name
+                        && matches!(site.storage, LateBoundOwnerFieldStorage::SplitDict { .. })
+                })
+                .min_by_key(|site| site.cell_index)
+            else {
+                plans.clear();
+                break;
+            };
+            plans.push(LateBoundOwnerFieldSpecializationPlan {
+                source: candidate.source,
+                access: candidate.access,
+                owner_type: candidate.owner_type.clone(),
+                attr_name: candidate.attr_name.clone(),
                 storage: LateBoundOwnerFieldStorage::SplitDict {
-                    expected_index: field.expected_index,
+                    expected_index: candidate.expected_index,
                 },
                 cell_index: anchor.cell_index,
-                reason: "profiled unique-owner field reuses an existing split-field late-binding guard cell"
-                    .to_string(),
-            },
-        ));
+                reason: if fields.len() == 1 {
+                    "profiled unique-owner field reuses an existing split-field late-binding guard cell"
+                        .to_string()
+                } else {
+                    "profiled uniform-index field reuses independently guarded exact-owner split-field cells"
+                        .to_string()
+                },
+            });
+        }
+        if plans.len() != fields.len() {
+            continue;
+        }
+
+        if plans.len() == 1 {
+            unique_candidates.push((
+                hot_count,
+                plans.pop().expect("unique owner candidate has one plan"),
+            ));
+        } else {
+            plans.sort_by_key(|plan| (plan.owner_type.qualname.clone(), plan.cell_index));
+            uniform_candidates.push((hot_count, field.source, field.access, plans));
+        }
     }
 
-    candidates
+    unique_candidates
         .sort_by_key(|(hot_count, plan)| (std::cmp::Reverse(*hot_count), plan.source, plan.access));
-    candidates.truncate(MAX_NONSELF_FIELDS_PER_FUNCTION);
-    candidates.into_iter().map(|(_, plan)| plan).collect()
+    unique_candidates.truncate(MAX_NONSELF_FIELDS_PER_FUNCTION);
+
+    let remaining_sources = MAX_NONSELF_FIELDS_PER_FUNCTION - unique_candidates.len();
+    uniform_candidates.sort_by_key(|(hot_count, source, access, _)| {
+        (std::cmp::Reverse(*hot_count), *source, *access)
+    });
+    uniform_candidates.truncate(remaining_sources);
+
+    unique_candidates
+        .into_iter()
+        .map(|(_, plan)| plan)
+        .chain(
+            uniform_candidates
+                .into_iter()
+                .flat_map(|(_, _, _, plans)| plans),
+        )
+        .collect()
 }
 
 fn function_uses_generator_resume_state(function: &BlockPyFunction<BlockPyModuleShape>) -> bool {
@@ -3417,6 +3473,319 @@ class SlottedChild(SlottedRoot):
             "unprofiled classes must not consume the bound and an existing profiled lexical owner must never be displaced"
         );
         assert!(plans.iter().all(|plan| plan.source == field_source));
+    }
+
+    #[test]
+    fn hot_nonself_uniform_split_fields_reuse_every_exact_owner_with_bounded_sources() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+class Base:
+    def __init__(self, value):
+        self.link = value
+
+    def read_self(self):
+        return self.link
+
+class Left(Base):
+    pass
+
+class Right(Base):
+    pass
+
+class Third(Base):
+    pass
+
+class Fourth(Base):
+    pass
+
+class Packet:
+    def __init__(self, value):
+        self.link = value
+
+class MixedLeft:
+    def __init__(self, value):
+        self.mixed = value
+
+class MixedRight:
+    def __init__(self, value):
+        self.padding = None
+        self.mixed = value
+
+class Unique:
+    def __init__(self, value):
+        self.payload = value
+
+class LocalForeign:
+    def __init__(self, value):
+        self.external = value
+
+class Anchored:
+    def __init__(self, value):
+        self.unanchored = value
+
+class Unanchored:
+    pass
+
+class OverOne:
+    def __init__(self, value):
+        self.overflow = value
+
+class OverTwo:
+    def __init__(self, value):
+        self.overflow = value
+
+class OverThree:
+    def __init__(self, value):
+        self.overflow = value
+
+class OverFour:
+    def __init__(self, value):
+        self.overflow = value
+
+class OverFive:
+    def __init__(self, value):
+        self.overflow = value
+
+class OverSix:
+    def __init__(self, value):
+        self.overflow = value
+
+def read_uniform(owner):
+    return owner.link
+
+def write_uniform(owner, value):
+    owner.link = value
+
+def read_mixed(owner):
+    return owner.mixed
+
+def read_foreign(owner):
+    return owner.external
+
+def read_unanchored(owner):
+    return owner.unanchored
+
+def read_overflow(owner):
+    return owner.overflow
+
+def read_cold(owner):
+    return owner.link
+
+def read_unique(owner):
+    return owner.payload
+
+def write_unique(owner, value):
+    owner.payload = value
+
+def capped_uniform(owner):
+    return (
+        owner.link, owner.link, owner.link, owner.link, owner.link,
+        owner.link, owner.link, owner.link, owner.link, owner.link,
+    )
+"#,
+        )
+        .expect("uniform polymorphic owner fixture should lower")
+        .blockpy_module;
+
+        struct FieldSources(Vec<(InstrId, IndexedFieldAccessKind)>);
+
+        impl Visit<InstrBlockPy> for FieldSources {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
+            where
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
+            {
+                match expr {
+                    InstrBlockPy::GetAttr(op) => self
+                        .0
+                        .push((op.semantic_instr_id(), IndexedFieldAccessKind::Load)),
+                    InstrBlockPy::SetAttr(op) => self
+                        .0
+                        .push((op.semantic_instr_id(), IndexedFieldAccessKind::Store)),
+                    _ => {}
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut fields_by_function = HashMap::new();
+        let mut capped_counts = HashMap::new();
+        for function in &lowered.callable_defs {
+            let name = function.names.qualname.as_str();
+            if !matches!(
+                name,
+                "Base.read_self"
+                    | "read_uniform"
+                    | "write_uniform"
+                    | "read_mixed"
+                    | "read_foreign"
+                    | "read_unanchored"
+                    | "read_overflow"
+                    | "read_cold"
+                    | "read_unique"
+                    | "write_unique"
+                    | "capped_uniform"
+            ) {
+                continue;
+            }
+            let mut sources = FieldSources(Vec::new());
+            sources.visit_fn(function);
+            for (index, (source, access)) in sources.0.iter().copied().enumerate() {
+                let count = if name == "read_cold" {
+                    7
+                } else if name == "capped_uniform" {
+                    32 + index as u64
+                } else {
+                    64
+                };
+                let mut field = row("field_access", function.function_id, source, count, None);
+                field.branch_values = vec![soac_core::profile::CounterDumpBranchValue {
+                    branch: match access {
+                        IndexedFieldAccessKind::Load => "generic_getattr".to_string(),
+                        IndexedFieldAccessKind::Store => "generic_setattr".to_string(),
+                    },
+                    value: count,
+                }];
+                rows.push(field);
+                if name == "capped_uniform" {
+                    capped_counts.insert(source, count);
+                }
+            }
+            fields_by_function.insert(name.to_string(), sources.0);
+        }
+
+        let owners = [
+            (1, "pkg.mod", "Left", "link", 0),
+            (2, "pkg.mod", "Right", "link", 0),
+            (3, "pkg.mod", "Third", "link", 0),
+            (4, "pkg.mod", "Fourth", "link", 0),
+            (5, "pkg.mod", "Packet", "link", 0),
+            (6, "pkg.mod", "MixedLeft", "mixed", 0),
+            (7, "pkg.mod", "MixedRight", "mixed", 1),
+            (8, "pkg.mod", "Unique", "payload", 0),
+            (9, "pkg.mod", "LocalForeign", "external", 0),
+            (10, "pkg.foreign", "External", "external", 0),
+            (11, "pkg.mod", "Anchored", "unanchored", 0),
+            (12, "pkg.mod", "Unanchored", "unanchored", 0),
+            (13, "pkg.mod", "OverOne", "overflow", 0),
+            (14, "pkg.mod", "OverTwo", "overflow", 0),
+            (15, "pkg.mod", "OverThree", "overflow", 0),
+            (16, "pkg.mod", "OverFour", "overflow", 0),
+            (17, "pkg.mod", "OverFive", "overflow", 0),
+            (18, "pkg.mod", "OverSix", "overflow", 0),
+        ];
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows,
+            module_keys: Vec::new(),
+            type_table: owners
+                .iter()
+                .map(|(id, module_name, name, _, _)| CounterDumpTypeTableEntry {
+                    type_id: *id,
+                    key: CounterDumpTypeKey {
+                        module_name: (*module_name).to_string(),
+                        qualname: (*name).to_string(),
+                    },
+                })
+                .collect(),
+            type_keys: owners
+                .iter()
+                .map(|(id, _, _, key, index)| CounterDumpTypeKeyLayout {
+                    owner_type_id: *id,
+                    key: (*key).to_string(),
+                    index: *index,
+                })
+                .collect(),
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+        let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+            &AlternativeCatalog::default_v3(),
+            module_identity(),
+            &lowered,
+            &evidence_store,
+        )
+        .expect("uniform polymorphic owner fixture should plan and emit");
+        let planned = |name: &str| {
+            artifacts
+                .plan
+                .functions
+                .iter()
+                .find(|function| function.function.debug_name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing function plan for {name}"))
+        };
+
+        for name in [
+            "write_uniform",
+            "read_mixed",
+            "read_foreign",
+            "read_unanchored",
+            "read_overflow",
+            "read_cold",
+        ] {
+            assert!(
+                planned(name).late_bound_owner_fields.is_empty(),
+                "{name} must preserve its original generic operation"
+            );
+        }
+        for name in ["read_unique", "write_unique"] {
+            assert_eq!(
+                planned(name).late_bound_owner_fields.len(),
+                1,
+                "existing unique-owner loads and stores must remain specialized"
+            );
+        }
+        assert!(
+            !planned("Base.read_self").late_bound_owner_fields.is_empty(),
+            "existing inherited self-field guards must remain specialized"
+        );
+
+        let uniform = &planned("read_uniform").late_bound_owner_fields;
+        assert_eq!(
+            uniform.len(),
+            5,
+            "all four related same-index owners and the unrelated Packet owner must reuse exact existing cells"
+        );
+        let owners = uniform
+            .iter()
+            .map(|plan| plan.owner_type.qualname.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            owners,
+            HashSet::from(["Left", "Right", "Third", "Fourth", "Packet"])
+        );
+        assert!(uniform.iter().all(|plan| {
+            plan.source == fields_by_function["read_uniform"][0].0
+                && plan.access == IndexedFieldAccessKind::Load
+                && plan.storage == LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 }
+        }));
+
+        let capped = &planned("capped_uniform").late_bound_owner_fields;
+        let selected_sources = capped
+            .iter()
+            .map(|plan| plan.source)
+            .collect::<HashSet<_>>();
+        assert_eq!(selected_sources.len(), 8, "the bound counts source sites");
+        assert_eq!(
+            capped.len(),
+            40,
+            "every selected site retains all five owners"
+        );
+        let mut expected = capped_counts.into_iter().collect::<Vec<_>>();
+        expected.sort_by_key(|(source, count)| (std::cmp::Reverse(*count), *source));
+        expected.truncate(8);
+        assert_eq!(
+            selected_sources,
+            expected
+                .into_iter()
+                .map(|(source, _)| source)
+                .collect::<HashSet<_>>(),
+            "the eight hottest distinct source sites retain complete owner groups"
+        );
     }
 
     #[test]
