@@ -1760,3 +1760,15 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   previous-SOAC `1.076213x`. Repeated `richards` improves `1.0881x`
   (`25.707 ms` to `23.626 ms`); targeted stock `0.513925x`, previous
   `1.06542x`; native code shrinks `54,697,320 B` to `54,686,760 B`.
+
+## 2026-08-19 - Inline guarded vectorcall native-stack recursion checks
+
+- jj change id: `yknrqtlm`
+- summary: skip redundant public recursion checks with one conservative
+  native-frame guard while preserving CPython's original cold fallback.
+- eight-workload stock `0.669445x` versus prior `0.667236x`, previous
+  `1.001622x`; repeated targeted stock `0.525149x`, previous `1.037466x`.
+  `deltablue` improves `1.0649x` (`2.469 ms` to `2.318 ms`) and
+  `richards` `1.0847x` (`23.626 ms` to `21.780 ms`); ordinary native
+  remains `54,686,760 B`, hidden trampolines grow `746,520 B` to
+  `777,240 B`. Full-suite stock `1.10x` remains unmet.

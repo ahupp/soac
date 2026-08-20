@@ -43,6 +43,31 @@ struct PyThreadStateCurrentExceptionPrefix {
 }
 
 #[repr(C)]
+struct RawPyInterpreterFrameForRecursion {
+    executable: usize,
+    previous: *mut c_void,
+    function: usize,
+    globals: *mut ffi::PyObject,
+    builtins: *mut ffi::PyObject,
+    locals: *mut ffi::PyObject,
+    frame_object: *mut ffi::PyObject,
+    instruction_pointer: *mut c_void,
+    stack_pointer: *mut c_void,
+    return_offset: u16,
+    owner: u8,
+    visited: u8,
+    locals_and_stack: [usize; 1],
+}
+
+#[repr(C)]
+struct RawPyThreadStateEmbeddedFrameTail {
+    base_frame: RawPyInterpreterFrameForRecursion,
+    refcount: ffi::Py_ssize_t,
+    c_stack_top: usize,
+    c_stack_soft_limit: usize,
+}
+
+#[repr(C)]
 pub struct ModuleJitContext {
     pub shared_module_state: *const SharedModuleState,
     pub globals_obj: ObjPtr,
@@ -175,6 +200,10 @@ pub const PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 =
 pub const FIRST_VALID_CPYTHON_FUNCTION_VERSION: u32 = 2;
 pub const PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET: i32 =
     offset_of!(PyThreadStateCurrentExceptionPrefix, current_exception) as i32;
+pub(super) const PY_THREAD_STATE_BASE_FRAME_OFFSET: i32 =
+    offset_of!(PyThreadStateCurrentExceptionPrefix, base_frame) as i32;
+pub(super) const PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET: i32 =
+    offset_of!(RawPyThreadStateEmbeddedFrameTail, c_stack_soft_limit) as i32;
 
 pub(super) fn load_function_env_obj(
     fb: &mut FunctionBuilder<'_>,

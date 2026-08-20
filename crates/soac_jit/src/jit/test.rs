@@ -15499,6 +15499,146 @@ def f(x):
     }
 
     #[test]
+    fn vectorcall_native_recursion_guard_keeps_cpython_helper_only_on_cold_stack_edge() {
+        use super::super::runtime_context::{
+            PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET, PY_THREAD_STATE_BASE_FRAME_OFFSET,
+        };
+
+        assert_eq!(std::mem::size_of::<usize>(), 8);
+        assert_eq!(PY_THREAD_STATE_BASE_FRAME_OFFSET, 80);
+        assert_eq!(PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET, 104);
+        assert_eq!(
+            PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET as usize - 2 * std::mem::size_of::<usize>(),
+            88,
+            "the pinned CPython embedded interpreter frame must occupy 88 bytes"
+        );
+
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let mut helper_signature = ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+        helper_signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        helper_signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I32));
+        let helper_signature = function.import_signature(helper_signature);
+        let helper_name = ir::UserExternalName::new(0, 81);
+        let helper_name_ref = function.declare_imported_user_function(helper_name.clone());
+        let helper = function.import_function(ir::ExtFuncData {
+            name: ir::ExternalName::user(helper_name_ref),
+            signature: helper_signature,
+            colocated: true,
+            patchable: false,
+        });
+        let mut builder_context = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_context);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+            let thread_state = fb.block_params(entry)[0];
+            let null_pointer = fb.ins().iconst(ir::types::I64, 0);
+
+            super::super::vectorcall::emit_vectorcall_native_recursion_guard(
+                &mut fb,
+                thread_state,
+                ir::types::I64,
+                helper,
+                null_pointer,
+            );
+
+            let success = fb.ins().iconst(ir::types::I64, 1);
+            fb.ins().return_(&[success]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+
+        let frame_pointer_reads = function
+            .layout
+            .blocks()
+            .flat_map(|block| function.layout.block_insts(block))
+            .filter(|inst| function.dfg.insts[*inst].opcode() == ir::Opcode::GetFramePointer)
+            .count();
+        assert_eq!(
+            frame_pointer_reads, 1,
+            "the production trampoline guard must read its native frame pointer before bypassing the public recursion helper"
+        );
+
+        let load_offsets = function
+            .layout
+            .blocks()
+            .flat_map(|block| function.layout.block_insts(block))
+            .filter_map(|inst| {
+                let instruction = &function.dfg.insts[inst];
+                (instruction.opcode() == ir::Opcode::Load)
+                    .then(|| instruction.load_store_offset())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert!(load_offsets.contains(&PY_THREAD_STATE_BASE_FRAME_OFFSET));
+        assert!(load_offsets.contains(&PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET));
+
+        let conservative_unsigned_window = function
+            .layout
+            .blocks()
+            .flat_map(|block| function.layout.block_insts(block))
+            .any(|inst| {
+                matches!(
+                    function.dfg.insts[inst],
+                    ir::InstructionData::IntCompareImm {
+                        opcode: ir::Opcode::IcmpImm,
+                        cond: ir::condcodes::IntCC::UnsignedLessThan,
+                        imm,
+                        ..
+                    } if imm.bits() == 98_304
+                )
+            });
+        assert!(
+            conservative_unsigned_window,
+            "release and sanitizer CPython margins require a wrapping unsigned 96 KiB conservative window"
+        );
+        let hot_guard_branches = function
+            .layout
+            .blocks()
+            .filter(|block| !function.layout.is_cold(*block))
+            .flat_map(|block| function.layout.block_insts(block))
+            .filter(|inst| function.dfg.insts[*inst].opcode() == ir::Opcode::Brif)
+            .count();
+        assert_eq!(
+            hot_guard_branches, 1,
+            "an attached Python vectorcall needs exactly one hot conditional branch to its cold recursion helper"
+        );
+        assert_eq!(
+            count_cold_block_direct_calls_to_runtime_helpers(&function, &[helper_name]),
+            1,
+            "the original CPython recursion helper must remain on exactly one marked-cold path"
+        );
+        let hot_helper_calls = function
+            .layout
+            .blocks()
+            .filter(|block| !function.layout.is_cold(*block))
+            .flat_map(|block| function.layout.block_insts(block))
+            .filter(|inst| {
+                matches!(
+                    function.dfg.insts[*inst],
+                    ir::InstructionData::Call { func_ref, .. }
+                        if func_ref == helper
+                )
+            })
+            .count();
+        assert_eq!(hot_helper_calls, 0);
+    }
+
+    #[test]
     fn jit_vectorcall_trampoline_can_link_runtime_decref_clif() {
         let compile_session = crate::session::CompileSession::new();
         let engine =

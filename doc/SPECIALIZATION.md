@@ -1897,6 +1897,117 @@ validates the subsequent iteration independently of the earlier retained
 binder's historical gate. The full-suite stock **1.10x** goal remains
 unmet.
 
+### Native Recursion Guards for Shared Vectorcall
+
+Existing exact-positional and generic vectorcall trampolines both acquire
+the current live thread state before entering a public CPython native
+recursion checker. Retained lossless `richards` call profiles attribute
+**2.459410%** to exact-trampoline recursion checks; an earlier
+`deltablue` profile attributes **7.316147%** to exact trampoline checks.
+These profile shares prioritize the opportunity; they are not promised
+speedups or runtime semantic proofs.
+
+The existing shared vectorcall emitter now uses its current thread state,
+the real Cranelift native frame pointer, and private pinned
+`#[repr(C)]` layout facts: `PyThreadState.base_frame` offset **80**,
+embedded interpreter-frame size **88**, and frame-relative native soft
+limit offset **104**. For 64-bit `aarch64` / `x86_64`, exactly **two
+trusted pinned loads** and **one hot unsigned conditional branch** check
+the conservative maximum-margin band
+**`[soft - 65536, soft + 32768)`** with wrapping unsigned
+**`(frame_pointer - soft + 65536) <u 98304`**. The universal
+**32,768-byte** margin covers both the pinned release margin **16,384**
+and documented debug/ASAN/TSAN margin **32,768** without changing the
+hot-path branch or instruction count.
+
+Pinned CPython attaches the nonnull live thread state only after its
+nonnull embedded base frame and nonzero native stack limits have been
+initialized; existing generated direct callees already rely on these
+attached-vectorcall invariants. The final emitter therefore has **no
+redundant null-state, null-base, or zero-limit presence branches**. Its
+single range branch sends an in-band native frame to the original
+**cold** `dp_jit_enter_recursive_call` → `Py_EnterRecursiveCall` path
+with unchanged TLS lookup, native stack check, failure, exception, and
+wrong-fiber handling. The initial **`UINTPTR_MAX`** soft-limit sentinel
+may skip only when the pinned public helper would also return zero.
+Unsupported architectures retain the unconditional public helper;
+arbitrary CPython layout changes are not dynamically detected. The
+current thread state is never cached across calls or threads, and no
+public helper, API, typed IR, or ordinary direct-function body is added.
+Only hidden exact/generic vectorcall trampoline code changes: ordinary
+targeted source bodies remain exactly **54,686,760 bytes / 3,596,430
+blocks**, while hidden trampolines grow retained **746,520 → 777,240
+bytes**, below rejected first **789,720 bytes**. Normal fixed-eight
+source bodies remain **23,159,960 bytes / 1,524,970 blocks**; hidden
+trampolines change retained **365,000 → rejected 386,920 → final 381,080
+bytes**.
+
+A genuine production-used Cranelift structured regression turns
+RED-to-GREEN, proving the real frame-pointer read, pinned offsets, two
+trusted loads, the final **98,304-byte** unsigned danger interval, and
+exactly **one cold / zero hot** original recursion-helper calls. A
+subsequent genuine refinement RED-to-GREEN reduces actual production
+hot conditional branches **4 → 1** while preserving the same interval,
+loads, layout, and cold helper. Actual
+stock versus transformed **Profile → Verify → Apply** recursion
+compatibility passes **1 / 1 in 1.60 seconds** across exact and generic
+calls, bounded `RecursionError`, three live thread states, ctypes
+callbacks, profiling, finalizers, and generated native bodies. Complete
+JIT / optimizer / typed-IR libraries pass **575 / 575**, **214 / 214**,
+and **54 / 54**; broad transformed coverage passes **17 / 17 in 40.06
+seconds**, and combined test-target / scoped formatting checks pass.
+Production changes exactly existing `runtime_context.rs` and
+`vectorcall.rs`; the existing JIT regression is `#[cfg(test)]`-only.
+The preceding four-branch implementation was rejected after a genuine
+three-round `chaos` regression: raw **0.970913x**, stock-adjusted
+**0.975258x**. Final clean targeted three-round `deltablue` improves
+**2.468877 → 2.318359 ms**, raw **1.064924x [1.030268, 1.086195]** /
+paired **1.073872x [1.036578, 1.107536]**; `richards` improves
+**23.625606 → 21.780125 ms**, raw **1.084732x [1.056110, 1.098710]** /
+paired **1.072466x [1.040196, 1.096731]**. `chaos` is neutral, raw
+**1.000030x [0.985100, 1.032427]** / paired
+**0.974080x [0.958827, 1.007537]**, and improves
+**1.029990x [1.017646, 1.065572]** over the rejected first iteration;
+`comprehensions` is neutral. Official targeted stock / previous SOAC are
+**0.525149227454957x / 1.0374660673409746x**; normal fixed-eight are
+**0.6694448241941483x / 1.0016222298324013x**. All **120 targeted Apply
+PIDs / 10,650 total JIT source rows including adapters / 5,490 actual
+direct-function bodies** preserve source identity, native bytes / blocks,
+and typed coverage, with **100,206 INFO / zero errors**.
+
+Matched lossless rejected-first / refined `deltablue` native captures
+contain **176 / 178 samples**, the same **600 loops / 99 Hz**, and zero
+lost samples. The targeted public recursion helper has zero samples in
+both; exact trampoline **self** declines **5.11333% → 2.80919%** after
+the three redundant branches are removed. Separately attributed
+exact-trampoline live-thread-state TLS acquisition declines
+**2.272591% → 0.561837%** but remains; the older-revision retained
+profile observed **6.096123%**. True matched retained / refined
+`richards` lossless captures have **244 / 226 samples**, the same **100
+loops / 99 Hz**, and zero loss: strict exact-trampoline public recursion
+helper **2.459410% → zero**, trampoline self
+**10.245541% → 7.081328%**, and live-thread-state TLS
+**1.639606% → 0.884416%**, still present. Unrelated refined
+`RichCompare` recursion contributes **0.442208%**. Limited samples and
+overlapping stack ancestry prohibit adding these shares.
+
+The authoritative full `just test-all` gate independently passes;
+complete evidence is
+`work/logs/inline-native-recursion-stack-guard-test-all.log`. Exactly
+**1,235 transformed pytest nodeids / 98 isolated batches / 8 workers**
+complete **98 passed / zero failed**. Rust JIT passes **575 in 21.50
+seconds**, optimizer **214 in 0.70 seconds**, typed IR **54 in 0.01
+seconds**, lowering **371 in 1.54 seconds**, and the PyO3 extension
+**8 in 0.14 seconds**. Runtime build is **1.571 seconds**, test-target
+compilation **36.23 seconds**, complete Cargo tests **62.855 seconds**,
+inner / outer parallel pytest **79.523 / 79.538 seconds**, and total
+test phase **142.405 seconds**. The new native-recursion integration
+passes in **2.20 seconds**, the prior uniform-field integration in
+**2.59 seconds**; one 28-node counter shard takes **78.87 seconds**.
+Status is **FULLY VALIDATED / RETAIN LANDING CANDIDATE**, not yet
+landed. No baseline CPython-visible bug is claimed; full-suite stock
+**1.10x** remains unmet and unmeasured.
+
 ### Counted Input
 
 - Source input is `call_hot_targets`.

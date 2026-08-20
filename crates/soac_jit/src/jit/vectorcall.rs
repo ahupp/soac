@@ -10,9 +10,9 @@ use super::imports::{
 use super::refcount_lowering::RefcountLowering;
 use super::runtime_context::{
     FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
-    PY_FUNCTION_CODE_OFFSET, PY_FUNCTION_DEFAULTS_OFFSET,
+    PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET, PY_FUNCTION_CODE_OFFSET, PY_FUNCTION_DEFAULTS_OFFSET,
     PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_FUNCTION_KWDEFAULTS_OFFSET,
-    load_function_env_obj, load_py_function_soac_metadata_obj,
+    PY_THREAD_STATE_BASE_FRAME_OFFSET, load_function_env_obj, load_py_function_soac_metadata_obj,
 };
 use super::{
     RuntimeFunctionId, SoacEnvConfig, VectorcallEntryFn,
@@ -24,6 +24,72 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
 use pyo3::ffi;
 use soac_ir_typed::PyObjFacts;
+
+pub(super) fn emit_vectorcall_native_recursion_guard(
+    fb: &mut FunctionBuilder<'_>,
+    thread_state: ir::Value,
+    ptr_ty: ir::Type,
+    enter_recursive_ref: ir::FuncRef,
+    null_ptr: ir::Value,
+) {
+    let helper_block = fb.create_block();
+    let bind_block = fb.create_block();
+    if ptr_ty == ir::types::I64
+        && cfg!(all(
+            target_pointer_width = "64",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ))
+    {
+        const MAX_CPYTHON_STACK_MARGIN_BYTES: i64 = 32 * 1024;
+        const LOWER_STACK_GUARD_BYTES: i64 = 2 * MAX_CPYTHON_STACK_MARGIN_BYTES;
+        const UPPER_STACK_GUARD_BYTES: i64 = MAX_CPYTHON_STACK_MARGIN_BYTES;
+
+        fb.set_cold_block(helper_block);
+
+        let base_frame = fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            thread_state,
+            PY_THREAD_STATE_BASE_FRAME_OFFSET,
+        );
+        let soft_limit = fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            base_frame,
+            PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET,
+        );
+        let frame_pointer = fb.ins().get_frame_pointer(ptr_ty);
+        let stack_distance = fb.ins().isub(frame_pointer, soft_limit);
+        let guarded_distance = fb.ins().iadd_imm(stack_distance, LOWER_STACK_GUARD_BYTES);
+        let needs_public_check = fb.ins().icmp_imm(
+            ir::condcodes::IntCC::UnsignedLessThan,
+            guarded_distance,
+            LOWER_STACK_GUARD_BYTES + UPPER_STACK_GUARD_BYTES,
+        );
+        fb.ins()
+            .brif(needs_public_check, helper_block, &[], bind_block, &[]);
+    } else {
+        fb.ins().jump(helper_block, &[]);
+    }
+
+    fb.seal_block(helper_block);
+    fb.switch_to_block(helper_block);
+    let enter_inst = fb.ins().call(enter_recursive_ref, &[thread_state]);
+    let enter_status = fb.inst_results(enter_inst)[0];
+    let enter_failed = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, enter_status, 0);
+    let recursion_fail_block = fb.create_block();
+    fb.ins()
+        .brif(enter_failed, recursion_fail_block, &[], bind_block, &[]);
+    fb.seal_block(recursion_fail_block);
+    fb.seal_block(bind_block);
+
+    fb.switch_to_block(recursion_fail_block);
+    fb.ins().return_(&[null_ptr]);
+
+    fb.switch_to_block(bind_block);
+}
 
 pub(super) fn define_shared_vectorcall_trampoline(
     jit_module: &mut JITModule,
@@ -280,22 +346,13 @@ pub(super) fn define_shared_vectorcall_trampoline(
         let callee_ptr = fb.block_params(function_env_ready)[1];
         let thread_state_inst = fb.ins().call(thread_state_get_ref, &[]);
         let thread_state_val = fb.inst_results(thread_state_inst)[0];
-        let enter_inst = fb.ins().call(enter_recursive_ref, &[thread_state_val]);
-        let enter_status = fb.inst_results(enter_inst)[0];
-        let enter_failed = fb
-            .ins()
-            .icmp_imm(ir::condcodes::IntCC::NotEqual, enter_status, 0);
-        let recursion_fail_block = fb.create_block();
-        let bind_block = fb.create_block();
-        fb.ins()
-            .brif(enter_failed, recursion_fail_block, &[], bind_block, &[]);
-        fb.seal_block(recursion_fail_block);
-        fb.seal_block(bind_block);
-
-        fb.switch_to_block(recursion_fail_block);
-        fb.ins().return_(&[null_ptr]);
-
-        fb.switch_to_block(bind_block);
+        emit_vectorcall_native_recursion_guard(
+            &mut fb,
+            thread_state_val,
+            ptr_ty,
+            enter_recursive_ref,
+            null_ptr,
+        );
         let bound_args_slot = if param_count == 0 {
             None
         } else {
