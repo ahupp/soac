@@ -338,6 +338,54 @@ apply/verify mode:
   boolean branches, but a future branch-table locality profile needs a
   wider representation or per-edge scalar counters.
 
+### Immutable Singleton Truthiness
+
+Existing branch lowering still calls the existing exported
+`dp_jit_is_true`; its private production hook now mirrors pinned CPython's
+immutable singleton identities directly: pointer-identical `True` returns
+**1**, while `False` and `None` return **0**. The existing null-pointer
+`RuntimeError` check runs before the classifier. Every other object takes
+the unchanged `PyObject_IsTrue` path, preserving `__bool__` / `__len__`
+precedence, custom callbacks, subclass behavior, mutation, errors, owned
+references, finalizers, and original branch-outcome counters.
+
+The pure classifier is private and changes exactly one existing runtime
+source file; there is no new exported helper, public API, mutable global,
+typed IR operation, or intended generated-native-body change. There was
+**no existing CPython behavior mismatch**: real stock/transformed
+**Profile → Verify → Apply** truthiness integration passes both before and
+after implementation. The actual exported-hook structured specialization
+decision turns RED-to-GREEN; final Rust suites pass JIT **573 / 573**,
+optimizer **213 / 213**, and typed IR **54 / 54**, with transformed
+compatibility **16 / 16**, scoped formatting checks, and JIT Cargo
+`--tests` check green. Candidate release smoke and all **80 / 120**
+normally sampled / repeated workers retain every source-function ID,
+native byte / block, and hidden trampoline; fixed-eight native remains
+**23,163,480 bytes / 1,524,480 blocks**.
+
+Clean three-round richards improves **27.146548 → 25.707173 ms**,
+**1.055991x [1.026761, 1.076974]** raw /
+**1.041139x [1.004715, 1.062791]** stock-adjusted; all three rounds win,
+although five candidate outliers remain disclosed. Comprehensions improves
+raw but is **0.954158x [0.935538, 0.974371]** stock-adjusted under
+approximately **6.5%** faster stock; do not claim a comprehensions gain.
+Matched zero-loss same-source richards profiles show C truth-call / PLT
+leaves **6.072336% → 0**, while the necessary existing helper rises
+**0.714157% → 4.314992%**: combined disjoint truth leaves decrease only
+**6.786493% → 4.314992%**, or **2.471501 percentage points net**.
+The optimization is **LANDED CANDIDATE / RETAIN** for measured richards
+improvement with unchanged public API and native bodies. The authoritative
+full **`just test-all` gate exits zero**: **1,233 transformed Python
+nodeids / 96 isolated batches / eight workers / 96 passed / zero
+failures**. Rust JIT passes **573**, optimizer **213**, typed IR **54**,
+lowering **371**, and PyO3 **8**. Runtime build takes **1.679 seconds**,
+Cargo **64.701 seconds**, pytest **80.356 inner / 80.374 outer seconds**,
+and total test phase **145.087 seconds**; the new truthiness integration
+passes in **2.85 seconds**, while the known 28-node counter-dump batch
+takes **79.97 seconds**. See
+`work/logs/immutable-singleton-truthiness-test-all.log`. Full-suite stock
+**1.10x** remains unmet / unmeasured.
+
 
 ## Profiled Cold Blocks
 

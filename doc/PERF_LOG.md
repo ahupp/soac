@@ -1740,3 +1740,13 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   `deltablue` improves `1.11845x` (`2.929 ms` to `2.618 ms`), with
   `comprehensions` neutral `0.99833x`; native code decreases
   `23,188,640 B` to `23,163,480 B`.
+
+## 2026-08-19 - Classify immutable singleton truth values
+
+- jj change id: `vosvuxuw`
+- summary: classify exact `True` / `False` / `None` in the existing
+  truthiness hook while preserving generic Python truth behavior.
+- eight-workload stock score `0.634579x` versus prior `0.627357x`;
+  official previous `1.05325x` uses a noisy baseline. Clean repeated
+  `richards` improves `1.05599x` (`27.15 ms` to `25.71 ms`); native code
+  and hidden trampolines remain unchanged.

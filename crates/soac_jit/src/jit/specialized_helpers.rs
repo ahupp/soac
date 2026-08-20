@@ -2191,6 +2191,18 @@ unsafe extern "C" fn dict_set_item_hook(dict_obj: ObjPtr, key: ObjPtr, value: Ob
         value as *mut ffi::PyObject,
     )
 }
+fn immutable_singleton_truthiness(value: ObjPtr) -> Option<i32> {
+    unsafe {
+        if ptr::eq(value, ffi::Py_True().cast()) {
+            Some(1)
+        } else if ptr::eq(value, ffi::Py_False().cast()) || ptr::eq(value, ffi::Py_None().cast()) {
+            Some(0)
+        } else {
+            None
+        }
+    }
+}
+
 unsafe extern "C" fn is_true_hook(value: ObjPtr) -> i32 {
     if value.is_null() {
         ffi::PyErr_SetString(
@@ -2199,8 +2211,117 @@ unsafe extern "C" fn is_true_hook(value: ObjPtr) -> i32 {
         );
         return -1;
     }
+    if let Some(truth) = immutable_singleton_truthiness(value) {
+        return truth;
+    }
     ffi::PyObject_IsTrue(value as *mut ffi::PyObject)
 }
+
+#[cfg(test)]
+#[test]
+fn immutable_singleton_truthiness_preserves_the_exported_python_protocol() {
+    use pyo3::exceptions::{PyRuntimeError, PyValueError};
+    use pyo3::prelude::*;
+
+    let _guard = crate::python_runtime_test_lock().lock().unwrap();
+    crate::initialize_test_python();
+    Python::attach(|py| unsafe {
+        let true_value = ffi::Py_True();
+        let false_value = ffi::Py_False();
+        let none_value = ffi::Py_None();
+        let singleton_refcounts = [
+            ffi::Py_REFCNT(true_value),
+            ffi::Py_REFCNT(false_value),
+            ffi::Py_REFCNT(none_value),
+        ];
+
+        assert_eq!(dp_jit_is_true(true_value.cast()), 1);
+        assert_eq!(dp_jit_is_true(false_value.cast()), 0);
+        assert_eq!(dp_jit_is_true(none_value.cast()), 0);
+        assert_eq!(
+            [
+                ffi::Py_REFCNT(true_value),
+                ffi::Py_REFCNT(false_value),
+                ffi::Py_REFCNT(none_value),
+            ],
+            singleton_refcounts,
+            "truthiness never takes ownership of immutable singleton arguments"
+        );
+
+        let custom = py
+            .eval(
+                c"type('TrackedTruth', (), {'__bool__': lambda self: setattr(self, 'calls', getattr(self, 'calls', 0) + 1) or True})()",
+                None,
+                None,
+            )
+            .expect("a custom truthiness callback should be created");
+        let custom_refcount = ffi::Py_REFCNT(custom.as_ptr());
+        assert_eq!(immutable_singleton_truthiness(custom.as_ptr().cast()), None);
+        assert_eq!(dp_jit_is_true(custom.as_ptr().cast()), 1);
+        assert_eq!(
+            custom
+                .getattr("calls")
+                .expect("the custom callback should update its instance")
+                .extract::<usize>()
+                .expect("callback count should be an integer"),
+            1,
+            "ordinary Python truthiness callbacks must run exactly once"
+        );
+        assert_eq!(ffi::Py_REFCNT(custom.as_ptr()), custom_refcount);
+
+        let empty = py
+            .eval(
+                c"type('SizedTruth', (), {'__len__': lambda self: 0})()",
+                None,
+                None,
+            )
+            .expect("a length-based truthiness object should be created");
+        assert_eq!(immutable_singleton_truthiness(empty.as_ptr().cast()), None);
+        assert_eq!(dp_jit_is_true(empty.as_ptr().cast()), 0);
+
+        let raising = py
+            .eval(
+                c"type('RaisingTruth', (), {'__bool__': lambda self: (_ for _ in ()).throw(ValueError('truth exploded'))})()",
+                None,
+                None,
+            )
+            .expect("a raising truthiness object should be created");
+        assert_eq!(
+            immutable_singleton_truthiness(raising.as_ptr().cast()),
+            None
+        );
+        assert_eq!(dp_jit_is_true(raising.as_ptr().cast()), -1);
+        let raised = PyErr::fetch(py);
+        assert!(raised.is_instance_of::<PyValueError>(py));
+        assert_eq!(raised.to_string(), "ValueError: truth exploded");
+
+        assert_eq!(immutable_singleton_truthiness(ptr::null_mut()), None);
+        assert_eq!(dp_jit_is_true(ptr::null_mut()), -1);
+        let null_error = PyErr::fetch(py);
+        assert!(null_error.is_instance_of::<PyRuntimeError>(py));
+        assert_eq!(
+            null_error.to_string(),
+            "RuntimeError: invalid null value for dp_jit_is_true"
+        );
+
+        assert_eq!(
+            immutable_singleton_truthiness(true_value.cast()),
+            Some(1),
+            "the real immutable True singleton must bypass generic truthiness"
+        );
+        assert_eq!(
+            immutable_singleton_truthiness(false_value.cast()),
+            Some(0),
+            "the real immutable False singleton must bypass generic truthiness"
+        );
+        assert_eq!(
+            immutable_singleton_truthiness(none_value.cast()),
+            Some(0),
+            "the real immutable None singleton must bypass generic truthiness"
+        );
+    });
+}
+
 unsafe extern "C" fn raise_from_exc_hook(exc: ObjPtr) -> i32 {
     if exc.is_null() {
         ffi::PyErr_SetString(
