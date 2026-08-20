@@ -198,6 +198,8 @@ pub const PY_FUNCTION_KWDEFAULTS_OFFSET: i32 =
 pub const PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 =
     offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_soac_function_id) as i32;
 pub const FIRST_VALID_CPYTHON_FUNCTION_VERSION: u32 = 2;
+pub(super) const PY_THREAD_STATE_EVAL_BREAKER_OFFSET: i32 =
+    offset_of!(PyThreadStateCurrentExceptionPrefix, eval_breaker) as i32;
 pub const PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET: i32 =
     offset_of!(PyThreadStateCurrentExceptionPrefix, current_exception) as i32;
 pub(super) const PY_THREAD_STATE_BASE_FRAME_OFFSET: i32 =

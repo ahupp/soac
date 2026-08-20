@@ -4359,6 +4359,53 @@ def build(values):
             1,
             "enabled JIT codegen should check pending calls on the loop backedge"
         );
+        assert_eq!(
+            count_cold_block_direct_calls_to_runtime_helpers(&enabled.ctx.func, &enabled_helpers),
+            1,
+            "the CPython pending-call helper must stay on a marked-cold eval-breaker edge"
+        );
+
+        let eval_breaker_offset = (3 * std::mem::size_of::<usize>()) as i32;
+        let hot_eval_breaker_load = enabled
+            .ctx
+            .func
+            .layout
+            .blocks()
+            .filter(|block| !enabled.ctx.func.layout.is_cold(*block))
+            .flat_map(|block| enabled.ctx.func.layout.block_insts(block))
+            .find_map(|inst| {
+                let instruction = &enabled.ctx.func.dfg.insts[inst];
+                (instruction.opcode() == ir::Opcode::Load
+                    && instruction.load_store_offset() == Some(eval_breaker_offset))
+                .then(|| instruction.memflags())
+                .flatten()
+            })
+            .expect("a native loop backedge must poll the actual PyThreadState eval breaker");
+        assert!(
+            !hot_eval_breaker_load.readonly() && !hot_eval_breaker_load.can_move(),
+            "other threads update the eval breaker, so its poll cannot be read-only or movable"
+        );
+        let masks_pending_events = enabled
+            .ctx
+            .func
+            .layout
+            .blocks()
+            .filter(|block| !enabled.ctx.func.layout.is_cold(*block))
+            .flat_map(|block| enabled.ctx.func.layout.block_insts(block))
+            .any(|inst| {
+                matches!(
+                    enabled.ctx.func.dfg.insts[inst],
+                    ir::InstructionData::BinaryImm64 {
+                        opcode: ir::Opcode::BandImm,
+                        imm,
+                        ..
+                    } if imm.bits() == 0xff
+                )
+            });
+        assert!(
+            masks_pending_events,
+            "the hot poll must ignore instrumentation-version bits outside CPython's low event byte"
+        );
 
         let disabled = build_test_specialized_function_with_env_config(
             &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],

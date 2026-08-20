@@ -31,6 +31,7 @@ _PYPERF_FLAGS_WITH_VALUE = {
     "--min-time",
     "--output",
     "--pipe",
+    "--timeout",
     "--track-memory",
     "--values",
     "--warmups",
@@ -61,9 +62,11 @@ def _enabled(name: str) -> bool:
 
 
 def _is_benchmark_worker() -> bool:
+    argv0 = sys.argv[0].replace(os.sep, "/")
+    if argv0.endswith("/pyperf/_process_time.py"):
+        return False
     if "PYPERFORMANCE_RUNID" in os.environ:
         return True
-    argv0 = sys.argv[0].replace(os.sep, "/")
     return (
         argv0.endswith("/run_benchmark.py")
         and "/pyperformance/data-files/benchmarks/" in argv0

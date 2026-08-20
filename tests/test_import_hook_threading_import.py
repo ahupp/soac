@@ -87,6 +87,53 @@ def test_import_hook_path_entrypoint_matches_script_import_context(tmp_path):
     assert result.stdout.splitlines() == ["True", "37"]
 
 
+def test_transformed_native_loop_hands_gil_to_waiting_thread_by_default(tmp_path):
+    module_path = tmp_path / "thread_handoff_probe.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "import threading",
+                "import time",
+                "",
+                "class Flag:",
+                "    def __init__(self):",
+                "        self.ready = False",
+                "",
+                "def signal(flag):",
+                "    time.sleep(0.05)",
+                "    flag.ready = True",
+                "",
+                "def wait_for_thread():",
+                "    flag = Flag()",
+                "    worker = threading.Thread(target=signal, args=(flag,), daemon=True)",
+                "    worker.start()",
+                "    while not flag.ready:",
+                "        pass",
+                "    worker.join(timeout=1)",
+                "    return flag.ready",
+                "",
+                "print(wait_for_thread())",
+            ]
+        )
+    )
+    env = os.environ.copy()
+    env.pop("SOAC_JIT_HANDLE_PENDING_CHECKS", None)
+    env["SOAC_MODULE_ENABLED"] = f"path:{module_path}"
+    env["SOAC_COMPILE_MODE"] = "eager"
+    env["SOAC_BACKGROUND_JIT"] = "0"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "soac.import_hook", str(module_path)],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=8,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "True"
+
+
 def test_import_hook_transforms_resolvable_frozen_module_source():
     env = os.environ.copy()
     ntpath_source = (

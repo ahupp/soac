@@ -244,7 +244,8 @@ use runtime_context::{
     LATE_BOUND_OWNER_FIELD_WEAKREF_OFFSET, PY_FUNCTION_CODE_OFFSET, PY_FUNCTION_DEFAULTS_OFFSET,
     PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_FUNCTION_KWDEFAULTS_OFFSET,
     PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET, PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET,
-    RAW_PY_WEAKREF_OBJECT_OFFSET, load_function_env_obj, load_py_function_soac_metadata_obj,
+    PY_THREAD_STATE_EVAL_BREAKER_OFFSET, RAW_PY_WEAKREF_OBJECT_OFFSET, load_function_env_obj,
+    load_py_function_soac_metadata_obj,
 };
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 #[cfg(test)]
@@ -21765,6 +21766,30 @@ fn emit_handle_pending_if_backedge(
         return Ok(());
     };
 
+    // CPython reserves the low byte for pending events; higher bits hold the
+    // instrumentation version and must not trigger the expensive handler.
+    let eval_breaker = fb.ins().load(
+        emit_ctx.consts.ptr_ty,
+        ir::MemFlags::trusted(),
+        emit_ctx.consts.thread_state_value,
+        PY_THREAD_STATE_EVAL_BREAKER_OFFSET,
+    );
+    let pending_events = fb.ins().band_imm(eval_breaker, 0xff);
+    let has_pending_events = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, pending_events, 0);
+    let handle_pending_block = fb.create_block();
+    fb.set_cold_block(handle_pending_block);
+    let continue_block = fb.create_block();
+    fb.ins().brif(
+        has_pending_events,
+        handle_pending_block,
+        &[],
+        continue_block,
+        &[],
+    );
+    fb.switch_to_block(handle_pending_block);
+
     let pending_inst = fb
         .ins()
         .call(py_handle_pending_ref, &[emit_ctx.consts.thread_state_value]);
@@ -21772,7 +21797,6 @@ fn emit_handle_pending_if_backedge(
     let pending_ok = fb
         .ins()
         .icmp_imm(ir::condcodes::IntCC::Equal, pending_rc, 0);
-    let continue_block = fb.create_block();
     fb.ins().brif(
         pending_ok,
         continue_block,

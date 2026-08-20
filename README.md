@@ -442,10 +442,12 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   owned-reference bookkeeping from generated code.
 
 - `SOAC_JIT_HANDLE_PENDING_CHECKS`
-  Generated JIT loop-backedge calls to `_Py_HandlePending` are disabled by
-  default. Set to `1`, `true`, `yes`, or `on` to enable them when CPython
-  pending-call, signal-handling, thread-handoff, or async-exception latency
-  matters for the workload.
+  Generated JIT loop backedges check CPython's pending-event bits by default and
+  call `_Py_HandlePending` only when an event is waiting. This preserves
+  pending calls, signal handling, thread handoff, cyclic garbage collection,
+  and async exceptions without an unconditional helper call in hot loops. Set
+  to `0`, `false`, `no`, or `off` only for an intentionally unsafe diagnostic;
+  disabling the checks can prevent other Python threads from running.
 
 - `SOAC_JIT_BB_MAP=1`
   Emit the detailed `$SOAC_WORK_DIR/jit-bb-map.jsonl` per-basic-block artifact

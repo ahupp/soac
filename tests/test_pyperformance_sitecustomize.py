@@ -5,6 +5,8 @@ import signal
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 
 def load_pyperformance_sitecustomize(monkeypatch):
     monkeypatch.delenv("SOAC_PYPERFORMANCE_ENABLE", raising=False)
@@ -19,6 +21,57 @@ def load_pyperformance_sitecustomize(monkeypatch):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def test_pyperformance_process_time_helper_is_not_a_benchmark_worker(
+    monkeypatch,
+    tmp_path,
+):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    helper = tmp_path / "site-packages" / "pyperf" / "_process_time.py"
+    monkeypatch.setattr(sitecustomize.sys, "argv", [str(helper), "1", "/fake/python"])
+    monkeypatch.setenv("PYPERFORMANCE_RUNID", "cpython3.15-bm_2to3")
+    monkeypatch.setenv("SOAC_PYPERFORMANCE_ENABLE", "1")
+    monkeypatch.setenv("SOAC_WORK_DIR", str(tmp_path / "work"))
+
+    assert sitecustomize._is_benchmark_worker() is False
+    assert sitecustomize._worker_timing_path() is None
+
+
+def test_pyperformance_wrapped_module_worker_keeps_inherited_runid(monkeypatch):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    monkeypatch.setattr(sitecustomize.sys, "argv", ["-m", "soac.import_hook"])
+    monkeypatch.setenv("PYPERFORMANCE_RUNID", "cpython3.15-bm_2to3")
+    monkeypatch.setenv("SOAC_PYPERFORMANCE_EXEC_WRAPPED", "1")
+
+    assert sitecustomize._is_benchmark_worker() is True
+
+
+@pytest.mark.parametrize("timeout_args", [["--timeout", "30"], ["--timeout=120"]])
+def test_pyperformance_work_dir_ignores_timeout(monkeypatch, tmp_path, timeout_args):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    script = (
+        tmp_path
+        / "pyperformance"
+        / "data-files"
+        / "benchmarks"
+        / "bm_2to3"
+        / "run_benchmark.py"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text("# benchmark placeholder\n")
+    monkeypatch.setenv("SOAC_WORK_DIR", str(tmp_path / "work"))
+
+    monkeypatch.setattr(sitecustomize.sys, "argv", [str(script), "--worker-task=0"])
+    expected_work_dir = sitecustomize._benchmark_work_dir()
+
+    monkeypatch.setattr(
+        sitecustomize.sys,
+        "argv",
+        [str(script), "--worker-task=0", *timeout_args],
+    )
+
+    assert sitecustomize._benchmark_work_dir() == expected_work_dir
 
 
 def test_pyperformance_work_dir_includes_benchmark_variant(monkeypatch, tmp_path):
