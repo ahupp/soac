@@ -1761,14 +1761,14 @@ const fn typed_i64_binop_kind_supported(kind: BinOpKind) -> bool {
     matches!(kind, BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul)
 }
 
-fn typed_expr_can_satisfy_planned_i64(
+fn typed_expr_planned_i64_facts(
     expr: &InstrTyped,
     local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
     exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
-) -> bool {
-    if typed_expr_planned_const_i64(expr, module_constants).is_some() {
-        return true;
+) -> Option<super::IntFacts> {
+    if let Some(value) = typed_expr_planned_const_i64(expr, module_constants) {
+        return Some(super::IntFacts::i64_known(value));
     }
     if expr
         .typed_extra()
@@ -1777,27 +1777,47 @@ fn typed_expr_can_satisfy_planned_i64(
         .and_then(exact_int_return_plan_i64_result)
         .is_some()
     {
-        return true;
+        return Some(super::IntFacts::i64_unknown());
     }
     match expr {
-        InstrTyped::Load(op) => op.name.local_location().is_some_and(|location| {
-            local_reprs.get(&location) == Some(&RuntimeBlockParamRepr::ExactI64)
-        }),
+        InstrTyped::Load(op) => op
+            .name
+            .local_location()
+            .filter(|location| local_reprs.get(location) == Some(&RuntimeBlockParamRepr::ExactI64))
+            .map(|_| super::IntFacts::i64_unknown()),
         InstrTyped::BinOp(op) if typed_i64_binop_kind_supported(op.kind) => {
-            typed_expr_can_satisfy_planned_i64(
+            let lhs_facts = typed_expr_planned_i64_facts(
                 op.left.as_ref(),
                 local_reprs,
                 module_constants,
                 exact_int_scalar_deopt_instr_ids,
-            ) && typed_expr_can_satisfy_planned_i64(
+            )?;
+            let rhs_facts = typed_expr_planned_i64_facts(
                 op.right.as_ref(),
                 local_reprs,
                 module_constants,
                 exact_int_scalar_deopt_instr_ids,
-            )
+            )?;
+            super::i64_binop_result_facts(op.kind, lhs_facts, rhs_facts)
         }
-        _ => matches!(expr.result_facts(), Some(ValueFacts::I64(_))),
+        _ => matches!(expr.result_facts(), Some(ValueFacts::I64(_)))
+            .then_some(super::IntFacts::i64_unknown()),
     }
+}
+
+fn typed_expr_can_satisfy_planned_i64(
+    expr: &InstrTyped,
+    local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+) -> bool {
+    typed_expr_planned_i64_facts(
+        expr,
+        local_reprs,
+        module_constants,
+        exact_int_scalar_deopt_instr_ids,
+    )
+    .is_some()
 }
 
 pub(super) fn exact_int_return_plan_i64_result(
@@ -4666,7 +4686,7 @@ def f(a, b):
     }
 
     #[test]
-    fn cleanup_root_slot_state_keeps_scalar_stores_empty() {
+    fn cleanup_root_slot_state_tracks_boxed_arithmetic_ownership() {
         let (prepared, function_index) = prepared_typed_function(
             r#"
 Ident1 = 1
@@ -4696,7 +4716,7 @@ def f(seq):
 
         assert!(
             plan.cleanup_root_names.contains("IntLoc"),
-            "expected edge-retired scalar IntLoc to remain a cleanup root: {:?}",
+            "expected edge-retired boxed IntLoc to remain a cleanup root: {:?}",
             plan.cleanup_root_names
         );
         let previous_states = plan
@@ -4707,20 +4727,23 @@ def f(seq):
             .collect::<Vec<_>>();
         assert!(
             !previous_states.is_empty(),
-            "expected scalar stores to record previous cleanup-root slot state"
+            "expected boxed arithmetic stores to record previous cleanup-root slot state"
         );
         assert!(
-            previous_states
-                .iter()
-                .all(|state| *state == CleanupRootSlotState::NoOwnedReference),
-            "scalar stores should keep the root slot known empty: {previous_states:?}"
+            previous_states.contains(&CleanupRootSlotState::NoOwnedReference),
+            "the initial cleanup-root store should see an empty slot: {previous_states:?}"
+        );
+        assert!(
+            previous_states.contains(&CleanupRootSlotState::MaybeOwnedReference),
+            "later boxed arithmetic must preserve its owned cleanup-root value: {previous_states:?}"
         );
         assert!(
             plan.cleanup_root_slot_states
                 .block_exit_states
                 .values()
-                .all(|states| states.get("IntLoc") == Some(&CleanupRootSlotState::NoOwnedReference)),
-            "scalar cleanup root IntLoc should not require exit sweeping: {:?}",
+                .any(|states| states.get("IntLoc")
+                    == Some(&CleanupRootSlotState::MaybeOwnedReference)),
+            "boxed cleanup root IntLoc must be available for exit sweeping: {:?}",
             plan.cleanup_root_slot_states.block_exit_states
         );
     }
@@ -5532,7 +5555,7 @@ def f():
     }
 
     #[test]
-    fn runtime_block_param_reprs_preserve_loop_carried_scalar_local() {
+    fn runtime_block_param_reprs_box_loop_carried_arithmetic_without_overflow_proof() {
         let (prepared, function_index) = prepared_typed_function(
             r#"
 def count(n):
@@ -5549,31 +5572,43 @@ def count(n):
             .function(function.function_id)
             .expect("missing JIT local plan");
 
-        let scalar_i_params = plan
+        let i_params = plan
             .runtime_block_params
             .iter()
             .enumerate()
             .flat_map(|(block_index, params)| params.iter().map(move |param| (block_index, param)))
-            .filter(|(_, param)| {
-                param.binding.name == "i" && param.repr == RuntimeBlockParamRepr::ExactI64
-            })
+            .filter(|(_, param)| param.binding.name == "i")
             .collect::<Vec<_>>();
         assert!(
-            !scalar_i_params.is_empty(),
-            "expected loop-carried i to use an ExactI64 runtime block param: {:#?}",
+            !i_params.is_empty(),
+            "expected loop-carried i to have runtime block params: {:#?}",
+            plan.runtime_block_params
+        );
+        assert!(
+            i_params
+                .iter()
+                .all(|(_, param)| param.repr == RuntimeBlockParamRepr::PyObject),
+            "loop-carried i without an overflow proof must stay boxed: {:#?}",
             plan.runtime_block_params
         );
 
-        let scalar_i_target_args = plan
+        let i_target_args = plan
             .implicit_target_transports
             .iter()
             .chain(plan.jump_edge_transports.iter().flatten())
             .flat_map(|transport| transport.target_args.iter())
-            .filter(|arg| arg.target_name == "i" && arg.repr == RuntimeBlockParamRepr::ExactI64)
-            .count();
+            .filter(|arg| arg.target_name == "i")
+            .collect::<Vec<_>>();
         assert!(
-            scalar_i_target_args > 0,
-            "expected an edge transport to carry i as ExactI64: {:#?}",
+            !i_target_args.is_empty(),
+            "expected edge transports to carry loop-local i: {:#?}",
+            plan.jump_edge_transports
+        );
+        assert!(
+            i_target_args
+                .iter()
+                .all(|arg| arg.repr == RuntimeBlockParamRepr::PyObject),
+            "loop-local i edge transports must agree on boxed representation: {:#?}",
             plan.jump_edge_transports
         );
     }

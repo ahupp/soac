@@ -1039,23 +1039,35 @@ class C:
 }
 
 #[test]
-fn unsound_name_binding_lifts_undeclared_builtin_global_loads_into_module_constants() {
+fn name_binding_keeps_len_as_a_live_module_global() {
     let source = r#"
 def f(value):
     print(len(range(value)))
 "#;
 
-    let bb_module = unsound_runtime_builtin_name_binding_module(source);
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("name binding pass should be tracked");
     let f = function_by_name(&bb_module, "f");
-    for name in ["print", "len", "range"] {
+    assert!(
+        !module_constant_runtime_name(&bb_module, "len"),
+        "source builtin len must not be frozen in a runtime-name constant; got {:?}",
+        bb_module.module_constants
+    );
+    assert!(
+        resolved_function_uses_global(f, "len"),
+        "source builtin len must remain a live module-global lookup; got {f:?}",
+    );
+
+    for name in ["print", "range"] {
         assert!(
             module_constant_runtime_name(&bb_module, name),
-            "expected {name} to be an extracted runtime-name constant; got {:?}",
+            "existing source builtin {name} must keep its runtime-name constant; got {:?}",
             bb_module.module_constants
         );
         assert!(
             !resolved_function_uses_global(f, name),
-            "expected {name} load to skip module globals in unsound mode; got {f:?}",
+            "existing source builtin {name} must retain its current runtime lookup; got {f:?}",
         );
     }
 }

@@ -54,11 +54,6 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
         "scope_locals",
     }:
         pytest.xfail(FRAME_SENSITIVE_BUILTINS_XFAIL)
-    if mode in {"soac", "entry"} and case_path.stem in {
-        "builtin_dynamic_global_shadow",
-    }:
-        pytest.xfail("runtime-builtin loads intentionally skip module-global shadowing")
-
     source, validate_source = split_integration_case(case_path)
     module_name = case_path.stem
 

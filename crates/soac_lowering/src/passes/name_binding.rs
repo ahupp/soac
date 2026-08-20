@@ -143,7 +143,6 @@ fn is_unsound_runtime_builtin_candidate(name: &str) -> bool {
             | "isinstance"
             | "issubclass"
             | "iter"
-            | "len"
             | "license"
             | "list"
             | "locals"

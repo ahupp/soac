@@ -5593,11 +5593,13 @@ def build(values):
     }
 
     #[test]
-    fn i64_demand_facts_accept_checked_machine_int_overflow_paths() {
+    fn i64_demand_facts_reject_binops_that_can_overflow_python_integers() {
         let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
         module.module_constants.push(int_literal(i64::MAX));
         module.module_constants.push(int_literal(1));
         module.module_constants.push(int_literal(3037000500i64));
+        module.module_constants.push(int_literal(0));
+        module.module_constants.push(int_literal(2));
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
 
@@ -5606,20 +5608,32 @@ def build(values):
             name_expr(test_constant_name(0)),
             name_expr(test_constant_name(1)),
         ));
-        let checked_mul = op_expr(BinOp::new(
+        let overflowing_sub = op_expr(BinOp::new(
+            BinOpKind::Sub,
+            op_expr(BinOp::new(
+                BinOpKind::Sub,
+                name_expr(test_constant_name(3)),
+                name_expr(test_constant_name(0)),
+            )),
+            name_expr(test_constant_name(4)),
+        ));
+        let overflowing_mul = op_expr(BinOp::new(
             BinOpKind::Mul,
             name_expr(test_constant_name(2)),
             name_expr(test_constant_name(2)),
         ));
 
-        assert_eq!(
-            codegen_expr_static_i64_demand_facts(&overflowing_add, &module_constants),
-            Some(IntFacts::i64_unknown()),
-        );
-        assert_eq!(
-            codegen_expr_static_i64_demand_facts(&checked_mul, &module_constants),
-            Some(IntFacts::i64_unknown()),
-        );
+        for (kind, overflowing) in [
+            (BinOpKind::Add, overflowing_add),
+            (BinOpKind::Sub, overflowing_sub),
+            (BinOpKind::Mul, overflowing_mul),
+        ] {
+            assert_eq!(
+                codegen_expr_static_i64_demand_facts(&overflowing, &module_constants),
+                None,
+                "{kind:?} must retain Python's arbitrary-precision fallback",
+            );
+        }
     }
 
     #[test]

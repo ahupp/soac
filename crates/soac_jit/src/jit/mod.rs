@@ -14914,11 +14914,11 @@ fn i64_binop_result_facts(
         },
         _ => None,
     };
-    let result_range = result_range.or_else(|| known_value.map(IntRange::exact));
+    let result_range = result_range.or_else(|| known_value.map(IntRange::exact))?;
     Some(IntFacts {
         width: IntWidth::I64,
         known_value,
-        range: result_range,
+        range: Some(result_range),
     })
 }
 
