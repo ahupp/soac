@@ -168,6 +168,7 @@ type RemappedTypedGeneratorInstancePlans =
 struct ImmediateMethodCallSource {
     getter_source: InstrId,
     method_name: String,
+    descriptor_function_guards: Vec<TypedDirectFunctionCallGuard>,
 }
 
 type ImmediateMethodCallSources = HashMap<InstrId, ImmediateMethodCallSource>;
@@ -237,6 +238,7 @@ fn immediate_method_call_sources(
                     ImmediateMethodCallSource {
                         getter_source,
                         method_name: method_name.to_string(),
+                        descriptor_function_guards: Vec::new(),
                     },
                 );
             }
@@ -284,6 +286,9 @@ fn source_resolved_immediate_method_call_for_source(
     }
     let mut call = call.clone();
     call.func = Box::new(getter.clone());
+    call.extra.resolved_descriptor_function_guards =
+        (!source.descriptor_function_guards.is_empty())
+            .then(|| source.descriptor_function_guards.clone());
     Some(InstrTyped::GuardedMethodCallTyped(
         TypedGuardedMethodCall::from_typed_call(call, source.method_name.clone(), Vec::new()),
     ))
@@ -10584,14 +10589,58 @@ fn optimize_blockpy_with_external_inline_callees(
             for function in &mut typed_module.callable_defs {
                 assign_missing_typed_function_instr_ids(function);
             }
+            let eligible_descriptor_targets = typed_module
+                .callable_defs
+                .iter()
+                .filter(|function| function.kind == FunctionKind::Function)
+                .map(|function| function.function_id)
+                .collect::<HashSet<_>>();
             let immediate_method_sources = typed_module
                 .callable_defs
                 .iter()
                 .map(|function| {
-                    (
-                        function.function_id,
-                        immediate_method_call_sources(function, &typed_module.module_constants),
-                    )
+                    let mut sources =
+                        immediate_method_call_sources(function, &typed_module.module_constants);
+                    if matches!(
+                        env_config.specialization_mode(),
+                        Some(SpecializationMode::Verify | SpecializationMode::Apply)
+                    ) && let Some(profile) = profile
+                    {
+                        let direct_calls =
+                            profile.typed_call_emission_direct_calls(function.function_id);
+                        for (instr_id, source) in &mut sources {
+                            let mut seen_targets = HashSet::new();
+                            source.descriptor_function_guards = direct_calls
+                                .get(instr_id)
+                                .into_iter()
+                                .flatten()
+                                .filter(|plan| {
+                                    matches!(
+                                        &plan.callee,
+                                        DirectCallCallee::Method { method_name }
+                                            if method_name == &source.method_name
+                                    ) && plan.target.runtime_module_id()
+                                        == function.function_id.runtime_module_id()
+                                        && eligible_descriptor_targets.contains(&plan.target)
+                                        && !plan.arg_plan.sources.iter().any(|arg| {
+                                            matches!(
+                                                arg,
+                                                soac_ir_typed::TypedDirectCallArgSource::PackedRest {
+                                                    ..
+                                                }
+                                            )
+                                        })
+                                        && seen_targets.insert(plan.target)
+                                })
+                                .take(2)
+                                .map(|plan| TypedDirectFunctionCallGuard {
+                                    function_id: plan.target,
+                                    arg_plan: plan.arg_plan.clone(),
+                                })
+                                .collect();
+                        }
+                    }
+                    (function.function_id, sources)
                 })
                 .collect::<HashMap<_, _>>();
             let static_generator_instances =
@@ -13715,6 +13764,199 @@ def keyword(owner, value):
                 }
             }
         }
+    }
+
+    #[test]
+    fn profiled_inherited_method_descriptors_retain_ownerless_direct_targets() {
+        let _runtime_guard = crate::python_runtime_test_lock()
+            .lock()
+            .expect("resolved-method test runtime lock should not be poisoned");
+        crate::initialize_test_python();
+
+        pyo3::Python::attach(|_| {
+            let source = r#"
+class Base:
+    def _soac_ownerless_inherited_descriptor_target(self, value):
+        return value
+
+class Child(Base):
+    pass
+
+def immediate(owner, value):
+    return owner._soac_ownerless_inherited_descriptor_target(value)
+
+def captured_comprehension(owner, value):
+    return [owner._soac_ownerless_inherited_descriptor_target(item)
+            for item in (value,)][0]
+"#;
+            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .expect("ownerless inherited method source should lower")
+                .blockpy_module;
+            let profile_config = SoacEnvConfig::default()
+                .with_specialization_mode(Some(SpecializationMode::Profile));
+            let mut counter_module = lower_blockpy_module_to_typed(lowered.clone());
+            soac_instrument::define_typed_module_counter_defs(
+                &mut counter_module,
+                &soac_instrument::InstrumentationConfig::from_env_config(&profile_config),
+            )
+            .expect("ownerless inherited method counters should retain source identities");
+
+            let caller = counter_module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "immediate")
+                .expect("ownerless inherited method caller should exist");
+            let caller_id = caller.function_id;
+            let sources = immediate_method_call_sources(caller, &counter_module.module_constants);
+            assert_eq!(sources.len(), 1, "the fixture should have one method site");
+            let (&call_source, recovered_source) = sources
+                .iter()
+                .next()
+                .expect("the source-grounded method site should exist");
+            let method_name = recovered_source.method_name.clone();
+            let captured = counter_module
+                .callable_defs
+                .iter()
+                .find(|function| {
+                    function
+                        .names
+                        .qualname
+                        .starts_with("captured_comprehension.<locals>._dp_listcomp_")
+                })
+                .expect("the captured comprehension must retain its source method");
+            let captured_id = captured.function_id;
+            let captured_sources =
+                immediate_method_call_sources(captured, &counter_module.module_constants);
+            let (&captured_source, _) = captured_sources
+                .iter()
+                .find(|(_, source)| source.method_name == method_name)
+                .expect("the captured method anchor must exist before hot cloning");
+            let target_id = counter_module
+                .callable_defs
+                .iter()
+                .find(|function| {
+                    function.names.qualname == "Base._soac_ownerless_inherited_descriptor_target"
+                })
+                .expect("the profiled inherited method target should exist")
+                .function_id;
+            lowered.counter_defs = counter_module.counter_defs;
+
+            let direct_call = |source| ResolvedV3DirectCallPlan {
+                source,
+                target: target_id,
+                callee: DirectCallCallee::Method {
+                    method_name: method_name.clone(),
+                },
+                arg_plan: TypedDirectCallArgPlan {
+                    sources: vec![
+                        soac_ir_typed::TypedDirectCallArgSource::Provided(0),
+                        soac_ir_typed::TypedDirectCallArgSource::Provided(1),
+                    ],
+                },
+                body: static_direct_call_body(),
+                reason: "profiled inherited descriptor test target".to_string(),
+            };
+            let profile = SpecializationProfile {
+                module_name: None,
+                counter_dump_path: None,
+                direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+                opt_v3_emitted_direct_calls: HashMap::from([
+                    (
+                        caller_id,
+                        HashMap::from([(call_source, vec![direct_call(call_source)])]),
+                    ),
+                    (
+                        captured_id,
+                        HashMap::from([(captured_source, vec![direct_call(captured_source)])]),
+                    ),
+                ]),
+                opt_v3_emitted_exact_list_items: HashMap::new(),
+                opt_v3_emitted_indexed_fields: HashMap::new(),
+                opt_v3_emitted_indexed_globals: HashMap::new(),
+                opt_v3_exact_int_branch_artifacts: HashMap::new(),
+                behavior_change_indexed_stores: false,
+                profiled_cold_blocks: false,
+                guard_miss_deopt: false,
+            };
+
+            #[derive(Default)]
+            struct RecoveredDescriptors {
+                guards: Vec<Option<Vec<TypedDirectFunctionCallGuard>>>,
+                owner_guards: Vec<usize>,
+            }
+
+            impl Visit<InstrTyped> for RecoveredDescriptors {
+                fn visit_instr(&mut self, expr: &InstrTyped) {
+                    if let InstrTyped::GuardedMethodCallTyped(call) = expr {
+                        self.guards
+                            .push(call.extra.resolved_descriptor_function_guards.clone());
+                        self.owner_guards.push(call.method_guards.len());
+                    }
+                    expr.visit_children(self);
+                }
+            }
+
+            for mode in [
+                SpecializationMode::Profile,
+                SpecializationMode::Verify,
+                SpecializationMode::Apply,
+            ] {
+                let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
+                let plan = optimize_blockpy_with_external_inline_callees(
+                    &lowered,
+                    Some(&profile),
+                    &config,
+                    HashMap::new(),
+                    StaticDirectCallTargets::default(),
+                )
+                .expect("the whole production pipeline should plan an ownerless method");
+                for (function_id, is_cloned) in [(caller_id, false), (captured_id, true)] {
+                    let function = plan
+                        .module
+                        .callable_defs
+                        .iter()
+                        .find(|function| function.function_id == function_id)
+                        .expect("the planned ownerless method caller should exist");
+                    let direct_targets =
+                        crate::jit::function_targets::collect_typed_call_direct_targets(function);
+                    let mut descriptors = RecoveredDescriptors::default();
+                    descriptors.visit_fn(function);
+                    assert!(
+                        descriptors.owner_guards.iter().all(|count| *count == 0),
+                        "the profiled class does not exist during eager planning"
+                    );
+                    if mode == SpecializationMode::Profile {
+                        assert!(
+                            !direct_targets.contains(&target_id),
+                            "Profile must preserve original target observations"
+                        );
+                        assert!(
+                            descriptors.guards.iter().all(Option::is_none),
+                            "Profile must not install speculative descriptor guards"
+                        );
+                    } else {
+                        assert!(
+                            direct_targets.contains(&target_id),
+                            "{mode:?} must retain the profiled inherited descriptor target even \
+                             when its class does not exist during eager planning"
+                        );
+                        assert!(
+                            descriptors.guards.iter().all(|guards| {
+                                matches!(guards.as_deref(), Some([guard]) if guard.function_id == target_id)
+                            }),
+                            "{mode:?} each recovered method must retain the original profiled target"
+                        );
+                        if is_cloned {
+                            assert_eq!(
+                                descriptors.guards.len(),
+                                2,
+                                "{mode:?} a hot-cloned method must inherit its original source guard"
+                            );
+                        }
+                    }
+                }
+            }
+        });
     }
 
     #[test]

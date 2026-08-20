@@ -1835,6 +1835,171 @@ changes exactly three existing production runtime paths plus one existing
 **`#[cfg(test)]`-only** collision assertion; the full-suite stock
 **1.10x** goal remains unmet and full-suite performance is unmeasured.
 
+The current continuation of this strategy also supports **profile-selected
+direct calls after authoritative CPython method lookup**. During Verify /
+Apply, existing v3 `call_hot_targets` decisions attach up to two
+same-module transformed Python-function targets and their validated
+`Provided` / `DefaultSentinel` receiver-plus-argument plans to the
+existing recovered immediate method's `TypedInstrExtra`. Profile retains
+the original observation graph and attaches no descriptor targets. The
+source-anchored decision also follows captured-comprehension
+hot-continuation clones; ordinary target collection predeclares those
+native bodies before codegen. No class or owner type needs to exist when
+eager compilation occurs, and the old receiver-owner guard list stays
+empty. Cross-module targets, generators, packed-rest bindings, builtin
+methods, and unsupported or unprofiled calls retain their original paths.
+
+The emitted call **always invokes the unchanged pinned
+`_PyObject_GetMethod` first**. CPython therefore remains responsible for
+inherited MRO lookup, instance shadows, descriptors, properties, custom
+attribute hooks, class replacement, and error behavior. Only its actual
+owned method descriptor is considered for a direct edge: it must be an
+exact Python function, and a single ordered pass compares its SOAC
+function ID against at most two profiled targets. Null runtime metadata,
+changed registered `__code__` / positional-default / keyword-default
+snapshots, mutable nonnull `__kwdefaults__`, or a null/replaced current
+vectorcall pointer reject the edge; the current nonnull vectorcall must
+equal the registered compiled entry. Another target or a non-method
+result also takes the unchanged original vectorcall fallback.
+Successful direct edges and fallback update their existing specialization
+counters; receiver / descriptor / argument ownership and exceptional
+cleanup remain explicit.
+
+The initial direct-descriptor iteration used its original unconditional
+public recursion checker and duplicated a packed target comparison.
+Three-round `deltablue` improved **1.078213x raw**, but its paired
+**1.038803x [0.999962, 1.074140]** was marginal, `richards` paired
+**0.999101x** was neutral, and `chaos` significantly regressed paired
+**0.962989x [0.949799, 0.995557]** while ordinary native bytes grew
+**5.09%**. A zero-loss matched `deltablue` profile exposed new public
+direct recursion **0% → 3.649635%**. This first shape was inconclusive /
+adverse; its benchmark evidence is not evidence for the refined shape.
+
+Only the newly selected resolved-descriptor direct edge now reuses the
+existing conservative native-stack guard. A genuine actual inherited
+direct-body Cranelift regression turns **RED frame-pointer 0 / public
+helper total 1 and cold 0 / packed target comparisons 2 → GREEN
+frame-pointer 1 / exactly one unchanged public helper exclusively on its
+marked cold path / packed target comparison 1**. The existing vectorcall
+trampoline's failure policy remains **`ReturnNull`**; the new descriptor
+guard uses **`JumpTo` the existing scoped owned-input cleanup** so an
+overflow releases its owned descriptor / receiver / arguments exactly
+once. Unsupported architectures retain the original public helper, and
+the four preexisting generic / constructor direct-call paths remain
+unchanged. The prior trampoline's structured guard regression still
+passes; exact release hidden-trampoline bytes and every arity remain
+unchanged across smoke, normally sampled, and repeated comparisons.
+The refined candidate changes exactly five existing production files:
+`crates/soac_ir_typed/src/typed.rs`,
+`crates/soac_jit/src/jit/typed_pipeline.rs`,
+`crates/soac_jit/src/jit/function_targets.rs`,
+`crates/soac_jit/src/jit/mod.rs`, and
+`crates/soac_jit/src/jit/vectorcall.rs`; existing
+`crates/soac_jit/src/jit/test.rs` changes are **`#[cfg(test)]`-only**.
+There is no new public API, runtime helper, or global state.
+
+The genuine unchanged-production whole-pipeline Rust optimization RED
+turns **GREEN: 1 passed / 577 filtered**, verifying no Profile
+descriptor guards and owner-independent Verify / Apply targets for both
+the original inherited call and each captured-comprehension clone. After
+package-scoped formatting, the genuine actual transformed direct-hit RED
+and frozen refined stock-parity integration both pass **2 / 2**:
+Verify records real `call_direct.hit`, and stock / Profile / Verify /
+Apply agree on inherited polymorphism, shadows, descriptors, custom
+getters, class/default mutation, builtin fallback, cleared/restored
+vectorcall, and replaced/restored method code. Retained focused method /
+recursion / compatibility controls pass **10 / 10**. Fresh complete
+serial Rust libraries pass **JIT 579 / 579**, **optimizer 214 / 214**,
+and **typed IR 54 / 54**. Expanded actual transformed compatibility
+passes **51 / 51 tests across 27 files in 63.47 seconds**; combined
+`cargo check -p soac_opt -p soac_ir_typed -p soac_jit --tests --quiet`
+and scoped formatting checks both pass. Package-scoped formatting was
+completed before the refined candidate pytest, and the five production
+paths are frozen. Refined release smoke preserves **397 total JIT source
+rows including adapters / 204 direct bodies / 38,108 hidden bytes**;
+the normally sampled comparison preserves **3,970 total rows / 2,040
+direct bodies / 381,080 hidden bytes** across **80 Apply PIDs**. Its
+official previous score **0.9970497902989457x** is noisy; significant
+raw timing changes for byte-identical control bodies demonstrate
+environment drift.
+
+Definitive refined three-round comparison
+`comparison-20260819-231434-GW1s2w` preserves all **120 measured Apply
+PIDs / 10,650 total source rows including adapters / 5,490 direct bodies
+/ 2,265 typed blocks / 183 typed functions**, every hidden-trampoline
+arity and exactly **777,240 hidden bytes**, with zero errors. Ordinary
+retained → rejected first → refined native code is **54,686,760 →
+57,470,520 → 56,982,240 bytes**, and machine blocks **3,596,430 →
+3,766,440 → 3,727,500**: refined remains larger than retained while
+removing **488,280 bytes / 38,940 blocks** from the first candidate.
+`deltablue` improves **2.305270891 → 2.077271844 ms**, raw
+**1.10975889x [1.09359, 1.12969]** and stock-paired
+**1.13970302x [1.10924, 1.16692]**; `richards` improves
+**21.821327875 → 20.933223937 ms**, raw
+**1.04242557x [1.02812, 1.05426]** and stock-paired
+**1.06015760x [1.04276, 1.08066]**. Raw `chaos` **0.958715x** and
+`comprehensions` **0.97442x** regress, but stock-paired
+**0.98850885x [0.97645, 1.02004]** and
+**0.99510391x [0.97957, 1.01549]** are neutral versus retained.
+Versus the rejected first candidate, paired `chaos` recovers
+**1.02650074x [1.0093, 1.0437]**, while `comprehensions`
+**0.97796807x [0.9614, 0.9962]** regresses despite remaining neutral
+against retained. Official targeted geometric means are
+**0.5613133486246105x stock / 1.027017074961002x previous SOAC**.
+
+All four refined causal captures have **`Total Lost Samples: 0`**, use
+the same measured worker / loop count / sample frequency within each
+comparison with **`SOAC_JIT_BB_MAP=0`**, and exclude interpreter
+shutdown only; measured in-loop GC is retained. Matched `deltablue`
+retained → first → refined has **160 → 156 → 162 samples**: targeted
+public recursion **0% → 3.649635% → 0%**, generic hook
+**6.944444% → 1.459854% → 2.174679%**, and TLS
+**5.555556% → 3.649635% → 2.898006%**. Authoritative method lookup
+remains **14.583333% → 15.328467% → 21.014067%**, including separate
+refined source parents `EqualityConstraint.execute` **8.697541
+percentage points**, `Planner.add_propagate` **4.347009 points**, and
+`Plan.execute` **2.173505 points**.
+
+Matched `richards` has **228 → 213 → 215 samples**: public recursion
+**0.440785% → 0.471442% → 0%**, generic hook
+**4.404840% → 6.132768% → 3.270666%**, trampoline
+**11.452382% → 1.886773% → 3.738909%**, TLS
+**2.203926% → 6.130757% → 6.541333%**, and retained method lookup
+**5.727195% → 5.659315% → 7.008571%**. Matched `comprehensions` has
+**545 → 504 → 601 samples**: generic hook
+**4.897931% → 3.220494% → 2.726336%**, TLS
+**5.528461% → 4.133180% → 4.276216%**, trampoline
+**1.277317% → 0% → 0.194320%**, and method lookup
+**2.340974% → 1.378886% → 1.555732%**; total recursion
+**0.212499% → 0% → 0.389811%** belongs to an unchanged separate direct
+site. `chaos` has **213 first / 205 refined samples and no retained
+profile**: targeted `Chaosgame.transform_point` recursion falls
+**0.471480% → 0%**, but total recursion rises **0.471480% → 0.975766%**
+from unchanged `GVector.__add__` / `linear_combination` paths; generic
+hook is **2.830890% → 3.902064%** and TLS
+**6.603736% → 6.830361%**. These source/leaf groups may overlap and are
+never added; sparse samples do not prove direct throughput causation.
+
+The authoritative full **`just test-all` correctness gate exits zero**;
+see **`work/logs/resolved-method-descriptor-test-all.log`**. Exactly
+**1,239 transformed Python nodeids / 100 isolated batches / eight
+workers / 100 passed / zero failed** complete. Rust passes **JIT 579 /
+579 in 15.86 seconds**, including the new cold descriptor-direct
+structured regression; **optimizer 214 / 214 in 0.59 seconds**, **typed
+IR 54 / 54 in 0.01 seconds**, **lowering 371 / 371 in 0.55 seconds**,
+and **PyO3 extension 8 / 8 in 0.11 seconds**. Runtime build takes
+**1.598 seconds**, the Cargo phase **82.978 seconds** including
+approximately **1 minute 04 seconds** compiling test targets, transformed
+pytest **78.708 inner / 78.725 outer seconds**, and the complete test
+phase **161.717 seconds**. The new two-node transformed integration
+passes in **3.37 seconds**; the known serial 28-node counter-dump shard
+takes **78.42 seconds**.
+
+Final status is **FULLY VALIDATED / RETAIN LANDING CANDIDATE**, not
+already landed. All four refined lossless causal profiles are complete;
+the full-suite stock **1.10x** goal remains unmet, and the complete
+performance suite has not been benchmarked.
+
 ### Exact Positional Argument Binding
 
 The existing immutable `DirectArgBindingPlan` can directly bind a fully

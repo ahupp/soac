@@ -8987,6 +8987,74 @@ fn emit_exact_function_id_match_bool01(
     ))
 }
 
+fn emit_py_function_registered_snapshots_match(
+    fb: &mut FunctionBuilder<'_>,
+    function: ir::Value,
+    metadata: ir::Value,
+    ptr_ty: ir::Type,
+) -> ir::Value {
+    let current_code = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        function,
+        PY_FUNCTION_CODE_OFFSET,
+    );
+    let registered_code = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        metadata,
+        PY_FUNCTION_JIT_EXTRA_REGISTERED_CODE_OFFSET,
+    );
+    let code_matches = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, current_code, registered_code);
+    let current_defaults = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        function,
+        PY_FUNCTION_DEFAULTS_OFFSET,
+    );
+    let registered_defaults = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        metadata,
+        crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_DEFAULTS_OFFSET,
+    );
+    let defaults_match = fb.ins().icmp(
+        ir::condcodes::IntCC::Equal,
+        current_defaults,
+        registered_defaults,
+    );
+    let current_kwdefaults = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        function,
+        PY_FUNCTION_KWDEFAULTS_OFFSET,
+    );
+    let registered_kwdefaults = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        metadata,
+        crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_KWDEFAULTS_OFFSET,
+    );
+    let kwdefaults_match = fb.ins().icmp(
+        ir::condcodes::IntCC::Equal,
+        current_kwdefaults,
+        registered_kwdefaults,
+    );
+    // Unlike positional defaults, keyword-only defaults live in a mutable
+    // dictionary. Pointer identity cannot prove that the copied runtime slots
+    // still contain the current values after an in-place update or deletion.
+    // Keep those functions on the vectorcall path, which rereads their
+    // keyword-only defaults before binding.
+    let kwdefaults_are_immutable =
+        fb.ins()
+            .icmp_imm(ir::condcodes::IntCC::Equal, current_kwdefaults, 0);
+    let code_and_defaults_match = fb.ins().band(code_matches, defaults_match);
+    let kwdefaults_are_safe = fb.ins().band(kwdefaults_match, kwdefaults_are_immutable);
+    fb.ins().band(code_and_defaults_match, kwdefaults_are_safe)
+}
+
 fn emit_callee_function_id_checked(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -9195,66 +9263,8 @@ fn emit_callee_function_id_checked(
         .brif(metadata_is_null, miss_block, &[], code_snapshot_block, &[]);
 
     fb.switch_to_block(code_snapshot_block);
-    let current_code = fb.ins().load(
-        ptr_ty,
-        ir::MemFlags::trusted(),
-        function_value,
-        PY_FUNCTION_CODE_OFFSET,
-    );
-    let registered_code = fb.ins().load(
-        ptr_ty,
-        ir::MemFlags::trusted(),
-        metadata,
-        PY_FUNCTION_JIT_EXTRA_REGISTERED_CODE_OFFSET,
-    );
-    let code_matches = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, current_code, registered_code);
-    let current_defaults = fb.ins().load(
-        ptr_ty,
-        ir::MemFlags::trusted(),
-        function_value,
-        PY_FUNCTION_DEFAULTS_OFFSET,
-    );
-    let registered_defaults = fb.ins().load(
-        ptr_ty,
-        ir::MemFlags::trusted(),
-        metadata,
-        crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_DEFAULTS_OFFSET,
-    );
-    let defaults_match = fb.ins().icmp(
-        ir::condcodes::IntCC::Equal,
-        current_defaults,
-        registered_defaults,
-    );
-    let current_kwdefaults = fb.ins().load(
-        ptr_ty,
-        ir::MemFlags::trusted(),
-        function_value,
-        PY_FUNCTION_KWDEFAULTS_OFFSET,
-    );
-    let registered_kwdefaults = fb.ins().load(
-        ptr_ty,
-        ir::MemFlags::trusted(),
-        metadata,
-        crate::PY_FUNCTION_JIT_EXTRA_REGISTERED_KWDEFAULTS_OFFSET,
-    );
-    let kwdefaults_match = fb.ins().icmp(
-        ir::condcodes::IntCC::Equal,
-        current_kwdefaults,
-        registered_kwdefaults,
-    );
-    // Unlike positional defaults, keyword-only defaults live in a mutable
-    // dictionary. Pointer identity cannot prove that the copied runtime slots
-    // still contain the current values after an in-place update or deletion.
-    // Keep those functions on the vectorcall path, which rereads their
-    // keyword-only defaults before binding.
-    let kwdefaults_are_immutable =
-        fb.ins()
-            .icmp_imm(ir::condcodes::IntCC::Equal, current_kwdefaults, 0);
-    let code_and_defaults_match = fb.ins().band(code_matches, defaults_match);
-    let kwdefaults_are_safe = fb.ins().band(kwdefaults_match, kwdefaults_are_immutable);
-    let snapshots_match = fb.ins().band(code_and_defaults_match, kwdefaults_are_safe);
+    let snapshots_match =
+        emit_py_function_registered_snapshots_match(fb, function_value, metadata, ptr_ty);
     let current_code_block = fb.create_block();
     fb.ins()
         .brif(snapshots_match, current_code_block, &[], miss_block, &[]);
@@ -9386,6 +9396,12 @@ fn emit_record_branch_outcome_sample(
     emit_record_top_value_sample(fb, counter_id, observed_value, ctx);
 }
 
+#[derive(Clone, Copy)]
+enum DirectCallRecursionGuard {
+    PublicHelper,
+    ConservativeNativeStack,
+}
+
 fn emit_direct_call_resolved_raw_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -9393,6 +9409,7 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     entry_kind: DirectCallEntryKind,
+    recursion_guard: DirectCallRecursionGuard,
     target_function: &BlockPyFunction<impl ModuleShape>,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -9403,22 +9420,39 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     let (function_metadata, function_env) =
         emit_resolved_direct_function_metadata_and_env(fb, callable, target_function, ctx);
 
-    let enter_inst = fb
-        .ins()
-        .call(ctx.enter_recursive_ref, &[ctx.consts.thread_state_value]);
-    let enter_status = fb.inst_results(enter_inst)[0];
-    let enter_failed = fb
-        .ins()
-        .icmp_imm(ir::condcodes::IntCC::NotEqual, enter_status, 0);
-    let entered_block = fb.create_block();
-    fb.ins().brif(
-        enter_failed,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        entered_block,
-        &[],
-    );
-    fb.switch_to_block(entered_block);
+    match recursion_guard {
+        DirectCallRecursionGuard::PublicHelper => {
+            let enter_inst = fb
+                .ins()
+                .call(ctx.enter_recursive_ref, &[ctx.consts.thread_state_value]);
+            let enter_status = fb.inst_results(enter_inst)[0];
+            let enter_failed = fb
+                .ins()
+                .icmp_imm(ir::condcodes::IntCC::NotEqual, enter_status, 0);
+            let entered_block = fb.create_block();
+            fb.ins().brif(
+                enter_failed,
+                ctx.consts.step_null_block,
+                &step_null_block_args(ctx),
+                entered_block,
+                &[],
+            );
+            fb.switch_to_block(entered_block);
+        }
+        DirectCallRecursionGuard::ConservativeNativeStack => {
+            let failure_args = step_null_block_args(ctx);
+            vectorcall::emit_vectorcall_native_recursion_guard(
+                fb,
+                ctx.consts.thread_state_value,
+                ctx.consts.ptr_ty,
+                ctx.enter_recursive_ref,
+                vectorcall::NativeRecursionGuardFailure::JumpTo {
+                    block: ctx.consts.step_null_block,
+                    args: failure_args.as_slice(),
+                },
+            );
+        }
+    }
 
     let mut call_args = Vec::with_capacity(arg_values.len() + 2);
     call_args.push(function_env);
@@ -9480,6 +9514,7 @@ fn emit_direct_call_resolved_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     entry_kind: DirectCallEntryKind,
+    recursion_guard: DirectCallRecursionGuard,
     target_function: &BlockPyFunction<impl ModuleShape>,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -9493,6 +9528,7 @@ fn emit_direct_call_resolved_with_arg_values(
         arg_values,
         arg_borrowed,
         entry_kind,
+        recursion_guard,
         target_function,
         ctx,
         codegen_env,
@@ -9615,6 +9651,7 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
         } else {
             DirectCallEntryKind::Core
         },
+        DirectCallRecursionGuard::PublicHelper,
         target_function,
         ctx,
         codegen_env,
@@ -9706,6 +9743,7 @@ fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
         } else {
             DirectCallEntryKind::Core
         },
+        DirectCallRecursionGuard::PublicHelper,
         target_function,
         ctx,
         codegen_env,
@@ -9768,6 +9806,7 @@ fn emit_direct_method_resolved_with_args_from_local_env(
         } else {
             DirectCallEntryKind::Core
         },
+        DirectCallRecursionGuard::PublicHelper,
         target_function,
         ctx,
         codegen_env,
@@ -9829,6 +9868,7 @@ fn emit_typed_direct_method_resolved_with_args_from_local_env(
         } else {
             DirectCallEntryKind::Core
         },
+        DirectCallRecursionGuard::PublicHelper,
         target_function,
         ctx,
         codegen_env,
@@ -17092,14 +17132,25 @@ fn emit_typed_source_resolved_immediate_method_call_result_with_local_env(
         fb.switch_to_block(receiver_ready_block);
     }
 
-    if let Some(counter_id) = call
-        .try_semantic_instr_id()
+    let site_instr_id = call.try_semantic_instr_id();
+    if let Some(counter_id) = site_instr_id
         .and_then(|instr_id| emit_ctx.call_target_counter_ids.get(&instr_id))
         .copied()
     {
         let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
     }
+    let descriptor_function_guards = call
+        .extra
+        .resolved_descriptor_function_guards
+        .as_deref()
+        .unwrap_or_default();
+    let direct_hit_counter_id = site_instr_id
+        .and_then(|instr_id| emit_ctx.call_direct_hit_counter_ids.get(&instr_id))
+        .copied();
+    let direct_fallback_counter_id = site_instr_id
+        .and_then(|instr_id| emit_ctx.call_direct_fallback_counter_ids.get(&instr_id))
+        .copied();
 
     let mut arg_values = Vec::<ir::Value>::with_capacity(arg_refs.len());
     let mut arg_borrowed = Vec::<bool>::with_capacity(arg_refs.len());
@@ -17170,6 +17221,205 @@ fn emit_typed_source_resolved_immediate_method_call_result_with_local_env(
     method_arg_borrowed.push(receiver_is_borrowed);
     method_arg_values.extend(arg_values.iter().copied());
     method_arg_borrowed.extend(arg_borrowed.iter().copied());
+
+    if !descriptor_function_guards.is_empty() {
+        let function_descriptor_block = fb.create_block();
+        let profiled_descriptor_block = fb.create_block();
+        let metadata_ready_block = fb.create_block();
+        let current_vectorcall_block = fb.create_block();
+        let method_fallback_block = fb.create_block();
+        fb.set_cold_block(method_fallback_block);
+
+        let callable_type = fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            callable,
+            offset_of!(ffi::PyObject, ob_type) as i32,
+        );
+        let py_function_type = emit_type_ptr_value_for_ref(
+            fb,
+            codegen_env,
+            emit_ctx,
+            &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Function),
+        )?
+        .ok_or_else(|| "resolved method descriptor requires PyFunction_Type".to_string())?;
+        let is_exact_function =
+            fb.ins()
+                .icmp(ir::condcodes::IntCC::Equal, callable_type, py_function_type);
+        fb.ins().brif(
+            is_exact_function,
+            function_descriptor_block,
+            &[],
+            method_fallback_block,
+            &[],
+        );
+
+        fb.switch_to_block(function_descriptor_block);
+        let callee_id = fb.ins().load(
+            emit_ctx.consts.i64_ty,
+            ir::MemFlags::trusted(),
+            callable,
+            PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET,
+        );
+        let mut target_matches = Vec::with_capacity(descriptor_function_guards.len());
+        let mut is_profiled_descriptor = None;
+        for guard in descriptor_function_guards {
+            debug_assert_ne!(guard.function_id.to_packed_runtime_u64(), 0);
+            let matches_id = fb.ins().icmp_imm(
+                ir::condcodes::IntCC::Equal,
+                callee_id,
+                guard.function_id.to_packed_runtime_u64() as i64,
+            );
+            target_matches.push(matches_id);
+            is_profiled_descriptor = Some(match is_profiled_descriptor {
+                Some(previous_match) => fb.ins().bor(previous_match, matches_id),
+                None => matches_id,
+            });
+        }
+        let is_profiled_descriptor = is_profiled_descriptor
+            .expect("nonempty descriptor guards must produce an identifier test");
+        fb.ins().brif(
+            is_profiled_descriptor,
+            profiled_descriptor_block,
+            &[],
+            method_fallback_block,
+            &[],
+        );
+
+        fb.switch_to_block(profiled_descriptor_block);
+        let metadata = load_py_function_soac_metadata_obj(fb, ptr_ty, callable);
+        let metadata_is_null = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, metadata, 0);
+        fb.ins().brif(
+            metadata_is_null,
+            method_fallback_block,
+            &[],
+            metadata_ready_block,
+            &[],
+        );
+
+        fb.switch_to_block(metadata_ready_block);
+        let snapshots_match =
+            emit_py_function_registered_snapshots_match(fb, callable, metadata, ptr_ty);
+        let current_vectorcall = fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            callable,
+            offset_of!(ffi::PyFunctionObject, vectorcall) as i32,
+        );
+        let compiled_vectorcall = fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            metadata,
+            offset_of!(crate::PyFunctionJitExtra, compiled_vectorcall_entry) as i32,
+        );
+        let compiled_vectorcall_is_live =
+            fb.ins()
+                .icmp_imm(ir::condcodes::IntCC::NotEqual, compiled_vectorcall, 0);
+        let vectorcall_matches = fb.ins().icmp(
+            ir::condcodes::IntCC::Equal,
+            current_vectorcall,
+            compiled_vectorcall,
+        );
+        let live_vectorcall_matches = fb
+            .ins()
+            .band(compiled_vectorcall_is_live, vectorcall_matches);
+        let may_call_direct = fb.ins().band(snapshots_match, live_vectorcall_matches);
+        fb.ins().brif(
+            may_call_direct,
+            current_vectorcall_block,
+            &[],
+            method_fallback_block,
+            &[],
+        );
+
+        fb.switch_to_block(current_vectorcall_block);
+        for (index, guard) in descriptor_function_guards.iter().enumerate() {
+            let miss_block = if index + 1 == descriptor_function_guards.len() {
+                None
+            } else {
+                let direct_block = fb.create_block();
+                let miss_block = fb.create_block();
+                fb.ins()
+                    .brif(target_matches[index], direct_block, &[], miss_block, &[]);
+                fb.switch_to_block(direct_block);
+                Some(miss_block)
+            };
+            let target_function = direct_call_target_function(emit_ctx, guard.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "resolved method descriptor direct target {} is unavailable",
+                        guard.function_id
+                    )
+                })?;
+            emit_record_direct_call_target_sample(fb, site_instr_id, guard.function_id, emit_ctx);
+            if let Some(counter_id) = direct_hit_counter_id {
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
+            }
+
+            let cleanup_block = fb.create_block();
+            fb.set_cold_block(cleanup_block);
+            let direct_emit_ctx = emit_ctx.with_step_null_target(cleanup_block, Vec::new());
+            let direct_arg_plan = direct_function::direct_call_arg_plan_from_typed(&guard.arg_plan);
+            let (direct_arg_values, _) = emit_direct_call_args_from_plan(
+                fb,
+                &direct_arg_plan,
+                method_arg_values.clone(),
+                vec![true; method_arg_values.len()],
+                &direct_emit_ctx,
+            );
+            let mut owned_inputs = method_arg_values
+                .iter()
+                .copied()
+                .zip(method_arg_borrowed.iter().copied())
+                .filter_map(|(value, borrowed)| (!borrowed).then_some(value))
+                .collect::<Vec<_>>();
+            owned_inputs.push(callable);
+            let direct_result = emit_direct_call_resolved_with_arg_values(
+                fb,
+                callable,
+                true,
+                direct_arg_values.clone(),
+                vec![true; direct_arg_values.len()],
+                if direct_arg_plan.requires_default_resolving_entry() {
+                    DirectCallEntryKind::DefaultResolving
+                } else {
+                    DirectCallEntryKind::Core
+                },
+                DirectCallRecursionGuard::ConservativeNativeStack,
+                target_function,
+                &direct_emit_ctx,
+                codegen_env,
+            );
+            emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
+            if result_has_value {
+                fb.ins()
+                    .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+            } else {
+                emit_release_owned_inputs(fb, emit_ctx, &[direct_result]);
+                fb.ins().jump(result_block, &[]);
+            }
+
+            fb.switch_to_block(cleanup_block);
+            emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
+            fb.ins().jump(
+                emit_ctx.consts.step_null_block,
+                &step_null_block_args(emit_ctx),
+            );
+
+            if let Some(miss_block) = miss_block {
+                fb.switch_to_block(miss_block);
+            }
+        }
+
+        fb.switch_to_block(method_fallback_block);
+        emit_ctx
+            .direct_edge_stats
+            .record_guarded_generic_fallback_block();
+        if let Some(counter_id) = direct_fallback_counter_id {
+            emit_increment_counter_ref(fb, counter_id, emit_ctx);
+        }
+    }
+
     let method_result = if result_has_value {
         emit_positional_vectorcall_result_with_arg_values(
             fb,
@@ -17201,6 +17451,11 @@ fn emit_typed_source_resolved_immediate_method_call_result_with_local_env(
     }
 
     fb.switch_to_block(regular_block);
+    if !descriptor_function_guards.is_empty()
+        && let Some(counter_id) = direct_fallback_counter_id
+    {
+        emit_increment_counter_ref(fb, counter_id, emit_ctx);
+    }
     let regular_result = if result_has_value {
         emit_positional_vectorcall_result_with_arg_values(
             fb,

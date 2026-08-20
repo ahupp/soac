@@ -15553,7 +15553,7 @@ def f(x):
                 thread_state,
                 ir::types::I64,
                 helper,
-                null_pointer,
+                super::super::vectorcall::NativeRecursionGuardFailure::ReturnNull(null_pointer),
             );
 
             let success = fb.ins().iconst(ir::types::I64, 1);
@@ -15636,6 +15636,136 @@ def f(x):
             })
             .count();
         assert_eq!(hot_helper_calls, 0);
+    }
+
+    #[test]
+    fn resolved_method_descriptor_direct_edge_has_one_exact_target_guard_and_cold_recursion() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+class Base:
+    def value(self, argument):
+        return argument
+
+def immediate(owner, argument):
+    return owner.value(argument)
+"#,
+        )
+        .expect("resolved method descriptor source should lower")
+        .blockpy_module;
+        let caller = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "immediate")
+            .expect("the resolved method caller should exist")
+            .clone();
+        let target = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "Base.value")
+            .expect("the resolved method descriptor target should exist");
+        let target_id = target.function_id;
+        let planned_module = optimize_blockpy(&lowered, None, &typed_v3_env_config())
+            .expect("the resolved method descriptor source should optimize");
+        let mut planned_caller = planned_module
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller.function_id)
+            .expect("the optimized resolved method caller should exist")
+            .clone();
+
+        struct AttachResolvedDescriptor {
+            target_id: RuntimeFunctionId,
+            attached: usize,
+        }
+
+        impl VisitMut<InstrTyped> for AttachResolvedDescriptor {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::GuardedMethodCallTyped(call) = expr
+                    && call.method_name == "value"
+                {
+                    assert!(
+                        call.method_guards.is_empty(),
+                        "the source-grounded fixture should not require a published owner"
+                    );
+                    call.extra.resolved_descriptor_function_guards =
+                        Some(vec![soac_ir_typed::TypedDirectFunctionCallGuard {
+                            function_id: self.target_id,
+                            arg_plan: TypedDirectCallArgPlan {
+                                sources: vec![
+                                    TypedDirectCallArgSource::Provided(0),
+                                    TypedDirectCallArgSource::Provided(1),
+                                ],
+                            },
+                        }]);
+                    self.attached += 1;
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        let mut attach = AttachResolvedDescriptor {
+            target_id,
+            attached: 0,
+        };
+        attach.visit_fn_mut(&mut planned_caller);
+        assert_eq!(
+            attach.attached, 1,
+            "the actual optimized source should have one immediate method call"
+        );
+
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let blocks = vec![std::ptr::null_mut::<c_void>(); caller.blocks.len()];
+        let built = build_test_jit_function_with_constants_and_options(
+            &lowered,
+            &caller,
+            blocks.as_slice(),
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(planned_caller),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        let recursive_helpers =
+            import_user_names_for_symbols(&built, &["dp_jit_enter_recursive_call"]);
+        let total_recursive_calls =
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &recursive_helpers);
+        let cold_recursive_calls =
+            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &recursive_helpers);
+        let frame_pointer_reads = count_opcode(&built.ctx.func, ir::Opcode::GetFramePointer);
+        let packed_target_id = target_id.to_packed_runtime_u64() as i64;
+        let exact_target_comparisons = built
+            .ctx
+            .func
+            .layout
+            .blocks()
+            .flat_map(|block| built.ctx.func.layout.block_insts(block))
+            .filter(|inst| {
+                matches!(
+                    built.ctx.func.dfg.insts[*inst],
+                    ir::InstructionData::IntCompareImm {
+                        opcode: ir::Opcode::IcmpImm,
+                        cond: ir::condcodes::IntCC::Equal,
+                        imm,
+                        ..
+                    } if imm.bits() == packed_target_id
+                )
+            })
+            .count();
+
+        assert!(
+            frame_pointer_reads == 1
+                && total_recursive_calls == 1
+                && cold_recursive_calls == 1
+                && exact_target_comparisons == 1,
+            "the actual resolved-descriptor caller must compare its exact target once and keep \
+             its one original CPython recursion call on a cold frame-pointer-guarded edge; \
+             observed frame-pointer reads={frame_pointer_reads}, total recursion calls=\
+             {total_recursive_calls}, cold recursion calls={cold_recursive_calls}, exact target \
+             comparisons={exact_target_comparisons}"
+        );
     }
 
     #[test]

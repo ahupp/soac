@@ -1549,6 +1549,7 @@ pub struct TypedInstrExtra {
     pub exact_int_return: Option<TypedExactIntReturnPlan>,
     pub constructor_init: Option<TypedConstructorInitPlan>,
     pub builtin_implementation: Option<TypedBuiltinImplementationPlan>,
+    pub resolved_descriptor_function_guards: Option<Vec<TypedDirectFunctionCallGuard>>,
     pub generator_instance: Option<TypedGeneratorInstancePlan>,
     pub generator_resume: Option<TypedGeneratorResumePlan>,
     pub opaque_fused_iteration: Option<TypedOpaqueFusedIterationPlan>,

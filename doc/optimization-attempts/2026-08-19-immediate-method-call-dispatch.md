@@ -4,7 +4,51 @@ title: "Immediate Zero-Argument and Positional Method Call Dispatch"
 
 # Immediate zero-argument and positional method call dispatch
 
-- Status: **LANDED CANDIDATE / RETAIN; real transformed CPython bound-method-visibility
+- Current status: **FULLY VALIDATED / RETAIN LANDING CANDIDATE / ATTEMPT 4; retained Attempts 1–3
+  and their negative evidence remain unchanged; owner-independent,
+  profile-selected direct dispatch after the existing CPython method lookup
+  was first implemented in four bounded production files; independent
+  whole-production Rust typed-decision RED → GREEN includes the original
+  and captured continuation clone; genuine actual transformed direct-hit
+  RED → GREEN plus stock-parity / live-vectorcall / method-code controls
+  both pass 2 / 2 in 2.61 seconds; first-candidate scoped formatting
+  completed before pytest; first-candidate full serial JIT 578 / 578,
+  optimizer 214 / 214, typed IR 54 / 54, broad transformed compatibility
+  41 / 41 across 25 files in 43.34 seconds, combined Cargo check, and
+  scoped formatting check are GREEN;
+  fixed-eight release DEBUG-SINGLE smoke passes with unchanged coverage
+  and hidden trampolines but ordinary native code grows 4.28% and blocks
+  grow 3.95%; normally sampled fixed-eight `richards` improves 1.055383x
+  while `deltablue` remains uncertain and candidate native bytes grow
+  4.147%; clean repeated target improves raw `deltablue` 1.078213x and
+  `comprehensions` 1.024145x but stock-paired `chaos` regresses 0.962989x
+  and ordinary native code grows 5.09%; four zero-loss causal profiles
+  expose replacement direct-call recursion and remaining code-growth /
+  `chaos` risks; FIRST DIRECT CANDIDATE INCONCLUSIVE / REFINE GUARD CFG
+  AND NATIVE DIRECT RECURSION; refined real-production Cranelift
+  RED → GREEN now proves one native frame-pointer read, one original
+  recursion helper only on its cold path, and one expected target-ID
+  comparison; refinement touches two existing production paths / five
+  production files total; original trampoline structured parity,
+  frozen transformed integration 2 / 2, retained focused controls 10 /
+  10, fresh serial JIT 579 / 579, optimizer 214 / 214, typed IR 54 / 54,
+  broad transformed compatibility 51 / 51 across 27 files in 63.47
+  seconds, combined Cargo check, and scoped formatting check are GREEN;
+  scoped formatting preceded refined pytest; refined fixed-eight release
+  DEBUG-SINGLE smoke preserves all coverage / hidden trampoline bytes and
+  reduces ordinary native code 16,580 bytes / 1,334 blocks versus the
+  rejected first candidate; normally sampled refined fixed-eight
+  `deltablue` improves 1.07343x raw / 1.14257x stock-paired with noisy
+  retained outliers, and stock-paired `chaos` is neutral; definitive
+  refined three-round `deltablue` improves 1.10975889x raw / 1.13970302x
+  stock-paired and `richards` 1.04242557x raw / 1.06015760x stock-paired,
+  while `chaos` and `comprehensions` are stock-paired neutral; all four
+  matched zero-loss refined causal profiles confirm descriptor-specific
+  hot public recursion is eliminated without claiming unrelated
+  recursion disappeared; authoritative full correctness gate is GREEN
+  with 1,239 Python nodeids / 100 isolated batches / eight workers / zero
+  failures; full-suite stock 1.10x remains unmet; not yet landed**.
+- Historical Attempts 1–3 status: **LANDED CANDIDATE / RETAIN; real transformed CPython bound-method-visibility
   correctness AND independent full-production typed-pipeline structured
   RED-to-GREEN verified for zero and one/two positional arguments;
   previous zero-argument full Rust / transformed suites and smoke GREEN;
@@ -26,11 +70,15 @@ title: "Immediate Zero-Argument and Positional Method Call Dispatch"
   authoritative full correctness gate GREEN: 1,232 Python nodeids /
   95 passing batches / zero failures**.
 - Pacific date: **2026-08-19 PDT**.
-- Integrated baseline: retained `main` change **`mzvpmvzo`**, commit
+- Historical Attempts 1–3 integrated baseline: retained `main` change **`mzvpmvzo`**, commit
   **`684842b9`**.
-- Candidate change: **`zkwnlurq`**, initially observed at mutable working
+- Historical Attempts 1–3 candidate change: **`zkwnlurq`**, initially observed at mutable working
   commit **`a94f0ca3`**; subsequent snapshots change that commit ID.
-- Outcome: investigate whether the existing typed method-call operation
+- Current Attempt 4 integrated baseline: retained `main` change
+  **`wmyqzzsr`**, commit **`149ad6c7`**.
+- Current Attempt 4 candidate: change **`srxzvruu`**, initially observed
+  at mutable working commit **`b23c1312`**.
+- Historical Attempts 1–3 outcome: investigate whether the existing typed method-call operation
   can use pinned CPython's actual immediate-call lookup protocol for proven
   zero-argument calls, avoiding unnecessary bound-method wrapper creation
   while preserving every descriptor, ownership, mutation, and evaluation
@@ -762,7 +810,666 @@ title: "Immediate Zero-Argument and Positional Method Call Dispatch"
   1.037585x over zero-argument; full gate GREEN 1,232 nodeids /
   95 batches / zero failures**.
 
-## Verdict and next action
+### Attempt 4: direct-call the profiled descriptor after unchanged CPython lookup
+
+- Current state: **PROPOSED / IN PROGRESS** against integrated
+  **`wmyqzzsr 149ad6c7`**, in new candidate **`srxzvruu b23c1312`**.
+  Attempts 1–3 above are already retained history, including their genuine
+  CPython-visibility corrections, the adverse **0.93660x** positional
+  comprehensions result, subsequent continuation-clone correction, and
+  final **1.118447x** repeated `deltablue` improvement. No current
+  user-visible CPython mismatch is claimed for this new optimization.
+- Hypothesis: the existing v3 **`call_hot_targets`** evidence already
+  identifies a hot transformed method's exact function ID and validated
+  receiver-plus-positional-argument plan, even when its class does not yet
+  exist during eager compilation. Keep the original pinned-CPython
+  **`_PyObject_GetMethod`** lookup and its actual owned returned
+  descriptor. Only if that lookup reports a real method and its live
+  descriptor independently matches the selected exact transformed Python
+  function, execute the existing JIT direct-function body instead of
+  routing the same descriptor and receiver through the generic vectorcall
+  hook plus exact-positional trampoline. Unsupported or changed values
+  retain the original vectorcall branch.
+- Saved implementation scope is exactly **four existing production files**:
+  `crates/soac_ir_typed/src/typed.rs`,
+  `crates/soac_jit/src/jit/typed_pipeline.rs`,
+  `crates/soac_jit/src/jit/function_targets.rs`, and
+  `crates/soac_jit/src/jit/mod.rs`. Preserve the existing typed immediate
+  method operation and source-grounded getter/call provenance; existing
+  **`TypedInstrExtra`** now carries same-source, same-module,
+  owner-independent **`TypedDirectFunctionCallGuard`** decisions for at
+  most **two** selected transformed Python functions. Only existing
+  **`Provided` / `DefaultSentinel`** argument plans qualify; packed-rest
+  arguments, cross-module targets, generators, unsupported calls, and
+  unprofiled targets stay excluded. The original anchored source pair
+  carries the selected decision through verified continuation clones;
+  existing function-target collection predeclares each direct body before
+  codegen. Mechanical emission retains the unconditional pinned
+  **`_PyObject_GetMethod`**, checks the actually returned exact Python
+  descriptor's existing function ID / code / defaults snapshot and its
+  current registered live vectorcall pointer, records existing direct-hit
+  or guarded-fallback counters, and preserves owned descriptor / receiver
+  / argument cleanup on success and recursion/error failure. No
+  preexisting owner type, owner relocation, class-name guess, global
+  state, or new runtime helper is required. Package-scoped formatting was
+  completed **before** the first candidate transformed pytest; both the
+  focused whole-production Rust typed decision and real transformed
+  semantic / direct-hit tests now pass. Full serial affected Rust suites,
+  broad transformed compatibility, combined crate/test-target checking,
+  and scoped formatting verification also pass; root-owned release smoke
+  confirms actual recovered direct/fallback edges but exposes material
+  ordinary-native-code growth. Valid normal / repeated benchmarks, causal
+  profiles, and the authoritative full correctness gate were **PENDING**
+  at this earlier first-candidate checkpoint.
+- Exact method-result guard must preserve the existing precise function
+  identity plus current **`__code__`**, positional **`__defaults__`**, and
+  **`__kwdefaults__`** snapshots; mutable keyword-only default dictionaries
+  cannot be justified by pointer identity alone. The current Python
+  function's actual **vectorcall pointer** must still match its registered
+  compiled entry: vendored **`PyFunction_SetVectorcall`** can replace or
+  clear it independently, and the repository already contains an actual
+  `ctypes` null-vectorcall compatibility control. Changed pointer, code,
+  defaults, identity, non-exact callable, alternate descriptor, or
+  unavailable target must use the unchanged generic fallback.
+- Since **`_PyObject_GetMethod` remains unconditional and unchanged**,
+  CPython still resolves inherited descriptors, instance-dictionary
+  shadows, dynamic class / MRO replacements, data descriptors, properties,
+  custom **`__getattribute__`** / **`__getattr__`**, `staticmethod`, and
+  `classmethod` before considering direct dispatch. Both motivating
+  `deltablue` and `richards` hierarchies have ordinary mutable instance
+  dictionaries, not proven slot-only instances; bypassing lookup or
+  inferring shadow absence from an owner type/version is unsound.
+- Preserve receiver evaluation and descriptor lookup before argument
+  evaluation, original getter / call counters, receiver and actual
+  descriptor ownership, positional default binding, raised exceptions,
+  recursion overflow, profiler / tracer / monitoring observation, and
+  exact reverse-order finalizer cleanup. The existing direct-entry path
+  still invokes the **public recursion-check helper unconditionally**;
+  unlike the retained vectorcall trampoline's hot inline stack guard,
+  that replacement work can materially offset or exceed avoided
+  dispatch. In particular, recursion-overflow failure must release the
+  owned lookup descriptor and receiver / argument prefixes before
+  propagating the original error. Performance and cleanup behavior need
+  actual evidence; do not assume the existing trampoline guard can be
+  copied directly because its cold failure currently returns immediately.
+- Current retained release-smoke baseline is
+  **`comparison-20260819-212319-5JbYy6`**: all **8 Apply workers / 397
+  total JIT source rows including adapters / 204 direct-function-body
+  rows**, **2,238,412 ordinary native bytes / 147,769 machine blocks /
+  38,108 hidden trampoline bytes**, with **2,866 optimized typed blocks /
+  204 functions**. Debug-single smoke timings are not valid throughput.
+- Current retained normally sampled fixed-eight baseline is
+  **`comparison-20260819-212444-EOYNr0`**: official stock
+  **0.6555584208465822x**, previous-SOAC
+  **0.9850631879265838x**, **80 Apply workers / 3,970 total source rows
+  including adapters / 2,040 direct-function-body rows**, **23,159,960
+  ordinary native bytes / 1,524,970 machine blocks / 381,080 hidden
+  trampoline bytes / 2,866 typed blocks / 204 functions**. Three
+  unusually slow `deltablue` workers contaminated that historical
+  official previous-SOAC aggregate; do not present it as a clean
+  regression or candidate gain.
+- Current retained clean three-round / four-workload baseline is
+  **`comparison-20260819-212748-3uvMT3`**: official stock
+  **0.5358039397819471x**, previous-SOAC
+  **1.0132710404047143x**, `chaos` approximately **38.9389 ms**,
+  `comprehensions` approximately **42.8007 µs**, `deltablue`
+  approximately **2.30527 ms**, and `richards` approximately
+  **21.8213 ms**. All **120 Apply workers / 10,650 total JIT source rows
+  including adapters / 5,490 direct-function-body rows** contain
+  **54,686,760 ordinary native bytes / 3,596,430 machine blocks /
+  777,240 hidden trampoline bytes / 2,265 typed blocks / 183 functions**.
+- Current lossless native profiles contain **160 `deltablue` samples /
+  228 `richards` samples**. The source-attributed, strictly disjoint
+  removable dispatch / trampoline leaf ceiling, with benchmark shutdown
+  excluded from the denominator, is at most approximately **13.888889%
+  for `deltablue`** and **6.167% for `richards`**, explicitly excluding
+  the retained **`_PyObject_GetMethod`** lookup. Using that **same
+  shutdown-excluded denominator** at the demonstrated
+  `EqualityConstraint.execute` source parent, disjoint vectorcall-hook
+  self **2.083333 percentage points**, exact-trampoline self **2.083333
+  points**, and live-thread-state acquisition **2.083333 points** total
+  approximately **6.25 points**; its separate method-lookup self
+  **2.083333 points** remains. For `Task.runTask`, the separately labeled
+  **whole-profile denominator, including shutdown**, gives disjoint hook
+  self **1.315553 points**, trampoline self **1.754404 points**, and
+  CPython vectorcall dispatch **0.438851 points**, totaling **3.508808
+  whole-profile points**; separate method-lookup self **1.315553
+  whole-profile points** remains. These `richards` whole-profile source
+  pieces must not be added to or directly compared with its
+  shutdown-excluded **6.167%** ceiling. These are
+  sample-limited ceilings, not predicted throughput gains; guard costs,
+  direct recursion checks, nested-site eligibility, and code growth can
+  eliminate the apparent opportunity. Do not add inclusive ancestors or
+  unrelated nested source parents.
+- Required focused unchanged-production evidence includes the now-verified
+  **whole-production Rust structured optimization RED** proving that a
+  source-selected inherited method
+  already has a hot v3 target ID / argument plan but its owner-independent
+  direct descriptor path is absent; a real transformed
+  **stock → Profile → Verify → Apply** integration covering inherited
+  classes, per-instance shadows, class / MRO mutation, properties,
+  descriptors, custom getters, method **`__code__` / `__defaults__` /
+  `__kwdefaults__` / vectorcall** mutation, tracing and monitoring,
+  finite recursion / `RecursionError`, finalizers, original counters, and
+  actual JIT native bodies. Existing wrapper-visibility,
+  continuation-clone, captured-builtin, generator, keyword/starred, and
+  `super` controls must remain intact.
+- The new unchanged-production transformed compatibility baseline,
+  **`tests/test_resolved_method_descriptor_direct_calls.py`**, is
+  independently **GREEN: 1 passed in 1.70 seconds**; outer focused
+  workflow elapsed **2.003 seconds**. It executes actual pinned stock
+  alongside eager **Profile → Verify → Apply** and verifies two
+  polymorphic inherited targets, zero / one / two explicit positional
+  arguments, an effect-only call, per-instance method shadowing, data
+  descriptors, custom **`__getattribute__`**, inherited class-method
+  replacement, changed and restored positional defaults, and an
+  unaffected builtin method. The actual profile contains at least
+  **48 `call_hot_targets` observations at each of four source sites**,
+  and generated native evidence contains **eight expected
+  direct-function bodies**. This is an unchanged-production semantic
+  **GREEN**, not an optimization RED and not a current CPython bug.
+- The subsequently expanded **same unchanged-production** integration is
+  independently **GREEN: 1 passed in 1.57 seconds**, now exercising real
+  inherited **`Base.value`** vectorcall and method-code mutation after
+  hot target training. Actual **`PyFunction_SetVectorcall(method, NULL)`**
+  produces the identical **`TypeError`** in pinned stock and in each
+  eager **Profile / Verify / Apply** subprocess; restoring the live
+  pointer again returns **11**. Replacing that same method's
+  **`__code__`** with a same-arity implementation returns **53** in
+  stock and all three transformed modes; restoring the code again
+  returns **11**. Existing inherited-polymorphism, shadows, descriptors,
+  defaults, four hot target counters, and eight generated native-body
+  controls remain GREEN. Production source was unchanged at this
+  historical baseline, and the successful compatibility baseline
+  demonstrates no CPython mismatch.
+  Additional tracing / monitoring, recursion-failure, and finalizer
+  controls remain **PENDING**.
+- A second focused test now independently proves a **genuine
+  unchanged-production transformed optimization RED** using actual
+  recorded specialization counters:
+  **`test_profiled_inherited_method_descriptors_use_direct_calls`** fails
+  in **1.10 seconds** after executing real eager **Profile → Verify**.
+  The inherited `immediate` call site first establishes at least **one
+  nonzero profiled transformed target** and at least **48
+  `call_hot_targets` observations**. Its actual Verify `call_direct`
+  counter is **`branches={'fallback': 0, 'hit': 0}`**, so the real
+  direct-hit assertion fails exactly **`0 > 0`**: the existing inherited
+  method resolves correctly but never reaches a profiled direct native
+  body. The complete unchanged-production focused file collects **two
+  tests**: the comprehensive stock-parity / vectorcall / code-mutation
+  integration **PASSES in 1.54 seconds**, and the direct-hit
+  specialization regression **FAILS in 1.10 seconds**; total elapsed is
+  **2.68 seconds**. An earlier draft mistakenly assumed a different
+  branch-counter schema and two independently nonzero target rows; that
+  fixture-only mistake was corrected before the authentic runtime RED and
+  is not a production failure. An initial separate Rust fixture also
+  failed during test-only name mangling **before reaching its intended
+  production assertion**; that setup failure is likewise **not** a
+  structured production RED. Production code was unchanged at the time
+  of these genuine baseline REDs, and no user-visible CPython mismatch is
+  asserted.
+- An independent corrected Rust test now separately proves a **genuine
+  unchanged-production whole-production typed-pipeline optimization
+  RED**:
+  **`profiled_inherited_method_descriptors_retain_ownerless_direct_targets`**
+  executes the actual source lowering, instrumentation, existing v3
+  selected method target / receiver-plus-argument plan, full
+  **`optimize_blockpy_with_external_inline_callees`**, and real typed
+  direct-target collector. Its **Profile control passes**, preserving
+  original target observation; **Verify fails exactly**
+  **`Verify must retain the profiled inherited descriptor target even
+  when its class does not exist during eager planning`**, because the
+  owner-independent selected target is absent. Focused Rust result is
+  **0 passed / 1 failed / 577 filtered**. A **21.66-second** Rust build
+  is workflow-only compilation time, never benchmark or runtime
+  throughput evidence. The earlier double-underscore/name-mangling
+  fixture failure and a transient iterator compile error are excluded
+  from this genuine production RED.
+- The same frozen production-path Rust regression now independently
+  verifies genuine **RED → GREEN: 1 passed / 577 filtered** after the
+  bounded four-file implementation. It still checks actual source
+  lowering, instrumentation, real v3 target selection / argument
+  binding, full typed production rewrites, and direct-target collection.
+  The strengthened real test now covers both the original inherited
+  method site **and a captured comprehension's original-plus-hot-cloned
+  continuation**. **Profile** retains no ownerless direct targets or
+  descriptor guards, preserving the original observation graph;
+  **Verify and Apply** retain the selected inherited target, direct-body
+  predeclaration, and descriptor guard on each original / cloned source,
+  while every old owner-guard list remains empty. This proves the
+  owner-independent typed decision remains valid even though its class
+  does not exist during eager planning.
+- After package-scoped formatting, the exact frozen actual transformed
+  focused file independently verifies genuine optimization **RED →
+  GREEN: 2 passed in 2.61 seconds**. The previously failing
+  **`test_profiled_inherited_method_descriptors_use_direct_calls`** now
+  observes an actual positive **Verify `call_direct.hit`** count for the
+  profiled inherited method. Its companion
+  **`test_resolved_method_descriptor_direct_calls_preserve_cpython_dispatch`**
+  simultaneously preserves pinned stock parity across eager **Profile →
+  Verify → Apply**, two inherited targets, zero / one / two positional
+  arguments, effect-only calls, instance shadowing, data descriptors,
+  custom getters, inherited class replacement, mutable defaults, a
+  builtin control, real **NULL vectorcall → `TypeError` → restoration**,
+  and same-arity **`__code__` 53 → restoration 11**. Four real hot target
+  counters and eight actual native function bodies remain present. A
+  one-time approximately **22-second** debug-extension rebuild is
+  workflow-only build overhead, never throughput evidence.
+- Fresh complete, serial affected Rust libraries are **GREEN: JIT 578 /
+  578, optimizer 214 / 214, and typed IR 54 / 54**. The broad actual
+  transformed compatibility matrix is **GREEN: 41 / 41 tests across 25
+  files in 43.34 seconds**. Combined
+  **`cargo check -p soac_ir_typed -p soac_jit --tests --quiet`** and
+  scoped **`just fmt-rust-check soac_ir_typed soac_jit`** both pass.
+  Package-scoped formatting preceded the first candidate pytest. The
+  four production paths are frozen; these correctness/check results are
+  neither throughput measurements nor evidence of a completed full gate.
+- The frozen candidate's fixed-eight release **DEBUG-SINGLE coverage
+  smoke `comparison-20260819-223233-tpmBoI`** versus mode-matched
+  retained **`comparison-20260819-212319-5JbYy6`** passes all **eight
+  actual Apply PIDs**, preserves the identical **397 JIT source rows
+  including adapters / 204 direct bodies**, and reports **2,866 typed
+  blocks / 204 typed functions** with zero errors. Hidden vectorcall
+  trampolines remain exactly **38,108 bytes**, including every arity.
+  Ordinary native code instead grows **2,238,412 → 2,334,180 bytes
+  (+95,768 / +4.28%)** and **147,769 → 153,608 blocks (+5,839 /
+  +3.95%)**. `deltablue` grows **60,732 bytes / 13.34% across 23
+  changed bodies**, including `EqualityConstraint.execute` **2,320 →
+  3,868 bytes**, `Plan.execute` **9,244 → 11,832**,
+  `Planner.add_propagate` **5,156 → 8,720**, and `make_plan` **7,484 →
+  13,676**. `richards` grows **18,856 bytes / 5.40% across nine changed
+  bodies**, including `Task.runTask` **8,880 → 11,240** and
+  `Handler.fn` **13,716 → 18,484**. `chaos` adds **10,252 bytes**,
+  `comprehensions` **2,676**, and `float` **3,252**; `fannkuch`,
+  `nbody`, and `spectral_norm` are unchanged. Actual source-edge events
+  confirm `EqualityConstraint.execute` **2 direct / 2 fallback**,
+  `Plan.execute` **4 direct / 2 fallback**, `Task.runTask` **3 direct /
+  3 fallback**, and `Handler.fn` **6 direct / 6 fallback**, without
+  missing-target, arity, or unsupported-edge errors. This proves real
+  direct-edge recovery and exposes a serious code-growth risk;
+  **DEBUG-SINGLE cold timings are not valid throughput measurements**.
+  At this smoke checkpoint, valid fixed-eight normal / clean repeated
+  comparisons, causal profiles, and the full gate remained pending.
+- The subsequent normally sampled fixed-eight candidate comparison
+  **`comparison-20260819-223548-gYDTS2`** versus retained
+  **`comparison-20260819-212444-EOYNr0`** verifies all **80 actual Apply
+  PIDs**, the same **3,970 total JIT source rows including adapters /
+  2,040 direct bodies**, **2,866 typed blocks / 204 typed functions**,
+  exactly **381,080 hidden-trampoline bytes**, and zero errors. Ordinary
+  native code grows **23,159,960 → 24,120,400 bytes (+960,440 /
+  +4.147%)** and **1,524,970 → 1,583,640 blocks (+58,670 / +3.847%)**.
+  The official fixed-eight geometric means are **0.6729416640142044x
+  versus stock** and **1.035396831312697x versus previous SOAC**.
+  Robust `deltablue` worker medians improve **2.265631 → 2.056944 ms**,
+  raw **1.101455x, 95% CI [0.98774, 1.43141]**, and stock-paired
+  **1.095627x**; the raw interval crosses neutral and severe historical
+  retained-baseline outliers prevent a definitive claim. `richards`
+  improves **22.299028 → 21.128856 ms**, raw **1.055383x, 95% CI
+  [1.02392, 1.07844]**, and stock-paired **1.056675x, 95% CI [1.02343,
+  1.08413]**. `chaos` and `comprehensions` remain neutral. `nbody` has
+  **byte-identical generated source bodies** yet an apparently
+  significant paired **0.91687x**, demonstrating external stock/worker
+  drift rather than evidence of a generated-code regression. This
+  normal run remained provisional before the subsequent clean repeated
+  comparison; causal profiles and the authoritative full gate were
+  **PENDING** at that checkpoint.
+- The definitive three-round targeted comparison
+  **`comparison-20260819-224008-shxzPs`** versus retained
+  **`comparison-20260819-212748-3uvMT3`** preserves all **120 actual
+  Apply PIDs**, the identical **10,650 total JIT source rows including
+  adapters / 5,490 direct bodies**, **2,265 typed blocks / 183 typed
+  functions**, exactly **777,240 hidden-trampoline bytes**, and zero
+  errors. Ordinary native code grows **54,686,760 → 57,470,520 bytes
+  (+2,783,760 / +5.09%)** and **3,596,430 → 3,766,440 blocks (+170,010
+  / +4.73%)**. Official targeted geometric means are
+  **0.5286221076693118x versus stock** and **1.0116250410937884x versus
+  previous SOAC**. Robust `deltablue` medians improve **2.305270891 →
+  2.138047430 ms**, raw **1.078213x, 95% CI [1.042818, 1.110329]**; its
+  stock-paired **1.038803x, 95% CI [0.999962, 1.074140]** is marginal
+  and crosses neutral. `richards` improves **21.821327875 →
+  21.141180437 ms**, raw **1.032172x, 95% CI [1.017447, 1.048155]**,
+  but stock-paired **0.999101x, 95% CI [0.980374, 1.017818]** is
+  neutral. `comprehensions` improves **42.800702 → 41.791633 μs**, raw
+  **1.024145x, 95% CI [1.012192, 1.040317]**, and stock-paired
+  **1.017522x, 95% CI [1.004959, 1.034576]**. The broad mixed guardrail
+  `chaos` instead worsens **38.938904 → 39.494066 ms**, raw
+  **0.985943x, 95% CI [0.970202, 1.011858]**; although that raw interval
+  is neutral, stock-paired **0.962989x, 95% CI [0.949799, 0.995557]**
+  is a significant slowdown. Round estimates **0.9677x / 1.0654x /
+  0.9660x** and a maximum **52.63 ms** expose substantial variability
+  without erasing the paired guardrail failure. Verdict is
+  **PROVISIONAL / INVESTIGATE CHAOS AND PUBLIC RECURSION**: inspect
+  generated-code growth and the retained direct-call public recursion
+  helper before any retention decision; matched lossless causal profiles
+  and the authoritative full gate were **PENDING** at this comparison
+  checkpoint.
+- The subsequent matched **zero-loss `deltablue` causal profiles** have
+  **160 retained / 156 candidate samples**; the percentages exclude
+  interpreter shutdown only. Generic vectorcall-hook self falls
+  **6.944444% → 1.459854% (−5.484590 percentage points)** and
+  thread-state/TLS self falls **5.555556% → 3.649635% (−1.905921
+  percentage points)**. However, direct calls introduce a previously
+  absent public recursion-check cost **0% → 3.649635%**, disjointly
+  attributed to `Plan.execute` **2.189781%**,
+  `EqualityConstraint.execute` **0.729927%**, and `Planner.make_plan`
+  **0.729927%**. Authoritative `_PyObject_GetMethod` remains intentionally
+  unchanged, **14.583333% → 15.328467%**. The replacement recursion cost
+  explains why eliminating generic dispatch does not translate directly
+  into equivalent stock-paired throughput; these separate groups are not
+  summed or represented as disjoint unless stated.
+- Matched **zero-loss `richards` causal profiles** have **228 retained /
+  213 candidate samples**. Exact-trampoline share falls **11.452382% →
+  1.886773%**, but generic-hook share rises **4.404840% → 6.132768%**
+  and thread-state/TLS share rises **2.203926% → 6.130757%**. These
+  groups may be nested or otherwise overlap; their percentages are not
+  additive. The shifted remaining costs are consistent with the
+  repeated stock-paired throughput result being neutral.
+- Matched **zero-loss `comprehensions` causal profiles** have **545
+  retained / 504 candidate samples**. Generic-hook share falls
+  **4.897931% → 3.220494%**, and public-recursion share falls
+  **0.212499% → 0%**; the separate reductions align with the positive
+  repeated stock-paired throughput result without summing potentially
+  nested groups.
+- The **zero-loss candidate-only `chaos` causal profile** has **213
+  samples**; there is **no matched retained `chaos` baseline**. Direct
+  public recursion accounts for only **0.471480%**, attributed solely
+  to `transform_point`, whose generated body grows **4,616 bytes**.
+  Thus recursion alone does not explain the significant paired mixed
+  guardrail slowdown; changed guard CFG / ordinary-native-code growth
+  remain plausible costs requiring refinement. Profiling requires the
+  measured worker directory **basename**, not its absolute path; this
+  is a workflow-only invocation constraint, not benchmark evidence.
+- Causal verdict: **FIRST DIRECT CANDIDATE INCONCLUSIVE / REFINE GUARD
+  CFG AND NATIVE DIRECT RECURSION**. Preserve unchanged authoritative
+  method lookup, live-vectorcall / descriptor guards, explicit ownership,
+  and recursion correctness while investigating a smaller emitted guard
+  CFG and the replacement public direct-call recursion overhead. At this
+  first-candidate checkpoint, no refined implementation, retained
+  performance claim, or completed authoritative full gate existed.
+- A new **genuine first-candidate production-path structured refinement
+  RED** now lowers a real inherited `Base.value` immediate call through
+  its actual selected typed descriptor guard and declared direct native
+  body, then inspects emitted Cranelift instructions/CFG rather than
+  rendered text. Unchanged first-candidate production has **zero native
+  frame-pointer reads**, **one original public recursion-helper call /
+  zero cold-only helper calls**, and **two comparisons of the same packed
+  direct target**. Independently verified saved refinement turns this
+  authentic real-production Cranelift optimization **RED → GREEN**:
+  actual lowered inherited `Base.value` now emits **exactly one
+  `GetFramePointer`**, **exactly one original public recursion helper
+  exclusively on its marked cold path**, and **exactly one comparison
+  with the expected packed target ID**. This contrasts with the genuine
+  first-candidate **frame-pointer 0 / helper total 1 and cold 0 / target
+  comparisons 2** RED; it is not a fixture/parser error, throughput
+  result, or CPython-visible behavior mismatch.
+- Saved same-strategy refinement changes only the existing production
+  **`crates/soac_jit/src/jit/mod.rs`** and
+  **`crates/soac_jit/src/jit/vectorcall.rs`**, plus an existing
+  **`#[cfg(test)]`-only `crates/soac_jit/src/jit/test.rs`** regression.
+  Since `vectorcall.rs` is new to this strategy while `mod.rs` was already
+  included, Attempt 4 now changes **five existing production files in
+  total**; the original typed selection / declaration architecture
+  remains unchanged. After unchanged authoritative
+  **`_PyObject_GetMethod`**, only an **exact Python function** can match
+  at most **two** profiled IDs through a single ordered ID pass. A null
+  runtime-metadata guard precedes the same shared current registered
+  `__code__` / positional-default / keyword-default snapshot checks;
+  mutable keyword defaults still require **`__kwdefaults__ == NULL`**,
+  and the nonnull current vectorcall pointer must exactly equal its
+  registered compiled entry. Original Profile / Verify classification,
+  generic and constructor direct-call paths, fallback counters, and all
+  ownership/error semantics remain intact. The existing shared
+  trampoline's recursion failure retains **`ReturnNull`**, while the new
+  resolved-descriptor native recursion guard uses **`JumpTo` its existing
+  scoped owned-input cleanup**, preserving descriptor / receiver /
+  argument release on overflow. Unsupported architectures retain their
+  original public CPython recursion helper. The preexisting four generic
+  / constructor direct-call paths are untouched; only the new resolved
+  descriptor direct edge opts into the native guard and scoped-cleanup
+  policy. The existing shared trampoline's genuine structured regression
+  independently remains **GREEN**. Refined package-scoped formatting
+  completed **before** candidate transformed pytest; the frozen real
+  stock / Profile → Verify → Apply semantic-and-direct-hit integration
+  passes **2 / 2**, while retained focused method / recursion /
+  compatibility controls pass **10 / 10**. Fresh complete serial Rust
+  suites pass **JIT 579 / 579, optimizer 214 / 214, and typed IR 54 /
+  54**. The expanded real transformed compatibility matrix passes
+  **51 / 51 across 27 files in 63.47 seconds**; combined
+  **`cargo check -p soac_opt -p soac_ir_typed -p soac_jit --tests
+  --quiet`** and the package-scoped formatting check pass. The subsequent
+  refined release smoke confirms unchanged hidden-trampoline bytes and
+  reduced ordinary native code versus the first candidate. Refined valid
+  fixed-eight normal sampling completed with all coverage preserved; the
+  definitive clean three-round benchmark was **RUNNING**, and new causal
+  profiles / the authoritative full gate remained **PENDING**, at this
+  earlier refined-validation checkpoint. At that time the preceding
+  three-round / causal-profile data applied only to the
+  adverse/inconclusive first candidate.
+- Refined release fixed-eight **DEBUG-SINGLE smoke
+  `comparison-20260819-230959-2ICnbd`** versus retained
+  **`comparison-20260819-212319-5JbYy6`** and adverse first candidate
+  **`comparison-20260819-223233-tpmBoI`** passes all **eight actual
+  measured Apply PIDs**, preserving the identical **397 total JIT source
+  rows including adapters / 204 direct bodies**, **2,866 typed blocks /
+  204 typed functions**, and every hidden-trampoline arity / exact total
+  **38,108 bytes**; there are zero **ERROR / CRITICAL** events. Ordinary
+  retained → first → refined native code is **2,238,412 → 2,334,180 →
+  2,317,600 bytes** and **147,769 → 153,608 → 152,274 blocks**. Refined
+  code remains **+79,188 bytes / +4,505 blocks** versus retained, but
+  removes **16,580 bytes / 1,334 blocks** versus the rejected first
+  candidate. First → refined per-workload byte reductions are
+  `deltablue` **10,064**, `richards` **3,604**, `chaos` **2,036**,
+  `comprehensions` **372**, and `float` **504**; `fannkuch`, `nbody`,
+  and `spectral_norm` remain byte-identical. Named first → refined
+  source-body **bytes / blocks** are `EqualityConstraint.execute`
+  **3,868 / 238 → 3,500 / 210**, `Plan.execute` **11,832 / 738 →
+  11,712 / 730**, `Planner.make_plan` **13,676 / 865 → 13,056 / 812**,
+  `Task.runTask` **11,240 / 694 → 10,784 / 654**, `HandlerTask.fn`
+  **18,484 / 1,168 → 17,432 / 1,076**, and
+  `Chaosgame.transform_point` **50,892 / 3,351 → 49,988 / 3,274**.
+  Actual direct / fallback edges remain present.
+  **DEBUG-SINGLE cold timings are invalid throughput evidence**. At this
+  coverage-smoke checkpoint, the normally sampled comparison was
+  running and clean repeated benchmarks, causal profiles, and full gate
+  were pending.
+- Refined normally sampled fixed-eight
+  **`comparison-20260819-231117-FXavZ9`** records exact official
+  geometric means **0.6865833897338185x versus stock** and
+  **0.9970497902989457x versus previous SOAC**; the official previous
+  mean is noisy. All **80 actual Apply PIDs** retain the identical
+  **3,970 total JIT source rows including adapters / 2,040 direct
+  bodies**, **2,866 typed blocks / 204 typed functions**, exactly
+  **381,080 hidden-trampoline bytes**, and zero errors; `fannkuch`,
+  `nbody`, and `spectral_norm` source bodies remain byte-identical.
+  Ordinary retained → first → refined native code is **23,159,960 →
+  24,120,400 → 23,952,600 bytes** and **1,524,970 → 1,583,640 →
+  1,570,300 blocks**: refined remains **+792,640 bytes / +45,330
+  blocks** versus retained but eliminates **167,800 bytes / 13,340
+  blocks** versus the first candidate. Relative to retained, robust
+  `deltablue` worker medians improve **2.26563 → 2.11065 ms**, raw
+  **1.07343x, 95% CI [1.06809, 1.39325]**, and stock-paired
+  **1.14257x, 95% CI [1.11695, 1.47461]**; substantial retained-baseline
+  outliers distort the upper interval and prevent treating this normal
+  pass as definitive. `richards` changes **22.2990 → 21.6909 ms**, raw
+  **1.02804x, 95% CI [0.99765, 1.05536]** / stock-paired
+  **1.04519x, 95% CI [1.01371, 1.09836]**. `chaos` raw **0.97784x** is
+  significantly adverse but stock-paired **0.99248x, 95% CI [0.97563,
+  1.03286]** is neutral; `comprehensions` paired **0.99820x** is also
+  neutral. Against the rejected first candidate, paired `deltablue`
+  improves **1.04284x, 95% CI [1.02533, 1.16514]**, while `richards`
+  **0.98913x**, `chaos` **1.00657x**, and `comprehensions` **0.99991x**
+  are neutral. Significant raw `fannkuch` / `spectral_norm` changes
+  despite **byte-identical generated source bodies** confirm external
+  timing drift. The definitive refined clean three-round comparison was
+  **RUNNING** at this normal-pass checkpoint; refined causal profiles and
+  authoritative full gate were then **PENDING**.
+- Definitive refined clean three-round targeted comparison
+  **`comparison-20260819-231434-GW1s2w`** records exact official
+  geometric means **0.5613133486246105x versus stock** and
+  **1.027017074961002x versus previous SOAC**. All **120 actual measured
+  Apply PIDs** preserve **10,650 identical total JIT source rows
+  including adapters / 5,490 direct bodies**, **2,265 typed blocks / 183
+  typed functions**, every hidden-trampoline arity and exact total
+  **777,240 bytes**, and zero errors. Ordinary retained → first →
+  refined native code is **54,686,760 → 57,470,520 → 56,982,240 bytes**
+  and **3,596,430 → 3,766,440 → 3,727,500 blocks**: refined still adds
+  **2,295,480 bytes / 131,070 blocks** versus retained, but removes
+  **488,280 bytes / 38,940 blocks** versus the adverse first candidate.
+  `deltablue` improves **2.305270891 → 2.077271844 ms**, raw
+  **1.10975889x, 95% CI [1.09359, 1.12969]** and stock-paired
+  **1.13970302x, 95% CI [1.10924, 1.16692]**. `richards` improves
+  **21.821327875 → 20.933223937 ms**, raw **1.04242557x, 95% CI
+  [1.02812, 1.05426]** and stock-paired **1.06015760x, 95% CI [1.04276,
+  1.08066]**. `chaos` raw **38.938904 → 40.615719 ms / 0.958715x,
+  approximately 95% CI [0.947, 0.986]**, and `comprehensions` raw
+  **42.800702 → 43.924292 μs / 0.97442x, 95% CI [0.9603, 0.9936]**, are
+  both adversely significant; however, their respective stock-paired
+  **0.98850885x [0.97645, 1.02004]** and **0.99510391x [0.97957,
+  1.01549]** are neutral. Against the adverse first candidate,
+  stock-paired `deltablue` improves **1.09713079x**, `richards`
+  **1.06111111x**, and `chaos` **1.02650074x [1.0093, 1.0437]**,
+  confirming recovery of its prior significant mixed-guardrail
+  regression. `comprehensions` is candidly slower than the first
+  candidate, **0.97796807x [0.9614, 0.9962]**, despite being neutral
+  versus retained. At this benchmark checkpoint, status was **RETAIN
+  LANDING CANDIDATE / AUTHORITATIVE FULL GATE PENDING**, not landed:
+  both motivating workloads improve
+  with raw and paired intervals above neutral; mixed controls are
+  stock-paired neutral versus retained, but adverse raw controls and
+  remaining ordinary-native-code growth are preserved. Refined matched
+  lossless causal profiles were **PENDING** at this comparison
+  checkpoint; the full-suite stock **1.10x** goal remains unmet /
+  unmeasured.
+- All **four refined causal profiles now complete with `Total Lost
+  Samples: 0`**, matched measured worker / loop count / sampling
+  frequency within each comparison, and **`SOAC_JIT_BB_MAP=0`**. Every
+  denominator excludes **interpreter shutdown only**; measured in-loop
+  garbage-collection work remains included. The following separate leaf
+  and source-parent shares are not additive across potentially nested
+  groups, and their sparse samples do not independently prove throughput
+  causation.
+- Matched zero-loss **`deltablue` retained → first → refined samples
+  160 → 156 → 162** verify descriptor direct public recursion
+  **0% → 3.649635% → 0%**, exactly removing the first candidate's new
+  hot helper. Generic-hook share is **6.944444% → 1.459854% →
+  2.174679%**, and thread-state/TLS share **5.555556% → 3.649635% →
+  2.898006%**. Authoritative `_PyObject_GetMethod` intentionally remains
+  **14.583333% → 15.328467% → 21.014067%**; separate refined source
+  parents include `EqualityConstraint.execute` **8.697541 percentage
+  points**, `Planner.add_propagate` **4.347009 points**, and
+  `Plan.execute` **2.173505 points**. Do not characterize required
+  lookup as removable or sum its ancestry with other leaf groups.
+- Matched zero-loss **`richards` retained → first → refined samples
+  228 → 213 → 215** show public recursion **0.440785% → 0.471442% →
+  0%**, generic hook **4.404840% → 6.132768% → 3.270666%**, exact
+  trampoline **11.452382% → 1.886773% → 3.738909%**, TLS
+  **2.203926% → 6.130757% → 6.541333%**, and retained method lookup
+  **5.727195% → 5.659315% → 7.008571%**. TLS rises despite the measured
+  workload gain; finite sampling and overlapping stack ancestry rule out
+  causal sums.
+- Matched zero-loss **`comprehensions` retained → first → refined samples
+  545 → 504 → 601** show generic hook **4.897931% → 3.220494% →
+  2.726336%**, TLS **5.528461% → 4.133180% → 4.276216%**, trampoline
+  **1.277317% → 0% → 0.194320%**, and method lookup
+  **2.340974% → 1.378886% → 1.555732%**. Total public recursion changes
+  **0.212499% → 0% → 0.389811%** entirely through a separate unchanged
+  direct-call site; it must not be attributed to the refined descriptor
+  edge or described as globally eliminated.
+- Zero-loss **`chaos` first → refined samples 213 → 205** have **no
+  retained baseline profile**. Descriptor-specific
+  `Chaosgame.transform_point` public recursion drops **0.471480% → 0%**,
+  but **total** public recursion rises **0.471480% → 0.975766%** through
+  unrelated unchanged `GVector.__add__` / `linear_combination` direct
+  sites. Generic hook changes **2.830890% → 3.902064%** and TLS
+  **6.603736% → 6.830361%**. Sparse unmatched-to-retained observations
+  do not prove why stock-paired throughput is neutral or justify
+  claiming all recursion vanished. The four causal captures are
+  complete; at this causal-profile checkpoint, only the authoritative
+  full correctness gate remained **PENDING** before landing.
+- The final authoritative **`just test-all` gate exits zero / GREEN**;
+  its retained log is
+  **`work/logs/resolved-method-descriptor-test-all.log`**. Transformed
+  Python covers exactly **1,239 pytest nodeids / 100 isolated batches /
+  eight workers / 100 passed / zero failures**. Rust suites pass **JIT
+  579 / 579 in 15.86 seconds**, including the new production-consumed
+  cold descriptor-direct guard regression; **optimizer 214 / 214 in
+  0.59 seconds**, **typed IR 54 / 54 in 0.01 seconds**, **lowering 371 /
+  371 in 0.55 seconds**, and **PyO3 extension 8 / 8 in 0.11 seconds**,
+  along with the remaining workspace tests. Runtime build takes **1.598
+  seconds**; the complete Cargo phase takes **82.978 seconds**,
+  including approximately **1 minute 04 seconds** compiling test
+  targets; transformed pytest takes **78.708 inner / 78.725 outer
+  seconds**, for total test phase **161.717 seconds**. The new real
+  transformed **two-node integration passes in 3.37 seconds**; the known
+  serial **28-node counter-dump shard takes 78.42 seconds**. Final
+  status is **FULLY VALIDATED / RETAIN LANDING CANDIDATE**, not already
+  landed; the full-suite stock **1.10x** goal remains unmet /
+  unmeasured.
+- Measurements and verdict: unchanged-production transformed stock
+  parity, inherited live-vectorcall mutation, and same-arity method-code
+  mutation **GREEN 1 / 1.57 seconds**, and again **GREEN 1 / 1.54
+  seconds** in the two-test focused run; genuine actual transformed
+  direct-hit optimization **RED 1 / 1.10 seconds → GREEN together with
+  unchanged stock-parity semantics, 2 passed / 2.61 seconds**; independent
+  whole-production Rust typed-decision optimization **RED 0 passed / 1
+  failed / 577 filtered → GREEN 1 passed / 577 filtered**; bounded
+  four-production-file implementation saved and package-formatted before
+  pytest; full serial Rust **JIT 578 / 578, optimizer 214 / 214, typed
+  IR 54 / 54**, broad transformed compatibility **41 / 41 across 25 files
+  in 43.34 seconds**, combined Cargo test-target check, and scoped
+  formatting check **GREEN**; mode-matched fixed-eight release coverage
+  smoke **GREEN 8 / 8**, but ordinary native bytes **+4.28%** and blocks
+  **+3.95%** with unchanged hidden trampolines; normally sampled
+  fixed-eight **80 Apply PIDs**, official stock **0.6729416640142044x**
+  / previous SOAC **1.035396831312697x**, `richards` **1.055383x** with
+  raw and paired intervals above neutral, `deltablue` **1.101455x** with
+  raw interval crossing neutral, and ordinary native bytes **+4.147%**;
+  clean three-round target **stock 0.5286221076693118x / previous SOAC
+  1.0116250410937884x**, raw `deltablue` **1.078213x** but marginal
+  stock-paired **1.038803x**, stock-paired `richards` neutral
+  **0.999101x**, `comprehensions` raw **1.024145x** / stock-paired
+  **1.017522x**, and significant stock-paired `chaos` regression
+  **0.962989x** with ordinary native bytes **+5.09%**; zero-loss causal
+  `deltablue` **160 / 156**, `richards` **228 / 213**,
+  `comprehensions` **545 / 504**, and candidate-only `chaos` **213**
+  complete, exposing new `deltablue` direct public recursion
+  **0% → 3.649635%**; new real-production Cranelift refinement
+  **RED frame-pointer 0 / helper total 1 and cold 0 / target comparisons
+  2 → GREEN frame-pointer 1 / original helper only cold / target
+  comparison 1**; saved refinement adds `vectorcall.rs` for **five total
+  production files**; refined original-trampoline structured parity,
+  frozen transformed integration **2 / 2**, retained controls **10 /
+  10**, fresh serial **JIT 579 / 579, optimizer 214 / 214, typed IR 54 /
+  54**, broad transformed **51 / 51 across 27 files in 63.47 seconds**,
+  combined Cargo check, and scoped formatting check **GREEN**; refined
+  fixed-eight DEBUG-SINGLE smoke **GREEN 8 / 8**, hidden trampolines
+  **38,108 bytes unchanged**, ordinary first → refined native
+  **2,334,180 → 2,317,600 bytes / 153,608 → 152,274 blocks**; refined
+  fixed-eight normal **80 Apply PIDs**, official stock
+  **0.6865833897338185x / previous SOAC 0.9970497902989457x**, robust
+  `deltablue` **1.07343x raw / 1.14257x stock-paired** with retained
+  outliers, stock-paired `chaos` neutral **0.99248x**, and
+  first → refined ordinary native **24,120,400 → 23,952,600 bytes /
+  1,583,640 → 1,570,300 blocks**; definitive refined clean repeated
+  official stock **0.5613133486246105x / previous SOAC
+  1.027017074961002x**, `deltablue` **1.10975889x raw / 1.13970302x
+  stock-paired**, `richards` **1.04242557x raw / 1.06015760x
+  stock-paired**, `chaos` / `comprehensions` raw adverse but paired
+  neutral **0.98850885x / 0.99510391x**, and unchanged hidden
+  trampolines **777,240 bytes**; four refined lossless causal profiles
+  **deltablue 160 / 156 / 162, richards 228 / 213 / 215,
+  comprehensions 545 / 504 / 601, chaos first / refined 213 / 205**
+  complete, with descriptor direct public recursion eliminated while
+  unrelated `chaos` / `comprehensions` recursion remains; authoritative
+  full **`just test-all`** gate **GREEN: 1,239 Python nodeids / 100
+  isolated batches / eight workers / zero failures**, JIT **579**,
+  optimizer **214**, typed IR **54**, lowering **371**, and PyO3 **8**.
+  The stock full-suite **1.10x** target remains unmet. No full-suite
+  stock gain, new CPython correctness fix, or already-landed candidate
+  is claimed; the final verdict is **FULLY VALIDATED / RETAIN LANDING
+  CANDIDATE**.
+
+## Historical Attempts 1–3 verdict and next action
 
 - Verdict: **LANDED CANDIDATE / RETAIN; genuine unchanged-production transformed
   stock-parity correctness AND independent whole-production
@@ -798,3 +1505,68 @@ title: "Immediate Zero-Argument and Positional Method Call Dispatch"
 - Next action: integrate the fully validated retained candidate; its
   full-suite performance acceptance target has not been measured.
   Full-suite stock **1.10x** remains unmet.
+
+## Current Attempt 4 verdict and next action
+
+- Verdict: **FULLY VALIDATED / RETAIN LANDING CANDIDATE; profiled, owner-independent direct
+  dispatch after unchanged CPython method lookup is package-formatted
+  and implemented in four existing production files; whole-production
+  Rust original / captured-clone decision turns RED → GREEN 1 passed /
+  577 filtered; actual transformed inherited direct-hit optimization and
+  full stock-parity / vectorcall / method-code compatibility both pass
+  2 / 2 in 2.61 seconds; complete serial JIT 578 / 578, optimizer 214 /
+  214, typed IR 54 / 54, broad transformed 41 / 41 across 25 files in
+  43.34 seconds, combined Cargo check, and scoped formatting check are
+  GREEN; mode-matched fixed-eight release DEBUG-SINGLE smoke passes
+  8 / 8 and recovers real direct/fallback edges, but ordinary native
+  bytes grow 4.28% and blocks 3.95% while hidden trampolines remain
+  unchanged; normally sampled fixed-eight `richards` improves 1.055383x
+  with raw and paired intervals above neutral, `deltablue` 1.101455x
+  remains uncertain, and ordinary native bytes grow 4.147%; clean
+  repeated targeted `deltablue` improves 1.078213x raw / marginal
+  1.038803x paired, `richards` paired 0.999101x is neutral,
+  `comprehensions` improves 1.024145x raw / 1.017522x paired, but
+  `chaos` stock-paired 0.962989x significantly regresses and ordinary
+  native bytes grow 5.09%; four zero-loss causal profiles expose new
+  `deltablue` public direct recursion 0% → 3.649635%, mixed remaining
+  wrapper/TLS costs, and unmatched `chaos` direct recursion only
+  0.471480%; FIRST DIRECT CANDIDATE INCONCLUSIVE / REFINE GUARD CFG AND
+  NATIVE DIRECT RECURSION; genuine actual emitted-production Cranelift
+  refinement turns RED → GREEN with exactly one frame-pointer read, one
+  original public recursion helper only on the cold path, and one target
+  comparison; bounded refinement saves two existing production paths /
+  five Attempt 4 production files total; refined original-trampoline
+  structured parity, frozen transformed integration 2 / 2, retained
+  focused controls 10 / 10, complete serial JIT 579 / 579, optimizer 214
+  / 214, typed IR 54 / 54, expanded transformed 51 / 51 across 27 files
+  in 63.47 seconds, combined Cargo check, and scoped formatting check
+  are GREEN; refined fixed-eight DEBUG-SINGLE smoke passes 8 / 8,
+  preserves 38,108 hidden bytes and all real direct/fallback edges, and
+  reduces first-candidate ordinary native code 16,580 bytes / 1,334
+  blocks while retaining 79,188 additional bytes versus retained;
+  refined normal covers all 80 Apply workers, improves `deltablue`
+  1.07343x raw / 1.14257x paired with retained outliers, leaves paired
+  `chaos` neutral 0.99248x, and removes 167,800 ordinary native bytes
+  versus the first candidate; definitive clean three-round `deltablue`
+  improves 1.10975889x raw / 1.13970302x paired, `richards`
+  1.04242557x raw / 1.06015760x paired, and `chaos` /
+  `comprehensions` remain paired-neutral versus retained despite adverse
+  raw controls; versus the first candidate, paired `chaos` recovers
+  1.02650074x while `comprehensions` regresses 0.97796807x; hidden
+  trampolines remain exactly 777,240 bytes, ordinary native code still
+  grows 2,295,480 bytes versus retained; all four matched refined
+  zero-loss causal profiles complete and prove descriptor-specific public
+  recursion elimination without removing authoritative method lookup or
+  unrelated direct recursion; authoritative full correctness gate exits
+  zero with 1,239 Python nodeids / 100 isolated batches / eight workers
+  / zero failures and JIT 579, optimizer 214, typed IR 54, lowering 371,
+  PyO3 8; full-suite stock 1.10x remains unmet and the candidate is not
+  yet landed**.
+- Next action: integrate the fully validated retained landing candidate;
+  preserve the adverse raw controls and ordinary-native-code growth.
+  Keep the genuine historical
+  transformed direct-hit / whole-production Rust REDs and vectorcall /
+  code-mutation controls frozen and preserve all Attempts 1–3 and their
+  negative outcomes;
+  reject any candidate that weakens method lookup, mutable vectorcall,
+  recursion / ownership semantics, or repeated benchmark performance.

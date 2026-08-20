@@ -1776,3 +1776,7 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 ## 2026-08-19 - Partition vectorcall callable kinds and validate builtin next
 
 - `wmyqzzsr`: fix rebound-`next` CPython `TypeError` mismatch and partition exact callable metadata; fixed-eight stock `0.655558x` / noisy previous `0.985063x`; repeated stock `0.535804x` / previous `1.013271x`, `chaos` `40.004 → 38.939 ms` (`1.05058x` stock-paired); generated native and hidden code unchanged.
+
+## 2026-08-19 - Direct guarded inherited methods after CPython lookup
+
+- `srxzvruu`: guard resolved inherited descriptors and reuse native-stack recursion checks; targeted stock `0.56131x` / previous `1.02702x`; `deltablue` `2.305 → 2.077 ms` (`1.10976x`), `richards` `21.821 → 20.933 ms` (`1.04243x`); stock-paired `chaos` neutral; full-suite stock `1.10x` unmet.

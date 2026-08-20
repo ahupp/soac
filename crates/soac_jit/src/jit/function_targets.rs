@@ -38,6 +38,13 @@ pub(super) fn collect_typed_call_direct_targets(
             if let InstrTyped::GuardedMethodCallTyped(call) = expr {
                 self.out
                     .extend(call.method_guards.iter().map(|guard| guard.function_id));
+                self.out.extend(
+                    call.extra
+                        .resolved_descriptor_function_guards
+                        .iter()
+                        .flatten()
+                        .map(|guard| guard.function_id),
+                );
             }
             if let InstrTyped::CallTyped(call) = expr
                 && let TypedCallAccessPlan::GuardedRuntimeProtocolMethod { method_guards, .. } =

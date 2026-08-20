@@ -25,12 +25,20 @@ use cranelift_jit::JITModule;
 use pyo3::ffi;
 use soac_ir_typed::PyObjFacts;
 
+pub(super) enum NativeRecursionGuardFailure<'a> {
+    ReturnNull(ir::Value),
+    JumpTo {
+        block: ir::Block,
+        args: &'a [ir::BlockArg],
+    },
+}
+
 pub(super) fn emit_vectorcall_native_recursion_guard(
     fb: &mut FunctionBuilder<'_>,
     thread_state: ir::Value,
     ptr_ty: ir::Type,
     enter_recursive_ref: ir::FuncRef,
-    null_ptr: ir::Value,
+    failure: NativeRecursionGuardFailure<'_>,
 ) {
     let helper_block = fb.create_block();
     let bind_block = fb.create_block();
@@ -86,7 +94,14 @@ pub(super) fn emit_vectorcall_native_recursion_guard(
     fb.seal_block(bind_block);
 
     fb.switch_to_block(recursion_fail_block);
-    fb.ins().return_(&[null_ptr]);
+    match failure {
+        NativeRecursionGuardFailure::ReturnNull(null_ptr) => {
+            fb.ins().return_(&[null_ptr]);
+        }
+        NativeRecursionGuardFailure::JumpTo { block, args } => {
+            fb.ins().jump(block, args);
+        }
+    }
 
     fb.switch_to_block(bind_block);
 }
@@ -351,7 +366,7 @@ pub(super) fn define_shared_vectorcall_trampoline(
             thread_state_val,
             ptr_ty,
             enter_recursive_ref,
-            null_ptr,
+            NativeRecursionGuardFailure::ReturnNull(null_ptr),
         );
         let bound_args_slot = if param_count == 0 {
             None
