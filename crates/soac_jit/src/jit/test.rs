@@ -4304,6 +4304,220 @@ def build(values):
         );
     }
 
+    fn assert_cfg_pending_poll_count(
+        function: BlockPyFunction<BlockPyModuleShape>,
+        constants: TestConstantPool,
+        expected_count: usize,
+    ) {
+        let block_objects = (0..function.blocks.len())
+            .map(|index| (index + 1) as ObjPtr)
+            .collect::<Vec<_>>();
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_specialized_function_with_env_config(
+            &block_objects,
+            &module,
+            &function,
+            &module_constants,
+            SoacEnvConfig::default().with_jit_handle_pending_checks_enabled(true),
+        );
+        let helpers = import_user_names_for_symbols(&built, &["_Py_HandlePending"]);
+
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helpers),
+            expected_count,
+            "pending polls must follow actual CFG cycle edges, not block storage order"
+        );
+    }
+
+    #[test]
+    fn specialized_jit_places_pending_polls_only_on_cfg_backedges_for_reordered_acyclic_blocks() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let exit_label = function.name_gen.next_block_name();
+        let late_label = function.name_gen.next_block_name();
+
+        let entry = BlockPyBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::Jump(BlockEdge::new(late_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let exit = BlockPyBlock {
+            label: exit_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let late = BlockPyBlock {
+            label: late_label,
+            body: vec![],
+            term: BlockTerm::Jump(BlockEdge::new(exit_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+
+        assert_cfg_pending_poll_count(
+            with_test_blocks(function, vec![entry, exit, late]),
+            constants,
+            0,
+        );
+    }
+
+    #[test]
+    fn specialized_jit_places_pending_polls_only_on_cfg_backedges_for_irreducible_cycles() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let exit_label = function.name_gen.next_block_name();
+        let left_label = function.name_gen.next_block_name();
+        let right_label = function.name_gen.next_block_name();
+
+        let entry = BlockPyBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(test_runtime_name("TRUE")),
+                then_label: left_label,
+                else_label: right_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let exit = BlockPyBlock {
+            label: exit_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let left = BlockPyBlock {
+            label: left_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(test_runtime_name("TRUE")),
+                then_label: right_label,
+                else_label: exit_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let right = BlockPyBlock {
+            label: right_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(test_runtime_name("TRUE")),
+                then_label: left_label,
+                else_label: exit_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+
+        assert_cfg_pending_poll_count(
+            with_test_blocks(function, vec![entry, exit, left, right]),
+            constants,
+            1,
+        );
+    }
+
+    #[test]
+    fn specialized_jit_places_pending_polls_on_exception_mediated_cycles() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let source_label = function.name_gen.next_block_name();
+        let handler_label = function.name_gen.next_block_name();
+
+        let source = BlockPyBlock {
+            label: source_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: Some(BlockEdge::new(handler_label)),
+            extra: Default::default(),
+        };
+        let handler = BlockPyBlock {
+            label: handler_label,
+            body: vec![],
+            term: BlockTerm::Jump(BlockEdge::new(source_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+
+        assert_cfg_pending_poll_count(
+            with_test_blocks(function, vec![source, handler]),
+            constants,
+            1,
+        );
+    }
+
+    #[test]
+    fn specialized_jit_places_pending_polls_on_all_overlapping_exception_cycles() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let handler_label = function.name_gen.next_block_name();
+        let left_label = function.name_gen.next_block_name();
+        let right_label = function.name_gen.next_block_name();
+        let source_label = function.name_gen.next_block_name();
+
+        let handler = BlockPyBlock {
+            label: handler_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(test_runtime_name("TRUE")),
+                then_label: left_label,
+                else_label: right_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let left = BlockPyBlock {
+            label: left_label,
+            body: vec![],
+            term: BlockTerm::Jump(BlockEdge::new(source_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let right = BlockPyBlock {
+            label: right_label,
+            body: vec![],
+            term: BlockTerm::Jump(BlockEdge::new(source_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let source = BlockPyBlock {
+            label: source_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: Some(BlockEdge::new(handler_label)),
+            extra: Default::default(),
+        };
+
+        assert_cfg_pending_poll_count(
+            with_test_blocks(function, vec![handler, left, right, source]),
+            constants,
+            2,
+        );
+    }
+
     #[test]
     fn specialized_jit_can_disable_handle_pending_backedge_checks() {
         let mut constants = TestConstantPool::default();

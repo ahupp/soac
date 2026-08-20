@@ -1668,6 +1668,8 @@ struct JitEmitCtx<'mc> {
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
     runtime_supported_deopt_resume_points: Option<&'mc [LocalEnvResumePoint]>,
     refcount_plan: &'mc FunctionRefcountPlan,
+    loop_backedges: &'mc HashSet<(BlockLabel, BlockLabel)>,
+    entry_materializations: &'mc [Vec<PlannedLocalEnvEntryMaterialization>],
     cleanup_root_slot_states: &'mc PlannedCleanupRootSlotStates,
     truthiness_only_local_locations: &'mc HashSet<LocalLocation>,
     return_cleanup_blocks_by_label: &'mc HashMap<BlockLabel, ir::Block>,
@@ -4602,6 +4604,17 @@ fn emit_typed_local_store_result_with_local_env(
         emit_ctx.decref_ref,
         emit_ctx.refcount_emitter(),
     );
+    if planned_borrowed_store && ownership.is_owned() {
+        // Typed Store operands are normally planned as owned even when the
+        // ownership plan proves this binding can borrow another live local.
+        // Release that temporary only after the new binding has been installed.
+        emit_ctx.emit_decref_for_family(
+            fb,
+            value,
+            Some(value_py_facts),
+            RefcountFamily::OwnedTemporary,
+        );
+    }
     Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)))
 }
 
@@ -6258,6 +6271,7 @@ impl std::fmt::Display for LocalEnvEdgePrepError {
 fn emit_forwarded_block_arg_source_value(
     fb: &mut FunctionBuilder<'_>,
     source_name: &str,
+    target_ref_kind: LocalRefKind,
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     forwarded_local_counts: &mut HashMap<usize, usize>,
@@ -6265,7 +6279,16 @@ fn emit_forwarded_block_arg_source_value(
     if let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name) {
         let entry = &local_env.entries[value_index];
         let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
-        let value = emit_local_env_entry_pyobject_for_forward(fb, entry, ctx, *forwarded_count);
+        let value = if entry.ref_kind() == LocalRefKind::Borrowed
+            && target_ref_kind == LocalRefKind::Borrowed
+        {
+            // The ownership plan has already proved that this alias's owner
+            // remains live across the edge. Do not manufacture an owned
+            // reference for a target that will continue to treat it as borrowed.
+            entry.value()
+        } else {
+            emit_local_env_entry_pyobject_for_forward(fb, entry, ctx, *forwarded_count)
+        };
         *forwarded_count += 1;
         return Ok((value, Some(value_index)));
     }
@@ -9888,6 +9911,7 @@ fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
 
 fn emit_planned_target_args_codegen_from_local_env(
     fb: &mut FunctionBuilder<'_>,
+    target_block_index: usize,
     target_args: &[RuntimeBlockArgPlan],
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
@@ -9897,7 +9921,7 @@ fn emit_planned_target_args_codegen_from_local_env(
     let mut args = Vec::with_capacity(target_args.len());
     let mut forwarded_locations = HashSet::new();
     let mut forwarded_local_counts = HashMap::new();
-    for target_arg in target_args {
+    for (target_arg_index, target_arg) in target_args.iter().enumerate() {
         let value = match (&target_arg.source, target_arg.repr) {
             (BlockArg::Name(source_name), RuntimeBlockParamRepr::ExactI64) => {
                 emit_forwarded_block_arg_source_i64_value(
@@ -9916,9 +9940,17 @@ fn emit_planned_target_args_codegen_from_local_env(
                 )?
             }
             (BlockArg::Name(source_name), RuntimeBlockParamRepr::PyObject) => {
+                let target_entry =
+                    &ctx.entry_materializations[target_block_index][target_arg_index];
+                debug_assert!(matches!(
+                    target_entry.source,
+                    PlannedLocalEnvEntrySource::BlockParam { param_index }
+                        if param_index == target_arg_index
+                ));
                 let (value, maybe_index) = emit_forwarded_block_arg_source_value(
                     fb,
                     source_name,
+                    target_entry.entry_ref_kind,
                     local_env,
                     ctx,
                     &mut forwarded_local_counts,
@@ -21677,13 +21709,7 @@ fn emit_codegen_if_target_arm(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     fb.switch_to_block(branch_block);
-    emit_handle_pending_if_backedge(
-        fb,
-        source_label,
-        target_label,
-        block_indices_by_label,
-        emit_ctx,
-    )?;
+    emit_handle_pending_if_backedge(fb, source_label, target_label, emit_ctx)?;
     if let Some(counter_ref) = entry_counter_ref {
         emit_increment_counter_ref(fb, counter_ref, emit_ctx);
     }
@@ -21696,6 +21722,7 @@ fn emit_codegen_if_target_arm(
     let mut jump_args = Vec::with_capacity(edge_transport.target_args.len());
     let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
         fb,
+        target_index,
         &edge_transport.target_args,
         local_env,
         emit_ctx,
@@ -21735,31 +21762,17 @@ fn emit_codegen_if_target_arm(
     Ok(())
 }
 
-fn is_codegen_backedge(
-    source_label: BlockLabel,
-    target_label: BlockLabel,
-    block_indices_by_label: &HashMap<BlockLabel, usize>,
-) -> Result<bool, String> {
-    let source_index = *block_indices_by_label
-        .get(&source_label)
-        .ok_or_else(|| format!("missing codegen block index for source label {source_label}"))?;
-    let target_index = *block_indices_by_label
-        .get(&target_label)
-        .ok_or_else(|| format!("missing codegen block index for target label {target_label}"))?;
-    Ok(target_index <= source_index)
-}
-
 fn emit_handle_pending_if_backedge(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     target_label: BlockLabel,
-    block_indices_by_label: &HashMap<BlockLabel, usize>,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Result<(), String> {
-    if !emit_ctx.handle_pending_checks_enabled {
-        return Ok(());
-    }
-    if !is_codegen_backedge(source_label, target_label, block_indices_by_label)? {
+    if !emit_ctx.handle_pending_checks_enabled
+        || !emit_ctx
+            .loop_backedges
+            .contains(&(source_label, target_label))
+    {
         return Ok(());
     }
     let Some(py_handle_pending_ref) = emit_ctx.py_handle_pending_ref else {
@@ -22068,19 +22081,14 @@ fn emit_codegen_branch_table_from_i64(
         fb.switch_to_block(*case_block);
         let target_index =
             codegen_block_index_for_label(function, block_indices_by_label, *target_label)?;
-        emit_handle_pending_if_backedge(
-            fb,
-            source_label,
-            *target_label,
-            block_indices_by_label,
-            emit_ctx,
-        )?;
+        emit_handle_pending_if_backedge(fb, source_label, *target_label, emit_ctx)?;
         let edge_transport = &implicit_target_transports[target_index];
         let mut case_local_env = local_env.clone();
         let mut case_jump_args = Vec::with_capacity(edge_transport.target_args.len());
         let (prepared_args, forwarded_locations) =
             emit_planned_target_args_codegen_from_local_env(
                 fb,
+                target_index,
                 &edge_transport.target_args,
                 &case_local_env,
                 emit_ctx,
@@ -22125,18 +22133,13 @@ fn emit_codegen_branch_table_from_i64(
     fb.switch_to_block(default_block);
     let default_index =
         codegen_block_index_for_label(function, block_indices_by_label, default_label)?;
-    emit_handle_pending_if_backedge(
-        fb,
-        source_label,
-        default_label,
-        block_indices_by_label,
-        emit_ctx,
-    )?;
+    emit_handle_pending_if_backedge(fb, source_label, default_label, emit_ctx)?;
     let edge_transport = &implicit_target_transports[default_index];
     let mut default_local_env = local_env.clone();
     let mut default_jump_args = Vec::with_capacity(edge_transport.target_args.len());
     let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
         fb,
+        default_index,
         &edge_transport.target_args,
         &default_local_env,
         emit_ctx,
@@ -22569,19 +22572,14 @@ fn emit_typed_codegen_term(
             codegen_block_index_for_label(function, block_indices_by_label, edge.target)?;
         let source_index =
             codegen_block_index_for_label(function, block_indices_by_label, source_label)?;
-        emit_handle_pending_if_backedge(
-            fb,
-            source_label,
-            edge.target,
-            block_indices_by_label,
-            emit_ctx,
-        )?;
+        emit_handle_pending_if_backedge(fb, source_label, edge.target, emit_ctx)?;
         let edge_transport = jump_edge_transports[source_index]
             .as_ref()
             .expect("jump term should have a planned edge transport");
         let mut jump_args = Vec::with_capacity(edge_transport.target_args.len());
         let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
             fb,
+            target_index,
             &edge_transport.target_args,
             local_env,
             emit_ctx,
@@ -23869,6 +23867,8 @@ fn build_cranelift_run_bb_specialized_function(
                     .runtime_supported_deopt_resume_points
                     .as_deref(),
                 refcount_plan,
+                loop_backedges: &jit_local_plan.loop_backedges,
+                entry_materializations,
                 cleanup_root_slot_states: &jit_local_plan.cleanup_root_slot_states,
                 truthiness_only_local_locations: &jit_local_plan.truthiness_only_local_locations,
                 return_cleanup_blocks_by_label: &return_cleanup_blocks_by_label,

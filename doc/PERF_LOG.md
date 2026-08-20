@@ -1784,3 +1784,7 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 ## 2026-08-20 - Restore CPython class layout and mixed owner guards
 
 - `lwyqsqsm`: restore CPython class-tail/key layout and independently guarded mixed-index owner fields; repeated stock `0.559687x` versus parent `0.556493x`, previous SOAC `1.03027x` (class-only `0.97444x`, mixed recovery `1.05729x`); parent-relative paired `richards` remains `0.9502x`; native `18,932,360 → 19,124,400 B`; full correctness gate passes; full-suite stock `1.10x` unmet.
+
+## 2026-08-20 - Restore scheduling safety and borrowed-local lifetimes
+
+- `urvkupqv`: preserve borrowed references and retain pending-event polls only on validated normal/exception CFG cycles; historical pre-strict fixed-four stock `0.553887x`, previous safe SOAC `1.028079x` (one round); native `21,082,920 → 19,393,800 B`, polls `1,488 → 130`; no authenticated strict modules or strict acceptance result.

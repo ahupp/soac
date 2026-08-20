@@ -87,6 +87,177 @@ fn typed_block_index_for_label(
     })
 }
 
+fn planned_loop_backedges_for_typed_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+) -> Result<HashSet<(BlockLabel, BlockLabel)>, String> {
+    const UNVISITED: u8 = 0;
+    const ACTIVE: u8 = 1;
+    const FINISHED: u8 = 2;
+
+    if function.blocks.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let successors = function
+        .blocks
+        .iter()
+        .map(|block| match &block.term {
+            BlockTerm::Jump(edge) => vec![edge.target],
+            BlockTerm::IfTerm(if_term) => vec![if_term.then_label, if_term.else_label],
+            BlockTerm::BranchTable(branch) => branch
+                .targets
+                .iter()
+                .copied()
+                .chain(std::iter::once(branch.default_label))
+                .collect(),
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut remaining_roots = (1..function.blocks.len()).collect::<Vec<_>>();
+    remaining_roots.sort_unstable_by_key(|index| function.blocks[*index].label);
+    let root_indices = std::iter::once(0)
+        .chain(remaining_roots)
+        .collect::<Vec<_>>();
+    let mut visit_states = vec![UNVISITED; function.blocks.len()];
+    let mut backedges = HashSet::new();
+
+    for root_index in root_indices.iter().copied() {
+        if visit_states[root_index] != UNVISITED {
+            continue;
+        }
+
+        visit_states[root_index] = ACTIVE;
+        let mut pending = vec![(root_index, 0usize)];
+        while let Some((block_index, next_successor_index)) = pending.last_mut() {
+            let source_index = *block_index;
+            if *next_successor_index == successors[source_index].len() {
+                visit_states[source_index] = FINISHED;
+                pending.pop();
+                continue;
+            }
+
+            let target_label = successors[source_index][*next_successor_index];
+            *next_successor_index += 1;
+            let target_index =
+                typed_block_index_for_label(function, block_indices_by_label, target_label);
+            match visit_states[target_index] {
+                UNVISITED => {
+                    visit_states[target_index] = ACTIVE;
+                    pending.push((target_index, 0));
+                }
+                ACTIVE => {
+                    backedges.insert((function.blocks[source_index].label, target_label));
+                }
+                FINISHED => {}
+                _ => unreachable!("invalid CFG traversal state"),
+            }
+        }
+    }
+
+    if function.blocks.iter().any(|block| block.exc_edge.is_some()) {
+        // Exception dispatches cannot host polls, but they can close cycles.
+        // Remove one pollable edge from each remaining full-CFG cycle until
+        // the unpolled graph is acyclic, including overlapping handler paths.
+        while let Some(edge) = next_unpolled_cfg_cycle_normal_edge(
+            function,
+            block_indices_by_label,
+            &successors,
+            &root_indices,
+            &backedges,
+        )? {
+            backedges.insert(edge);
+        }
+    }
+
+    Ok(backedges)
+}
+
+fn next_unpolled_cfg_cycle_normal_edge(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    normal_successors: &[Vec<BlockLabel>],
+    root_indices: &[usize],
+    selected_normal_edges: &HashSet<(BlockLabel, BlockLabel)>,
+) -> Result<Option<(BlockLabel, BlockLabel)>, String> {
+    const UNVISITED: u8 = 0;
+    const ACTIVE: u8 = 1;
+    const FINISHED: u8 = 2;
+
+    let mut visit_states = vec![UNVISITED; function.blocks.len()];
+    let mut incoming_edges = vec![None; function.blocks.len()];
+
+    for root_index in root_indices.iter().copied() {
+        if visit_states[root_index] != UNVISITED {
+            continue;
+        }
+
+        visit_states[root_index] = ACTIVE;
+        let mut pending = vec![(root_index, 0usize)];
+        while let Some((block_index, next_successor_index)) = pending.last_mut() {
+            let source_index = *block_index;
+            let normal_count = normal_successors[source_index].len();
+            let exceptional_target = function.blocks[source_index]
+                .exc_edge
+                .as_ref()
+                .map(|edge| edge.target);
+            let successor_count = normal_count + usize::from(exceptional_target.is_some());
+            if *next_successor_index == successor_count {
+                visit_states[source_index] = FINISHED;
+                pending.pop();
+                continue;
+            }
+
+            let successor_index = *next_successor_index;
+            *next_successor_index += 1;
+            let (target_label, is_exceptional) = if successor_index < normal_count {
+                (normal_successors[source_index][successor_index], false)
+            } else {
+                (
+                    exceptional_target.expect("exceptional successor should exist"),
+                    true,
+                )
+            };
+            let source_label = function.blocks[source_index].label;
+            if !is_exceptional && selected_normal_edges.contains(&(source_label, target_label)) {
+                continue;
+            }
+
+            let target_index =
+                typed_block_index_for_label(function, block_indices_by_label, target_label);
+            match visit_states[target_index] {
+                UNVISITED => {
+                    visit_states[target_index] = ACTIVE;
+                    incoming_edges[target_index] =
+                        Some((source_label, target_label, is_exceptional));
+                    pending.push((target_index, 0));
+                }
+                ACTIVE if !is_exceptional => return Ok(Some((source_label, target_label))),
+                ACTIVE => {
+                    for (active_index, _) in pending.iter().rev() {
+                        if *active_index == target_index {
+                            break;
+                        }
+                        if let Some((parent_label, child_label, false)) =
+                            incoming_edges[*active_index]
+                        {
+                            return Ok(Some((parent_label, child_label)));
+                        }
+                    }
+                    return Err(format!(
+                        "function {} ({}) has an exception-only CFG cycle with no safe pending-event poll edge",
+                        function.function_id, function.names.qualname
+                    ));
+                }
+                FINISHED => {}
+                _ => unreachable!("invalid CFG traversal state"),
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 #[derive(Clone, Debug)]
 pub struct BlockExcDispatchPlan {
     pub target_index: usize,
@@ -251,6 +422,7 @@ impl PlannedCleanupRootSlotStates {
 pub struct PlannedJitFunctionLocals {
     pub local_plan: FunctionLocalPlan,
     pub refcount_plan: FunctionRefcountPlan,
+    pub loop_backedges: HashSet<(BlockLabel, BlockLabel)>,
     pub cleanup_root_names: HashSet<String>,
     pub cleanup_root_slot_states: PlannedCleanupRootSlotStates,
     pub truthiness_only_local_locations: HashSet<LocalLocation>,
@@ -527,6 +699,14 @@ impl PlannedJitFunctionLocals {
         {
             return Err(format!(
                 "planned JIT local state for function {} ({}) has inconsistent block counts",
+                function.function_id, function.names.qualname
+            ));
+        }
+        if self.loop_backedges
+            != planned_loop_backedges_for_typed_function(function, &block_indices_by_label)?
+        {
+            return Err(format!(
+                "planned JIT loop backedges for function {} ({}) do not match its control-flow graph",
                 function.function_id, function.names.qualname
             ));
         }
@@ -3693,6 +3873,8 @@ pub fn plan_jit_typed_function_locals_from_plans(
     let total_start = Instant::now();
     let setup_start = Instant::now();
     let block_indices_by_label = typed_block_indices_by_label(function);
+    let loop_backedges =
+        planned_loop_backedges_for_typed_function(function, &block_indices_by_label)?;
     let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(&refcount_plan);
     let truthiness_only_local_locations = typed_truthiness_only_internal_local_locations(function);
     let exact_int_scalar_deopt_instr_ids = exact_int_scalar_deopt_instr_ids_for_typed_function(
@@ -3803,6 +3985,7 @@ pub fn plan_jit_typed_function_locals_from_plans(
     let plan = PlannedJitFunctionLocals {
         local_plan,
         refcount_plan,
+        loop_backedges,
         cleanup_root_names,
         cleanup_root_slot_states,
         truthiness_only_local_locations,
@@ -4764,6 +4947,59 @@ def f(flag):
                 .iter()
                 .any(|name| name.starts_with("_dp_try_exc_")),
             "expected exception state stack slots to be represented in the pre-codegen plan: {required_stack_slot_names:?}"
+        );
+    }
+
+    #[test]
+    fn planned_jit_function_locals_rejects_tampered_cfg_loop_backedges() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def f(value):
+    while value:
+        value -= 1
+    return value
+"#,
+            "f",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let mut plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan")
+            .clone();
+
+        assert!(
+            !plan.loop_backedges.is_empty(),
+            "a genuine source loop must have a planned CFG backedge"
+        );
+        plan.validate_for_typed_function(function)
+            .expect("the original CFG backedge plan should validate");
+
+        plan.loop_backedges.clear();
+        assert!(
+            plan.validate_for_typed_function(function).is_err(),
+            "a tampered CFG backedge plan must be rejected before code generation"
+        );
+    }
+
+    #[test]
+    fn planned_jit_function_locals_rejects_exception_only_cycles() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def f():
+    return None
+"#,
+            "f",
+        );
+        let mut function = prepared.module.callable_defs[function_index].clone();
+        let entry_label = function.blocks[0].label;
+        function.blocks[0].exc_edge = Some(soac_core::block_py::BlockEdge::new(entry_label));
+        let block_indices_by_label = typed_block_indices_by_label(&function);
+
+        assert!(
+            super::planned_loop_backedges_for_typed_function(&function, &block_indices_by_label,)
+                .is_err(),
+            "exception-only cycles must fail explicitly rather than silently skip pending events"
         );
     }
 
