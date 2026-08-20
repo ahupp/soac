@@ -4,6 +4,7 @@ digraph soac_crate_dependencies {
   node [shape=box, style="rounded,filled", fillcolor="#f8fafc", color="#475569", fontname="Helvetica", fontsize=11];
   edge [fontname="Helvetica", fontsize=9, arrowsize=0.7];
 
+  "soac_contracts" [label="soac_contracts", tooltip="crates/soac_contracts"];
   "soac_core" [label="soac_core", tooltip="crates/soac_core"];
   "soac_cpython" [label="soac_cpython", tooltip="crates/soac_cpython"];
   "soac_driver" [label="soac_driver", tooltip="crates/soac_driver"];
@@ -15,7 +16,9 @@ digraph soac_crate_dependencies {
   "soac_lowering" [label="soac_lowering", tooltip="crates/soac_lowering"];
   "soac_opt" [label="soac_opt", tooltip="crates/soac_opt"];
   "soac_pyo3" [label="soac_pyo3", tooltip="crates/soac_pyo3"];
+  "soac_source" [label="soac_source", tooltip="crates/soac_source"];
 
+  "soac_core" -> "soac_contracts" [color="#394150"];
   "soac_driver" -> "soac_core" [color="#394150"];
   "soac_driver" -> "soac_instrument" [color="#394150"];
   "soac_driver" -> "soac_ir_blockpy" [color="#394150"];
@@ -33,8 +36,10 @@ digraph soac_crate_dependencies {
   "soac_instrument" -> "soac_core" [color="#394150"];
   "soac_instrument" -> "soac_ir_typed" [color="#394150"];
   "soac_ir_blockpy" -> "soac_core" [color="#394150"];
+  "soac_ir_typed" -> "soac_contracts" [color="#394150"];
   "soac_ir_typed" -> "soac_core" [color="#394150"];
   "soac_ir_typed" -> "soac_ir_blockpy" [color="#394150"];
+  "soac_jit" -> "soac_contracts" [color="#394150"];
   "soac_jit" -> "soac_core" [color="#394150"];
   "soac_jit" -> "soac_driver" [color="#394150"];
   "soac_jit" -> "soac_instrument" [color="#394150"];
@@ -42,8 +47,10 @@ digraph soac_crate_dependencies {
   "soac_jit" -> "soac_ir_typed" [color="#394150"];
   "soac_jit" -> "soac_lowering" [color="#394150"];
   "soac_jit" -> "soac_opt" [color="#394150"];
+  "soac_lowering" -> "soac_contracts" [color="#394150"];
   "soac_lowering" -> "soac_core" [color="#394150"];
   "soac_lowering" -> "soac_ir_blockpy" [color="#394150"];
+  "soac_lowering" -> "soac_source" [color="#394150"];
   "soac_opt" -> "soac_core" [color="#394150"];
   "soac_opt" -> "soac_ir_blockpy" [color="#394150"];
   "soac_opt" -> "soac_ir_typed" [color="#394150"];
