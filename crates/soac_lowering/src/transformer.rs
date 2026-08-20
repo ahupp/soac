@@ -315,6 +315,7 @@ pub(crate) fn walk_stmt<V: Transformer + ?Sized>(visitor: &mut V, stmt: &mut Stm
         }
         Stmt::Import(ast::StmtImport {
             names,
+            is_lazy: _,
             range: _,
             node_index: _,
         }) => {
@@ -463,7 +464,9 @@ pub(crate) fn walk_expr<V: Transformer + ?Sized>(visitor: &mut V, expr: &mut Exp
             for comprehension in generators {
                 visitor.visit_comprehension(comprehension);
             }
-            visitor.visit_expr(key);
+            if let Some(key) = key {
+                visitor.visit_expr(key);
+            }
             visitor.visit_expr(value);
         }
         Expr::Generator(ast::ExprGenerator {
@@ -515,7 +518,7 @@ pub(crate) fn walk_expr<V: Transformer + ?Sized>(visitor: &mut V, expr: &mut Exp
         Expr::Call(ast::ExprCall {
             func,
             arguments,
-            range: _,
+            range_start: _,
             node_index: _,
         }) => {
             visitor.visit_expr(func);

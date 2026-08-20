@@ -1,7 +1,9 @@
 use super::stmt_lowering::{lower_instr_into_with_expr, plan_instr_head_for_blockpy};
 use super::*;
 use crate::block_py::{
-    Await, BlockTerm, Call, CallArgPositional, ExprAttribute, TermRaise, WithMeta,
+    Await, BlockParam, BlockParamRole, BlockTerm, Call, CallArgPositional, ExprAttribute,
+    HandledExceptionContext, HasMeta, IteratorStep, RaiseDisposition, Store, StoreLifetime,
+    TakeOperand, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::InstrRuff;
@@ -86,6 +88,7 @@ fn compat_blockpy_raise_from_instr(
     );
     TermRaise {
         exc: raise_stmt.exc.map(|expr| *expr),
+        disposition: RaiseDisposition::Source,
     }
 }
 
@@ -260,57 +263,28 @@ fn synthetic_assign(target: InstrRuff, value: InstrRuff) -> InstrRuff {
         .into()
 }
 
-fn synthetic_delete(target: InstrRuff) -> InstrRuff {
-    crate::block_py::StmtDelete::new(vec![target])
+fn synthetic_operand_assign(name_gen: &FunctionNameGen, name: &str, value: InstrRuff) -> InstrRuff {
+    Store::new(name, value)
+        .with_lifetime(StoreLifetime::Operand {
+            unwind_order: name_gen.next_temporary_sequence(),
+        })
         .with_meta(crate::block_py::Meta::synthetic())
         .into()
 }
 
-fn stop_iteration_handler_with_body(
-    exception_name: &str,
+fn synthetic_operand_take(name: &str) -> InstrRuff {
+    TakeOperand::new(name)
+        .with_meta(crate::block_py::Meta::synthetic())
+        .into()
+}
+
+struct ExpandedFor {
+    setup: Vec<InstrRuff>,
+    fetch_next: InstrRuff,
     body: Vec<InstrRuff>,
-) -> ast::ExceptHandler {
-    let mut try_stmt = match exception_name {
-        "StopIteration" => {
-            let ast::Stmt::Try(try_stmt) = py_stmt!(
-                r#"
-try:
-    pass
-except __soac__.StopIteration:
-    pass
-"#
-            ) else {
-                unreachable!("synthetic StopIteration handler should parse as try statement");
-            };
-            try_stmt
-        }
-        "StopAsyncIteration" => {
-            let ast::Stmt::Try(try_stmt) = py_stmt!(
-                r#"
-try:
-    pass
-except __soac__.StopAsyncIteration:
-    pass
-"#
-            ) else {
-                unreachable!("synthetic StopAsyncIteration handler should parse as try statement");
-            };
-            try_stmt
-        }
-        other => panic!("unsupported synthetic for-loop stop exception {other}"),
-    };
-    assert_eq!(
-        try_stmt.handlers.len(),
-        1,
-        "synthetic {exception_name} handler should contain one handler"
-    );
-    let handler = try_stmt.handlers.remove(0);
-    let ast::ExceptHandler::ExceptHandler(mut handler) = handler;
-    handler.body = body
-        .into_iter()
-        .map(crate::passes::ast_to_instr::into_ast_stmt)
-        .collect();
-    ast::ExceptHandler::ExceptHandler(handler)
+    exhaustion: Vec<InstrRuff>,
+    stop_exception: &'static str,
+    continuation: Vec<InstrRuff>,
 }
 
 fn expand_for_stmt(
@@ -319,49 +293,35 @@ fn expand_for_stmt(
     iter_name: &str,
     tmp_name: &str,
     assign_body: Vec<InstrRuff>,
-) -> Vec<InstrRuff> {
+) -> ExpandedFor {
+    let for_meta = for_stmt.meta();
     let iter_helper = if for_stmt.is_async { "aiter" } else { "iter" };
     let iterable_name = name_gen.next_tmp_name("iterable").to_string();
-    let iterable_assign = synthetic_assign(synthetic_name_expr(&iterable_name), *for_stmt.iter);
+    let iterable_assign = synthetic_operand_assign(name_gen, &iterable_name, *for_stmt.iter);
     let iter_value: InstrRuff = Call::new(
         runtime_helper_expr(iter_helper),
-        vec![CallArgPositional::Positional(synthetic_name_expr(
+        vec![CallArgPositional::Positional(synthetic_operand_take(
             &iterable_name,
         ))],
         Vec::new(),
     )
     .with_meta(crate::block_py::Meta::synthetic())
     .into();
-    let iter_assign = synthetic_assign(synthetic_name_expr(&iter_name), iter_value);
-    let iter_setup = crate::block_py::StmtTry::new(
-        vec![iter_assign],
-        Vec::new(),
-        Vec::new(),
-        vec![synthetic_delete(synthetic_name_expr_with_context(
-            &iterable_name,
-            ast::ExprContext::Del,
-        ))],
-        false,
-    )
-    .with_meta(crate::block_py::Meta::synthetic())
-    .into();
+    // The ordinary call consumes the iterable's one evaluated operand, on
+    // success or error. No synthetic Python finally changes its error context.
+    let iter_assign = synthetic_operand_assign(name_gen, iter_name, iter_value);
 
     let completed_name =
         (!for_stmt.orelse.is_empty()).then(|| name_gen.next_tmp_name("completed").to_string());
-    let mut stop_body = Vec::new();
+    let mut exhaustion = Vec::new();
     if let Some(completed_name) = &completed_name {
-        stop_body.push(synthetic_assign(
+        exhaustion.push(synthetic_assign(
             synthetic_name_expr(completed_name),
             crate::passes::ast_to_instr::from_ast_expr(py_expr!("True")),
         ));
     }
-    stop_body.push(
-        crate::block_py::StmtBreak::new()
-            .with_meta(crate::block_py::Meta::synthetic())
-            .into(),
-    );
 
-    let mut while_body = if for_stmt.is_async {
+    let next_value: InstrRuff = if for_stmt.is_async {
         let next_call: InstrRuff = Call::new(
             runtime_helper_expr("anext"),
             vec![CallArgPositional::Positional(synthetic_name_expr(
@@ -371,66 +331,31 @@ fn expand_for_stmt(
         )
         .with_meta(crate::block_py::Meta::synthetic())
         .into();
-        let next_value = Await::new(next_call)
-            .with_meta(crate::block_py::Meta::synthetic())
-            .into();
-        let next_assign = synthetic_assign(synthetic_name_expr(tmp_name), next_value);
-        let fetch_next = crate::block_py::StmtTry::new(
-            vec![next_assign],
-            vec![stop_iteration_handler_with_body(
-                "StopAsyncIteration",
-                stop_body,
-            )],
-            Vec::new(),
-            Vec::new(),
-            false,
-        )
-        .with_meta(crate::block_py::Meta::synthetic())
-        .into();
-        vec![fetch_next]
+        Await::new(next_call).with_meta(for_meta.clone()).into()
     } else {
-        let next_call: InstrRuff = Call::new(
-            runtime_helper_expr("next"),
-            vec![CallArgPositional::Positional(synthetic_name_expr(
-                iter_name,
-            ))],
-            Vec::new(),
-        )
-        .with_meta(crate::block_py::Meta::synthetic())
-        .into();
-        let next_assign = synthetic_assign(synthetic_name_expr(tmp_name), next_call);
-        let fetch_next = crate::block_py::StmtTry::new(
-            vec![next_assign],
-            vec![stop_iteration_handler_with_body("StopIteration", stop_body)],
-            Vec::new(),
-            Vec::new(),
-            false,
-        )
-        .with_meta(crate::block_py::Meta::synthetic())
-        .into();
-        vec![fetch_next]
+        IteratorStep::new(iter_name)
+            .with_meta(for_meta.clone())
+            .into()
     };
-    while_body.extend(assign_body);
-    while_body.extend(for_stmt.body);
+    let fetch_next = Store::new(tmp_name, next_value)
+        .with_lifetime(StoreLifetime::Operand {
+            unwind_order: name_gen.next_temporary_sequence(),
+        })
+        .with_meta(for_meta)
+        .into();
+    let mut body = assign_body;
+    body.extend(for_stmt.body);
 
-    let while_stmt: InstrRuff = crate::block_py::StmtWhile::new(
-        crate::passes::ast_to_instr::from_ast_expr(py_expr!("True")),
-        while_body,
-        Vec::new(),
-    )
-    .with_meta(crate::block_py::Meta::synthetic())
-    .into();
-
-    let mut expanded = vec![iterable_assign, iter_setup];
+    let mut setup = vec![iterable_assign, iter_assign];
     if let Some(completed_name) = &completed_name {
-        expanded.push(synthetic_assign(
+        setup.push(synthetic_assign(
             synthetic_name_expr(completed_name),
             crate::passes::ast_to_instr::from_ast_expr(py_expr!("False")),
         ));
     }
-    expanded.push(while_stmt);
+    let mut continuation = Vec::new();
     if let Some(completed_name) = completed_name {
-        expanded.push(
+        continuation.push(
             crate::block_py::StmtIf::new(
                 crate::passes::ast_to_instr::from_ast_expr(py_expr!(
                     "{completed:id}",
@@ -443,7 +368,202 @@ fn expand_for_stmt(
             .into(),
         );
     }
-    expanded
+    ExpandedFor {
+        setup,
+        fetch_next,
+        body,
+        exhaustion,
+        stop_exception: if for_stmt.is_async {
+            "StopAsyncIteration"
+        } else {
+            "StopIteration"
+        },
+        continuation,
+    }
+}
+
+/// Keep the iterator live until the actual loop boundary, including through
+/// inner handlers/finally and return-expression evaluation. These are compiler
+/// operand cleanups, not Python finally suites that activate a caught error.
+fn lower_for_stmt_sequence<E>(
+    context: &Context,
+    name_gen: &FunctionNameGen,
+    for_stmt: crate::block_py::StmtFor<InstrRuff>,
+    remaining_stmts: &[InstrRuff],
+    targets: RegionTargets,
+    mut linear: Vec<InstrRuff>,
+    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
+) -> BlockLabel
+where
+    E: RuffToBlockPyExpr,
+{
+    let iter_name = name_gen.next_tmp_name("iter");
+    let tmp_name = name_gen.next_tmp_name("tmp");
+    let assign_body = build_for_target_assign_body(*for_stmt.target.clone(), tmp_name.as_str());
+    let expanded = expand_for_stmt(
+        name_gen,
+        for_stmt,
+        iter_name.as_str(),
+        tmp_name.as_str(),
+        assign_body,
+    );
+    let rest_entry = lower_instr_stmt_sequence_with_state(
+        context,
+        remaining_stmts,
+        targets.clone(),
+        blocks,
+        name_gen,
+    );
+    let continuation = lower_instr_stmt_sequence_with_state(
+        context,
+        &expanded.continuation,
+        targets.nested(rest_entry),
+        blocks,
+        name_gen,
+    );
+    let normal_cleanup = name_gen.next_block_name();
+    blocks.push(Block::new(
+        normal_cleanup,
+        vec![E::from_lowered_expr(synthetic_operand_take(
+            iter_name.as_str(),
+        ))],
+        BlockTerm::Jump(crate::block_py::BlockEdge::new(continuation)),
+        Vec::new(),
+        targets.active_exc.map(crate::block_py::BlockEdge::new),
+    ));
+
+    let error_cleanup = name_gen.next_block_name();
+    let error_name = name_gen.next_tmp_name("for_error");
+    let mut error_block = Block::new(
+        error_cleanup,
+        vec![E::from_lowered_expr(synthetic_operand_take(
+            iter_name.as_str(),
+        ))],
+        BlockTerm::Raise(TermRaise {
+            exc: Some(E::from_lowered_expr(synthetic_name_expr(
+                error_name.as_str(),
+            ))),
+            disposition: RaiseDisposition::PropagateNormalized,
+        }),
+        vec![BlockParam {
+            name: error_name.to_string(),
+            role: BlockParamRole::Exception,
+        }],
+        targets.active_exc.map(crate::block_py::BlockEdge::new),
+    );
+    // This new exception parameter transports the already normalized error;
+    // Unwind only trims exited inner handlers. It never enters a new handler.
+    error_block.extra.handled_exception = HandledExceptionContext::Unwind;
+    blocks.push(error_block);
+
+    let region_start = blocks.len();
+    let loop_entry = name_gen.next_block_name();
+    let body_entry = lower_instr_stmt_sequence_with_state(
+        context,
+        &expanded.body,
+        RegionTargets {
+            normal_cont: loop_entry,
+            loop_labels: Some(LoopLabels {
+                continue_label: loop_entry,
+                break_label: normal_cleanup,
+            }),
+            active_exc: Some(error_cleanup),
+        },
+        blocks,
+        name_gen,
+    );
+    let exhausted_entry = lower_instr_stmt_sequence_with_state(
+        context,
+        &expanded.exhaustion,
+        targets.nested(normal_cleanup),
+        blocks,
+        name_gen,
+    );
+    let stop_dispatch = name_gen.next_block_name();
+    let mut dispatch = Block::new(
+        stop_dispatch,
+        Vec::new(),
+        BlockTerm::IfTerm(crate::block_py::TermIf {
+            test: E::helper_call(
+                Default::default(),
+                Default::default(),
+                "exception_matches",
+                vec![
+                    E::from_lowered_expr(synthetic_name_expr(error_name.as_str())),
+                    E::from_lowered_expr(runtime_helper_expr(expanded.stop_exception)),
+                ],
+            ),
+            then_label: exhausted_entry,
+            else_label: error_cleanup,
+        }),
+        vec![BlockParam {
+            name: error_name.to_string(),
+            role: BlockParamRole::Exception,
+        }],
+        Some(crate::block_py::BlockEdge::new(error_cleanup)),
+    );
+    // This is a native iteration boundary, not a Python except suite. Keep
+    // the normalized error in the transport parameter without activating it
+    // as the handled exception. Only fetch errors reach the exhaustion test.
+    dispatch.extra.handled_exception = HandledExceptionContext::Unwind;
+    blocks.push(dispatch);
+    let fetch_entry = emit_sequence_jump_block(
+        context,
+        blocks,
+        name_gen,
+        vec![expanded.fetch_next],
+        body_entry,
+        Some(&stop_dispatch),
+    );
+    blocks.push(Block::new(
+        loop_entry,
+        Vec::new(),
+        BlockTerm::Jump(crate::block_py::BlockEdge::new(fetch_entry)),
+        Vec::new(),
+        Some(crate::block_py::BlockEdge::new(error_cleanup)),
+    ));
+    let region_end = blocks.len();
+    let mut return_cleanups = Vec::new();
+    for block in &mut blocks[region_start..region_end] {
+        let BlockTerm::Return(value) = &block.term else {
+            continue;
+        };
+        let value = value.clone();
+        let returned = name_gen.next_tmp_name("for_return");
+        let cleanup = name_gen.next_block_name();
+        // Evaluate the return before leaving inner semantic scopes, then move
+        // that result through cleanup. A failed evaluation still unwinds the
+        // iterator through this region's original exceptional continuation.
+        block.body.push(
+            Store::new(returned.as_str(), value)
+                .with_lifetime(StoreLifetime::Operand {
+                    unwind_order: name_gen.next_temporary_sequence(),
+                })
+                .with_meta(crate::block_py::Meta::synthetic())
+                .into(),
+        );
+        block.term = BlockTerm::Jump(crate::block_py::BlockEdge::new(cleanup));
+        return_cleanups.push(Block::new(
+            cleanup,
+            vec![E::from_lowered_expr(synthetic_operand_take(
+                iter_name.as_str(),
+            ))],
+            BlockTerm::Return(E::from_lowered_expr(synthetic_operand_take(
+                returned.as_str(),
+            ))),
+            Vec::new(),
+            targets.active_exc.map(crate::block_py::BlockEdge::new),
+        ));
+    }
+    blocks.extend(return_cleanups);
+    linear.extend(expanded.setup);
+    lower_instr_stmt_sequence_with_state(
+        context,
+        &linear,
+        targets.nested(loop_entry),
+        blocks,
+        name_gen,
+    )
 }
 
 pub(crate) fn lower_stmt_sequence_with_state<E>(
@@ -495,6 +615,28 @@ where
                     plan,
                 } => (linear, index + break_index, plan),
             };
+
+        if !linear.is_empty() && matches!(&plan, StmtSequenceHeadPlan::Try(_)) {
+            // The try-region builder still accepts original AST suites. Its
+            // preceding instructions may already contain compiler operations
+            // (for example a loop target consuming a fetched Operand). Emit
+            // that prefix directly, before entering the source try region.
+            let entry = lower_instr_stmt_sequence_with_state(
+                context,
+                &stmts[index..],
+                targets.clone(),
+                blocks,
+                name_gen,
+            );
+            return emit_sequence_jump_block(
+                context,
+                blocks,
+                name_gen,
+                linear,
+                entry,
+                targets.active_exc.as_ref(),
+            );
+        }
 
         match plan {
             plan @ (StmtSequenceHeadPlan::Raise(_)
@@ -551,27 +693,14 @@ where
                 return entry;
             }
             StmtSequenceHeadPlan::For(for_stmt) => {
-                let iter_name = name_gen.next_tmp_name("iter");
-                let tmp_name = name_gen.next_tmp_name("tmp");
-                let assign_body = build_for_target_assign_body(
-                    *for_stmt.target.clone(),
-                    crate::passes::ast_to_instr::from_ast_expr(py_expr!(
-                        "{name:id}",
-                        name = tmp_name.as_str()
-                    )),
-                    tmp_name.as_str(),
-                );
-                let mut expanded = linear;
-                expanded.extend(expand_for_stmt(
+                return lower_for_stmt_sequence(
+                    context,
                     name_gen,
                     for_stmt,
-                    iter_name.as_str(),
-                    tmp_name.as_str(),
-                    assign_body,
-                ));
-                expanded.extend_from_slice(&stmts[index + 1..]);
-                return lower_instr_stmt_sequence_with_state(
-                    context, &expanded, targets, blocks, name_gen,
+                    &stmts[index + 1..],
+                    targets,
+                    linear,
+                    blocks,
                 );
             }
             StmtSequenceHeadPlan::Try(try_stmt) => {
@@ -895,22 +1024,26 @@ where
 }
 
 #[cfg(test)]
-mod stop_iteration_handler_tests {
+mod iteration_dispatch_tests {
     use super::*;
+    use crate::block_py::NameLike;
 
     #[test]
-    fn synthetic_iteration_handlers_use_compiler_owned_runtime_exceptions() {
-        for exception_name in ["StopIteration", "StopAsyncIteration"] {
-            let ast::ExceptHandler::ExceptHandler(handler) =
-                stop_iteration_handler_with_body(exception_name, Vec::new());
-            let Some(ast::Expr::Attribute(exception)) = handler.type_.as_deref() else {
-                panic!("synthetic {exception_name} handler must use a runtime attribute");
+    fn for_loop_dispatch_uses_compiler_owned_runtime_exceptions() {
+        for (exception_name, expected) in [
+            ("StopIteration", crate::block_py::RuntimeName::StopIteration),
+            (
+                "StopAsyncIteration",
+                crate::block_py::RuntimeName::StopAsyncIteration,
+            ),
+        ] {
+            let expr = crate::block_py::InstrWithAwaitAndYield::from_lowered_expr(
+                runtime_helper_expr(exception_name),
+            );
+            let crate::block_py::InstrWithAwaitAndYield::Load(exception) = expr else {
+                panic!("synthetic {exception_name} dispatch must use a resolved runtime load");
             };
-            assert_eq!(exception.attr.as_str(), exception_name);
-            let ast::Expr::Name(runtime) = exception.value.as_ref() else {
-                panic!("synthetic {exception_name} handler must load the runtime namespace");
-            };
-            assert_eq!(runtime.id.as_str(), "__soac__");
+            assert_eq!(exception.name.runtime_name_id(), Some(expected));
         }
     }
 }

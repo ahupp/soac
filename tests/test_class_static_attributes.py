@@ -1,22 +1,111 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from tests._integration import soac_module, stock_module
+from tests._integration import exec_integration_validation, stock_module
+from tests._strict_integration import create_strict_project
 
 
 @pytest.fixture(
     params=[
-        pytest.param(stock_module, id="stock"),
-        pytest.param(soac_module, id="soac"),
+        pytest.param("stock", id="stock"),
+        pytest.param("soac", id="soac"),
+        pytest.param("cpython", id="cpython"),
     ]
 )
-def class_module_loader(request):
+def class_mode(request):
     return request.param
 
 
+def _retained_cell_refusal_program(module_name, class_identity):
+    expected = (
+        f"retained class {class_identity}: Store __static_attributes__ "
+        "has no canonical native slot access"
+    )
+    return f"""
+import importlib
+import sys
+from soac.strict import StrictRuntimeUnavailableError
+
+assert {module_name!r} not in sys.modules
+try:
+    importlib.import_module({module_name!r})
+except StrictRuntimeUnavailableError as error:
+    assert type(error) is StrictRuntimeUnavailableError
+    assert str(error).startswith({expected!r}), str(error)
+else:
+    raise AssertionError('an unrepresented retained class cell operation was admitted')
+assert {module_name!r} not in sys.modules
+"""
+
+
+def _run_class_case(
+    tmp_path,
+    mode,
+    module_name,
+    source,
+    validation,
+    *,
+    required_functions,
+    checker_diagnostics=(),
+    retained_missing_cell_class=None,
+):
+    if mode == "stock":
+        with stock_module(tmp_path, module_name, source) as module:
+            exec_integration_validation(
+                validation, module, Path(__file__), mode="stock"
+            )
+        return
+
+    assert mode in {"soac", "cpython"}, mode
+    root = tmp_path / "strict"
+    filename = f"{module_name}.py"
+
+    def publish():
+        return create_strict_project(
+            root,
+            {filename: "from __future__ import strict\n" + source},
+            modules={module_name: filename},
+            backend=mode,
+        )
+
+    if checker_diagnostics:
+        # These exact, otherwise unchanged sources violate ordinary ty rules.
+        # This is analysis-only evidence, never native execution acceptance.
+        with pytest.raises(AssertionError, match="actual checker rejected fixture"):
+            publish()
+        errors = (root / "checker.stderr.log").read_text()
+        for diagnostic in checker_diagnostics:
+            assert diagnostic in errors, errors
+        assert not (root / "authority" / "deployment.json").exists()
+        return
+
+    project = publish()
+    if mode == "soac" and retained_missing_cell_class is not None:
+        # Both retained entries must explicitly refuse before source execution.
+        # PanicException and unrelated runtime errors are deliberately uncaught.
+        for entry_interpreter in (False, True):
+            project.run(
+                _retained_cell_refusal_program(module_name, retained_missing_cell_class),
+                backend="soac",
+                entry_interpreter=entry_interpreter,
+            )
+        return
+    # run_case proves native source/generation/body ownership. On the CPython
+    # backend it checks all three compilation counters before and after use.
+    # Positive branches still accept no runtime exception or missing-receipt panic.
+    project.run_case(
+        module_name,
+        validation,
+        Path(__file__),
+        required_functions=required_functions,
+    )
+
+
 def test_static_attributes_include_only_compiler_recorded_self_stores(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 class Subject:
@@ -40,20 +129,35 @@ class Subject:
         self.textual_name = 7
 """
 
-    with class_module_loader(tmp_path, "static_attribute_store_shapes", source) as module:
-        assert module.Subject.__static_attributes__ == (
-            "__private",
-            "alpha",
-            "annotated_with_value",
-            "comprehension_target",
-            "loop_target",
-            "textual_name",
-            "zeta",
-        )
+    validation = """
+def validate_module(module):
+    assert module.Subject.__static_attributes__ == (
+        "__private",
+        "alpha",
+        "annotated_with_value",
+        "comprehension_target",
+        "loop_target",
+        "textual_name",
+        "zeta",
+    )
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_store_shapes',
+        source,
+        validation,
+        required_functions=('Subject.collect', 'Subject.textual_self'),
+        checker_diagnostics=(
+            'unresolved-attribute: Object of type `Self@collect` has no attribute `augmented_only`',
+            'unresolved-attribute: Object of type `Self@collect` has no attribute `deleted_only`',
+            'unresolved-attribute: Object of type `Self@collect` has no attribute `parent`',
+        ),
+    )
 
 
 def test_static_attributes_follow_nearest_lexical_class_through_nested_scopes(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 class Outer:
@@ -76,17 +180,27 @@ class Outer:
                 self.inner_nested = 5
 """
 
-    with class_module_loader(tmp_path, "static_attribute_nested_scopes", source) as module:
-        assert module.Outer.__static_attributes__ == (
-            "from_lambda",
-            "from_nested_function",
-            "outer",
-        )
-        assert module.Outer.Inner.__static_attributes__ == ("inner", "inner_nested")
+    validation = """
+def validate_module(module):
+    assert module.Outer.__static_attributes__ == (
+        "from_lambda",
+        "from_nested_function",
+        "outer",
+    )
+    assert module.Outer.Inner.__static_attributes__ == ("inner", "inner_nested")
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_nested_scopes',
+        source,
+        validation,
+        required_functions=('Outer.method', 'Outer.Inner.method'),
+    )
 
 
 def test_static_attributes_overwrite_explicit_class_body_assignments(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 class Explicit:
@@ -100,13 +214,23 @@ class Empty:
     __static_attributes__ = ("manually_chosen",)
 """
 
-    with class_module_loader(tmp_path, "static_attribute_explicit_overwrite", source) as module:
-        assert module.Explicit.__static_attributes__ == ("inferred",)
-        assert module.Empty.__static_attributes__ == ()
+    validation = """
+def validate_module(module):
+    assert module.Explicit.__static_attributes__ == ("inferred",)
+    assert module.Empty.__static_attributes__ == ()
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_explicit_overwrite',
+        source,
+        validation,
+        required_functions=('Explicit.method',),
+    )
 
 
 def test_static_attributes_are_written_after_body_and_before_metaclass_creation(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 EVENTS = []
@@ -141,19 +265,32 @@ class Observed(metaclass=Meta):
         self.inferred = 1
 """
 
-    with class_module_loader(tmp_path, "static_attribute_namespace_events", source) as module:
-        assert module.Observed.__static_attributes__ == ("inferred",)
-        assert module.EVENTS == [
-            ("static-write", ("manual",)),
-            ("body-write", "class body"),
-            ("annotation-write", True),
-            ("static-write", ("inferred",)),
-            ("create", ("inferred",)),
-        ]
+    validation = """
+def validate_module(module):
+    assert module.Observed.__static_attributes__ == ("inferred",)
+    assert module.EVENTS == [
+        ("static-write", ("manual",)),
+        ("body-write", "class body"),
+        ("annotation-write", True),
+        ("static-write", ("inferred",)),
+        ("create", ("inferred",)),
+    ]
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_namespace_events',
+        source,
+        validation,
+        required_functions=('Namespace.__setitem__', 'Meta.__prepare__', 'Meta.__new__'),
+        checker_diagnostics=(
+            'invalid-method-override: Invalid override of method `__prepare__`',
+        ),
+    )
 
 
 def test_static_attributes_are_not_inherited_from_base_constructors(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 class Base:
@@ -170,14 +307,24 @@ class OwnFields(Base):
         self.from_child = 2
 """
 
-    with class_module_loader(tmp_path, "static_attribute_inherited_owners", source) as module:
-        assert module.Base.__static_attributes__ == ("from_base",)
-        assert module.InheritedOnly.__static_attributes__ == ()
-        assert module.OwnFields.__static_attributes__ == ("from_child",)
+    validation = """
+def validate_module(module):
+    assert module.Base.__static_attributes__ == ("from_base",)
+    assert module.InheritedOnly.__static_attributes__ == ()
+    assert module.OwnFields.__static_attributes__ == ("from_child",)
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_inherited_owners',
+        source,
+        validation,
+        required_functions=('Base.__init__', 'OwnFields.method'),
+    )
 
 
 def test_static_attributes_skip_current_class_body_and_attribute_nested_body_to_parent(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 class Carrier:
@@ -199,13 +346,27 @@ class Outer:
             self.inner_method = 4
 """
 
-    with class_module_loader(tmp_path, "static_attribute_direct_class_body", source) as module:
-        assert module.Outer.__static_attributes__ == ("inner_body", "outer_method")
-        assert module.Outer.Inner.__static_attributes__ == ("inner_method",)
+    validation = """
+def validate_module(module):
+    assert module.Outer.__static_attributes__ == ("inner_body", "outer_method")
+    assert module.Outer.Inner.__static_attributes__ == ("inner_method",)
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_direct_class_body',
+        source,
+        validation,
+        required_functions=('Outer.method', 'Outer.Inner.method'),
+        checker_diagnostics=(
+            'unresolved-attribute: Unresolved attribute `outer_body_only` on type `Carrier`',
+            'unresolved-attribute: Unresolved attribute `inner_body` on type `Carrier`',
+        ),
+    )
 
 
 def test_static_attributes_compiler_tail_updates_a_captured_enclosing_cell(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 def make_class():
@@ -224,12 +385,23 @@ def make_class():
     )
 """
 
-    with class_module_loader(tmp_path, "static_attribute_closure_capture", source) as module:
-        assert module.make_class() == ("from enclosing scope", False, ("inferred",))
+    validation = """
+def validate_module(module):
+    assert module.make_class() == ("from enclosing scope", False, ("inferred",))
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_closure_capture',
+        source,
+        validation,
+        required_functions=('make_class',),
+        retained_missing_cell_class='make_class.<locals>.Subject',
+    )
 
 
 def test_static_attributes_compiler_tail_updates_cell_captured_only_by_nested_method(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 def make_class():
@@ -249,12 +421,23 @@ def make_class():
     )
 """
 
-    with class_module_loader(tmp_path, "static_attribute_nested_method_capture", source) as module:
-        assert module.make_class() == (False, ("inferred",), ("inferred",))
+    validation = """
+def validate_module(module):
+    assert module.make_class() == (False, ("inferred",), ("inferred",))
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_nested_method_capture',
+        source,
+        validation,
+        required_functions=('make_class',),
+        retained_missing_cell_class='make_class.<locals>.Subject',
+    )
 
 
 def test_static_attributes_compiler_tail_updates_cell_captured_only_by_lambda(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 def make_class():
@@ -273,12 +456,23 @@ def make_class():
     )
 """
 
-    with class_module_loader(tmp_path, "static_attribute_lambda_capture", source) as module:
-        assert module.make_class() == (False, ("inferred",), ("inferred",))
+    validation = """
+def validate_module(module):
+    assert module.make_class() == (False, ("inferred",), ("inferred",))
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_lambda_capture',
+        source,
+        validation,
+        required_functions=('make_class',),
+        retained_missing_cell_class='make_class.<locals>.Subject',
+    )
 
 
 def test_static_attributes_compiler_tail_honors_global_nonlocal_and_local_bindings(
-    tmp_path, class_module_loader
+    tmp_path, class_mode
 ):
     source = """
 def unread_outer():
@@ -339,8 +533,56 @@ def explicit_local():
     return Subject.captured, Subject.__static_attributes__, __static_attributes__
 """
 
-    with class_module_loader(tmp_path, "static_attribute_binding_scopes", source) as module:
-        assert module.unread_outer() == (("unread_field",), "outer untouched")
-        assert module.GLOBAL_RESULT == ("global before", False, ("global_field",))
-        assert module.explicit_nonlocal() == ("nonlocal before", False, ("nonlocal_field",))
-        assert module.explicit_local() == (("manual",), ("local_field",), "outer untouched")
+    validation = """
+def validate_module(module):
+    assert module.unread_outer() == (("unread_field",), "outer untouched")
+    assert module.GLOBAL_RESULT == ("global before", False, ("global_field",))
+    assert module.explicit_nonlocal() == ("nonlocal before", False, ("nonlocal_field",))
+    assert module.explicit_local() == (("manual",), ("local_field",), "outer untouched")
+"""
+    _run_class_case(
+        tmp_path,
+        class_mode,
+        'static_attribute_binding_scopes',
+        source,
+        validation,
+        required_functions=('unread_outer', 'ExplicitGlobal.method', 'explicit_nonlocal', 'explicit_local'),
+        retained_missing_cell_class='explicit_nonlocal.<locals>.Subject',
+    )
+
+
+@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["soac", "entry"])
+def test_retained_unrepresented_class_cell_refuses_before_module_effects(
+    tmp_path, entry_interpreter
+):
+    source = """
+from __future__ import strict
+import body_effects
+
+body_effects.events.append("module body entered")
+
+def make_class():
+    __static_attributes__ = "outer"
+    class Subject:
+        captured = __static_attributes__
+        def method(self):
+            self.inferred = 1
+    return Subject
+"""
+    project = create_strict_project(
+        tmp_path,
+        {
+            "unrepresented_class_cell.py": source,
+            "body_effects.py": "events: list[str] = []\n",
+        },
+        modules={"unrepresented_class_cell": "unrepresented_class_cell.py"},
+        backend="soac",
+    )
+    program = (
+        "import body_effects\nassert body_effects.events == []\n"
+        + _retained_cell_refusal_program(
+            "unrepresented_class_cell", "make_class.<locals>.Subject"
+        )
+        + "\nassert body_effects.events == []\n"
+    )
+    project.run(program, backend="soac", entry_interpreter=entry_interpreter)

@@ -5,7 +5,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SKIP_FILE="${SKIP_FILE:-$REPO_ROOT/cpython_skipped_tests.txt}"
 EXPECTED_FAILURES_FILE="${EXPECTED_FAILURES_FILE:-$REPO_ROOT/EXPECTED_FAILURE.md}"
 SKIP_EXPECTED_FAILURES="${SKIP_EXPECTED_FAILURES:-1}"
-PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/vendor/cpython/python}"
+PYTHON_BIN="${PYTHON_BIN:-${CPYTHON_BIN:-$REPO_ROOT/vendor/cpython/python}}"
 
 normalize_expected_to_module() {
   local test_id="$1"

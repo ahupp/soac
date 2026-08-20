@@ -12,7 +12,9 @@ def _load_lima_environment_module():
         / "scripts"
         / "run_lima_with_host_environment.py"
     )
-    spec = importlib.util.spec_from_file_location("run_lima_with_host_environment", script)
+    spec = importlib.util.spec_from_file_location(
+        "run_lima_with_host_environment", script
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -91,9 +93,7 @@ def test_lima_bridge_rejects_invalid_extra_environment_names(extra_names: str) -
     module = _load_lima_environment_module()
 
     with pytest.raises(ValueError, match="environment name"):
-        module.forwarded_environment(
-            {"PYPERFORMANCE_INHERIT_ENV_EXTRA": extra_names}
-        )
+        module.forwarded_environment({"PYPERFORMANCE_INHERIT_ENV_EXTRA": extra_names})
 
 
 def test_lima_bridge_sends_credentials_only_through_guest_stdin(
@@ -135,6 +135,8 @@ def test_lima_bridge_sends_credentials_only_through_guest_stdin(
     assert arguments == [
         "limactl",
         "shell",
+        "--workdir",
+        "/home/example/project",
         "ubuntu24",
         "--",
         "python3",
@@ -207,7 +209,9 @@ def test_lima_bridge_receives_environment_and_executes_guest_login_shell(
         ["just", "pyperformance-compare", "all", "1"],
     )
 
-    assert module.os.environ["PIP_INDEX_URL"] == "https://packages.example.invalid/simple"
+    assert (
+        module.os.environ["PIP_INDEX_URL"] == "https://packages.example.invalid/simple"
+    )
     assert observed["workdir"] == str(tmp_path)
     assert observed["executable"] == "bash"
     assert observed["arguments"] == [

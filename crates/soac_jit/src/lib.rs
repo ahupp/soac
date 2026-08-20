@@ -10,18 +10,59 @@ pub mod config;
 pub mod function_instantiation;
 pub mod import_helpers;
 mod jit;
-pub use function_instantiation::{
-    instantiate_bb_function, make_function, make_function_from_python_args,
-};
+pub use function_instantiation::{instantiate_bb_function, make_function_from_python_args};
 pub use jit::*;
 
+mod class_bindings;
+mod code_view;
 pub mod counter;
+mod handled_exception;
+mod managed_generator;
 pub mod module_constants;
 pub mod module_type;
 pub mod preserved_state;
 pub mod session;
+mod strict_admission;
+mod strict_annotation;
+mod strict_call;
+mod strict_checks;
+mod strict_class;
+mod strict_class_decorator;
+mod strict_class_state;
+mod strict_dataclass;
+mod strict_descriptor;
+mod strict_field_bindings;
+mod strict_fields;
+mod strict_function;
+mod strict_interpreter;
+mod strict_interpreter_source;
+mod strict_loading;
+mod strict_module;
+mod strict_namespace;
+mod strict_nominal;
+mod strict_optimization;
+mod strict_slots;
+mod strict_state;
 
-pub use session::{CompileSession, CompileSessionId, allocate_compile_session_id};
+pub use module_type::{CompiledStrictSource, finalize_strict_module_contents};
+pub use session::{
+    CompileSession, CompileSessionId, RuntimeCompilationActivity, StrictExecutionBackend,
+    allocate_compile_session_id,
+};
+pub use strict_admission::AuthenticatedCodeCatalog;
+pub use strict_annotation::initialize_strict_runtime;
+pub use strict_call::StrictFunctionCallStatistics;
+pub use strict_checks::{
+    StrictNominalTypeResolver, StrictValueAcceptance, StrictValueProof,
+    UnresolvedStrictNominalTypes, strict_value_guard,
+};
+pub use strict_interpreter::{
+    create_interpreter_module, exec_interpreter_module, interpreter_function_diagnostics,
+    interpreter_module_diagnostics,
+};
+pub use strict_loading::{StrictArtifactLoader, VerifiedStrictModule, strict_runtime_unavailable};
+pub use strict_module::StrictModuleRuntimeState;
+pub(crate) use strict_module::{StrictModuleExecutionRef, StrictPendingKind};
 
 #[cfg(test)]
 pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
@@ -33,13 +74,13 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use soac_core::block_py::{
     BlockPyFunction, ClosureInit, FunctionExecutionMode, FunctionKind, ParamKind,
-    PreservedSlotStorage, RuntimeFunctionId, RuntimeName,
+    PreservedSlotStorage, RuntimeFunctionId, RuntimeName, StorageLayout,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
 use soac_ir_typed::plan_v3::{IndexedFieldAccessKind, LateBoundOwnerFieldStorage};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
@@ -88,6 +129,8 @@ pub(crate) fn run_test_in_isolated_process_if_needed(module_path: &str, test_nam
 }
 
 unsafe extern "C" {
+    static mut PyMethod_Type: ffi::PyTypeObject;
+    fn PyMethod_Function(method: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyFunction_SetVectorcall(
         func: *mut ffi::PyFunctionObject,
@@ -100,10 +143,20 @@ unsafe extern "C" {
         destructor: Option<unsafe extern "C" fn(*mut c_void)>,
     ) -> i32;
     fn PyFunction_GetSoacMetadata(function: *mut ffi::PyObject) -> *mut c_void;
+    fn PyFunction_GetSoacMetadataForDestructorV1(
+        function: *mut ffi::PyObject,
+        expected_destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> *mut c_void;
     fn PyFunction_GetSoacFunctionId(function: *mut ffi::PyObject) -> u64;
+    fn PyFunction_GetSoacStrictId(function: *mut ffi::PyObject) -> u64;
     fn PyFunction_GetDefaults(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyFunction_GetKwDefaults(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyFunction_GetClosure(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    fn PyDict_GetItemRef(
+        dictionary: *mut ffi::PyObject,
+        key: *mut ffi::PyObject,
+        result: *mut *mut ffi::PyObject,
+    ) -> i32;
     fn PyType_SetSoacMetadata(
         type_obj: *mut ffi::PyObject,
         soac_function_id: u64,
@@ -115,6 +168,8 @@ unsafe extern "C" {
     fn PyFunction_AddWatcher(callback: PyFunctionWatchCallback) -> i32;
     fn PyType_Modified(type_obj: *mut ffi::PyTypeObject);
     fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
+    fn _PySOAC_HasOrdinaryInstanceWrites(type_obj: *mut ffi::PyTypeObject) -> i32;
+    fn _PySOAC_UsesObjectSlotPolicy(type_obj: *mut ffi::PyTypeObject) -> i32;
     fn PyWeakref_NewRef(
         object: *mut ffi::PyObject,
         callback: *mut ffi::PyObject,
@@ -162,7 +217,7 @@ unsafe fn function_may_have_registered_owner_types(function: *mut ffi::PyFunctio
 unsafe extern "C" fn function_owner_type_watcher_callback(
     event: PyFunctionWatchEvent,
     func: *mut ffi::PyFunctionObject,
-    new_value: *mut ffi::PyObject,
+    _new_value: *mut ffi::PyObject,
 ) -> i32 {
     if event == PY_FUNCTION_EVENT_CREATE
         || (event == PY_FUNCTION_EVENT_DESTROY
@@ -180,32 +235,23 @@ unsafe extern "C" fn function_owner_type_watcher_callback(
         | PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS
         | PY_FUNCTION_EVENT_MODIFY_QUALNAME => {
             if event == PY_FUNCTION_EVENT_MODIFY_CODE {
-                let metadata = unsafe { PyFunction_GetSoacMetadata(func as *mut ffi::PyObject) };
-                if !metadata.is_null() {
-                    let data = unsafe { &mut *(metadata as *mut PyFunctionJitExtra) };
-                    unsafe { PyFunction_SetVectorcall(func, data.previous_vectorcall) };
+                if let Some(metadata) = unsafe { observe_py_function_jit_extra(func.cast()) } {
+                    let (strict_owner_installed, previous_vectorcall) = {
+                        let data = unsafe { &*metadata };
+                        (data.strict_owner_installed, data.previous_vectorcall)
+                    };
+                    if !strict_owner_installed {
+                        unsafe { PyFunction_SetVectorcall(func, previous_vectorcall) };
+                    }
+                    // Strict provenance survives ordinary code replacement.
+                    // Keep its per-call owner/contract disposition check;
+                    // publishing raw native vectorcall would bypass it later.
                     unsafe { jit::invalidate_py_function_soac_function_id(func) };
                 }
             }
-            if event == PY_FUNCTION_EVENT_MODIFY_DEFAULTS
-                || event == PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS
-            {
-                let metadata = unsafe { PyFunction_GetSoacMetadata(func as *mut ffi::PyObject) };
-                if !metadata.is_null() {
-                    let data = unsafe { &mut *(metadata as *mut PyFunctionJitExtra) };
-                    if unsafe {
-                        data.refresh_runtime_objects_after_function_update(
-                            func as *mut ffi::PyObject,
-                            event,
-                            new_value,
-                        )
-                    }
-                    .is_err()
-                    {
-                        return -1;
-                    }
-                }
-            }
+            // Idle SOAC metadata never owns cached defaults. The checked
+            // binder reads current native fields into its owning call, not
+            // an arbitrary extension's opaque payload into a metadata cache.
             if !unsafe { function_may_have_registered_owner_types(func) } {
                 return 0;
             }
@@ -329,12 +375,22 @@ struct FunctionEnvAbiHeader {
     globals_obj: *mut ffi::PyObject,
     builtins_obj: *mut ffi::PyObject,
     late_bound_owner_cells: *const module_type::LateBoundOwnerFieldCell,
+    namespace_execution: *const strict_namespace::NamespaceExecution,
+    strict_field_slots: *const usize,
+    strict_field_slot_count: usize,
+    strict_method_slots: *const usize,
+    strict_method_slot_count: usize,
+    active_strict_call: *const strict_function::StrictFunctionCall,
 }
 
 struct FunctionEnv {
     abi: NonNull<FunctionEnvAbiHeader>,
     runtime_object_len: usize,
     compiled_function: Option<Arc<jit::CompiledFunctionHandle>>,
+    owns_python_references: bool,
+    namespace_execution: Option<Arc<strict_namespace::NamespaceExecution>>,
+    strict_field_capabilities: Option<Arc<strict_optimization::StrictFieldCapabilities>>,
+    strict_method_capabilities: Option<Arc<strict_optimization::StrictMethodCapabilities>>,
 }
 
 #[repr(C)]
@@ -350,6 +406,7 @@ struct PyFunctionJitExtra {
     registered_code: *mut ffi::PyObject,
     registered_defaults: *mut ffi::PyObject,
     registered_kwdefaults: *mut ffi::PyObject,
+    strict_owner_installed: bool,
 }
 
 pub(crate) const PY_FUNCTION_JIT_EXTRA_REGISTERED_CODE_OFFSET: i32 =
@@ -358,9 +415,16 @@ pub(crate) const PY_FUNCTION_JIT_EXTRA_REGISTERED_DEFAULTS_OFFSET: i32 =
     mem::offset_of!(PyFunctionJitExtra, registered_defaults) as i32;
 pub(crate) const PY_FUNCTION_JIT_EXTRA_REGISTERED_KWDEFAULTS_OFFSET: i32 =
     mem::offset_of!(PyFunctionJitExtra, registered_kwdefaults) as i32;
+pub(crate) const PY_FUNCTION_JIT_EXTRA_STRICT_OWNER_OFFSET: i32 =
+    mem::offset_of!(PyFunctionJitExtra, strict_owner_installed) as i32;
 
 impl Drop for PyFunctionJitExtra {
     fn drop(&mut self) {
+        // Strict metadata contains only borrowed identities. Native function
+        // fields and its traversed strict owner own the corresponding edges.
+        if self.strict_owner_installed {
+            return;
+        }
         unsafe {
             if !self.registered_code.is_null() {
                 ffi::Py_DECREF(self.registered_code);
@@ -450,16 +514,43 @@ impl DirectArgBindingPlan {
         self.positional_param_indices.len()
     }
 
-    fn binds_exact_positional(&self, nargsf: usize, kwnames: *mut ffi::PyObject) -> bool {
-        kwnames.is_null()
-            && self.varargs_param.is_none()
+    fn has_fixed_positional_body_abi(&self) -> bool {
+        self.varargs_param.is_none()
             && self.varkw_param.is_none()
             && self.positional_capacity() == self.param_count()
+    }
+
+    fn binds_exact_positional(&self, nargsf: usize, kwnames: *mut ffi::PyObject) -> bool {
+        kwnames.is_null()
+            && self.has_fixed_positional_body_abi()
             && unsafe { ffi::PyVectorcall_NARGS(nargsf) as usize } == self.param_count()
     }
 
     fn param_index(&self, name: &str) -> Option<usize> {
         self.param_indices_by_name.get(name).copied()
+    }
+
+    /// Native code lists keyword-only arguments before variadic names, while
+    /// the logical parameter plan preserves source declaration order.
+    fn native_parameter_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.positional_param_indices
+            .iter()
+            .copied()
+            .chain(
+                self.params
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, parameter)| {
+                        (parameter.kind == ParamKind::KwOnly).then_some(index)
+                    }),
+            )
+            .chain(self.varargs_param)
+            .chain(self.varkw_param)
+    }
+
+    fn keyword_parameter_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.native_parameter_indices()
+            .filter(|index| matches!(self.params[*index].kind, ParamKind::Any | ParamKind::KwOnly))
     }
 }
 
@@ -471,6 +562,7 @@ pub(crate) struct FunctionInstantiationTemplate {
     entry_plan: jit::RuntimeFunctionEntryPlan,
     prepared_original_code: OnceLock<Option<function_instantiation::PreparedOriginalCode>>,
     prepared_synthetic_code: OnceLock<function_instantiation::PreparedSyntheticCode>,
+    prepared_denied_helper_code: OnceLock<function_instantiation::PreparedDeniedHelperCode>,
     prepared_runtime_lookup_keys: OnceLock<function_instantiation::PreparedRuntimeLookupKeys>,
     prepared_bootstrap_factory_origin:
         OnceLock<function_instantiation::PreparedBootstrapFactoryOrigin>,
@@ -478,57 +570,6 @@ pub(crate) struct FunctionInstantiationTemplate {
     prepared_direct_entry: OnceLock<PreparedDirectEntry>,
     prepared_vectorcall_trampoline: OnceLock<PreparedVectorcallTrampoline>,
     prepared_generator_factory: OnceLock<PreparedGeneratorFactory>,
-    prepared_generator_builtin_consumer: OnceLock<PreparedGeneratorBuiltinConsumer>,
-    prepared_stop_iteration_matcher: OnceLock<PreparedStopIterationMatcher>,
-}
-
-#[derive(Clone, Copy)]
-struct PreparedStopIterationDictionaryEntry {
-    index: usize,
-    key: usize,
-    value: usize,
-}
-
-struct PreparedStopIterationMatcher {
-    compile_session_id: CompileSessionId,
-    helper_function_id: RuntimeFunctionId,
-    helper: usize,
-    helper_code: usize,
-    validator_function_id: RuntimeFunctionId,
-    validator: usize,
-    validator_code: usize,
-    runtime_globals: usize,
-    runtime_keys: usize,
-    runtime_values: usize,
-    builtins: usize,
-    builtin_keys: usize,
-    runtime_entries: [PreparedStopIterationDictionaryEntry; 7],
-    builtin_entries: [PreparedStopIterationDictionaryEntry; 4],
-}
-
-#[derive(Clone, Copy)]
-struct PreparedGeneratorConsumerMethod {
-    function: usize,
-    code: usize,
-    function_id: RuntimeFunctionId,
-}
-
-struct PreparedGeneratorBuiltinConsumer {
-    compile_session_id: CompileSessionId,
-    constructor_function_id: RuntimeFunctionId,
-    owner_type: usize,
-    owner_type_version: u32,
-    runtime_globals: usize,
-    runtime_keys: usize,
-    runtime_values: usize,
-    builtins: usize,
-    builtin_keys: usize,
-    runtime_entries: [PreparedStopIterationDictionaryEntry; 9],
-    builtin_entries: [PreparedStopIterationDictionaryEntry; 5],
-    methods: [PreparedGeneratorConsumerMethod; 5],
-    resume_function_offset: usize,
-    preserved_values_offset: usize,
-    closed_slot_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -569,7 +610,7 @@ struct PreparedGeneratorFactory {
     generator_init: usize,
     generator_init_code: usize,
     generator_init_vectorcall: ffi::vectorcallfunc,
-    generator_field_offsets: [usize; 8],
+    generator_field_offsets: [usize; 7],
     code_template: usize,
     getattr_key: Py<PyAny>,
     preserved_state_key: Py<PyAny>,
@@ -604,14 +645,13 @@ impl FunctionInstantiationTemplate {
             entry_plan,
             prepared_original_code: OnceLock::new(),
             prepared_synthetic_code: OnceLock::new(),
+            prepared_denied_helper_code: OnceLock::new(),
             prepared_runtime_lookup_keys: OnceLock::new(),
             prepared_bootstrap_factory_origin: OnceLock::new(),
             prepared_eager_comprehension: OnceLock::new(),
             prepared_direct_entry: OnceLock::new(),
             prepared_vectorcall_trampoline: OnceLock::new(),
             prepared_generator_factory: OnceLock::new(),
-            prepared_generator_builtin_consumer: OnceLock::new(),
-            prepared_stop_iteration_matcher: OnceLock::new(),
         })
     }
 
@@ -658,6 +698,7 @@ impl FunctionEnv {
         builtins_obj: *mut ffi::PyObject,
         late_bound_owner_cells: *const module_type::LateBoundOwnerFieldCell,
         mut runtime_object_values: Box<[*mut ffi::PyObject]>,
+        owns_python_references: bool,
     ) -> Result<Self, ()> {
         if globals_obj.is_null() || builtins_obj.is_null() {
             unsafe { cleanup_state_values(&mut runtime_object_values) };
@@ -665,9 +706,11 @@ impl FunctionEnv {
                 "missing globals or captured builtins while creating JIT function environment",
             );
         }
-        unsafe {
-            ffi::Py_INCREF(globals_obj);
-            ffi::Py_INCREF(builtins_obj);
+        if owns_python_references {
+            unsafe {
+                ffi::Py_INCREF(globals_obj);
+                ffi::Py_INCREF(builtins_obj);
+            }
         }
         let runtime_object_len = runtime_object_values.len();
         let layout = Self::allocation_layout(runtime_object_len);
@@ -683,6 +726,12 @@ impl FunctionEnv {
                 globals_obj,
                 builtins_obj,
                 late_bound_owner_cells,
+                namespace_execution: ptr::null(),
+                strict_field_slots: ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: ptr::null(),
             });
             let runtime_objects =
                 raw.add(Self::runtime_objects_offset()) as *mut *mut ffi::PyObject;
@@ -692,11 +741,21 @@ impl FunctionEnv {
                 runtime_object_len,
             );
         }
-        runtime_object_values.fill(ptr::null_mut());
+        if owns_python_references {
+            runtime_object_values.fill(ptr::null_mut());
+        } else {
+            // The sole borrowed environment is strict idle metadata. Do not
+            // retain defaults/cells here: each active call owns its snapshot.
+            debug_assert!(runtime_object_values.iter().all(|value| value.is_null()));
+        }
         Ok(Self {
             abi,
             runtime_object_len,
             compiled_function: None,
+            owns_python_references,
+            namespace_execution: None,
+            strict_field_capabilities: None,
+            strict_method_capabilities: None,
         })
     }
 
@@ -718,6 +777,72 @@ impl FunctionEnv {
 
     fn builtins_obj(&self) -> *mut ffi::PyObject {
         self.header().builtins_obj
+    }
+
+    fn set_namespace_execution(&mut self, execution: Arc<strict_namespace::NamespaceExecution>) {
+        debug_assert!(self.namespace_execution.is_none());
+        self.header_mut().namespace_execution = Arc::as_ptr(&execution);
+        self.namespace_execution = Some(execution);
+    }
+
+    /// Each active strict call clones this immutable Rust-only array before
+    /// argument callbacks. Publishing capabilities on an idle function never
+    /// reallocates or changes an already-running frame's slot storage.
+    fn set_strict_field_capabilities(
+        &mut self,
+        capabilities: Option<Arc<strict_optimization::StrictFieldCapabilities>>,
+    ) {
+        let (slots, count) = capabilities
+            .as_ref()
+            .map_or((ptr::null(), 0), |capabilities| capabilities.raw_slots());
+        self.header_mut().strict_field_slots = slots;
+        self.header_mut().strict_field_slot_count = count;
+        self.strict_field_capabilities = capabilities;
+    }
+
+    fn set_strict_method_capabilities(
+        &mut self,
+        capabilities: Option<Arc<strict_optimization::StrictMethodCapabilities>>,
+    ) {
+        let (slots, count) = capabilities
+            .as_ref()
+            .map_or((ptr::null(), 0), |capabilities| capabilities.raw_slots());
+        self.header_mut().strict_method_slots = slots;
+        self.header_mut().strict_method_slot_count = count;
+        self.strict_method_capabilities = capabilities;
+    }
+
+    /// The caller must keep this active ABI environment alive while cloning
+    /// the Rust-only creation identity. Idle metadata never carries one.
+    unsafe fn namespace_execution_from_raw(
+        environment: *const c_void,
+    ) -> Option<Arc<strict_namespace::NamespaceExecution>> {
+        if environment.is_null() {
+            return None;
+        }
+        let execution =
+            unsafe { (*environment.cast::<FunctionEnvAbiHeader>()).namespace_execution };
+        if execution.is_null() {
+            None
+        } else {
+            unsafe { Arc::increment_strong_count(execution) };
+            Some(unsafe { Arc::from_raw(execution) })
+        }
+    }
+
+    /// Runtime-data pointers always immediately follow their ABI header.
+    /// This is shared by direct code and the deopt/entry interpreter.
+    unsafe fn environment_from_runtime_objects(objects: *const c_void) -> *const c_void {
+        if objects.is_null() {
+            ptr::null()
+        } else {
+            unsafe {
+                objects
+                    .cast::<u8>()
+                    .sub(Self::runtime_objects_offset())
+                    .cast()
+            }
+        }
     }
 
     fn direct_code_ptr(&self) -> *const u8 {
@@ -776,6 +901,7 @@ impl FunctionEnv {
         &mut self,
         mut new_values: Box<[*mut ffi::PyObject]>,
     ) -> Result<(), ()> {
+        debug_assert!(self.owns_python_references);
         if new_values.len() != self.runtime_object_len {
             unsafe { cleanup_state_values(&mut new_values) };
             return Err(());
@@ -798,105 +924,23 @@ impl FunctionEnv {
 
 impl Drop for FunctionEnv {
     fn drop(&mut self) {
-        unsafe { cleanup_state_values(self.runtime_objects_mut()) };
-        let globals_obj = self.globals_obj();
-        if !globals_obj.is_null() {
-            unsafe { ffi::Py_DECREF(globals_obj) };
+        if self.owns_python_references {
+            let error = unsafe { ffi::PyErr_GetRaisedException() };
+            unsafe { cleanup_state_values(self.runtime_objects_mut()) };
+            let globals_obj = self.globals_obj();
             self.header_mut().globals_obj = ptr::null_mut();
-        }
-        let builtins_obj = self.builtins_obj();
-        if !builtins_obj.is_null() {
-            unsafe { ffi::Py_DECREF(builtins_obj) };
+            if !globals_obj.is_null() {
+                unsafe { ffi::Py_DECREF(globals_obj) };
+            }
+            let builtins_obj = self.builtins_obj();
             self.header_mut().builtins_obj = ptr::null_mut();
+            if !builtins_obj.is_null() {
+                unsafe { ffi::Py_DECREF(builtins_obj) };
+            }
+            unsafe { ffi::PyErr_SetRaisedException(error) };
         }
         let layout = Self::allocation_layout(self.runtime_object_len);
         unsafe { dealloc(self.abi.as_ptr() as *mut u8, layout) };
-    }
-}
-
-impl PyFunctionJitExtra {
-    fn function(&self) -> Result<&soac_core::block_py::BlockPyFunction<BlockPyModuleShape>, ()> {
-        Ok(self.function_template.function())
-    }
-
-    unsafe fn refresh_runtime_objects_after_function_update(
-        &mut self,
-        callable: *mut ffi::PyObject,
-        event: PyFunctionWatchEvent,
-        new_value: *mut ffi::PyObject,
-    ) -> Result<(), ()> {
-        let defaults_override = (event == PY_FUNCTION_EVENT_MODIFY_DEFAULTS).then_some(new_value);
-        let kwdefaults_override =
-            (event == PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS).then_some(new_value);
-        let values = unsafe {
-            collect_function_runtime_objects(
-                callable,
-                self.function_template.runtime_data_layout(),
-                defaults_override,
-                kwdefaults_override,
-            )?
-        };
-        unsafe { self.function_env.replace_runtime_objects(values)? };
-        if event == PY_FUNCTION_EVENT_MODIFY_DEFAULTS {
-            unsafe { replace_owned_function_snapshot(&mut self.registered_defaults, new_value) };
-        }
-        if event == PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS {
-            unsafe { replace_owned_function_snapshot(&mut self.registered_kwdefaults, new_value) };
-        }
-        Ok(())
-    }
-
-    unsafe fn refresh_runtime_objects_from_current_function(
-        &mut self,
-        callable: *mut ffi::PyObject,
-    ) -> Result<(), ()> {
-        let function = callable.cast::<ffi::PyFunctionObject>();
-        let current_defaults = unsafe { (*function).func_defaults };
-        let current_kwdefaults = unsafe { (*function).func_kwdefaults };
-        let has_mutable_kwdefaults = !current_kwdefaults.is_null()
-            && self
-                .function_template
-                .runtime_data_layout()
-                .kwonly_default_slots()
-                .next()
-                .is_some();
-        if current_defaults == self.registered_defaults
-            && current_kwdefaults == self.registered_kwdefaults
-            && !has_mutable_kwdefaults
-        {
-            return Ok(());
-        }
-
-        let values = unsafe {
-            collect_function_runtime_objects(
-                callable,
-                self.function_template.runtime_data_layout(),
-                None,
-                None,
-            )?
-        };
-        unsafe {
-            self.function_env.replace_runtime_objects(values)?;
-            replace_owned_function_snapshot(&mut self.registered_defaults, current_defaults);
-            replace_owned_function_snapshot(&mut self.registered_kwdefaults, current_kwdefaults);
-        }
-        Ok(())
-    }
-}
-
-unsafe fn replace_owned_function_snapshot(
-    snapshot: &mut *mut ffi::PyObject,
-    replacement: *mut ffi::PyObject,
-) {
-    if *snapshot == replacement {
-        return;
-    }
-    if !replacement.is_null() {
-        unsafe { ffi::Py_INCREF(replacement) };
-    }
-    let previous = mem::replace(snapshot, replacement);
-    if !previous.is_null() {
-        unsafe { ffi::Py_DECREF(previous) };
     }
 }
 
@@ -1219,14 +1263,16 @@ unsafe fn make_clif_function_data(
         }
         return Err(());
     };
-    let runtime_object_values = unsafe {
-        collect_function_runtime_objects(
-            callable,
-            function_template.runtime_data_layout(),
-            None,
-            None,
-        )?
-    };
+    let py = unsafe { Python::assume_attached() };
+    let function = unsafe { Bound::from_borrowed_ptr(py, callable) };
+    strict_function::authenticate_registration(py, &function, &module_state, &function_template)
+        .map_err(|error| error.restore(py))?;
+    // Actual execution captures the native function's current values after
+    // binding. Idle metadata must not retain ordinary defaults, closure cells,
+    // or globals, and an ordinary function has no JIT registration lane.
+    let runtime_object_values =
+        vec![ptr::null_mut(); function_template.runtime_data_layout().total_len()]
+            .into_boxed_slice();
     let raw_function = callable.cast::<ffi::PyFunctionObject>();
     let mut function_env = unsafe {
         Box::new(FunctionEnv::new(
@@ -1238,21 +1284,13 @@ unsafe fn make_clif_function_data(
                 .cells
                 .as_ptr(),
             runtime_object_values,
+            false,
         )?)
     };
     let function_env_ptr = function_env.as_mut_ptr();
     let registered_code = unsafe { (*raw_function).func_code };
     let registered_defaults = unsafe { (*raw_function).func_defaults };
     let registered_kwdefaults = unsafe { (*raw_function).func_kwdefaults };
-    unsafe {
-        ffi::Py_INCREF(registered_code);
-        if !registered_defaults.is_null() {
-            ffi::Py_INCREF(registered_defaults);
-        }
-        if !registered_kwdefaults.is_null() {
-            ffi::Py_INCREF(registered_kwdefaults);
-        }
-    }
     let py_function_extra = Box::new(PyFunctionJitExtra {
         function_env_ptr,
         function_id,
@@ -1265,27 +1303,88 @@ unsafe fn make_clif_function_data(
         registered_code,
         registered_defaults,
         registered_kwdefaults,
+        strict_owner_installed: true,
     });
     Ok(Box::into_raw(py_function_extra) as *mut c_void)
 }
 
+/// Borrow only this implementation's opaque payload. The owning destructor
+/// identifies its Rust allocation type, not source or execution authority.
+/// A successful query is callback-free; errors may allocate. The returned
+/// pointer expires at any callback/release/replacement: clone needed owners
+/// in a callback-free scope, and never expose a static borrow.
 unsafe fn py_function_jit_extra(
     function: *mut ffi::PyObject,
-) -> Result<&'static mut PyFunctionJitExtra, ()> {
-    if ffi::PyFunction_Check(function) == 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_TypeError,
-            b"expected Python function for CLIF vectorcall data lookup\0"
-                .as_ptr()
-                .cast(),
-        );
+) -> Result<*mut PyFunctionJitExtra, ()> {
+    let metadata = unsafe {
+        PyFunction_GetSoacMetadataForDestructorV1(function, Some(free_clif_function_data))
+    };
+    if metadata.is_null() {
+        // The native getter preserves a primary error, including on mismatch.
+        if unsafe { ffi::PyErr_Occurred() }.is_null() {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"missing CLIF vectorcall metadata".as_ptr(),
+                )
+            };
+        }
         return Err(());
     }
-    let ptr = PyFunction_GetSoacMetadata(function);
-    if ptr.is_null() {
-        return set_runtime_error("missing CLIF vectorcall metadata");
+    Ok(metadata.cast())
+}
+
+/// Ordinary functions may legally carry another extension's opaque metadata.
+/// Such a payload supplies no SOAC observation and must not poison the caller's
+/// exception. Only a successful match returns a callback-free borrowed pointer.
+unsafe fn observe_py_function_jit_extra(
+    function: *mut ffi::PyObject,
+) -> Option<*mut PyFunctionJitExtra> {
+    if function.is_null() || unsafe { ffi::PyFunction_Check(function) } == 0 {
+        return None;
     }
-    Ok(&mut *(ptr as *mut PyFunctionJitExtra))
+    let had_error = !unsafe { ffi::PyErr_Occurred() }.is_null();
+    let metadata = unsafe {
+        PyFunction_GetSoacMetadataForDestructorV1(function, Some(free_clif_function_data))
+    };
+    if metadata.is_null() {
+        if !had_error && !unsafe { ffi::PyErr_Occurred() }.is_null() {
+            unsafe { ffi::PyErr_Clear() };
+        }
+        None
+    } else {
+        Some(metadata.cast())
+    }
+}
+
+/// Revalidate an entry's borrowed pointer before touching its payload. A
+/// callback can replace the association while the Python function stays live.
+unsafe fn associated_py_function_jit_extra(
+    function: *mut ffi::PyObject,
+    expected: *mut c_void,
+) -> Result<*mut PyFunctionJitExtra, ()> {
+    let current = unsafe { py_function_jit_extra(function)? };
+    if current.cast::<c_void>() != expected {
+        if unsafe { ffi::PyErr_Occurred() }.is_null() {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_RuntimeError,
+                    c"SOAC entry metadata was replaced".as_ptr(),
+                )
+            };
+        }
+        return Err(());
+    }
+    Ok(current)
+}
+
+/// Fixed generated-entry helper: an absent/foreign payload returns NULL with
+/// an error. No private payload is borrowed while constructing that error.
+pub(crate) unsafe extern "C" fn checked_function_metadata(function: *mut c_void) -> *mut c_void {
+    match unsafe { py_function_jit_extra(function.cast()) } {
+        Ok(metadata) => metadata.cast(),
+        Err(()) => ptr::null_mut(),
+    }
 }
 
 pub unsafe fn registered_clif_function_id(
@@ -1299,6 +1398,84 @@ pub unsafe fn registered_clif_function_id(
         return Ok(None);
     }
     Ok(Some(RuntimeFunctionId::from_packed_runtime_u64(packed)))
+}
+
+/// An observational identity for profile counters, never an unchecked entry
+/// token. The legacy native ID field gates direct bodies and may correctly be
+/// zero even when this particular function has authenticated source ownership.
+/// Missing, replaced, foreign or terminal owners simply do not supply evidence.
+pub(crate) unsafe fn observed_strict_function_id(
+    callable: *mut ffi::PyObject,
+) -> Option<RuntimeFunctionId> {
+    if callable.is_null() || !ffi::PyErr_Occurred().is_null() {
+        return None;
+    }
+    let function = if ffi::Py_TYPE(callable) == std::ptr::addr_of_mut!(PyMethod_Type) {
+        PyMethod_Function(callable)
+    } else {
+        callable
+    };
+    if function.is_null() || ffi::PyFunction_Check(function) == 0 {
+        return None;
+    }
+    let py = Python::assume_attached();
+    let function = Borrowed::from_ptr(py, function);
+    strict_function::authenticate_borrowed_strict_function(py, function)
+        .ok()
+        .flatten()
+        .and_then(|owner| {
+            (!owner.is_interpreter())
+                .then(|| owner.function_id().ok())
+                .flatten()
+        })
+}
+
+/// Recover the SOAC-owned checked trampoline, not the public mutable
+/// `func.vectorcall` implementation pointer. This is a lookup-time operation:
+/// it never compiles, reads defaults, checks their liveness, or binds arguments.
+/// The selected entry validates actual ownership and performs ordinary argument binding.
+///
+/// The caller must retain this actual function while holding/using the entry;
+/// its private metadata owns the compilation session. A native call consumer
+/// must compare the current public vectorcall with this entry *after* argument
+/// evaluation and call the same captured function normally on mismatch.
+pub(crate) fn private_checked_vectorcall_entry(
+    function: &Bound<'_, PyAny>,
+) -> PyResult<Option<ffi::vectorcallfunc>> {
+    let py = function.py();
+    unsafe {
+        if ffi::PyFunction_Check(function.as_ptr()) == 0 {
+            return Ok(None);
+        }
+        let sealed_identity = PyFunction_GetSoacStrictId(function.as_ptr());
+        if sealed_identity == 0 {
+            return Ok(None);
+        }
+        let metadata = py_function_jit_extra(function.as_ptr()).map_err(|()| PyErr::fetch(py))?;
+        let data = &*metadata;
+        if !data.strict_owner_installed {
+            return Ok(None);
+        }
+        if data.function_id.to_packed_runtime_u64() != sealed_identity
+            || (*function.as_ptr().cast::<ffi::PyFunctionObject>()).func_code
+                != data.registered_code
+            || !data
+                .module_state
+                .admits_function(data.function_template.function())
+        {
+            return Err(strict_runtime_unavailable(
+                py,
+                "sealed checked entry lost its authenticated implementation",
+            ));
+        }
+        // Suspended/forced-interpreter entries deliberately have no compiled
+        // checked vectorcall trampoline and take ordinary captured-call fallback.
+        Ok(data.compiled_vectorcall_entry.map(|entry| {
+            // Both signatures have the standard four-operand vectorcall ABI;
+            // the JIT's ObjPtr is the raw void-pointer spelling of PyObject*.
+            std::mem::transmute::<jit::VectorcallEntryFn, ffi::vectorcallfunc>(entry)
+        }))
+    }
 }
 
 pub unsafe fn registered_clif_type_function_id(
@@ -1645,7 +1822,12 @@ unsafe fn late_bound_slot_offset_for_owner(
     attr_name: &std::ffi::CStr,
     access: IndexedFieldAccessKind,
 ) -> Option<usize> {
-    if (*owner_type).tp_itemsize != 0 || (*owner_type).tp_dict.is_null() {
+    // Both late-bound fields and the generator-factory shortcut consume this
+    // raw offset. Neither may bypass an actual inherited native slot policy.
+    if _PySOAC_UsesObjectSlotPolicy(owner_type) != 0
+        || (*owner_type).tp_itemsize != 0
+        || (*owner_type).tp_dict.is_null()
+    {
         return None;
     }
     let descriptor = ffi::PyDict_GetItemString((*owner_type).tp_dict, attr_name.as_ptr());
@@ -1693,17 +1875,23 @@ unsafe fn publish_late_bound_owner_fields_for_function(
     owner_type: *mut ffi::PyTypeObject,
     shared_state: &module_type::SharedModuleState,
 ) -> Result<(), ()> {
-    if !owner_type_has_generic_attribute_hooks(owner_type) {
+    // Native ordinary-storage checks also apply through an ordinary subclass.
+    // Raw field cells are not authority to bypass those write predicates.
+    if _PySOAC_HasOrdinaryInstanceWrites(owner_type) != 0
+        || !owner_type_has_generic_attribute_hooks(owner_type)
+    {
         return Ok(());
     }
-    let metadata = PyFunction_GetSoacMetadata(function);
-    if metadata.is_null() {
+    let Some(metadata) = observe_py_function_jit_extra(function) else {
         return Ok(());
-    }
-    let metadata = &*(metadata as *const PyFunctionJitExtra);
-    if !ptr::eq(Arc::as_ptr(&metadata.module_state), shared_state) {
-        return Ok(());
-    }
+    };
+    let registered_function_id = {
+        let metadata = &*metadata;
+        if !ptr::eq(Arc::as_ptr(&metadata.module_state), shared_state) {
+            return Ok(());
+        }
+        metadata.function_id
+    };
     let owner_qualname = ffi::PyType_GetQualName(owner_type);
     if owner_qualname.is_null() {
         return Err(());
@@ -1717,7 +1905,7 @@ unsafe fn publish_late_bound_owner_fields_for_function(
     let qualname_bytes = std::slice::from_raw_parts(qualname_utf8.cast::<u8>(), length as usize);
     let result = (|| {
         for (function_id, site) in &shared_state.late_bound_owner_fields.sites {
-            if *function_id != metadata.function_id
+            if *function_id != registered_function_id
                 || site.owner_type.qualname.as_bytes() != qualname_bytes
             {
                 continue;
@@ -1790,7 +1978,9 @@ unsafe fn publish_inherited_late_bound_owner_fields(
     owner_type: *mut ffi::PyTypeObject,
     shared_state: &module_type::SharedModuleState,
 ) -> Result<(), ()> {
-    if !owner_type_has_generic_attribute_hooks(owner_type) {
+    if _PySOAC_HasOrdinaryInstanceWrites(owner_type) != 0
+        || !owner_type_has_generic_attribute_hooks(owner_type)
+    {
         return Ok(());
     }
     let mro = (*owner_type).tp_mro;
@@ -1843,11 +2033,10 @@ unsafe fn publish_inherited_late_bound_owner_fields(
                 {
                     continue;
                 }
-                let metadata = PyFunction_GetSoacMetadata(value);
-                if metadata.is_null() {
+                let Some(metadata) = observe_py_function_jit_extra(value) else {
                     continue;
-                }
-                let metadata = &*(metadata as *const PyFunctionJitExtra);
+                };
+                let metadata = &*metadata;
                 if !ptr::eq(Arc::as_ptr(&metadata.module_state), shared_state)
                     || !function_ids.contains(&metadata.function_id)
                 {
@@ -2120,13 +2309,12 @@ pub unsafe fn register_created_owner_type_from_namespace(
         return Ok(());
     }
 
-    let metadata = PyFunction_GetSoacMetadata(namespace_function);
-    if metadata.is_null() {
+    let Some(metadata) = observe_py_function_jit_extra(namespace_function) else {
         return Ok(());
-    }
+    };
 
     let (shared_state, compile_session, globals) = {
-        let namespace_data = &*(metadata as *const PyFunctionJitExtra);
+        let namespace_data = &*metadata;
         let globals = namespace_data.function_env.globals_obj();
         if globals.is_null() {
             return set_runtime_error("class namespace function has no module globals");
@@ -2235,13 +2423,26 @@ pub unsafe fn register_function_owner_types_for_module_keys_with_constructor_ent
 }
 
 unsafe fn ensure_clif_direct_entries_compiled(
-    _py: Python<'_>,
-    data: &mut PyFunctionJitExtra,
+    py: Python<'_>,
+    callable: *mut ffi::PyObject,
 ) -> Result<(), ()> {
-    if data.function_env.compiled_function.is_none() {
+    let expected = unsafe { py_function_jit_extra(callable)? }.cast();
+    let data = unsafe { FunctionCallMetadata::for_function(callable)? };
+    if !data
+        .module_state
+        .admits_function(data.function_template.function())
+    {
+        strict_runtime_unavailable(
+            py,
+            "JIT entry requires an individually authenticated strict template",
+        )
+        .restore(py);
+        return Err(());
+    }
+    if data.compiled_function.is_none() {
         let ensure_start = Instant::now();
         let (compiled_function, function_qualname, function_block_count) = {
-            let function = data.function()?;
+            let function = data.function_template.function();
             let function_block_count = function.blocks.len();
             let function_qualname = function.names.qualname.clone();
             let compiled_function_result = lookup_or_compile_direct_function_handle(
@@ -2266,14 +2467,26 @@ unsafe fn ensure_clif_direct_entries_compiled(
             };
             (compiled_function, function_qualname, function_block_count)
         };
-        attach_compiled_function_to_env(&mut data.function_env, compiled_function)?;
+        let metadata = unsafe { data.current_metadata(callable, expected)? };
+        unsafe {
+            attach_compiled_function_to_env(&mut (*metadata).function_env, compiled_function)?
+        };
         let elapsed_ms = ensure_start.elapsed().as_secs_f64() * 1000.0;
         info!(
             "soac_jit_precompile module={} qualname={} blocks={} elapsed_ms={elapsed_ms:.3}",
             data.module_state.module_name, function_qualname, function_block_count,
         );
     }
-    if data.function_env.direct_code_ptr().is_null() {
+    let (direct_missing, default_missing, deopt_missing) = {
+        let metadata = unsafe { data.current_metadata(callable, expected)? };
+        let environment = unsafe { &(*metadata).function_env };
+        (
+            environment.direct_code_ptr().is_null(),
+            environment.default_direct_code_ptr().is_null(),
+            environment.deopt_table_ptr().is_null(),
+        )
+    };
+    if direct_missing {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
             b"compiled CLIF function is missing a direct entry pointer\0"
@@ -2282,7 +2495,7 @@ unsafe fn ensure_clif_direct_entries_compiled(
         );
         return Err(());
     }
-    if data.function_env.default_direct_code_ptr().is_null() {
+    if default_missing {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
             b"compiled CLIF function is missing a default direct entry pointer\0"
@@ -2291,7 +2504,7 @@ unsafe fn ensure_clif_direct_entries_compiled(
         );
         return Err(());
     }
-    if data.function_env.deopt_table_ptr().is_null() {
+    if deopt_missing {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
             b"compiled CLIF function is missing deopt metadata\0"
@@ -2309,6 +2522,11 @@ fn lookup_or_compile_direct_function_handle(
     function: &BlockPyFunction<BlockPyModuleShape>,
     log_event: &str,
 ) -> Result<Arc<jit::CompiledFunctionHandle>, String> {
+    if !module_state.admits_function(function) {
+        return Err(
+            "JIT compilation requires an individually authenticated strict template".into(),
+        );
+    }
     let compile_start = Instant::now();
     match module_state
         .lookup_or_compile_direct_function_handle(compile_session, function.function_id)
@@ -2367,9 +2585,37 @@ pub unsafe fn resume_generator(
     send_value: *mut ffi::PyObject,
     resume_exc: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
-    let Ok(data) = (unsafe { py_function_jit_extra(resume_function) }) else {
+    let Ok(data) = (unsafe { FunctionCallMetadata::for_function(resume_function) }) else {
         return ptr::null_mut();
     };
+    let managed = match unsafe { preserved_state::managed_binding(preserved_state) } {
+        Ok(Some(_)) => {
+            // Inspect the actual state even for an unrelated non-strict handle:
+            // substituting a compiler helper cannot bypass native operation
+            // ownership after discovering a capsule through GC inspection.
+            if unsafe {
+                managed_generator::consume_resume_permit(resume_function, owner, preserved_state)
+            }
+            .is_err()
+            {
+                return ptr::null_mut();
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(()) => return ptr::null_mut(),
+    };
+    if !matches!(
+        data.function_template.function().lowered_kind(),
+        FunctionKind::Generator | FunctionKind::Coroutine
+    ) {
+        strict_runtime_unavailable(
+            unsafe { Python::assume_attached() },
+            "strict resume entry requires an authenticated generator or coroutine body",
+        )
+        .restore(unsafe { Python::assume_attached() });
+        return ptr::null_mut();
+    }
     if data.function_template.function().body_params().len() != 4 {
         unsafe {
             ffi::PyErr_SetString(
@@ -2380,9 +2626,26 @@ pub unsafe fn resume_generator(
         return ptr::null_mut();
     }
     let py = unsafe { Python::assume_attached() };
-    if unsafe { ensure_clif_direct_entries_compiled(py, data) }.is_err() {
+    if unsafe { ensure_clif_direct_entries_compiled(py, resume_function) }.is_err() {
         return ptr::null_mut();
     }
+    let Ok(data) = (unsafe { FunctionCallMetadata::for_function(resume_function) }) else {
+        return ptr::null_mut();
+    };
+    // The four operands are the compiler's resume-control ABI, not the source
+    // callable's parameters. Its normal binder already ran at object creation.
+    // Strict idle environments deliberately own no cells: every resumed body
+    // must pin the actual execution's cells and globals while callbacks run.
+    let mut activation = match unsafe {
+        strict_function::StrictFunctionCall::for_resume(py, resume_function, &data, preserved_state)
+    } {
+        Ok(activation) => activation,
+        Err(error) => {
+            error.restore(py);
+            return ptr::null_mut();
+        }
+    };
+    let environment = activation.environment_mut();
     let entry: unsafe extern "C" fn(
         *mut c_void,
         *mut c_void,
@@ -2390,17 +2653,27 @@ pub unsafe fn resume_generator(
         *mut ffi::PyObject,
         *mut ffi::PyObject,
         *mut ffi::PyObject,
-    ) -> *mut ffi::PyObject = unsafe { mem::transmute(data.function_env.direct_code_ptr()) };
-    unsafe {
+    ) -> *mut ffi::PyObject = unsafe { mem::transmute(environment.direct_code_ptr()) };
+    if managed && unsafe { managed_generator::mark_body_entry(preserved_state) }.is_err() {
+        return ptr::null_mut();
+    }
+    let result = unsafe {
         entry(
-            data.function_env.as_mut_ptr(),
+            environment.as_mut_ptr(),
             ffi::PyThreadState_Get().cast(),
             owner,
             preserved_state,
             send_value,
             resume_exc,
         )
-    }
+    };
+    let result = if managed {
+        unsafe { managed_generator::finish_body_result(preserved_state, result) }
+    } else {
+        result
+    };
+    unsafe { preserved_state::finish_strict_resume(preserved_state) };
+    result
 }
 
 #[unsafe(no_mangle)]
@@ -2458,9 +2731,31 @@ pub unsafe fn resume_async_generator(
     resume_exc: *mut ffi::PyObject,
     transport_sent: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
-    let Ok(data) = (unsafe { py_function_jit_extra(resume_function) }) else {
+    let Ok(data) = (unsafe { FunctionCallMetadata::for_function(resume_function) }) else {
         return ptr::null_mut();
     };
+    let managed = match unsafe { preserved_state::managed_binding(preserved_state) } {
+        Ok(Some(_)) => {
+            if unsafe {
+                managed_generator::consume_resume_permit(resume_function, owner, preserved_state)
+            }
+            .is_err()
+            {
+                return ptr::null_mut();
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(()) => return ptr::null_mut(),
+    };
+    if *data.function_template.function().lowered_kind() != FunctionKind::AsyncGenerator {
+        strict_runtime_unavailable(
+            unsafe { Python::assume_attached() },
+            "strict async resume entry requires an authenticated async-generator body",
+        )
+        .restore(unsafe { Python::assume_attached() });
+        return ptr::null_mut();
+    }
     if data.function_template.function().body_params().len() != 5 {
         unsafe {
             ffi::PyErr_SetString(
@@ -2471,9 +2766,24 @@ pub unsafe fn resume_async_generator(
         return ptr::null_mut();
     }
     let py = unsafe { Python::assume_attached() };
-    if unsafe { ensure_clif_direct_entries_compiled(py, data) }.is_err() {
+    if unsafe { ensure_clif_direct_entries_compiled(py, resume_function) }.is_err() {
         return ptr::null_mut();
     }
+    let Ok(data) = (unsafe { FunctionCallMetadata::for_function(resume_function) }) else {
+        return ptr::null_mut();
+    };
+    // No synchronous argument or return contract applies to these internal
+    // control values or to an individual yielded value.
+    let mut activation = match unsafe {
+        strict_function::StrictFunctionCall::for_resume(py, resume_function, &data, preserved_state)
+    } {
+        Ok(activation) => activation,
+        Err(error) => {
+            error.restore(py);
+            return ptr::null_mut();
+        }
+    };
+    let environment = activation.environment_mut();
     let entry: unsafe extern "C" fn(
         *mut c_void,
         *mut c_void,
@@ -2482,10 +2792,13 @@ pub unsafe fn resume_async_generator(
         *mut ffi::PyObject,
         *mut ffi::PyObject,
         *mut ffi::PyObject,
-    ) -> *mut ffi::PyObject = unsafe { mem::transmute(data.function_env.direct_code_ptr()) };
-    unsafe {
+    ) -> *mut ffi::PyObject = unsafe { mem::transmute(environment.direct_code_ptr()) };
+    if managed && unsafe { managed_generator::mark_body_entry(preserved_state) }.is_err() {
+        return ptr::null_mut();
+    }
+    let result = unsafe {
         entry(
-            data.function_env.as_mut_ptr(),
+            environment.as_mut_ptr(),
             ffi::PyThreadState_Get().cast(),
             owner,
             preserved_state,
@@ -2493,7 +2806,38 @@ pub unsafe fn resume_async_generator(
             resume_exc,
             transport_sent,
         )
+    };
+    let result = if managed {
+        unsafe { managed_generator::finish_body_result(preserved_state, result) }
+    } else {
+        result
+    };
+    unsafe { preserved_state::finish_strict_resume(preserved_state) };
+    result
+}
+
+/// The compiler's exceptional-resume decision, read from its actual owned
+/// binding. This does not create an execution permit or normalize an exception.
+pub unsafe fn generator_resume_delivery(preserved_state: *mut ffi::PyObject) -> i64 {
+    match unsafe { managed_generator::delivery(preserved_state) } {
+        Ok(delivery) => delivery as i64,
+        Err(()) => -1,
     }
+}
+
+/// Transfer an already normalized, compiler-owned resume exception into the
+/// active body's handled context. The result is always NULL with an error.
+pub unsafe fn inject_generator_resume_exception(
+    preserved_state: *mut ffi::PyObject,
+    exception: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    unsafe { managed_generator::inject_resume_exception(preserved_state, exception) }
+}
+
+/// Allocate the native async-yield token at the source operation, before its
+/// suspension edge, so an allocation failure remains catchable in the body.
+pub unsafe fn async_gen_wrap_yield(value: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    unsafe { managed_generator::wrap_async_yield(value) }
 }
 
 fn attach_compiled_function_to_env(
@@ -2563,19 +2907,21 @@ fn prepared_vectorcall_trampoline(
 pub(crate) unsafe fn attach_ready_clif_direct_entry(
     function: *mut ffi::PyObject,
 ) -> Result<bool, ()> {
-    let data = unsafe { py_function_jit_extra(function)? };
-    if data.function_env.compiled_function.is_some() {
+    let expected = unsafe { py_function_jit_extra(function)? };
+    let registered_code = unsafe { (*expected).registered_code };
+    let data = unsafe { FunctionCallMetadata::for_function(function)? };
+    if data.compiled_function.is_some() {
         return Ok(true);
     }
     let registered_code_is_current =
-        unsafe { (*function.cast::<ffi::PyFunctionObject>()).func_code == data.registered_code };
+        unsafe { (*function.cast::<ffi::PyFunctionObject>()).func_code == registered_code };
     let key = PreparedDirectEntryKey {
         compile_session_id: data.compile_session.id(),
-        code_ptr: data.registered_code as usize,
-        code_version: unsafe { jit::raw_py_code_version(data.registered_code) },
+        code_ptr: registered_code as usize,
+        code_version: unsafe { jit::raw_py_code_version(registered_code) },
     };
     let ready = {
-        let function = data.function()?;
+        let function = data.function_template.function();
         if entry_interpreter_vectorcall_requested(function) {
             return Ok(false);
         }
@@ -2608,20 +2954,33 @@ pub(crate) unsafe fn attach_ready_clif_direct_entry(
                 handle: Arc::clone(&compiled_function),
             });
     }
-    attach_compiled_function_to_env(&mut data.function_env, compiled_function)?;
+    let metadata = unsafe { data.current_metadata(function, expected.cast())? };
+    unsafe { attach_compiled_function_to_env(&mut (*metadata).function_env, compiled_function)? };
     Ok(true)
 }
 
 unsafe fn ensure_clif_vectorcall_compiled(
     py: Python<'_>,
     callable: *mut ffi::PyObject,
-    data: &mut PyFunctionJitExtra,
 ) -> Result<(), ()> {
-    unsafe { ensure_clif_direct_entries_compiled(py, data)? };
-    if *data.function()?.lowered_kind() != FunctionKind::Function {
+    let expected = unsafe { py_function_jit_extra(callable)? }.cast();
+    let data = unsafe { FunctionCallMetadata::for_function(callable)? };
+    // Registration may deliberately have installed the entry interpreter.
+    // Eager preparation must not replace that selected execution boundary
+    // after attach_ready_clif_direct_entry correctly declined a native body.
+    if entry_interpreter_vectorcall_requested(data.function_template.function()) {
         return Ok(());
     }
-    if data.compiled_vectorcall_entry.is_none() {
+    unsafe { ensure_clif_direct_entries_compiled(py, callable)? };
+    if *data.function_template.function().lowered_kind() != FunctionKind::Function {
+        return Ok(());
+    }
+    let needs_vectorcall = unsafe {
+        (*data.current_metadata(callable, expected)?)
+            .compiled_vectorcall_entry
+            .is_none()
+    };
+    if needs_vectorcall {
         let param_count = data.function_template.binding_plan().param_count();
         let entry = match prepared_vectorcall_trampoline(
             data.function_template.as_ref(),
@@ -2643,7 +3002,8 @@ unsafe fn ensure_clif_vectorcall_compiled(
                 return Err(());
             }
         };
-        data.compiled_vectorcall_entry = Some(entry);
+        let metadata = unsafe { data.current_metadata(callable, expected)? };
+        unsafe { (*metadata).compiled_vectorcall_entry = Some(entry) };
         let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
         PyFunction_SetVectorcall(
             callable as *mut ffi::PyFunctionObject,
@@ -2666,14 +3026,15 @@ unsafe fn cleanup_output_args(out_args: *mut *mut ffi::PyObject, out_len: usize)
     if out_args.is_null() {
         return;
     }
+    let error = ffi::PyErr_GetRaisedException();
     for index in 0..out_len {
         let slot = out_args.add(index);
-        let value = *slot;
+        let value = std::mem::replace(&mut *slot, ptr::null_mut());
         if !value.is_null() {
             ffi::Py_DECREF(value);
-            *slot = ptr::null_mut();
         }
     }
+    ffi::PyErr_SetRaisedException(error);
 }
 
 unsafe fn initialize_output_args(
@@ -2717,20 +3078,491 @@ unsafe fn write_output_arg_from_owned(
     *out_args.add(param_index) = value;
 }
 
-fn binding_type_error<T>(msg: String) -> Result<T, ()> {
-    let _ = set_type_error::<()>(&msg);
+/// Call-stack ownership only: source names are the original native objects,
+/// not equal replacement strings. Logical compiler helpers have an explicit
+/// separate path because their placeholder code has no source signature.
+struct BindingParameterNames {
+    by_parameter: Box<[Py<PyAny>]>,
+}
+
+impl BindingParameterNames {
+    fn new(
+        py: Python<'_>,
+        plan: &DirectArgBindingPlan,
+        strict_call: Option<&strict_function::StrictFunctionCall>,
+    ) -> PyResult<Self> {
+        let native = strict_call
+            .map(|activation| activation.original_parameter_names(py))
+            .transpose()?
+            .flatten();
+        let mut names: Vec<Option<Py<PyAny>>> = plan.params.iter().map(|_| None).collect();
+        if let Some(native) = native {
+            if unsafe { ffi::PyTuple_GET_SIZE(native.as_ptr()) } < plan.param_count() as isize {
+                return Err(strict_runtime_unavailable(
+                    py,
+                    "strict source code omits logical parameter names",
+                ));
+            }
+            // Counts/kinds were authenticated with this code's source mapping.
+            // Check the precise native-order-to-logical-index association too.
+            for (native_index, parameter_index) in plan.native_parameter_indices().enumerate() {
+                let name = unsafe {
+                    ffi::PyTuple_GET_ITEM(native.as_ptr(), native_index as ffi::Py_ssize_t)
+                };
+                if unsafe { ffi::PyUnicode_CheckExact(name) } == 0
+                    || unsafe { py_unicode_utf8_str(name) }.map_err(|()| PyErr::fetch(py))?
+                        != plan.params[parameter_index].name
+                {
+                    return Err(strict_runtime_unavailable(
+                        py,
+                        "strict native parameter name differs from its logical plan",
+                    ));
+                }
+                names[parameter_index] =
+                    Some(unsafe { Bound::<PyAny>::from_borrowed_ptr(py, name) }.unbind());
+            }
+        } else {
+            for (index, parameter) in plan.params.iter().enumerate() {
+                let name = CString::new(parameter.name.as_str()).map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "compiler parameter name contains a null byte",
+                    )
+                })?;
+                let name = unsafe {
+                    Bound::<PyAny>::from_owned_ptr_or_err(
+                        py,
+                        ffi::PyUnicode_InternFromString(name.as_ptr()),
+                    )?
+                };
+                names[index] = Some(name.unbind());
+            }
+        }
+        Ok(Self {
+            by_parameter: names
+                .into_iter()
+                .map(|name| name.expect("every logical parameter has one native-order name"))
+                .collect(),
+        })
+    }
+
+    fn name(&self, parameter_index: usize) -> *mut ffi::PyObject {
+        self.by_parameter[parameter_index].as_ptr()
+    }
+
+    unsafe fn match_keyword(
+        &self,
+        plan: &DirectArgBindingPlan,
+        keyword: *mut ffi::PyObject,
+    ) -> Result<Option<usize>, ()> {
+        // CPython completes the identity pass over every formal name before
+        // invoking even the first overloaded equality method.
+        for index in plan.keyword_parameter_indices() {
+            if keyword == self.name(index) {
+                return Ok(Some(index));
+            }
+        }
+        for index in plan.keyword_parameter_indices() {
+            match unsafe { ffi::PyObject_RichCompareBool(keyword, self.name(index), ffi::Py_EQ) } {
+                0 => {}
+                value if value > 0 => return Ok(Some(index)),
+                _ => return Err(()),
+            }
+        }
+        Ok(None)
+    }
+
+    unsafe fn positional_only_conflicts<'py>(
+        &self,
+        py: Python<'py>,
+        plan: &DirectArgBindingPlan,
+        keywords: *mut ffi::PyObject,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        if !plan
+            .params
+            .iter()
+            .any(|parameter| parameter.kind == ParamKind::PosOnly)
+        {
+            return Ok(None);
+        }
+        let conflicts = unsafe { Bound::<PyAny>::from_owned_ptr_or_err(py, ffi::PyList_New(0))? };
+        let keyword_count = unsafe { ffi::PyTuple_GET_SIZE(keywords) };
+        for &index in plan.positional_param_indices.iter() {
+            if plan.params[index].kind != ParamKind::PosOnly {
+                continue;
+            }
+            let name = self.name(index);
+            for keyword_index in 0..keyword_count {
+                let keyword = unsafe { ffi::PyTuple_GET_ITEM(keywords, keyword_index) };
+                let comparison = if name == keyword {
+                    1
+                } else {
+                    // The native conflict scan intentionally reverses the
+                    // comparison operands relative to ordinary matching.
+                    unsafe { ffi::PyObject_RichCompareBool(name, keyword, ffi::Py_EQ) }
+                };
+                if comparison < 0 {
+                    return Err(PyErr::fetch(py));
+                }
+                if comparison > 0 && unsafe { ffi::PyList_Append(conflicts.as_ptr(), keyword) } < 0
+                {
+                    return Err(PyErr::fetch(py));
+                }
+            }
+        }
+        if unsafe { ffi::PyList_Size(conflicts.as_ptr()) } == 0 {
+            return Ok(None);
+        }
+        let separator = unsafe {
+            Bound::<PyAny>::from_owned_ptr_or_err(py, ffi::PyUnicode_FromString(c", ".as_ptr()))?
+        };
+        unsafe {
+            Bound::<PyAny>::from_owned_ptr_or_err(
+                py,
+                ffi::PyUnicode_Join(separator.as_ptr(), conflicts.as_ptr()),
+            )
+        }
+        .map(Some)
+    }
+}
+
+/// Read the actual name after argument/default callbacks. Source functions may
+/// still change metadata before sealing; logical helpers have no native source
+/// signature and use their explicit compiler name.
+unsafe fn binding_callable_name<'py>(
+    py: Python<'py>,
+    plan: &DirectArgBindingPlan,
+    function: Option<*mut ffi::PyObject>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(function) = function {
+        let raw = function.cast::<ffi::PyFunctionObject>();
+        Ok(unsafe { Bound::<PyAny>::from_borrowed_ptr(py, (*raw).func_qualname) })
+    } else {
+        unsafe {
+            Bound::<PyAny>::from_owned_ptr_or_err(
+                py,
+                ffi::PyUnicode_FromStringAndSize(
+                    plan.callable_name.as_ptr().cast(),
+                    plan.callable_name.len() as ffi::Py_ssize_t,
+                ),
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MissingBindingArguments {
+    Positional,
+    KeywordOnly,
+}
+
+impl MissingBindingArguments {
+    fn label(self) -> &'static CStr {
+        match self {
+            Self::Positional => c"positional",
+            Self::KeywordOnly => c"keyword-only",
+        }
+    }
+}
+
+/// Match CPython's aggregate missing-argument grammar and Unicode repr/name
+/// behavior. Returning an owned exception keeps cleanup from replacing it.
+unsafe fn missing_binding_arguments_error(
+    plan: &DirectArgBindingPlan,
+    names: &BindingParameterNames,
+    function: Option<*mut ffi::PyObject>,
+    missing: &[usize],
+    kind: MissingBindingArguments,
+) -> PyErr {
+    assert!(!missing.is_empty());
+    let py = unsafe { Python::assume_attached() };
+    let result = (|| -> PyResult<()> {
+        let qualname = unsafe { binding_callable_name(py, plan, function)? };
+        let quoted = unsafe {
+            Bound::<PyAny>::from_owned_ptr_or_err(
+                py,
+                ffi::PyList_New(missing.len() as ffi::Py_ssize_t),
+            )?
+        };
+        for (position, &index) in missing.iter().enumerate() {
+            let name = unsafe {
+                Bound::<PyAny>::from_owned_ptr_or_err(py, ffi::PyObject_Repr(names.name(index)))?
+            };
+            unsafe {
+                ffi::PyList_SET_ITEM(
+                    quoted.as_ptr(),
+                    position as ffi::Py_ssize_t,
+                    name.into_ptr(),
+                );
+            }
+        }
+        let length = missing.len() as ffi::Py_ssize_t;
+        let name_text = match length {
+            1 => unsafe {
+                Bound::<PyAny>::from_borrowed_ptr(py, ffi::PyList_GET_ITEM(quoted.as_ptr(), 0))
+            },
+            2 => unsafe {
+                Bound::<PyAny>::from_owned_ptr_or_err(
+                    py,
+                    ffi::PyUnicode_FromFormat(
+                        c"%U and %U".as_ptr(),
+                        ffi::PyList_GET_ITEM(quoted.as_ptr(), 0),
+                        ffi::PyList_GET_ITEM(quoted.as_ptr(), 1),
+                    ),
+                )?
+            },
+            _ => unsafe {
+                let tail = Bound::<PyAny>::from_owned_ptr_or_err(
+                    py,
+                    ffi::PyUnicode_FromFormat(
+                        c", %U, and %U".as_ptr(),
+                        ffi::PyList_GET_ITEM(quoted.as_ptr(), length - 2),
+                        ffi::PyList_GET_ITEM(quoted.as_ptr(), length - 1),
+                    ),
+                )?;
+                if ffi::PyList_SetSlice(quoted.as_ptr(), length - 2, length, ptr::null_mut()) < 0 {
+                    return Err(PyErr::fetch(py));
+                }
+                let comma = Bound::<PyAny>::from_owned_ptr_or_err(
+                    py,
+                    ffi::PyUnicode_FromString(c", ".as_ptr()),
+                )?;
+                let head = Bound::<PyAny>::from_owned_ptr_or_err(
+                    py,
+                    ffi::PyUnicode_Join(comma.as_ptr(), quoted.as_ptr()),
+                )?;
+                Bound::<PyAny>::from_owned_ptr_or_err(
+                    py,
+                    ffi::PyUnicode_Concat(head.as_ptr(), tail.as_ptr()),
+                )?
+            },
+        };
+        unsafe {
+            ffi::PyErr_Format(
+                ffi::PyExc_TypeError,
+                c"%U() missing %zd required %s argument%s: %U".as_ptr(),
+                qualname.as_ptr(),
+                length,
+                kind.label().as_ptr(),
+                if length == 1 {
+                    c"".as_ptr()
+                } else {
+                    c"s".as_ptr()
+                },
+                name_text.as_ptr(),
+            );
+        }
+        Err(PyErr::fetch(py))
+    })();
+    result.expect_err("missing-argument formatting always produces an exception")
+}
+
+/// Excess positional arguments are reported after explicit keyword matching
+/// but before defaults. Only already-bound keyword-only slots count here.
+unsafe fn excess_positional_binding_error(
+    plan: &DirectArgBindingPlan,
+    function: Option<*mut ffi::PyObject>,
+    given: usize,
+    default_count: usize,
+    keyword_only_given: usize,
+) -> PyErr {
+    let py = unsafe { Python::assume_attached() };
+    let result = (|| -> PyResult<()> {
+        let qualname = unsafe { binding_callable_name(py, plan, function)? };
+        let capacity = plan.positional_capacity() as ffi::Py_ssize_t;
+        let signature = unsafe {
+            Bound::<PyAny>::from_owned_ptr_or_err(
+                py,
+                if default_count == 0 {
+                    ffi::PyUnicode_FromFormat(c"%zd".as_ptr(), capacity)
+                } else {
+                    ffi::PyUnicode_FromFormat(
+                        c"from %zd to %zd".as_ptr(),
+                        capacity - default_count as ffi::Py_ssize_t,
+                        capacity,
+                    )
+                },
+            )?
+        };
+        let keyword_signature = unsafe {
+            Bound::<PyAny>::from_owned_ptr_or_err(
+                py,
+                if keyword_only_given == 0 {
+                    ffi::PyUnicode_FromString(c"".as_ptr())
+                } else {
+                    ffi::PyUnicode_FromFormat(
+                        c" positional argument%s (and %zd keyword-only argument%s)".as_ptr(),
+                        if given == 1 {
+                            c"".as_ptr()
+                        } else {
+                            c"s".as_ptr()
+                        },
+                        keyword_only_given as ffi::Py_ssize_t,
+                        if keyword_only_given == 1 {
+                            c"".as_ptr()
+                        } else {
+                            c"s".as_ptr()
+                        },
+                    )
+                },
+            )?
+        };
+        unsafe {
+            ffi::PyErr_Format(
+                ffi::PyExc_TypeError,
+                c"%U() takes %U positional argument%s but %zd%U %s given".as_ptr(),
+                qualname.as_ptr(),
+                signature.as_ptr(),
+                if default_count == 0 && capacity == 1 {
+                    c"".as_ptr()
+                } else {
+                    c"s".as_ptr()
+                },
+                given as ffi::Py_ssize_t,
+                keyword_signature.as_ptr(),
+                if given == 1 && keyword_only_given == 0 {
+                    c"was".as_ptr()
+                } else {
+                    c"were".as_ptr()
+                },
+            );
+        }
+        Err(PyErr::fetch(py))
+    })();
+    result.expect_err("excess-argument formatting always produces an exception")
+}
+
+unsafe fn keyword_binding_error<T>(
+    plan: &DirectArgBindingPlan,
+    strict_call: Option<&strict_function::StrictFunctionCall>,
+    format: &CStr,
+    keyword: *mut ffi::PyObject,
+) -> Result<T, ()> {
+    let py = unsafe { Python::assume_attached() };
+    let name = binding_callable_name(py, plan, strict_call.map(|call| call.function()))
+        .map_err(|error| error.restore(py))?;
+    unsafe {
+        ffi::PyErr_Format(
+            ffi::PyExc_TypeError,
+            format.as_ptr(),
+            name.as_ptr(),
+            keyword,
+        );
+    }
+    let error = PyErr::fetch(py);
+    drop(name);
+    error.restore(py);
     Err(())
 }
 
+/// Borrow the function's current dictionary for exactly this lookup. Equality
+/// can replace __kwdefaults__, so each later parameter must reload the field.
+/// PyDict_GetItemRef propagates equality/hash errors and gives the bound local
+/// its own reference before a callback can release the old defaults mapping.
+unsafe fn current_keyword_default_owned(
+    function: *mut ffi::PyObject,
+    name: *mut ffi::PyObject,
+) -> Result<*mut ffi::PyObject, ()> {
+    let dictionary = (*function.cast::<ffi::PyFunctionObject>()).func_kwdefaults;
+    if dictionary.is_null() {
+        return Ok(ptr::null_mut());
+    }
+    let py = Python::assume_attached();
+    let dictionary = Bound::<PyAny>::from_borrowed_ptr(py, dictionary);
+    let mut value = ptr::null_mut();
+    let status = PyDict_GetItemRef(dictionary.as_ptr(), name, &mut value);
+    let error = (status < 0).then(|| PyErr::fetch(py));
+    // No borrowed Rust state spans these potentially reentrant decrefs.
+    drop(dictionary);
+    if let Some(error) = error {
+        error.restore(py);
+        Err(())
+    } else {
+        Ok(value)
+    }
+}
+
+/// Fill only unbound parameters from the actual, mutable native function.
+/// Explicit argument errors and missing positional errors precede keyword
+/// default lookups. A missing keyword does not stop later lookups: CPython
+/// reports the aggregate missing-argument error only after all of them finish.
+unsafe fn bind_current_function_defaults(
+    plan: &DirectArgBindingPlan,
+    names: &BindingParameterNames,
+    function: *mut ffi::PyObject,
+    out_args: *mut *mut ffi::PyObject,
+) -> Result<(), ()> {
+    let defaults = (*function.cast::<ffi::PyFunctionObject>()).func_defaults;
+    let count = if defaults.is_null() {
+        0
+    } else {
+        ffi::PyTuple_GET_SIZE(defaults) as usize
+    };
+    let capacity = plan.positional_capacity();
+    let first_default = capacity.saturating_sub(count);
+    let first_tuple_item = count.saturating_sub(capacity);
+    let missing: Vec<_> = plan.positional_param_indices[..first_default]
+        .iter()
+        .copied()
+        .filter(|&index| !output_arg_is_assigned(out_args, index))
+        .collect();
+    if !missing.is_empty() {
+        missing_binding_arguments_error(
+            plan,
+            names,
+            Some(function),
+            &missing,
+            MissingBindingArguments::Positional,
+        )
+        .restore(Python::assume_attached());
+        return Err(());
+    }
+    for (position, &index) in plan.positional_param_indices.iter().enumerate() {
+        if output_arg_is_assigned(out_args, index) {
+            continue;
+        }
+        let value = ffi::PyTuple_GET_ITEM(
+            defaults,
+            (first_tuple_item + position - first_default) as ffi::Py_ssize_t,
+        );
+        write_output_arg_from_borrowed(out_args, index, value);
+    }
+
+    let mut missing = Vec::new();
+    for (index, parameter) in plan.params.iter().enumerate() {
+        if parameter.kind != ParamKind::KwOnly || output_arg_is_assigned(out_args, index) {
+            continue;
+        }
+        let value = current_keyword_default_owned(function, names.name(index))?;
+        if value.is_null() {
+            missing.push(index);
+        } else {
+            write_output_arg_from_owned(out_args, index, value);
+        }
+    }
+    if !missing.is_empty() {
+        missing_binding_arguments_error(
+            plan,
+            names,
+            Some(function),
+            &missing,
+            MissingBindingArguments::KeywordOnly,
+        )
+        .restore(Python::assume_attached());
+        return Err(());
+    }
+    Ok(())
+}
+
 unsafe fn bind_function_args_to_output(
-    data: &PyFunctionJitExtra,
+    plan: &DirectArgBindingPlan,
+    function_env: *const FunctionEnv,
+    strict_call: Option<&strict_function::StrictFunctionCall>,
     args: *const *mut ffi::PyObject,
     nargsf: usize,
     kwnames: *mut ffi::PyObject,
     out_args: *mut *mut ffi::PyObject,
     out_len: usize,
 ) -> Result<(), ()> {
-    let plan = data.function_template.binding_plan();
     if out_len != plan.param_count() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
@@ -2766,7 +3598,6 @@ unsafe fn bind_function_args_to_output(
     }
 
     initialize_output_args(out_args, out_len)?;
-    let callable_name = plan.callable_name.as_str();
     let nargs = ffi::PyVectorcall_NARGS(nargsf) as usize;
     let nkw = if kwnames.is_null() {
         0
@@ -2781,18 +3612,11 @@ unsafe fn bind_function_args_to_output(
         return Err(());
     }
 
-    let positional_capacity = plan.positional_capacity();
-    if plan.varargs_param.is_none() && nargs > positional_capacity {
-        return binding_type_error(format!(
-            "{}() takes {} positional argument{} but {} {} given",
-            callable_name,
-            positional_capacity,
-            if positional_capacity == 1 { "" } else { "s" },
-            nargs,
-            if nargs == 1 { "was" } else { "were" }
-        ));
-    }
+    let py = Python::assume_attached();
+    let names =
+        BindingParameterNames::new(py, plan, strict_call).map_err(|error| error.restore(py))?;
 
+    let positional_capacity = plan.positional_capacity();
     let positional_bound = nargs.min(positional_capacity);
     for position in 0..positional_bound {
         let param_index = plan.positional_param_indices[position];
@@ -2837,7 +3661,6 @@ unsafe fn bind_function_args_to_output(
         write_output_arg_from_owned(out_args, varargs_param, extra_tuple);
     }
 
-    let has_varkw = plan.varkw_param.is_some();
     let mut varkw_dict = ptr::null_mut();
     if let Some(varkw_param) = plan.varkw_param {
         varkw_dict = ffi::PyDict_New();
@@ -2863,79 +3686,144 @@ unsafe fn bind_function_args_to_output(
             );
             return Err(());
         }
-        let key_name = match py_unicode_utf8_str(key) {
-            Ok(name) => name,
+        if ffi::PyUnicode_Check(key) == 0 {
+            let error = keyword_binding_error(
+                plan,
+                strict_call,
+                c"%U() keywords must be strings",
+                ptr::null_mut(),
+            );
+            cleanup_output_args(out_args, out_len);
+            return error;
+        }
+        let matched = match names.match_keyword(plan, key) {
+            Ok(matched) => matched,
             Err(()) => {
                 cleanup_output_args(out_args, out_len);
                 return Err(());
             }
         };
-        if let Some(param_index) = plan.param_index(key_name) {
-            let param = &plan.params[param_index];
-            match param.kind {
-                ParamKind::PosOnly | ParamKind::VarArg => {
-                    if !has_varkw {
-                        cleanup_output_args(out_args, out_len);
-                        return binding_type_error(format!(
-                            "{}() got an unexpected keyword argument '{}'",
-                            callable_name, key_name
-                        ));
-                    }
-                    if !varkw_dict.is_null() && ffi::PyDict_SetItem(varkw_dict, key, value) != 0 {
-                        cleanup_output_args(out_args, out_len);
-                        return Err(());
-                    }
-                }
-                ParamKind::Any | ParamKind::KwOnly => {
-                    if output_arg_is_assigned(out_args, param_index) {
-                        cleanup_output_args(out_args, out_len);
-                        return binding_type_error(format!(
-                            "{}() got multiple values for argument '{}'",
-                            callable_name, key_name
-                        ));
-                    }
-                    write_output_arg_from_borrowed(out_args, param_index, value);
-                }
-                ParamKind::KwArg => {
-                    if !varkw_dict.is_null() && ffi::PyDict_SetItem(varkw_dict, key, value) != 0 {
-                        cleanup_output_args(out_args, out_len);
-                        return Err(());
-                    }
-                }
+        if let Some(param_index) = matched {
+            if output_arg_is_assigned(out_args, param_index) {
+                let error = keyword_binding_error(
+                    plan,
+                    strict_call,
+                    c"%U() got multiple values for argument '%S'",
+                    key,
+                );
+                cleanup_output_args(out_args, out_len);
+                return error;
             }
-        } else if has_varkw {
-            if !varkw_dict.is_null() && ffi::PyDict_SetItem(varkw_dict, key, value) != 0 {
+            write_output_arg_from_borrowed(out_args, param_index, value);
+        } else if !varkw_dict.is_null() {
+            if ffi::PyDict_SetItem(varkw_dict, key, value) != 0 {
                 cleanup_output_args(out_args, out_len);
                 return Err(());
             }
         } else {
+            let conflicts = match names.positional_only_conflicts(py, plan, kwnames) {
+                Ok(conflicts) => conflicts,
+                Err(error) => {
+                    error.restore(py);
+                    cleanup_output_args(out_args, out_len);
+                    return Err(());
+                }
+            };
+            let error = if let Some(conflicts) = conflicts {
+                keyword_binding_error(
+                    plan,
+                    strict_call,
+                    c"%U() got some positional-only arguments passed as keyword arguments: '%U'",
+                    conflicts.as_ptr(),
+                )
+            } else {
+                keyword_binding_error(
+                    plan,
+                    strict_call,
+                    c"%U() got an unexpected keyword argument '%S'",
+                    key,
+                )
+            };
             cleanup_output_args(out_args, out_len);
-            return binding_type_error(format!(
-                "{}() got an unexpected keyword argument '{}'",
-                callable_name, key_name
-            ));
+            return error;
         }
     }
 
-    for (param_index, param) in plan.params.iter().enumerate() {
-        if output_arg_is_assigned(out_args, param_index) {
-            continue;
-        }
-        match param.kind {
-            ParamKind::VarArg | ParamKind::KwArg => {}
-            _ => {
-                if param
-                    .default_slot
-                    .is_some_and(|slot| !data.function_env.runtime_object(slot).is_null())
-                {
-                    continue;
-                }
-                cleanup_output_args(out_args, out_len);
-                return binding_type_error(format!(
-                    "{}() missing required argument '{}'",
-                    callable_name, param.name
-                ));
+    if plan.varargs_param.is_none() && nargs > positional_capacity {
+        let default_count = if let Some(activation) = strict_call {
+            let defaults = (*activation.function().cast::<ffi::PyFunctionObject>()).func_defaults;
+            if defaults.is_null() {
+                0
+            } else {
+                ffi::PyTuple_GET_SIZE(defaults) as usize
             }
+        } else {
+            plan.positional_param_indices
+                .iter()
+                .filter(|&&index| {
+                    plan.params[index]
+                        .default_slot
+                        .is_some_and(|slot| !(*function_env).runtime_object(slot).is_null())
+                })
+                .count()
+        };
+        let keyword_only_given = plan
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(index, parameter)| {
+                parameter.kind == ParamKind::KwOnly && output_arg_is_assigned(out_args, *index)
+            })
+            .count();
+        excess_positional_binding_error(
+            plan,
+            strict_call.map(|call| call.function()),
+            nargs,
+            default_count,
+            keyword_only_given,
+        )
+        .restore(py);
+        cleanup_output_args(out_args, out_len);
+        return Err(());
+    }
+
+    if let Some(activation) = strict_call {
+        return match bind_current_function_defaults(plan, &names, activation.function(), out_args) {
+            Ok(()) => Ok(()),
+            Err(()) => {
+                cleanup_output_args(out_args, out_len);
+                Err(())
+            }
+        };
+    }
+
+    for kind in [
+        MissingBindingArguments::Positional,
+        MissingBindingArguments::KeywordOnly,
+    ] {
+        let missing: Vec<_> = plan
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(index, parameter)| {
+                let selected = match kind {
+                    MissingBindingArguments::Positional => {
+                        matches!(parameter.kind, ParamKind::PosOnly | ParamKind::Any)
+                    }
+                    MissingBindingArguments::KeywordOnly => parameter.kind == ParamKind::KwOnly,
+                };
+                (selected
+                    && !output_arg_is_assigned(out_args, index)
+                    && !parameter
+                        .default_slot
+                        .is_some_and(|slot| !(*function_env).runtime_object(slot).is_null()))
+                .then_some(index)
+            })
+            .collect();
+        if !missing.is_empty() {
+            missing_binding_arguments_error(plan, &names, None, &missing, kind).restore(py);
+            cleanup_output_args(out_args, out_len);
+            return Err(());
         }
     }
     Ok(())
@@ -2949,32 +3837,67 @@ pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(
     data_ptr: *mut c_void,
     out_args: *mut *mut c_void,
     out_len: i64,
-) -> i32 {
+    out_activation: *mut *mut c_void,
+) -> *mut c_void {
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        if callable.is_null() || data_ptr.is_null() || out_len < 0 {
+        if callable.is_null() || data_ptr.is_null() || out_len < 0 || out_activation.is_null() {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
                 b"invalid direct vectorcall bind input\0".as_ptr().cast(),
             );
-            return 0;
+            return ptr::null_mut();
         }
-        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
-        if data
-            .refresh_runtime_objects_from_current_function(callable as *mut ffi::PyObject)
-            .is_err()
-        {
-            return 0;
+        *out_activation = ptr::null_mut();
+        let py = Python::assume_attached();
+        if associated_py_function_jit_extra(callable.cast(), data_ptr).is_err() {
+            return ptr::null_mut();
         }
+        let snapshot = match FunctionCallMetadata::for_function(callable.cast()) {
+            Ok(snapshot) => snapshot,
+            Err(()) => return ptr::null_mut(),
+        };
+        let template = &snapshot.function_template;
+        let mut activation =
+            match strict_function::StrictFunctionCall::new(py, callable.cast(), &snapshot) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    error.restore(py);
+                    return ptr::null_mut();
+                }
+            };
+        // The activation and immutable snapshot own every value used below.
+        // Supported metadata replacement during binding cannot free them.
         match bind_function_args_to_output(
-            data,
+            template.binding_plan(),
+            activation.environment(),
+            Some(&activation),
             args as *const *mut ffi::PyObject,
             nargsf,
             kwnames as *mut ffi::PyObject,
             out_args as *mut *mut ffi::PyObject,
             out_len as usize,
         ) {
-            Ok(()) => 1,
-            Err(()) => 0,
+            Ok(()) => {
+                let values = if out_len == 0 {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(
+                        out_args.cast::<*mut ffi::PyObject>(),
+                        out_len as usize,
+                    )
+                };
+                if let Err(error) =
+                    activation.complete_binding(py, template.runtime_data_layout(), values)
+                {
+                    cleanup_output_args(out_args.cast(), out_len as usize);
+                    error.restore(py);
+                    return ptr::null_mut();
+                }
+                let environment = activation.environment_mut().as_mut_ptr();
+                *out_activation = Box::into_raw(activation).cast();
+                environment
+            }
+            Err(()) => ptr::null_mut(),
         }
     })) {
         Ok(value) => value,
@@ -2993,7 +3916,7 @@ pub(crate) unsafe extern "C" fn bind_direct_args_from_vectorcall(
                         .cast(),
                 );
             }
-            0
+            ptr::null_mut()
         }
     }
 }
@@ -3019,15 +3942,38 @@ pub(crate) unsafe extern "C" fn vectorcall_previous_for_changed_code(
         }
 
         let function = callable.cast::<ffi::PyFunctionObject>();
-        let data = &mut *data_ptr.cast::<PyFunctionJitExtra>();
-        let Some(previous_vectorcall) = data.previous_vectorcall else {
+        let (strict_owner_installed, previous_vectorcall) = {
+            let metadata = match associated_py_function_jit_extra(callable.cast(), data_ptr) {
+                Ok(metadata) => metadata,
+                Err(()) => return ptr::null_mut(),
+            };
+            let data = &*metadata;
+            (data.strict_owner_installed, data.previous_vectorcall)
+        };
+        let Some(previous_vectorcall) = previous_vectorcall else {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
                 c"changed function is missing its original vectorcall".as_ptr(),
             );
             return ptr::null_mut();
         };
-        PyFunction_SetVectorcall(function, Some(previous_vectorcall));
+        if strict_owner_installed {
+            let py = Python::assume_attached();
+            let callable = Bound::<PyAny>::from_borrowed_ptr(py, callable.cast());
+            if let Err(error) = strict_function::authorize_ordinary_replacement(
+                py,
+                &callable,
+                data_ptr.cast::<PyFunctionJitExtra>(),
+            ) {
+                error.restore(py);
+                return ptr::null_mut();
+            }
+            // Do not replace the custom vectorcall. CPython's native CALL
+            // specializer requires its stock vectorcall and must not bypass
+            // owner-state checks on a later warmed call.
+        } else {
+            PyFunction_SetVectorcall(function, Some(previous_vectorcall));
+        }
         jit::invalidate_py_function_soac_function_id(function);
         previous_vectorcall(
             callable.cast::<ffi::PyObject>(),
@@ -3076,9 +4022,14 @@ pub(crate) unsafe extern "C" fn vectorcall_compile_function_env(
             return ptr::null_mut();
         }
         let py = Python::assume_attached();
-        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
-        match ensure_clif_vectorcall_compiled(py, callable as *mut ffi::PyObject, data) {
-            Ok(()) => data.function_env_ptr,
+        if associated_py_function_jit_extra(callable.cast(), data_ptr).is_err() {
+            return ptr::null_mut();
+        }
+        match ensure_clif_vectorcall_compiled(py, callable.cast()) {
+            Ok(()) => match associated_py_function_jit_extra(callable.cast(), data_ptr) {
+                Ok(data) => (*data).function_env_ptr,
+                Err(()) => ptr::null_mut(),
+            },
             Err(()) => ptr::null_mut(),
         }
     })) {
@@ -3108,8 +4059,7 @@ pub(crate) unsafe extern "C" fn direct_compile_function_env(
     data_ptr: *mut c_void,
 ) -> *mut c_void {
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        let _ = callable;
-        if data_ptr.is_null() {
+        if callable.is_null() || data_ptr.is_null() {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
                 b"invalid direct function env compile input\0"
@@ -3118,12 +4068,17 @@ pub(crate) unsafe extern "C" fn direct_compile_function_env(
             );
             return ptr::null_mut();
         }
-        let py = Python::assume_attached();
-        let data = &mut *(data_ptr as *mut PyFunctionJitExtra);
-        match ensure_clif_direct_entries_compiled(py, data) {
-            Ok(()) => data.function_env_ptr,
-            Err(()) => ptr::null_mut(),
+        if associated_py_function_jit_extra(callable.cast(), data_ptr).is_err() {
+            return ptr::null_mut();
         }
+        // All registered SOAC implementations require an owning checked call.
+        // A public opaque metadata slot cannot authorize an unchecked ABI.
+        strict_runtime_unavailable(
+            Python::assume_attached(),
+            "unchecked direct call to a strict function",
+        )
+        .restore(Python::assume_attached());
+        ptr::null_mut()
     })) {
         Ok(value) => value,
         Err(payload) => {
@@ -3144,6 +4099,13 @@ pub(crate) unsafe extern "C" fn direct_compile_function_env(
     }
 }
 
+unsafe fn unchecked_direct_target_id(_metadata: *mut c_void) -> u64 {
+    // Source entry authentication, ordinary binding and activation ownership
+    // remain mandatory. Compilation alone cannot authorize the old unchecked
+    // target path; guarded source-body calls use their explicit preparation.
+    0
+}
+
 pub(crate) unsafe fn register_clif_direct_metadata(
     function: *mut ffi::PyObject,
     function_id: RuntimeFunctionId,
@@ -3159,7 +4121,7 @@ pub(crate) unsafe fn register_clif_direct_metadata(
     let data_ptr = make_clif_function_data(function, function_id, module_runtime, None)?;
     if PyFunction_SetSoacMetadata(
         function,
-        function_id.to_packed_runtime_u64(),
+        unchecked_direct_target_id(data_ptr),
         data_ptr,
         Some(free_clif_function_data),
     ) != 0
@@ -3193,14 +4155,39 @@ unsafe fn register_clif_vectorcall_with_template(
     }
     let func = function as *mut ffi::PyFunctionObject;
     if !PyFunction_GetSoacMetadata(function).is_null() {
-        let data = unsafe { py_function_jit_extra(function)? };
-        if *data.function()?.lowered_kind() != FunctionKind::Function {
-            data.compiled_vectorcall_entry = None;
+        let expected = unsafe { py_function_jit_extra(function)? }.cast();
+        let data = unsafe { FunctionCallMetadata::for_function(function)? };
+        let py = unsafe { Python::assume_attached() };
+        if data.function_id != function_id
+            || !Arc::ptr_eq(
+                &data.module_state,
+                &module_runtime.shared_module_state_owner,
+            )
+            || known_function_template
+                .as_ref()
+                .is_some_and(|template| !Arc::ptr_eq(template, &data.function_template))
+        {
+            strict_runtime_unavailable(py, "vectorcall re-registration changed its compiler owner")
+                .restore(py);
+            return Err(());
+        }
+        let actual = unsafe { Bound::from_borrowed_ptr(py, function) };
+        strict_function::authenticate_registration(
+            py,
+            &actual,
+            &data.module_state,
+            &data.function_template,
+        )
+        .map_err(|error| error.restore(py))?;
+        if *data.function_template.function().lowered_kind() != FunctionKind::Function {
+            let metadata = data.current_metadata(function, expected)?;
+            (*metadata).compiled_vectorcall_entry = None;
             PyFunction_SetVectorcall(func, Some(generator_factory_vectorcall));
             return Ok(());
         }
-        if entry_interpreter_vectorcall_requested(data.function()?) {
-            data.compiled_vectorcall_entry = None;
+        if entry_interpreter_vectorcall_requested(data.function_template.function()) {
+            let metadata = data.current_metadata(function, expected)?;
+            (*metadata).compiled_vectorcall_entry = None;
             PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall));
             return Ok(());
         }
@@ -3222,7 +4209,8 @@ unsafe fn register_clif_vectorcall_with_template(
                 );
             }
         })?;
-        data.compiled_vectorcall_entry = Some(entry);
+        let metadata = data.current_metadata(function, expected)?;
+        (*metadata).compiled_vectorcall_entry = Some(entry);
         let vectorcall_entry: ffi::vectorcallfunc = std::mem::transmute(entry);
         PyFunction_SetVectorcall(func, Some(vectorcall_entry));
         return Ok(());
@@ -3257,7 +4245,7 @@ unsafe fn register_clif_vectorcall_with_template(
         )?;
         if PyFunction_SetSoacMetadata(
             function,
-            function_id.to_packed_runtime_u64(),
+            unchecked_direct_target_id(data_ptr),
             data_ptr,
             Some(free_clif_function_data),
         ) != 0
@@ -3277,7 +4265,7 @@ unsafe fn register_clif_vectorcall_with_template(
         )?;
         if PyFunction_SetSoacMetadata(
             function,
-            function_id.to_packed_runtime_u64(),
+            unchecked_direct_target_id(data_ptr),
             data_ptr,
             Some(free_clif_function_data),
         ) != 0
@@ -3297,7 +4285,7 @@ unsafe fn register_clif_vectorcall_with_template(
         )?;
         if PyFunction_SetSoacMetadata(
             function,
-            function_id.to_packed_runtime_u64(),
+            unchecked_direct_target_id(data_ptr),
             data_ptr,
             Some(free_clif_function_data),
         ) != 0
@@ -3338,7 +4326,7 @@ unsafe fn register_clif_vectorcall_with_template(
     data.compiled_vectorcall_entry = Some(entry);
     if PyFunction_SetSoacMetadata(
         function,
-        function_id.to_packed_runtime_u64(),
+        unchecked_direct_target_id(data_ptr),
         data_ptr,
         Some(free_clif_function_data),
     ) != 0
@@ -3360,12 +4348,91 @@ pub unsafe fn compile_clif_vectorcall(function: *mut ffi::PyObject) -> Result<()
         return Err(());
     }
     let py = Python::assume_attached();
-    let data = py_function_jit_extra(function)?;
-    ensure_clif_vectorcall_compiled(py, function, data)
+    ensure_clif_vectorcall_compiled(py, function)
 }
 
 pub fn force_entry_interpreter_vectorcall_for_tests(enabled: bool) -> bool {
     FORCE_ENTRY_INTERPRETER_VECTORCALL_FOR_TESTS.swap(enabled, Ordering::SeqCst)
+}
+
+/// An observed public call entry, never admission or optimization permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictFunctionEntryKind {
+    OriginalCode,
+    OrdinaryReplacement,
+    EntryInterpreter,
+    CheckedNative,
+    GeneratorFactory,
+    PublicOverride,
+}
+
+impl StrictFunctionEntryKind {
+    /// Stable names shared by function and module-initializer diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginalCode => "original_code",
+            Self::OrdinaryReplacement => "ordinary_replacement",
+            Self::EntryInterpreter => "entry_interpreter",
+            Self::CheckedNative => "checked_native",
+            Self::GeneratorFactory => "generator_factory",
+            Self::PublicOverride => "public_override",
+        }
+    }
+}
+
+/// Read-only evidence of the actual public entry, not a requested mode or an
+/// optimization capability. In particular, eager compilation and supported
+/// C vectorcall replacement are visible to compatibility tests through this
+/// snapshot. Ordinary functions have no authenticated SOAC entry to report.
+pub fn strict_function_entry_kind(
+    function: &Bound<'_, PyAny>,
+) -> PyResult<Option<StrictFunctionEntryKind>> {
+    let py = function.py();
+    let Some(owner) =
+        strict_function::authenticate_borrowed_strict_function(py, function.as_borrowed())?
+    else {
+        return Ok(None);
+    };
+    if owner.is_interpreter() {
+        return Ok(Some(if owner.interpreter_source_authority()? {
+            StrictFunctionEntryKind::OriginalCode
+        } else {
+            StrictFunctionEntryKind::OrdinaryReplacement
+        }));
+    }
+    unsafe {
+        let data = &*py_function_jit_extra(function.as_ptr()).map_err(|()| PyErr::fetch(py))?;
+        let public = (*function.as_ptr().cast::<ffi::PyFunctionObject>()).vectorcall;
+        let Some(public) = public else {
+            return Ok(Some(StrictFunctionEntryKind::PublicOverride));
+        };
+        if std::ptr::fn_addr_eq(public, entry_interpreter_vectorcall as ffi::vectorcallfunc) {
+            return Ok(Some(StrictFunctionEntryKind::EntryInterpreter));
+        }
+        if std::ptr::fn_addr_eq(public, generator_factory_vectorcall as ffi::vectorcallfunc) {
+            return Ok(Some(StrictFunctionEntryKind::GeneratorFactory));
+        }
+        if data.compiled_vectorcall_entry.is_some_and(|entry| {
+            std::ptr::fn_addr_eq(
+                public,
+                std::mem::transmute::<jit::VectorcallEntryFn, ffi::vectorcallfunc>(entry),
+            )
+        }) {
+            return Ok(Some(StrictFunctionEntryKind::CheckedNative));
+        }
+        Ok(Some(StrictFunctionEntryKind::PublicOverride))
+    }
+}
+
+/// Snapshot counters owned by the actual authenticated function. This creates
+/// no mutable handle and cannot admit a function or grant a checked-value fact.
+pub fn strict_function_call_statistics(
+    function: &Bound<'_, PyAny>,
+) -> PyResult<Option<StrictFunctionCallStatistics>> {
+    Ok(
+        strict_function::authenticate_strict_function(function.py(), function)?
+            .map(|owner| owner.call_statistics()),
+    )
 }
 
 fn entry_interpreter_vectorcall_for_tests_enabled() -> bool {
@@ -3398,20 +4465,17 @@ unsafe extern "C" fn entry_interpreter_vectorcall(
         Ok(data) => data,
         Err(()) => return ptr::null_mut(),
     };
-    if unsafe { (*callable.cast::<ffi::PyFunctionObject>()).func_code } != data.registered_code {
+    if unsafe { (*callable.cast::<ffi::PyFunctionObject>()).func_code != (*data).registered_code } {
         return unsafe {
             vectorcall_previous_for_changed_code(
                 callable.cast::<c_void>(),
                 args.cast::<*mut c_void>(),
                 nargsf,
                 kwnames.cast::<c_void>(),
-                ptr::from_mut(data).cast::<c_void>(),
+                data.cast::<c_void>(),
             )
             .cast::<ffi::PyObject>()
         };
-    }
-    if unsafe { data.refresh_runtime_objects_from_current_function(callable) }.is_err() {
-        return ptr::null_mut();
     }
     if ffi::Py_EnterRecursiveCall(c" while calling a Python object".as_ptr()) != 0 {
         return ptr::null_mut();
@@ -3447,6 +4511,33 @@ fn generator_kind_tag(kind: FunctionKind) -> Option<i64> {
         FunctionKind::AsyncGenerator => Some(2),
         FunctionKind::Function => None,
     }
+}
+
+fn preserved_operand_slots(layout: &StorageLayout) -> Result<Vec<usize>, ()> {
+    let mut operands = Vec::new();
+    if operands
+        .try_reserve_exact(layout.expression_temporaries.len())
+        .is_err()
+    {
+        unsafe { ffi::PyErr_NoMemory() };
+        return Err(());
+    }
+    for location in &layout.expression_temporaries {
+        let Some(location) = location.preserved_location() else {
+            continue;
+        };
+        let Some(slot) = layout.preserved_slot(location.slot()) else {
+            return set_runtime_error("generator operand has no preserved storage");
+        };
+        if slot.storage != PreservedSlotStorage::PyObjectOrNull
+            || slot.init != ClosureInit::Deferred
+            || slot.generator_control.is_some()
+        {
+            return set_runtime_error("generator operand must be a deferred boxed owner");
+        }
+        operands.push(location.slot() as usize);
+    }
+    Ok(operands)
 }
 
 unsafe fn tuple_set_owned(
@@ -3493,15 +4584,90 @@ unsafe fn exact_c_function_has_name(
     matches
 }
 
+/// Rust-owned implementation snapshot for one invocation. Capturing this is
+/// callback-free after the destructor guard; source/owner authentication is a
+/// separate step. No pointer into replaceable PyFunctionJitExtra survives into
+/// binding, authenticated construction, or user callbacks.
+struct FunctionCallMetadata {
+    function_id: RuntimeFunctionId,
+    function_template: Arc<FunctionInstantiationTemplate>,
+    module_state: Arc<module_type::SharedModuleState>,
+    compile_session: Arc<CompileSession>,
+    compiled_function: Option<Arc<jit::CompiledFunctionHandle>>,
+    direct_code_ptr: *const u8,
+    default_direct_code_ptr: *const u8,
+    deopt_table_ptr: *const c_void,
+    strict_field_capabilities: Option<Arc<strict_optimization::StrictFieldCapabilities>>,
+    strict_method_capabilities: Option<Arc<strict_optimization::StrictMethodCapabilities>>,
+}
+
+impl FunctionCallMetadata {
+    fn capture(metadata: &PyFunctionJitExtra) -> Self {
+        Self {
+            function_id: metadata.function_id,
+            function_template: Arc::clone(&metadata.function_template),
+            module_state: Arc::clone(&metadata.module_state),
+            compile_session: Arc::clone(&metadata.compile_session),
+            compiled_function: metadata.function_env.compiled_function.clone(),
+            direct_code_ptr: metadata.function_env.direct_code_ptr(),
+            default_direct_code_ptr: metadata.function_env.default_direct_code_ptr(),
+            deopt_table_ptr: metadata.function_env.deopt_table_ptr(),
+            strict_field_capabilities: metadata.function_env.strict_field_capabilities.clone(),
+            strict_method_capabilities: metadata.function_env.strict_method_capabilities.clone(),
+        }
+    }
+
+    unsafe fn for_function(function: *mut ffi::PyObject) -> Result<Self, ()> {
+        let (owned, snapshot) = {
+            let metadata = unsafe { py_function_jit_extra(function)? };
+            let metadata = unsafe { &*metadata };
+            (metadata.strict_owner_installed, Self::capture(metadata))
+        };
+        if !owned {
+            return set_runtime_error("SOAC entry requires an authenticated source owner");
+        }
+        Ok(snapshot)
+    }
+
+    unsafe fn current_metadata(
+        &self,
+        function: *mut ffi::PyObject,
+        expected: *mut c_void,
+    ) -> Result<*mut PyFunctionJitExtra, ()> {
+        let current = unsafe { associated_py_function_jit_extra(function, expected)? };
+        let matches = {
+            let current = unsafe { &*current };
+            current.strict_owner_installed
+                && current.function_id == self.function_id
+                && Arc::ptr_eq(&current.function_template, &self.function_template)
+                && Arc::ptr_eq(&current.module_state, &self.module_state)
+                && Arc::ptr_eq(&current.compile_session, &self.compile_session)
+        };
+        if !matches {
+            return set_runtime_error("SOAC entry implementation changed during preparation");
+        }
+        Ok(current)
+    }
+}
+
 unsafe fn prepare_generator_factory(
     py: Python<'_>,
-    data: &PyFunctionJitExtra,
+    data: &FunctionCallMetadata,
     helper: *mut ffi::PyObject,
 ) -> Result<Option<PreparedGeneratorFactory>, ()> {
     let Some(helper_function_id) = (unsafe { registered_clif_function_id(helper)? }) else {
         return Ok(None);
     };
-    let helper_data = unsafe { py_function_jit_extra(helper)? };
+    let (helper_data, registered_code, expected_globals, expected_builtins) = {
+        let metadata = unsafe { py_function_jit_extra(helper)? };
+        let metadata = unsafe { &*metadata };
+        (
+            FunctionCallMetadata::capture(metadata),
+            metadata.registered_code,
+            metadata.function_env.globals_obj(),
+            metadata.function_env.builtins_obj(),
+        )
+    };
     if helper_data.compile_session.id() != data.compile_session.id()
         || helper_data.function_id != helper_function_id
         || helper_data.module_state.module_name != "soac.runtime"
@@ -3517,11 +4683,12 @@ unsafe fn prepare_generator_factory(
     };
     let helper_function = helper.cast::<ffi::PyFunctionObject>();
     let helper_code = unsafe { (*helper_function).func_code };
-    if helper_code != original_helper_code.as_ptr() || helper_code != helper_data.registered_code {
+    if helper_code != original_helper_code.as_ptr() || helper_code != registered_code {
         return Ok(None);
     }
     let runtime_globals = unsafe { (*helper_function).func_globals };
-    if runtime_globals != helper_data.function_env.globals_obj() {
+    let builtins = unsafe { (*helper_function).func_builtins };
+    if runtime_globals != expected_globals || builtins != expected_builtins {
         return Ok(None);
     }
 
@@ -3534,7 +4701,6 @@ unsafe fn prepare_generator_factory(
     let init_key = unsafe { interned_generator_factory_key(py, c"__init__")? };
 
     let builtin_getattr = unsafe { ffi::PyDict_GetItem(runtime_globals, getattr_key.as_ptr()) };
-    let builtins = helper_data.function_env.builtins_obj();
     if builtins.is_null()
         || unsafe { ffi::PyDict_Check(builtins) } == 0
         || builtin_getattr != unsafe { ffi::PyDict_GetItem(builtins, getattr_key.as_ptr()) }
@@ -3601,13 +4767,12 @@ unsafe fn prepare_generator_factory(
         c"_resume_function",
         c"_preserved_values",
         c"_yield_from_slot",
-        c"_throw_context_slot",
         c"_closed_slot",
         c"__name__",
         c"__qualname__",
         c"gi_code",
     ];
-    let mut generator_field_offsets = [0; 8];
+    let mut generator_field_offsets = [0; 7];
     for (index, field_name) in field_names.into_iter().enumerate() {
         let Some(offset) = (unsafe {
             late_bound_slot_offset_for_owner(owner_type, field_name, IndexedFieldAccessKind::Store)
@@ -3673,7 +4838,7 @@ unsafe fn prepare_generator_factory(
 
 unsafe fn generator_factory_still_canonical(
     prepared: &PreparedGeneratorFactory,
-    data: &PyFunctionJitExtra,
+    data: &FunctionCallMetadata,
     helper: *mut ffi::PyObject,
 ) -> bool {
     if data.compile_session.id() != prepared.compile_session_id
@@ -3683,9 +4848,6 @@ unsafe fn generator_factory_still_canonical(
             != prepared.helper_code
         || unsafe { PyFunction_GetSoacFunctionId(helper) }
             != prepared.helper_function_id.to_packed_runtime_u64()
-        || unsafe {
-            jit::raw_py_function_activation_is_observed(prepared.helper_code as *mut ffi::PyObject)
-        }
     {
         return false;
     }
@@ -3731,21 +4893,15 @@ unsafe fn generator_constructor_still_canonical(prepared: &PreparedGeneratorFact
         return false;
     };
     ptr::fn_addr_eq(vectorcall, prepared.generator_init_vectorcall)
-        && !unsafe {
-            jit::raw_py_function_activation_is_observed(
-                prepared.generator_init_code as *mut ffi::PyObject,
-            )
-        }
 }
 
-unsafe fn try_make_source_generator_instance_direct(
+unsafe fn try_make_intrinsic_generator_instance_direct(
     py: Python<'_>,
     function_obj: *mut ffi::PyObject,
-    data: &PyFunctionJitExtra,
+    data: &FunctionCallMetadata,
     helper: *mut ffi::PyObject,
     bound_args: &mut [*mut ffi::PyObject],
     yieldfrom_slot: usize,
-    throw_context_slot: usize,
     closed_slot: usize,
 ) -> Result<Option<*mut ffi::PyObject>, ()> {
     let function = data.function_template.function();
@@ -3811,10 +4967,6 @@ unsafe fn try_make_source_generator_instance_direct(
             if unsafe { ffi::PyFunction_Check(helper) } == 0 {
                 return Ok(None);
             }
-            let helper_code = unsafe { (*helper.cast::<ffi::PyFunctionObject>()).func_code };
-            if unsafe { jit::raw_py_function_activation_is_observed(helper_code) } {
-                return Ok(None);
-            }
             let Some(prepared) = (unsafe { prepare_generator_factory(py, data, helper)? }) else {
                 return Ok(None);
             };
@@ -3831,9 +4983,16 @@ unsafe fn try_make_source_generator_instance_direct(
         return Ok(None);
     }
 
-    let mut state =
-        preserved_state::PreservedStateBuilder::with_capacity(layout.preserved_slots.len())?;
-    for slot in &layout.preserved_slots {
+    let operand_slots = preserved_operand_slots(layout)?;
+    let mut state = preserved_state::PreservedStateBuilder::with_capacity(
+        layout.preserved_slots.len(),
+        &operand_slots,
+    )?;
+    for (index, slot) in layout.preserved_slots.iter().enumerate() {
+        if operand_slots.contains(&index) {
+            state.push_empty_operand();
+            continue;
+        }
         match (&slot.storage, &slot.init) {
             (PreservedSlotStorage::I64, ClosureInit::RuntimePcUnstarted) => state.push_i64(1),
             (
@@ -3869,19 +5028,7 @@ unsafe fn try_make_source_generator_instance_direct(
                 };
                 let mut value = bound_args[param_index];
                 if value.is_null() {
-                    let Some(default_slot) = data
-                        .function_template
-                        .binding_plan()
-                        .params
-                        .get(param_index)
-                        .and_then(|param| param.default_slot)
-                    else {
-                        return set_runtime_error("preserved parameter slot was not bound");
-                    };
-                    value = data.function_env.runtime_object(default_slot);
-                    if value.is_null() {
-                        return set_runtime_error("preserved parameter slot default was not bound");
-                    }
+                    return set_runtime_error("preserved parameter slot was not bound");
                 }
                 if *storage == PreservedSlotStorage::PyCellObject {
                     value = unsafe { PyCell_New(value) };
@@ -3903,11 +5050,8 @@ unsafe fn try_make_source_generator_instance_direct(
     }
     unsafe { cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len()) };
 
-    let mut slot_indices = [ptr::null_mut(); 3];
-    for (index, slot) in [yieldfrom_slot, throw_context_slot, closed_slot]
-        .into_iter()
-        .enumerate()
-    {
+    let mut slot_indices = [ptr::null_mut(); 2];
+    for (index, slot) in [yieldfrom_slot, closed_slot].into_iter().enumerate() {
         let value = unsafe { ffi::PyLong_FromSize_t(slot) };
         if value.is_null() {
             for previous in slot_indices {
@@ -3927,7 +5071,6 @@ unsafe fn try_make_source_generator_instance_direct(
         preserved_values,
         slot_indices[0],
         slot_indices[1],
-        slot_indices[2],
     ];
     let direct_constructor = unsafe { generator_constructor_still_canonical(prepared) };
     let result = if direct_constructor {
@@ -3944,7 +5087,6 @@ unsafe fn try_make_source_generator_instance_direct(
                     preserved_values,
                     slot_indices[0],
                     slot_indices[1],
-                    slot_indices[2],
                     function_name,
                     function_qualname,
                     source_code,
@@ -4006,8 +5148,12 @@ unsafe fn make_generator_instance_from_vectorcall(
     kwnames: *mut ffi::PyObject,
 ) -> Result<*mut ffi::PyObject, ()> {
     let py = Python::assume_attached();
-    let data = py_function_jit_extra(function_obj)?;
-    let function = data.function()?;
+    let data = FunctionCallMetadata::for_function(function_obj)?;
+    let mut activation = Some(
+        strict_function::StrictFunctionCall::new(py, function_obj, &data)
+            .map_err(|error| error.restore(py))?,
+    );
+    let function = data.function_template.function();
     let Some(kind_tag) = generator_kind_tag(*function.lowered_kind()) else {
         return set_runtime_error(
             "generator factory vectorcall expected a generator-like function",
@@ -4033,71 +5179,81 @@ unsafe fn make_generator_instance_from_vectorcall(
         "generator_factory_public_preserved_layout",
     );
     let Some(yieldfrom_slot) = layout
-        .preserved_slots
-        .iter()
-        .position(|slot| slot.logical_name == "_dp_yieldfrom")
+        .generator_control_slot(soac_core::block_py::GeneratorControlRole::Delegate)
+        .map(|location| location.slot() as usize)
     else {
-        return set_runtime_error(
-            "generator-like function is missing _dp_yieldfrom preserved slot",
-        );
-    };
-    let Some(throw_context_slot) = layout
-        .preserved_slots
-        .iter()
-        .position(|slot| slot.logical_name == "_dp_throw_context")
-    else {
-        return set_runtime_error(
-            "generator-like function is missing _dp_throw_context preserved slot",
-        );
+        return set_runtime_error("generator-like function is missing its delegate control slot");
     };
     let Some(closed_slot) = layout
-        .preserved_slots
-        .iter()
-        .position(|slot| slot.logical_name == "_dp_is_closed")
+        .generator_control_slot(soac_core::block_py::GeneratorControlRole::IsClosed)
+        .map(|location| location.slot() as usize)
     else {
         return set_runtime_error(
-            "generator-like function is missing _dp_is_closed preserved slot",
+            "generator-like function is missing its closed-state control slot",
         );
     };
 
     let mut bound_args = vec![ptr::null_mut(); data.function_template.binding_plan().param_count()];
     bind_function_args_to_output(
-        data,
+        data.function_template.binding_plan(),
+        activation
+            .as_ref()
+            .expect("registered generator owns its activation")
+            .environment(),
+        activation.as_deref(),
         args,
         nargsf,
         kwnames,
         bound_args.as_mut_ptr(),
         bound_args.len(),
     )?;
-
-    let make_instance_ptr = data
-        .module_state
-        .runtime_name_owned_cached(RuntimeName::MakeGeneratorInstance);
-    if make_instance_ptr.is_null() {
-        cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
-        return Err(());
-    }
-    let make_instance: Bound<'_, PyAny> = Bound::from_owned_ptr(py, make_instance_ptr);
-    match try_make_source_generator_instance_direct(
-        py,
-        function_obj,
-        data,
-        make_instance.as_ptr(),
-        &mut bound_args,
-        yieldfrom_slot,
-        throw_context_slot,
-        closed_slot,
-    ) {
-        Ok(Some(generator)) => {
+    if let Some(activation) = activation.as_mut() {
+        if let Err(error) = activation.complete_binding(
+            py,
+            data.function_template.runtime_data_layout(),
+            &bound_args,
+        ) {
             cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
-            return Ok(generator);
-        }
-        Ok(None) => {}
-        Err(()) => {
-            cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+            error.restore(py);
             return Err(());
         }
     }
+
+    let make_instance = if activation.is_none() {
+        // Compiler-intrinsic workers retain their existing internal protocol.
+        // An authenticated source generator/coroutine/async-generator always
+        // uses native construction below, including in countered modes.
+        let make_instance_ptr = data
+            .module_state
+            .runtime_name_owned_cached(RuntimeName::MakeGeneratorInstance);
+        if make_instance_ptr.is_null() {
+            cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+            return Err(());
+        }
+        let make_instance: Bound<'_, PyAny> = Bound::from_owned_ptr(py, make_instance_ptr);
+        match try_make_intrinsic_generator_instance_direct(
+            py,
+            function_obj,
+            &data,
+            make_instance.as_ptr(),
+            &mut bound_args,
+            yieldfrom_slot,
+            closed_slot,
+        ) {
+            Ok(Some(generator)) => {
+                cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                return Ok(generator);
+            }
+            Ok(None) => {}
+            Err(()) => {
+                cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                return Err(());
+            }
+        }
+        Some(make_instance)
+    } else {
+        None
+    };
 
     let initial_values = ffi::PyTuple_New(layout.preserved_slots.len() as ffi::Py_ssize_t);
     if initial_values.is_null() {
@@ -4124,30 +5280,12 @@ unsafe fn make_generator_instance_from_vectorcall(
                     return set_runtime_error("preserved parameter slot has no public parameter");
                 };
                 let value = bound_args[param_index];
-                let value = if value.is_null() {
-                    let Some(default_slot) = data
-                        .function_template
-                        .binding_plan()
-                        .params
-                        .get(param_index)
-                        .and_then(|param| param.default_slot)
-                    else {
-                        ffi::Py_DECREF(initial_values);
-                        ffi::Py_DECREF(slot_kinds);
-                        cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
-                        return set_runtime_error("preserved parameter slot was not bound");
-                    };
-                    let default_value = data.function_env.runtime_object(default_slot);
-                    if default_value.is_null() {
-                        ffi::Py_DECREF(initial_values);
-                        ffi::Py_DECREF(slot_kinds);
-                        cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
-                        return set_runtime_error("preserved parameter slot default was not bound");
-                    }
-                    default_value
-                } else {
-                    value
-                };
+                if value.is_null() {
+                    ffi::Py_DECREF(initial_values);
+                    ffi::Py_DECREF(slot_kinds);
+                    cleanup_output_args(bound_args.as_mut_ptr(), bound_args.len());
+                    return set_runtime_error("preserved parameter slot was not bound");
+                }
                 match slot.storage {
                     PreservedSlotStorage::PyCellObject => {
                         let cell = PyCell_New(value);
@@ -4202,12 +5340,37 @@ unsafe fn make_generator_instance_from_vectorcall(
 
     let initial_values = Bound::from_owned_ptr(py, initial_values);
     let slot_kinds = Bound::from_owned_ptr(py, slot_kinds);
+    let operand_slots = preserved_operand_slots(layout)?;
+    let exposed_code = if function.scope.generator_expression_code.is_some() {
+        if activation.is_none() {
+            return set_runtime_error(
+                "generator code exposure requires its compiler-owned activation",
+            );
+        }
+        match data
+            .module_state
+            .lookup_generator_expression_code(function.function_id)
+        {
+            Some(code) => Some(code.bind(py).clone()),
+            None => return set_runtime_error("original generator-expression code is unavailable"),
+        }
+    } else {
+        None
+    };
     let raw_function = function_obj.cast::<ffi::PyFunctionObject>();
-    let (function_name, function_qualname) = if jit::raw_py_code_has_function_names(
-        (*raw_function).func_code,
-        (*raw_function).func_name,
-        (*raw_function).func_qualname,
-    ) {
+    let (function_name, function_qualname) = if let Some(code) = &exposed_code {
+        (
+            code.getattr("co_name").map_err(|error| error.restore(py))?,
+            code.getattr("co_qualname")
+                .map_err(|error| error.restore(py))?,
+        )
+    } else if activation.is_some()
+        || jit::raw_py_code_has_function_names(
+            (*raw_function).func_code,
+            (*raw_function).func_name,
+            (*raw_function).func_qualname,
+        )
+    {
         (
             Bound::<PyAny>::from_borrowed_ptr(py, (*raw_function).func_name),
             Bound::<PyAny>::from_borrowed_ptr(py, (*raw_function).func_qualname),
@@ -4219,21 +5382,65 @@ unsafe fn make_generator_instance_from_vectorcall(
         )
     };
     let function_obj = Bound::from_borrowed_ptr(py, function_obj);
-    let result = make_instance
-        .call1((
-            function_obj,
-            kind_tag,
-            function_name,
-            function_qualname,
-            initial_values,
-            slot_kinds,
+    let result = if let Some(activation) = &activation {
+        let preserved = Bound::<PyAny>::from_owned_ptr_or_err(
+            py,
+            preserved_state::new_preserved_state(
+                initial_values.as_ptr(),
+                slot_kinds.as_ptr(),
+                &operand_slots,
+            ),
+        )
+        .map_err(|error| error.restore(py))?;
+        let source_code = match exposed_code {
+            Some(code) => code,
+            None => activation
+                .original_code(py)
+                .map_err(|error| error.restore(py))?,
+        };
+        activation
+            .attach_suspended_state(
+                py,
+                &data.function_template,
+                &data.module_state,
+                &preserved,
+                &source_code,
+                closed_slot,
+            )
+            .map_err(|error| error.restore(py))?;
+        let no_default = Bound::<PyAny>::from_owned_ptr_or_err(
+            py,
+            data.module_state
+                .runtime_name_owned_cached(RuntimeName::NoDefault),
+        )
+        .map_err(|error| error.restore(py))?;
+        managed_generator::new_generator(
+            py,
+            &function_obj,
+            *function.lowered_kind(),
+            &source_code,
+            &function_name,
+            &function_qualname,
+            &preserved,
+            no_default,
             yieldfrom_slot,
-            throw_context_slot,
-            closed_slot,
-        ))
-        .map_err(|err| {
-            err.restore(py);
-        })?;
+        )
+    } else {
+        make_instance
+            .expect("intrinsic construction helper")
+            .call1((
+                function_obj,
+                kind_tag,
+                function_name,
+                function_qualname,
+                initial_values,
+                slot_kinds,
+                yieldfrom_slot,
+                closed_slot,
+                operand_slots,
+            ))
+    }
+    .map_err(|err| err.restore(py))?;
     Ok(result.into_ptr())
 }
 
@@ -4247,20 +5454,17 @@ unsafe extern "C" fn generator_factory_vectorcall(
         Ok(data) => data,
         Err(()) => return ptr::null_mut(),
     };
-    if unsafe { (*callable.cast::<ffi::PyFunctionObject>()).func_code } != data.registered_code {
+    if unsafe { (*callable.cast::<ffi::PyFunctionObject>()).func_code != (*data).registered_code } {
         return unsafe {
             vectorcall_previous_for_changed_code(
                 callable.cast::<c_void>(),
                 args.cast::<*mut c_void>(),
                 nargsf,
                 kwnames.cast::<c_void>(),
-                ptr::from_mut(data).cast::<c_void>(),
+                data.cast::<c_void>(),
             )
             .cast::<ffi::PyObject>()
         };
-    }
-    if unsafe { data.refresh_runtime_objects_from_current_function(callable) }.is_err() {
-        return ptr::null_mut();
     }
     if ffi::Py_EnterRecursiveCall(c" while calling a Python object".as_ptr()) != 0 {
         return ptr::null_mut();
@@ -4304,18 +5508,25 @@ pub(crate) unsafe fn run_registered_clif_function_from_vectorcall_entry(
         );
         return Err(());
     }
-    let data = py_function_jit_extra(function_obj)?;
-    let blockpy_function = data.function()?;
+    let data = FunctionCallMetadata::for_function(function_obj)?;
+    let template = Arc::clone(&data.function_template);
+    let py = Python::assume_attached();
+    let activation = strict_function::StrictFunctionCall::new(py, function_obj, &data)
+        .map_err(|error| error.restore(py))?;
     let context = jit::BlockPyEntryRuntimeContext::new(
         Arc::clone(&data.compile_session),
         Arc::clone(&data.module_state),
-        data.function_env.globals_obj().cast::<c_void>(),
-        data.function_env.builtins_obj().cast::<c_void>(),
-        data.function_env.runtime_objects_ptr().cast::<c_void>(),
-        data.function_template.entry_plan(),
-    );
+        activation.environment().globals_obj().cast::<c_void>(),
+        activation.environment().builtins_obj().cast::<c_void>(),
+        activation
+            .environment()
+            .runtime_objects_ptr()
+            .cast::<c_void>(),
+        template.entry_plan(),
+    )
+    .with_strict_call(activation, Arc::clone(&template));
     match jit::run_blockpy_function_from_vectorcall_entry(
-        blockpy_function,
+        template.function(),
         context,
         args.cast::<*mut c_void>(),
         nargsf,
@@ -4323,13 +5534,15 @@ pub(crate) unsafe fn run_registered_clif_function_from_vectorcall_entry(
     ) {
         Ok(result) => Ok(result.cast::<ffi::PyObject>()),
         Err(err) => {
-            if let Ok(c_msg) = CString::new(err) {
-                ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-            } else {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    c"entry interpreter failed".as_ptr(),
-                );
+            if ffi::PyErr_Occurred().is_null() {
+                if let Ok(c_msg) = CString::new(err) {
+                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                } else {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        c"entry interpreter failed".as_ptr(),
+                    );
+                }
             }
             Err(())
         }
@@ -4343,7 +5556,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn repeated_closure_registration_reuses_its_known_template_and_vectorcall_trampoline() {
+    fn ordinary_closure_registration_cannot_borrow_a_known_source_template() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         initialize_test_python();
 
@@ -4421,33 +5634,58 @@ mod tests {
             };
 
             for closure in [&first, &second] {
-                unsafe {
+                let result = unsafe {
                     register_clif_vectorcall_with_template(
                         closure.as_ptr(),
                         function_id,
                         runtime(),
                         Some(Arc::clone(&template)),
                     )
-                }
-                .expect("each actual closure should register through the production path");
-                let metadata = unsafe { py_function_jit_extra(closure.as_ptr()) }
-                    .expect("each actual closure should expose its registered JIT metadata");
+                };
                 assert!(
-                    Arc::ptr_eq(&metadata.function_template, &template),
-                    "registration must retain the already-known immutable function template"
+                    result.is_err(),
+                    "a source template does not authenticate an ordinary closure"
                 );
+                assert!(PyErr::occurred(py));
+                let _error = PyErr::fetch(py);
+                assert!(unsafe { PyFunction_GetSoacMetadata(closure.as_ptr()).is_null() });
             }
 
-            unsafe { register_clif_vectorcall(public_closure.as_ptr(), function_id, runtime()) }
-                .expect("the existing public registration entrypoint should remain supported");
-            let public_metadata = unsafe { py_function_jit_extra(public_closure.as_ptr()) }
-                .expect("public registration should expose its normal JIT metadata");
-            assert!(Arc::ptr_eq(&public_metadata.function_template, &template));
+            assert!(
+                unsafe {
+                    register_clif_vectorcall(public_closure.as_ptr(), function_id, runtime())
+                }
+                .is_err(),
+                "the public registration entrypoint must enforce the same admission boundary"
+            );
+            assert!(PyErr::occurred(py));
+            let _error = PyErr::fetch(py);
+            assert!(unsafe { PyFunction_GetSoacMetadata(public_closure.as_ptr()).is_null() });
 
+            for (closure, captured) in [(&first, 3), (&second, 9), (&public_closure, 15)] {
+                assert_eq!(
+                    closure
+                        .call1((2,))
+                        .and_then(|value| value.extract::<i64>())
+                        .unwrap(),
+                    captured + 2,
+                    "rejected registration must preserve the native closure and its own cell"
+                );
+            }
+            // Exercise the private trampoline cache as a compiler kernel. No
+            // function is admitted or executed through an unauthenticated body.
+            let entry = prepared_vectorcall_trampoline(template.as_ref(), &session, 1).expect(
+                "an internal template can prepare a trampoline without admitting a function",
+            );
             let prepared = template
                 .prepared_vectorcall_trampoline
                 .get()
-                .expect("repeated actual closure registration should cache its shared trampoline");
+                .expect("private trampoline preparation should populate its shared cache");
+            assert_eq!(entry as usize, prepared.entry as usize);
+            assert_eq!(
+                prepared_vectorcall_trampoline(template.as_ref(), &session, 1).unwrap() as usize,
+                prepared.entry as usize
+            );
             assert!(prepared.matches(session.id(), 1));
             assert!(!prepared.matches(session.id(), 2));
             let other_session = Arc::new(CompileSession::new());
@@ -4474,60 +5712,9 @@ mod tests {
                 "session and arity mismatches must not overwrite the original positive cache"
             );
 
-            let first_metadata = unsafe { py_function_jit_extra(first.as_ptr()) }
-                .expect("the first closure metadata should remain live");
-            let second_metadata = unsafe { py_function_jit_extra(second.as_ptr()) }
-                .expect("the second closure metadata should remain live");
-            assert_ne!(
-                first_metadata.function_env_ptr, second_metadata.function_env_ptr,
-                "sharing a template or trampoline must never share per-function environments"
-            );
-            let closure_slot = template.runtime_data_layout().closure_cell_slot(0);
-            let first_cell = first_metadata.function_env.runtime_object(closure_slot);
-            let second_cell = second_metadata.function_env.runtime_object(closure_slot);
-            assert!(!first_cell.is_null());
-            assert!(!second_cell.is_null());
-            assert_ne!(
-                first_cell, second_cell,
-                "separately instantiated closures must retain their own captured cells"
-            );
-            let first_cell = unsafe { Bound::<PyAny>::from_borrowed_ptr(py, first_cell) };
-            let second_cell = unsafe { Bound::<PyAny>::from_borrowed_ptr(py, second_cell) };
-            assert_eq!(
-                first_cell
-                    .getattr("cell_contents")
-                    .and_then(|value| value.extract::<i64>())
-                    .expect("the first closure cell should expose its original value"),
-                3
-            );
-            assert_eq!(
-                second_cell
-                    .getattr("cell_contents")
-                    .and_then(|value| value.extract::<i64>())
-                    .expect("the second closure cell should expose its original value"),
-                9
-            );
-            assert_eq!(
-                first_metadata
-                    .compiled_vectorcall_entry
-                    .expect("the first closure should have a vectorcall trampoline")
-                    as usize,
-                prepared.entry as usize
-            );
-            assert_eq!(
-                second_metadata
-                    .compiled_vectorcall_entry
-                    .expect("the second closure should have a vectorcall trampoline")
-                    as usize,
-                prepared.entry as usize
-            );
-            assert_eq!(
-                public_metadata
-                    .compiled_vectorcall_entry
-                    .expect("the public registration should have a vectorcall trampoline")
-                    as usize,
-                prepared.entry as usize
-            );
+            assert!(unsafe { PyFunction_GetSoacMetadata(first.as_ptr()).is_null() });
+            assert!(unsafe { PyFunction_GetSoacMetadata(second.as_ptr()).is_null() });
+            assert!(unsafe { PyFunction_GetSoacMetadata(public_closure.as_ptr()).is_null() });
         });
     }
 
@@ -4738,6 +5925,7 @@ def generated(value):
                             builtins.as_ptr(),
                             module_state.late_bound_owner_fields.cells.as_ptr(),
                             Vec::new().into_boxed_slice(),
+                            true,
                         )
                     }
                     .expect("binding fixture function environment should allocate"),
@@ -4750,6 +5938,7 @@ def generated(value):
                     compile_session: Arc::new(CompileSession::new()),
                     module_state: Arc::clone(&module_state),
                     compiled_vectorcall_entry: None,
+                    strict_owner_installed: false,
                     previous_vectorcall: None,
                     registered_code: ptr::null_mut(),
                     registered_defaults: ptr::null_mut(),
@@ -4761,7 +5950,9 @@ def generated(value):
             assert!(
                 unsafe {
                     bind_function_args_to_output(
-                        &zero,
+                        zero.function_template.binding_plan(),
+                        zero.function_env.as_ref(),
+                        None,
                         ptr::null(),
                         ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
                         ptr::null_mut(),
@@ -4786,7 +5977,9 @@ def generated(value):
             assert!(
                 unsafe {
                     bind_function_args_to_output(
-                        &three,
+                        three.function_template.binding_plan(),
+                        three.function_env.as_ref(),
+                        None,
                         args.as_ptr(),
                         3 | ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
                         ptr::null_mut(),
@@ -4820,7 +6013,9 @@ def generated(value):
             assert!(
                 unsafe {
                     bind_function_args_to_output(
-                        &three,
+                        three.function_template.binding_plan(),
+                        three.function_env.as_ref(),
+                        None,
                         malformed.as_ptr(),
                         malformed.len(),
                         ptr::null_mut(),
@@ -4846,7 +6041,9 @@ def generated(value):
             assert!(
                 unsafe {
                     bind_function_args_to_output(
-                        &three,
+                        three.function_template.binding_plan(),
+                        three.function_env.as_ref(),
+                        None,
                         ptr::null(),
                         3,
                         ptr::null_mut(),
@@ -4867,7 +6064,9 @@ def generated(value):
             assert!(
                 unsafe {
                     bind_function_args_to_output(
-                        &three,
+                        three.function_template.binding_plan(),
+                        three.function_env.as_ref(),
+                        None,
                         ptr::null(),
                         3,
                         ptr::null_mut(),
@@ -4883,6 +6082,187 @@ def generated(value):
                     .to_string()
                     .contains("missing vectorcall argument array in CLIF function binding")
             );
+        });
+    }
+
+    #[test]
+    fn argument_binding_errors_match_native_arity_and_current_qualname() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| {
+            let source = c"
+def positional(first, second, third, fourth):
+    return first, second, third, fourth
+
+def keyword_only(*, first, second, third):
+    return first, second, third
+
+def defaulted(first, second=20, third=30, *, fourth, fifth=50):
+    return first, second, third, fourth, fifth
+
+def make_nested():
+    def nested(first, second):
+        return first, second
+    return nested
+
+nested = make_nested()
+";
+            let native = pyo3::types::PyModule::from_code(
+                py,
+                source,
+                c"binding_errors.py",
+                c"_soac_binding_errors",
+            )
+            .expect("ordinary CPython binding control should compile");
+            let lowered =
+                soac_lowering::lower_python_to_blockpy_for_testing(source.to_str().unwrap())
+                    .expect("binding plans should use the same source")
+                    .blockpy_module;
+            let cases: &[(&str, usize, &[&str])] = &[
+                ("positional", 0, &[]),
+                ("positional", 1, &[]),
+                ("positional", 2, &[]),
+                ("positional", 3, &[]),
+                ("positional", 0, &["first", "fourth"]),
+                ("positional", 5, &[]),
+                ("keyword_only", 0, &[]),
+                ("keyword_only", 0, &["first"]),
+                ("keyword_only", 0, &["first", "second"]),
+                ("keyword_only", 1, &[]),
+                ("keyword_only", 1, &["first"]),
+                ("defaulted", 0, &["fourth"]),
+                ("defaulted", 1, &[]),
+                ("defaulted", 4, &[]),
+                ("defaulted", 4, &["fourth"]),
+                ("defaulted", 4, &["fourth", "fifth"]),
+                ("nested", 0, &[]),
+            ];
+            for &(name, positional_count, keywords) in cases {
+                let function = native.getattr(name).unwrap();
+                if name == "nested" {
+                    // The formatter must use the current native Unicode object,
+                    // not the compiler spelling or a lossy UTF-8 conversion.
+                    function
+                        .setattr(
+                            "__qualname__",
+                            py.eval(c"'renamed\\ud800'", None, None).unwrap(),
+                        )
+                        .unwrap();
+                }
+                let qualname = if name == "nested" {
+                    "make_nested.<locals>.nested"
+                } else {
+                    name
+                };
+                let definition = lowered
+                    .callable_defs
+                    .iter()
+                    .find(|definition| definition.names.qualname == qualname)
+                    .unwrap();
+                let plan = DirectArgBindingPlan::from_function(definition);
+                let names = BindingParameterNames::new(py, &plan, None).unwrap();
+                let value = PyList::empty(py);
+                let original_refcount = unsafe { ffi::Py_REFCNT(value.as_ptr()) };
+                let argv = vec![value.as_ptr(); positional_count + keywords.len()];
+                let kwnames = pyo3::types::PyTuple::new(py, keywords.iter().copied()).unwrap();
+                let native_result = unsafe {
+                    ffi::PyObject_Vectorcall(
+                        function.as_ptr(),
+                        argv.as_ptr(),
+                        positional_count,
+                        if keywords.is_empty() {
+                            ptr::null_mut()
+                        } else {
+                            kwnames.as_ptr()
+                        },
+                    )
+                };
+                assert!(
+                    native_result.is_null(),
+                    "control {name} must reject invalid arguments"
+                );
+                let expected = PyErr::fetch(py);
+                let mut output = vec![ptr::null_mut(); plan.param_count()];
+                for &index in plan.positional_param_indices.iter().take(positional_count) {
+                    unsafe {
+                        write_output_arg_from_borrowed(output.as_mut_ptr(), index, value.as_ptr());
+                    }
+                }
+                for keyword in keywords {
+                    let index = plan
+                        .params
+                        .iter()
+                        .position(|parameter| parameter.name == *keyword)
+                        .unwrap();
+                    unsafe {
+                        write_output_arg_from_borrowed(output.as_mut_ptr(), index, value.as_ptr());
+                    }
+                }
+                if positional_count > plan.positional_capacity() {
+                    let defaults = unsafe {
+                        (*function.as_ptr().cast::<ffi::PyFunctionObject>()).func_defaults
+                    };
+                    let default_count = if defaults.is_null() {
+                        0
+                    } else {
+                        unsafe { ffi::PyTuple_GET_SIZE(defaults) as usize }
+                    };
+                    let keyword_only_given = plan
+                        .params
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, parameter)| {
+                            parameter.kind == ParamKind::KwOnly && !output[*index].is_null()
+                        })
+                        .count();
+                    unsafe {
+                        excess_positional_binding_error(
+                            &plan,
+                            Some(function.as_ptr()),
+                            positional_count,
+                            default_count,
+                            keyword_only_given,
+                        )
+                        .restore(py);
+                    }
+                } else {
+                    assert!(
+                        unsafe {
+                            bind_current_function_defaults(
+                                &plan,
+                                &names,
+                                function.as_ptr(),
+                                output.as_mut_ptr(),
+                            )
+                        }
+                        .is_err()
+                    );
+                }
+                unsafe {
+                    cleanup_output_args(output.as_mut_ptr(), output.len());
+                }
+                let actual = PyErr::fetch(py);
+                assert!(actual.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+                let actual_message = actual.value(py).str().unwrap();
+                let expected_message = expected.value(py).str().unwrap();
+                assert_eq!(
+                    unsafe {
+                        ffi::PyObject_RichCompareBool(
+                            actual_message.as_ptr(),
+                            expected_message.as_ptr(),
+                            ffi::Py_EQ,
+                        )
+                    },
+                    1,
+                    "{name}: native {expected}; binder {actual}",
+                );
+                assert!(output.iter().all(|value| value.is_null()));
+                assert_eq!(
+                    unsafe { ffi::Py_REFCNT(value.as_ptr()) },
+                    original_refcount,
+                    "failed binding must release every copied argument"
+                );
+            }
         });
     }
 
@@ -5311,6 +6691,116 @@ def generated(value):
                 "wrong method name should not produce an exact owner binding"
             );
 
+            ffi::Py_DECREF(function);
+        });
+    }
+
+    #[test]
+    fn typed_function_metadata_rejects_foreign_payload_and_preserves_primary_error() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
+            let function = make_test_function(py);
+            let foreign = Box::into_raw(Box::new(123usize)).cast::<c_void>();
+            let primary = ffi::PyObject_CallNoArgs(ffi::PyExc_LookupError);
+            assert!(!primary.is_null());
+            for payload in [ptr::null_mut(), foreign] {
+                assert_eq!(
+                    PyFunction_SetSoacMetadata(
+                        function,
+                        0,
+                        payload,
+                        (!payload.is_null()).then_some(free_test_soac_metadata),
+                    ),
+                    0,
+                );
+                assert!(observe_py_function_jit_extra(function).is_none());
+                assert!(
+                    ffi::PyErr_Occurred().is_null(),
+                    "ordinary observation is a miss"
+                );
+                assert!(checked_function_metadata(function.cast()).is_null());
+                assert_ne!(ffi::PyErr_ExceptionMatches(ffi::PyExc_RuntimeError), 0);
+                ffi::PyErr_Clear();
+
+                ffi::Py_INCREF(primary);
+                ffi::PyErr_SetRaisedException(primary);
+                assert!(observe_py_function_jit_extra(function).is_none());
+                assert!(checked_function_metadata(function.cast()).is_null());
+                let actual = ffi::PyErr_GetRaisedException();
+                assert_eq!(
+                    actual, primary,
+                    "metadata errors preserve the original exception"
+                );
+                ffi::Py_DECREF(actual);
+                assert_eq!(PyFunction_GetSoacMetadata(function), payload);
+            }
+            assert_eq!(
+                PyFunction_SetSoacMetadata(function, 0, ptr::null_mut(), None),
+                0
+            );
+            assert_eq!(TEST_SOAC_METADATA_DROPS.load(Ordering::SeqCst), 1);
+            ffi::Py_DECREF(primary);
+            ffi::Py_DECREF(function);
+        });
+    }
+
+    #[test]
+    fn ordinary_function_mutation_does_not_claim_foreign_metadata() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            function_owner_type_registry().expect("owner watcher should initialize");
+            TEST_SOAC_METADATA_DROPS.store(0, Ordering::SeqCst);
+            let function = make_test_function(py);
+            let foreign = Box::into_raw(Box::new(456usize)).cast::<c_void>();
+            let foreign_id = 123;
+            assert_eq!(
+                PyFunction_SetSoacMetadata(
+                    function,
+                    foreign_id,
+                    foreign,
+                    Some(free_test_soac_metadata)
+                ),
+                0,
+            );
+            let code = (*function.cast::<ffi::PyFunctionObject>()).func_code;
+            assert_eq!(
+                ffi::PyObject_SetAttrString(function, c"__code__".as_ptr(), code),
+                0
+            );
+            let defaults = pyo3::types::PyTuple::empty(py);
+            let kwdefaults = PyDict::new(py);
+            assert_eq!(
+                ffi::PyObject_SetAttrString(function, c"__defaults__".as_ptr(), defaults.as_ptr()),
+                0
+            );
+            assert_eq!(
+                ffi::PyObject_SetAttrString(
+                    function,
+                    c"__kwdefaults__".as_ptr(),
+                    kwdefaults.as_ptr()
+                ),
+                0
+            );
+            assert!(observe_py_function_jit_extra(function).is_none());
+            assert!(observed_strict_function_id(function).is_none());
+            assert!(ffi::PyErr_Occurred().is_null());
+            assert_eq!(PyFunction_GetSoacMetadata(function), foreign);
+            assert_eq!(PyFunction_GetSoacFunctionId(function), foreign_id);
+            let result = ffi::PyObject_CallNoArgs(function);
+            assert!(
+                !result.is_null(),
+                "ordinary calls must not adopt a SOAC boundary"
+            );
+            assert_eq!(ffi::PyLong_AsLong(result), 1);
+            ffi::Py_DECREF(result);
+            assert_eq!(
+                PyFunction_SetSoacMetadata(function, 0, ptr::null_mut(), None),
+                0
+            );
+            assert_eq!(TEST_SOAC_METADATA_DROPS.load(Ordering::SeqCst), 1);
             ffi::Py_DECREF(function);
         });
     }

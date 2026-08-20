@@ -15,6 +15,9 @@ use ruff_text_size::{Ranged, TextRange};
 use crate::passes::ast_symbol_analysis::CurrentScopeNameTraversal;
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
+use crate::passes::ast_to_ast::source_origins::{
+    pattern_name, statement_names, type_parameter_name, SourceNameCatalog,
+};
 use crate::transformer::Transformer;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +45,7 @@ struct SemanticScopeId(usize);
 
 #[derive(Clone, Debug)]
 struct SemanticScopeData {
+    source_names: HashSet<String>,
     kind: SemanticScopeKind,
     bindings: HashMap<String, SemanticBindingKind>,
     local_defs: HashSet<String>,
@@ -70,19 +74,26 @@ impl SemanticSnapshot {
     }
 }
 
+/// The actual lowered syntax of a lambda whose expression needs helper
+/// definitions. Its original ExprLambda still owns parameters, defaults and
+/// source identity; this body is analyzed and executed in that same scope.
+#[derive(Clone, Debug)]
+pub(crate) struct LoweredLambdaBody {
+    pub(crate) statements: Suite,
+}
+
 #[derive(Debug, Default)]
 struct SemanticProvenance {
     function_scope_overrides: HashMap<NodeIndex, SemanticScopeId>,
+    lowered_lambda_bodies: HashMap<NodeIndex, LoweredLambdaBody>,
     next_node_index: u32,
 }
 
 impl SemanticProvenance {
     fn ensure_node_index<T: HasNodeIndex>(&mut self, node: &T) -> NodeIndex {
         let node_index = node.node_index().load();
-        if node_index != NodeIndex::NONE {
-            if let Some(value) = node_index.as_u32() {
-                self.next_node_index = self.next_node_index.max(value + 1);
-            }
+        if let Some(value) = node_index.as_u32() {
+            self.next_node_index = self.next_node_index.max(value + 1);
             return node_index;
         }
 
@@ -118,6 +129,33 @@ impl Transformer for MaxNodeIndexCollector {
         }
         crate::transformer::walk_expr(self, expr);
     }
+    fn visit_parameter(&mut self, node: &mut ast::Parameter) {
+        if let Some(value) = node.node_index().load().as_u32() {
+            self.max = self.max.max(value);
+        }
+        crate::transformer::walk_parameter(self, node);
+    }
+
+    fn visit_except_handler(&mut self, node: &mut ast::ExceptHandler) {
+        if let Some(value) = node.node_index().load().as_u32() {
+            self.max = self.max.max(value);
+        }
+        crate::transformer::walk_except_handler(self, node);
+    }
+
+    fn visit_type_param(&mut self, node: &mut ast::TypeParam) {
+        if let Some(value) = node.node_index().load().as_u32() {
+            self.max = self.max.max(value);
+        }
+        crate::transformer::walk_type_param(self, node);
+    }
+
+    fn visit_pattern(&mut self, node: &mut ast::Pattern) {
+        if let Some(value) = node.node_index().load().as_u32() {
+            self.max = self.max.max(value);
+        }
+        crate::transformer::walk_pattern(self, node);
+    }
 }
 
 fn next_node_index_for_suite(module: &mut Suite) -> u32 {
@@ -133,7 +171,7 @@ struct MissingNodeIndexAssigner {
 
 impl Transformer for MissingNodeIndexAssigner {
     fn visit_stmt(&mut self, stmt: &mut ast::Stmt) {
-        if stmt.node_index().load() == NodeIndex::NONE {
+        if stmt.node_index().load().as_u32().is_none() {
             stmt.node_index().set(NodeIndex::from(self.next));
             self.next += 1;
         }
@@ -141,15 +179,46 @@ impl Transformer for MissingNodeIndexAssigner {
     }
 
     fn visit_expr(&mut self, expr: &mut ast::Expr) {
-        if expr.node_index().load() == NodeIndex::NONE {
+        if expr.node_index().load().as_u32().is_none() {
             expr.node_index().set(NodeIndex::from(self.next));
             self.next += 1;
         }
         crate::transformer::walk_expr(self, expr);
     }
+    fn visit_parameter(&mut self, node: &mut ast::Parameter) {
+        if node.node_index().load().as_u32().is_none() {
+            node.node_index().set(NodeIndex::from(self.next));
+            self.next += 1;
+        }
+        crate::transformer::walk_parameter(self, node);
+    }
+
+    fn visit_except_handler(&mut self, node: &mut ast::ExceptHandler) {
+        if node.node_index().load().as_u32().is_none() {
+            node.node_index().set(NodeIndex::from(self.next));
+            self.next += 1;
+        }
+        crate::transformer::walk_except_handler(self, node);
+    }
+
+    fn visit_type_param(&mut self, node: &mut ast::TypeParam) {
+        if node.node_index().load().as_u32().is_none() {
+            node.node_index().set(NodeIndex::from(self.next));
+            self.next += 1;
+        }
+        crate::transformer::walk_type_param(self, node);
+    }
+
+    fn visit_pattern(&mut self, node: &mut ast::Pattern) {
+        if node.node_index().load().as_u32().is_none() {
+            node.node_index().set(NodeIndex::from(self.next));
+            self.next += 1;
+        }
+        crate::transformer::walk_pattern(self, node);
+    }
 }
 
-fn ensure_node_indices_for_suite(module: &mut Suite) -> u32 {
+pub(crate) fn ensure_node_indices_for_suite(module: &mut Suite) -> u32 {
     let next = next_node_index_for_suite(module);
     MissingNodeIndexAssigner { next }.visit_body(module);
     next_node_index_for_suite(module)
@@ -181,6 +250,10 @@ impl SemanticScope {
         self.state.inner.snapshot.scope(self.scope_id)
     }
 
+    pub(crate) fn source_names(&self) -> HashSet<String> {
+        self.data().source_names.clone()
+    }
+
     pub(crate) fn kind(&self) -> SemanticScopeKind {
         self.data().kind
     }
@@ -207,7 +280,7 @@ impl SemanticScope {
         if let Some(binding) = self.binding_in_current_scope(name) {
             return binding;
         }
-        if is_internal_symbol(name) {
+        if is_internal_symbol(name) && !self.data().source_names.contains(name) {
             return SemanticBindingKind::Local;
         }
         let mut current = self.data().parent;
@@ -327,6 +400,8 @@ fn child_qualname(parent: &SemanticScopeData, name: &str) -> String {
 
 #[derive(Default)]
 struct RuffScopeBindingCollector {
+    original_names: Arc<SourceNameCatalog>,
+    source_names: HashSet<String>,
     bound_names: HashSet<String>,
     type_param_names: HashSet<String>,
     explicit_globals: Vec<(String, TextRange)>,
@@ -334,9 +409,9 @@ struct RuffScopeBindingCollector {
     load_names: HashSet<String>,
 }
 
-#[derive(Default)]
-struct ImplicitClassCellUseDetector {
+struct ImplicitClassCellUseDetector<'a> {
     uses_class_cell: bool,
+    lowered_lambda_bodies: &'a HashMap<NodeIndex, LoweredLambdaBody>,
 }
 
 fn is_super_call(expr: &ast::Expr) -> bool {
@@ -349,7 +424,7 @@ fn is_super_call(expr: &ast::Expr) -> bool {
     )
 }
 
-impl Transformer for ImplicitClassCellUseDetector {
+impl Transformer for ImplicitClassCellUseDetector<'_> {
     fn visit_stmt(&mut self, stmt: &mut ast::Stmt) {
         match stmt {
             ast::Stmt::ClassDef(class_def) => {
@@ -393,6 +468,21 @@ impl Transformer for ImplicitClassCellUseDetector {
     }
 
     fn visit_expr(&mut self, expr: &mut ast::Expr) {
+        if let ast::Expr::Lambda(lambda) = expr {
+            if let Some(mut body) = self
+                .lowered_lambda_bodies
+                .get(&lambda.node_index.load())
+                .cloned()
+            {
+                if let Some(parameters) = &mut lambda.parameters {
+                    self.visit_parameters(parameters);
+                }
+                // Preparing an enclosing function must see the same transitive
+                // class-cell uses that an ordinary inline lambda body exposes.
+                self.visit_body(&mut body.statements);
+                return;
+            }
+        }
         match expr {
             ast::Expr::Name(ast::ExprName {
                 id,
@@ -412,20 +502,43 @@ impl Transformer for ImplicitClassCellUseDetector {
     }
 }
 
-fn uses_implicit_class_cell(body: &mut Suite) -> bool {
-    let mut detector = ImplicitClassCellUseDetector::default();
+fn uses_implicit_class_cell(
+    body: &mut Suite,
+    lowered_lambda_bodies: &HashMap<NodeIndex, LoweredLambdaBody>,
+) -> bool {
+    let mut detector = ImplicitClassCellUseDetector {
+        uses_class_cell: false,
+        lowered_lambda_bodies,
+    };
     detector.visit_body(body);
     detector.uses_class_cell
 }
 
-fn expr_uses_implicit_class_cell(expr: &mut ast::Expr) -> bool {
-    let mut detector = ImplicitClassCellUseDetector::default();
+fn expr_uses_implicit_class_cell(
+    expr: &mut ast::Expr,
+    lowered_lambda_bodies: &HashMap<NodeIndex, LoweredLambdaBody>,
+) -> bool {
+    let mut detector = ImplicitClassCellUseDetector {
+        uses_class_cell: false,
+        lowered_lambda_bodies,
+    };
     detector.visit_expr(expr);
     detector.uses_class_cell
 }
 
+impl RuffScopeBindingCollector {
+    fn record_source_name(&mut self, name: &str, range: TextRange, node: NodeIndex) {
+        if self.original_names.contains(name, range, node) {
+            self.source_names.insert(name.to_owned());
+        }
+    }
+}
+
 impl Transformer for RuffScopeBindingCollector {
     fn visit_stmt(&mut self, stmt: &mut ast::Stmt) {
+        statement_names(stmt, |name, range, node| {
+            self.record_source_name(name, range, node)
+        });
         match stmt {
             ast::Stmt::Global(global_stmt) => {
                 for name in &global_stmt.names {
@@ -444,10 +557,38 @@ impl Transformer for RuffScopeBindingCollector {
     }
 
     fn visit_expr(&mut self, expr: &mut ast::Expr) {
+        match expr {
+            ast::Expr::Name(name) => {
+                self.record_source_name(name.id.as_str(), name.range, name.node_index.load())
+            }
+            ast::Expr::Named(named) => {
+                if let ast::Expr::Name(name) = named.target.as_ref() {
+                    self.record_source_name(name.id.as_str(), name.range, name.node_index.load());
+                }
+            }
+            _ => {}
+        }
         self.visit_current_scope_expr_impl(expr);
     }
 
+    fn visit_except_handler(&mut self, handler: &mut ast::ExceptHandler) {
+        let ast::ExceptHandler::ExceptHandler(value) = handler;
+        if let Some(name) = &value.name {
+            self.record_source_name(name.as_str(), name.range(), value.node_index.load());
+        }
+        crate::transformer::walk_except_handler(self, handler);
+    }
+
+    fn visit_pattern(&mut self, pattern: &mut ast::Pattern) {
+        if let Some(name) = pattern_name(pattern) {
+            self.record_source_name(name.as_str(), name.range(), pattern.node_index().load());
+        }
+        crate::transformer::walk_pattern(self, pattern);
+    }
+
     fn visit_type_param(&mut self, type_param: &mut ast::TypeParam) {
+        let name = type_parameter_name(type_param);
+        self.record_source_name(name.as_str(), name.range(), type_param.node_index().load());
         match type_param {
             ast::TypeParam::TypeVar(ast::TypeParamTypeVar { name, .. })
             | ast::TypeParam::TypeVarTuple(ast::TypeParamTypeVarTuple { name, .. })
@@ -470,7 +611,7 @@ impl CurrentScopeNameTraversal for RuffScopeBindingCollector {
     }
 
     fn record_loaded_name(&mut self, name: &str) {
-        if !is_internal_symbol(name) {
+        if !is_internal_symbol(name) || self.source_names.contains(name) {
             self.load_names.insert(name.to_string());
         }
     }
@@ -479,8 +620,12 @@ impl CurrentScopeNameTraversal for RuffScopeBindingCollector {
 fn collect_scope_bindings(
     body: &mut Suite,
     type_params: Option<&mut ast::TypeParams>,
+    original_names: Arc<SourceNameCatalog>,
 ) -> RuffScopeBindingCollector {
-    let mut collector = RuffScopeBindingCollector::default();
+    let mut collector = RuffScopeBindingCollector {
+        original_names,
+        ..Default::default()
+    };
     if let Some(type_params) = type_params {
         collector.visit_type_params(type_params);
     }
@@ -488,8 +633,14 @@ fn collect_scope_bindings(
     collector
 }
 
-fn collect_scope_expr_bindings(expr: &mut ast::Expr) -> RuffScopeBindingCollector {
-    let mut collector = RuffScopeBindingCollector::default();
+fn collect_scope_expr_bindings(
+    expr: &mut ast::Expr,
+    original_names: Arc<SourceNameCatalog>,
+) -> RuffScopeBindingCollector {
+    let mut collector = RuffScopeBindingCollector {
+        original_names,
+        ..Default::default()
+    };
     collector.visit_expr(expr);
     collector
 }
@@ -515,8 +666,9 @@ fn set_semantic_binding(
     bindings: &mut HashMap<String, SemanticBindingKind>,
     name: &str,
     binding: SemanticBindingKind,
+    source_name: bool,
 ) {
-    let binding = if is_internal_symbol(name) {
+    let binding = if is_internal_symbol(name) && !source_name {
         SemanticBindingKind::Local
     } else {
         binding
@@ -531,7 +683,34 @@ fn set_semantic_binding(
     }
 }
 
+/// The nearest lexical owner, before physical cell storage is assigned.
+/// A function-owned cell with no alias is still a real binding; it must not be
+/// confused with absence of a binding and replaced by an enclosing class cell.
+enum EnclosingBinding {
+    Function { cell_storage_name: Option<String> },
+    ClassCell,
+    Global,
+}
+
+impl EnclosingBinding {
+    fn binding_kind(&self) -> SemanticBindingKind {
+        match self {
+            Self::Function { .. } | Self::ClassCell => SemanticBindingKind::Nonlocal,
+            Self::Global => SemanticBindingKind::Global,
+        }
+    }
+
+    fn into_cell_storage_name(self) -> Option<String> {
+        match self {
+            Self::Function { cell_storage_name } => cell_storage_name,
+            Self::ClassCell => Some("_dp_classcell".to_string()),
+            Self::Global => None,
+        }
+    }
+}
+
 struct ScopePreparation {
+    source_names: HashSet<String>,
     bindings: HashMap<String, SemanticBindingKind>,
     local_defs: HashSet<String>,
     type_param_names: HashSet<String>,
@@ -539,6 +718,8 @@ struct ScopePreparation {
 }
 
 struct RuffSemanticSnapshotBuilder {
+    lowered_lambda_bodies: HashMap<NodeIndex, LoweredLambdaBody>,
+    original_names: Arc<SourceNameCatalog>,
     semantic: RuffSemanticModel<'static>,
     snapshot: SemanticSnapshot,
     scope_stack: Vec<(SemanticScopeId, RuffScopeId)>,
@@ -547,7 +728,11 @@ struct RuffSemanticSnapshotBuilder {
 }
 
 impl RuffSemanticSnapshotBuilder {
-    fn build(module: &mut Suite) -> SemanticStateInner {
+    fn build(
+        module: &mut Suite,
+        original_names: &SourceNameCatalog,
+        lowered_lambda_bodies: &HashMap<NodeIndex, LoweredLambdaBody>,
+    ) -> SemanticStateInner {
         let module_for_model = Box::leak(Box::new(module.clone()));
         let module_for_build = Box::leak(Box::new(module.clone()));
         let path = Path::new("<semantic-state>");
@@ -559,11 +744,21 @@ impl RuffSemanticSnapshotBuilder {
             name: Some("<semantic-state>"),
         };
         let typing_modules: &[String] = &[];
-        let semantic = RuffSemanticModel::new(typing_modules, path, module_info);
+        let semantic = RuffSemanticModel::new(
+            typing_modules,
+            &[],
+            ast::PythonVersion::PY315,
+            ast::PySourceType::Python,
+            path,
+            module_info,
+        );
         let mut builder = Self {
+            lowered_lambda_bodies: lowered_lambda_bodies.clone(),
+            original_names: Arc::new(original_names.clone()),
             semantic,
             snapshot: SemanticSnapshot {
                 scopes: vec![SemanticScopeData {
+                    source_names: HashSet::new(),
                     kind: SemanticScopeKind::Module,
                     bindings: HashMap::new(),
                     local_defs: HashSet::new(),
@@ -585,12 +780,17 @@ impl RuffSemanticSnapshotBuilder {
         let module_preparation = builder.prepare_current_scope(module_for_build, None, &[]);
         {
             let module_scope = builder.snapshot.scope_mut(SemanticScopeId(0));
+            module_scope.source_names = module_preparation.source_names;
             module_scope.bindings = module_preparation.bindings;
             module_scope.local_defs = module_preparation.local_defs;
             module_scope.type_param_names = module_preparation.type_param_names;
             module_scope.cell_storage_names = module_preparation.cell_storage_names;
         }
         builder.visit_body(module_for_build);
+        assert!(
+            builder.lowered_lambda_bodies.is_empty(),
+            "every lowered body must belong to an encountered lambda"
+        );
         builder.propagate_nonlocal_roots();
         builder.compute_local_cell_bindings();
 
@@ -608,10 +808,8 @@ impl RuffSemanticSnapshotBuilder {
 
     fn ensure_node_index<T: HasNodeIndex>(&mut self, node: &T) -> NodeIndex {
         let node_index = node.node_index().load();
-        if node_index != NodeIndex::NONE {
-            if let Some(value) = node_index.as_u32() {
-                self.next_node_index = self.next_node_index.max(value + 1);
-            }
+        if let Some(value) = node_index.as_u32() {
+            self.next_node_index = self.next_node_index.max(value + 1);
             return node_index;
         }
 
@@ -625,20 +823,20 @@ impl RuffSemanticSnapshotBuilder {
         &mut self,
         body: &mut Suite,
         type_params: Option<&mut ast::TypeParams>,
-        parameters: &[(String, TextRange)],
+        parameters: &[(String, TextRange, NodeIndex)],
     ) -> ScopePreparation {
-        let collector = collect_scope_bindings(body, type_params);
-        let uses_class_cell = uses_implicit_class_cell(body);
+        let collector = collect_scope_bindings(body, type_params, self.original_names.clone());
+        let uses_class_cell = uses_implicit_class_cell(body, &self.lowered_lambda_bodies);
         self.prepare_scope_from_collector(collector, uses_class_cell, parameters)
     }
 
     fn prepare_current_expr_scope(
         &mut self,
         expr: &mut ast::Expr,
-        parameters: &[(String, TextRange)],
+        parameters: &[(String, TextRange, NodeIndex)],
     ) -> ScopePreparation {
-        let collector = collect_scope_expr_bindings(expr);
-        let uses_class_cell = expr_uses_implicit_class_cell(expr);
+        let collector = collect_scope_expr_bindings(expr, self.original_names.clone());
+        let uses_class_cell = expr_uses_implicit_class_cell(expr, &self.lowered_lambda_bodies);
         self.prepare_scope_from_collector(collector, uses_class_cell, parameters)
     }
 
@@ -646,17 +844,16 @@ impl RuffSemanticSnapshotBuilder {
         for decorator in &mut func_def.decorator_list {
             self.visit_decorator(decorator);
         }
-        for param in &mut func_def.parameters.posonlyargs {
-            if let Some(default) = &mut param.default {
-                self.visit_expr(default);
-            }
-        }
-        for param in &mut func_def.parameters.args {
-            if let Some(default) = &mut param.default {
-                self.visit_expr(default);
-            }
-        }
-        for param in &mut func_def.parameters.kwonlyargs {
+        self.visit_parameter_defaults(&mut func_def.parameters);
+    }
+
+    fn visit_parameter_defaults(&mut self, parameters: &mut ast::Parameters) {
+        for param in parameters
+            .posonlyargs
+            .iter_mut()
+            .chain(parameters.args.iter_mut())
+            .chain(parameters.kwonlyargs.iter_mut())
+        {
             if let Some(default) = &mut param.default {
                 self.visit_expr(default);
             }
@@ -667,8 +864,14 @@ impl RuffSemanticSnapshotBuilder {
         &mut self,
         collector: RuffScopeBindingCollector,
         uses_class_cell: bool,
-        parameters: &[(String, TextRange)],
+        parameters: &[(String, TextRange, NodeIndex)],
     ) -> ScopePreparation {
+        let mut source_names = collector.source_names;
+        for (name, range, node) in parameters {
+            if self.original_names.contains(name, *range, *node) {
+                source_names.insert(name.clone());
+            }
+        }
         let explicit_globals = collector
             .explicit_globals
             .iter()
@@ -683,12 +886,13 @@ impl RuffSemanticSnapshotBuilder {
         for (name, range) in collector.explicit_globals {
             if !self.semantic.scope_id.is_global() {
                 let global_binding = self.semantic.global_scope().get(name.as_str());
+                let leaked_name = Box::leak(name.into_boxed_str());
                 let binding_id = self.semantic.push_binding(
+                    leaked_name,
                     range,
                     RuffBindingKind::Global(global_binding),
                     RuffBindingFlags::GLOBAL,
                 );
-                let leaked_name = Box::leak(name.into_boxed_str());
                 self.semantic
                     .current_scope_mut()
                     .add(leaked_name, binding_id);
@@ -696,24 +900,26 @@ impl RuffSemanticSnapshotBuilder {
         }
         for (name, range) in collector.explicit_nonlocals {
             if let Some((scope_id, binding_id)) = self.semantic.nonlocal(name.as_str()) {
+                let leaked_name = Box::leak(name.into_boxed_str());
                 let binding_id = self.semantic.push_binding(
+                    leaked_name,
                     range,
                     RuffBindingKind::Nonlocal(binding_id, scope_id),
                     RuffBindingFlags::NONLOCAL,
                 );
-                let leaked_name = Box::leak(name.into_boxed_str());
                 self.semantic
                     .current_scope_mut()
                     .add(leaked_name, binding_id);
             }
         }
-        for (name, range) in parameters {
+        for (name, range, _) in parameters {
+            let leaked_name = Box::leak(name.clone().into_boxed_str());
             let binding_id = self.semantic.push_binding(
+                leaked_name,
                 *range,
                 RuffBindingKind::Argument,
                 RuffBindingFlags::empty(),
             );
-            let leaked_name = Box::leak(name.clone().into_boxed_str());
             self.semantic
                 .current_scope_mut()
                 .add(leaked_name, binding_id);
@@ -722,12 +928,13 @@ impl RuffSemanticSnapshotBuilder {
             if self.semantic.current_scope().has(name.as_str()) {
                 continue;
             }
+            let leaked_name = Box::leak(name.clone().into_boxed_str());
             let binding_id = self.semantic.push_binding(
+                leaked_name,
                 TextRange::default(),
                 RuffBindingKind::Assignment,
                 RuffBindingFlags::empty(),
             );
-            let leaked_name = Box::leak(name.clone().into_boxed_str());
             self.semantic
                 .current_scope_mut()
                 .add(leaked_name, binding_id);
@@ -737,56 +944,92 @@ impl RuffSemanticSnapshotBuilder {
         let mut local_defs = HashSet::new();
         let mut cell_storage_names = HashMap::new();
         for name in &explicit_globals {
-            set_semantic_binding(&mut bindings, name, SemanticBindingKind::Global);
+            set_semantic_binding(
+                &mut bindings,
+                name,
+                SemanticBindingKind::Global,
+                source_names.contains(name),
+            );
         }
         for name in &explicit_nonlocals {
-            set_semantic_binding(&mut bindings, name, SemanticBindingKind::Nonlocal);
+            set_semantic_binding(
+                &mut bindings,
+                name,
+                SemanticBindingKind::Nonlocal,
+                source_names.contains(name),
+            );
         }
-        for (name, _) in parameters {
-            set_semantic_binding(&mut bindings, name.as_str(), SemanticBindingKind::Local);
+        for (name, _, _) in parameters {
+            set_semantic_binding(
+                &mut bindings,
+                name.as_str(),
+                SemanticBindingKind::Local,
+                source_names.contains(name),
+            );
             if !explicit_globals.contains(name) && !explicit_nonlocals.contains(name) {
                 local_defs.insert(name.clone());
             }
         }
         for name in &collector.bound_names {
-            set_semantic_binding(&mut bindings, name.as_str(), SemanticBindingKind::Local);
+            set_semantic_binding(
+                &mut bindings,
+                name.as_str(),
+                SemanticBindingKind::Local,
+                source_names.contains(name),
+            );
             if !explicit_globals.contains(name) && !explicit_nonlocals.contains(name) {
                 local_defs.insert(name.clone());
             }
         }
+        // Resolve the class-cell dependency once from its nearest owner.
+        // This also covers explicit nonlocal declarations and implicit super()
+        // uses, whose __class__ dependency need not occur in load_names.
+        if self.current_scope_is_function()
+            && uses_class_cell
+            && !matches!(
+                bindings.get("__class__"),
+                Some(SemanticBindingKind::Local | SemanticBindingKind::Global)
+            )
+        {
+            if let Some(owner) = self.enclosing_binding_owner("__class__") {
+                set_semantic_binding(
+                    &mut bindings,
+                    "__class__",
+                    owner.binding_kind(),
+                    source_names.contains("__class__"),
+                );
+                if let Some(storage_name) = owner.into_cell_storage_name() {
+                    cell_storage_names.insert("__class__".to_string(), storage_name);
+                }
+            }
+        }
+
         for name in collector.load_names {
             if bindings.contains_key(name.as_str()) {
                 continue;
             }
-            if let Some(storage_name) = self.enclosing_function_capture_storage_name(name.as_str())
-            {
-                set_semantic_binding(&mut bindings, name.as_str(), SemanticBindingKind::Nonlocal);
-                if let Some(storage_name) = storage_name {
+            if let Some(owner) = self.enclosing_binding_owner(name.as_str()) {
+                let kind = owner.binding_kind();
+                set_semantic_binding(
+                    &mut bindings,
+                    name.as_str(),
+                    kind,
+                    source_names.contains(&name),
+                );
+                if let Some(storage_name) = owner.into_cell_storage_name() {
                     cell_storage_names.insert(name.clone(), storage_name);
                 }
-                self.implicit_nonlocals_by_scope
-                    .entry(self.current_ids().0)
-                    .or_default()
-                    .insert(name);
+                if kind == SemanticBindingKind::Nonlocal {
+                    self.implicit_nonlocals_by_scope
+                        .entry(self.current_ids().0)
+                        .or_default()
+                        .insert(name);
+                }
             }
         }
 
-        let should_synthesize_class_cell = self.current_scope_is_function()
-            && uses_class_cell
-            && self.current_scope_has_class_ancestor();
-        if should_synthesize_class_cell && !bindings.contains_key("__class__") {
-            set_semantic_binding(&mut bindings, "__class__", SemanticBindingKind::Nonlocal);
-            cell_storage_names.insert("__class__".to_string(), "_dp_classcell".to_string());
-        } else if should_synthesize_class_cell
-            && matches!(
-                bindings.get("__class__"),
-                Some(SemanticBindingKind::Nonlocal)
-            )
-        {
-            cell_storage_names.insert("__class__".to_string(), "_dp_classcell".to_string());
-        }
-
         ScopePreparation {
+            source_names,
             bindings,
             local_defs,
             type_param_names: collector.type_param_names,
@@ -801,33 +1044,34 @@ impl RuffSemanticSnapshotBuilder {
         )
     }
 
-    fn current_scope_has_class_ancestor(&self) -> bool {
-        let mut current = Some(self.current_ids().0);
-        while let Some(scope_id) = current {
-            let scope = self.snapshot.scope(scope_id);
-            match scope.kind {
-                SemanticScopeKind::Class => return true,
-                SemanticScopeKind::Module => return false,
-                SemanticScopeKind::Function => current = scope.parent,
-            }
-        }
-        false
-    }
-
-    fn enclosing_function_capture_storage_name(&self, name: &str) -> Option<Option<String>> {
+    fn enclosing_binding_owner(&self, name: &str) -> Option<EnclosingBinding> {
+        // Class dictionaries do not provide ordinary lexical bindings. Only a
+        // function/lambda's implicit __class__ dependency stops at a class;
+        // source class-body lookup retains its separate namespace semantics.
+        let class_cell = self.current_scope_is_function() && name == "__class__";
         let mut current = Some(self.current_ids().0);
         while let Some(scope_id) = current {
             let scope = self.snapshot.scope(scope_id);
             match scope.kind {
                 SemanticScopeKind::Function => {
+                    if class_cell
+                        && matches!(scope.bindings.get(name), Some(SemanticBindingKind::Global))
+                    {
+                        return Some(EnclosingBinding::Global);
+                    }
                     if scope.local_defs.contains(name)
                         || matches!(
                             scope.bindings.get(name),
                             Some(SemanticBindingKind::Nonlocal)
                         )
                     {
-                        return Some(scope.cell_storage_names.get(name).cloned());
+                        return Some(EnclosingBinding::Function {
+                            cell_storage_name: scope.cell_storage_names.get(name).cloned(),
+                        });
                     }
+                }
+                SemanticScopeKind::Class if class_cell => {
+                    return Some(EnclosingBinding::ClassCell);
                 }
                 SemanticScopeKind::Module => return None,
                 SemanticScopeKind::Class => {}
@@ -848,6 +1092,7 @@ impl RuffSemanticSnapshotBuilder {
         let qualname = child_qualname(self.snapshot.scope(parent_id), name);
         let scope_id = SemanticScopeId(self.snapshot.scopes.len());
         self.snapshot.scopes.push(SemanticScopeData {
+            source_names: preparation.source_names,
             kind,
             bindings: preparation.bindings,
             local_defs: preparation.local_defs,
@@ -906,10 +1151,12 @@ impl RuffSemanticSnapshotBuilder {
                             Some(SemanticBindingKind::Local)
                         )
                     {
+                        let source_name = parent.source_names.contains(&name);
                         set_semantic_binding(
                             &mut self.snapshot.scope_mut(parent_id).bindings,
                             name.as_str(),
                             SemanticBindingKind::Nonlocal,
+                            source_name,
                         );
                         break;
                     }
@@ -1011,6 +1258,11 @@ impl Transformer for RuffSemanticSnapshotBuilder {
     fn visit_expr(&mut self, expr: &mut ast::Expr) {
         match expr {
             ast::Expr::Lambda(lambda) => {
+                if let Some(parameters) = lambda.parameters.as_mut() {
+                    // These callables and captures belong to the enclosing
+                    // execution, not to the lambda body being constructed.
+                    self.visit_parameter_defaults(parameters);
+                }
                 let node_index = self.ensure_node_index(lambda);
                 let leaked_lambda = Box::leak(Box::new(lambda.clone()));
                 self.semantic
@@ -1020,8 +1272,13 @@ impl Transformer for RuffSemanticSnapshotBuilder {
                     .as_deref()
                     .map(parameter_refs)
                     .unwrap_or_default();
-                let preparation =
-                    self.prepare_current_expr_scope(lambda.body.as_mut(), &parameters);
+                let mut lowered_body = self.lowered_lambda_bodies.remove(&node_index);
+                let preparation = match &mut lowered_body {
+                    Some(body) => {
+                        self.prepare_current_scope(&mut body.statements, None, &parameters)
+                    }
+                    None => self.prepare_current_expr_scope(lambda.body.as_mut(), &parameters),
+                };
                 let scope_id = self.push_snapshot_scope(
                     SemanticScopeKind::Function,
                     "<lambda>",
@@ -1030,7 +1287,10 @@ impl Transformer for RuffSemanticSnapshotBuilder {
                 );
                 let ruff_scope_id = self.semantic.scope_id;
                 self.scope_stack.push((scope_id, ruff_scope_id));
-                self.visit_expr(lambda.body.as_mut());
+                match &mut lowered_body {
+                    Some(body) => self.visit_body(&mut body.statements),
+                    None => self.visit_expr(lambda.body.as_mut()),
+                }
                 self.scope_stack.pop();
                 self.semantic.pop_scope();
             }
@@ -1039,45 +1299,125 @@ impl Transformer for RuffSemanticSnapshotBuilder {
     }
 }
 
-fn parameter_refs(parameters: &ast::Parameters) -> Vec<(String, TextRange)> {
+fn parameter_refs(parameters: &ast::Parameters) -> Vec<(String, TextRange, NodeIndex)> {
     let mut refs = Vec::new();
     for parameter in &parameters.posonlyargs {
         refs.push((
             parameter.parameter.name.id.to_string(),
             parameter.parameter.range(),
+            parameter.parameter.node_index.load(),
         ));
     }
     for parameter in &parameters.args {
         refs.push((
             parameter.parameter.name.id.to_string(),
             parameter.parameter.range(),
+            parameter.parameter.node_index.load(),
         ));
     }
     if let Some(vararg) = parameters.vararg.as_ref() {
-        refs.push((vararg.name.id.to_string(), vararg.range()));
+        refs.push((
+            vararg.name.id.to_string(),
+            vararg.range(),
+            vararg.node_index.load(),
+        ));
     }
     for parameter in &parameters.kwonlyargs {
         refs.push((
             parameter.parameter.name.id.to_string(),
             parameter.parameter.range(),
+            parameter.parameter.node_index.load(),
         ));
     }
     if let Some(kwarg) = parameters.kwarg.as_ref() {
-        refs.push((kwarg.name.id.to_string(), kwarg.range()));
+        refs.push((
+            kwarg.name.id.to_string(),
+            kwarg.range(),
+            kwarg.node_index.load(),
+        ));
     }
     refs
 }
 
 impl SemanticAstState {
-    pub(crate) fn from_ruff(module: &mut Suite) -> Self {
-        let next_node_index = ensure_node_indices_for_suite(module);
-        let inner = Arc::new(RuffSemanticSnapshotBuilder::build(module));
-        let mut provenance = SemanticProvenance::default();
-        provenance.next_node_index = next_node_index;
+    /// Allocate from the same namespace as the preserved source AST. Only the
+    /// rewrite which just created this node may attach intrinsic provenance.
+    pub(crate) fn assign_generated_node_index<T: HasNodeIndex>(&self, node: &T) -> NodeIndex {
+        assert!(
+            node.node_index().load().as_u32().is_none(),
+            "a generated intrinsic must not reuse a source node's identity"
+        );
+        self.provenance
+            .lock()
+            .expect("semantic provenance mutex poisoned")
+            .ensure_node_index(node)
+    }
+
+    pub(crate) fn from_ruff(module: &mut Suite, original_names: &SourceNameCatalog) -> Self {
+        Self::from_ruff_with_lambda_bodies(module, original_names, HashMap::new())
+    }
+
+    pub(crate) fn from_ruff_with_lambda_bodies(
+        module: &mut Suite,
+        original_names: &SourceNameCatalog,
+        mut lowered_lambda_bodies: HashMap<NodeIndex, LoweredLambdaBody>,
+    ) -> Self {
+        // Allocate generated node identities from one namespace across the
+        // visible AST and the lambda-owned bodies. Source node IDs stay intact.
+        let mut next = next_node_index_for_suite(module);
+        for body in lowered_lambda_bodies.values_mut() {
+            next = next.max(next_node_index_for_suite(&mut body.statements));
+        }
+        let mut assigner = MissingNodeIndexAssigner { next };
+        assigner.visit_body(module);
+        let mut nodes = lowered_lambda_bodies.keys().copied().collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.as_u32().expect("lowered lambda has an identity"));
+        for node in nodes {
+            assigner.visit_body(&mut lowered_lambda_bodies.get_mut(&node).unwrap().statements);
+        }
+        let inner = Arc::new(RuffSemanticSnapshotBuilder::build(
+            module,
+            original_names,
+            &lowered_lambda_bodies,
+        ));
+        let provenance = SemanticProvenance {
+            next_node_index: assigner.next,
+            lowered_lambda_bodies,
+            ..Default::default()
+        };
         Self {
             inner,
             provenance: Arc::new(Mutex::new(provenance)),
         }
+    }
+
+    pub(crate) fn lowered_lambda_body(
+        &self,
+        lambda: &ast::ExprLambda,
+    ) -> Option<LoweredLambdaBody> {
+        self.provenance
+            .lock()
+            .expect("semantic provenance mutex poisoned")
+            .lowered_lambda_bodies
+            .get(&lambda.node_index.load())
+            .cloned()
+    }
+
+    pub(crate) fn replace_lowered_lambda_body(
+        &self,
+        lambda: &ast::ExprLambda,
+        body: LoweredLambdaBody,
+    ) {
+        let previous = self
+            .provenance
+            .lock()
+            .expect("semantic provenance mutex poisoned")
+            .lowered_lambda_bodies
+            .insert(lambda.node_index.load(), body);
+        assert!(
+            previous.is_some(),
+            "only an existing lowered lambda body can be rewritten"
+        );
     }
 
     fn scope(&self, scope_id: SemanticScopeId) -> SemanticScope {
@@ -1136,19 +1476,21 @@ impl SemanticAstState {
     ) -> SemanticScope {
         let module_scope = self.module_scope();
         let module_data = module_scope.data().clone();
+        let source_names = module_data.source_names;
         let translated_bindings = module_data
             .bindings
             .into_iter()
             .map(|(name, binding)| {
-                let translated = if is_internal_symbol(name.as_str()) {
-                    SemanticBindingKind::Local
-                } else {
-                    match binding {
-                        SemanticBindingKind::Local => SemanticBindingKind::Global,
-                        SemanticBindingKind::Nonlocal => SemanticBindingKind::Nonlocal,
-                        SemanticBindingKind::Global => SemanticBindingKind::Global,
-                    }
-                };
+                let translated =
+                    if is_internal_symbol(name.as_str()) && !source_names.contains(&name) {
+                        SemanticBindingKind::Local
+                    } else {
+                        match binding {
+                            SemanticBindingKind::Local => SemanticBindingKind::Global,
+                            SemanticBindingKind::Nonlocal => SemanticBindingKind::Nonlocal,
+                            SemanticBindingKind::Global => SemanticBindingKind::Global,
+                        }
+                    };
                 (name, translated)
             })
             .collect::<HashMap<_, _>>();
@@ -1157,6 +1499,7 @@ impl SemanticAstState {
             let inner = Arc::make_mut(&mut self.inner);
             let scope_id = SemanticScopeId(inner.snapshot.scopes.len());
             inner.snapshot.scopes.push(SemanticScopeData {
+                source_names,
                 kind: SemanticScopeKind::Module,
                 bindings: translated_bindings,
                 local_defs: HashSet::new(),

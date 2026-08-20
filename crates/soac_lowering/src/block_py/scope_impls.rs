@@ -110,6 +110,14 @@ impl ScopeExprNode for InstrRuff {
                     f(name);
                 }
             }
+            Self::ComprehensionInsert(op) => f(op.container.id_str()),
+            Self::IteratorStep(op) => f(op.name.id_str()),
+            Self::CallArgumentOp(op) => {
+                for name in op.read_names() {
+                    f(name.id_str());
+                }
+            }
+            Self::TakeOperand(op) => f(op.name.id_str()),
             Self::StmtExpr(stmt) => stmt.value.as_ref().walk_root_loaded_names(f),
             _ => {}
         }
@@ -130,6 +138,13 @@ impl ScopeExprNode for InstrRuff {
                     walk_assigned_name_targets_in_instr_ruff(target, f);
                 }
             }
+            Self::CallArgumentOp(op) => {
+                for name in op.written_names() {
+                    f(name.id_str());
+                }
+            }
+            Self::Store(op) => f(op.name.id_str()),
+            Self::TakeOperand(op) => f(op.name.id_str()),
             Self::StmtFunctionDef(stmt) => f(stmt.name.as_str()),
             Self::StmtClassDef(stmt) => f(stmt.name.as_str()),
             Self::StmtExpr(stmt) => stmt.value.as_ref().walk_root_defined_names(f),
@@ -149,6 +164,7 @@ impl ScopeExprNode for InstrRuff {
                     walk_assigned_name_targets_in_instr_ruff(target, f);
                 }
             }
+            Self::TakeOperand(op) => f(op.name.id_str()),
             Self::StmtExpr(stmt) => stmt.value.as_ref().walk_root_deleted_names(f),
             _ => {}
         }
@@ -161,6 +177,7 @@ impl ScopeExprNode for InstrRuff {
                     f(name.as_str());
                 }
             }
+            Self::CellRefForName(op) if op.lexical_scope.is_none() => f(op.logical_name.as_str()),
             Self::StmtExpr(stmt) => stmt.value.as_ref().walk_root_cell_ref_logical_names(f),
             _ => {}
         }
@@ -194,6 +211,14 @@ impl ScopeExprNode for InstrWithAwaitAndYield {
                 }
             }
             Self::Load(op) => f(op.name.id_str()),
+            Self::TakeOperand(op) => f(op.name.id_str()),
+            Self::ComprehensionInsert(op) => f(op.container.id_str()),
+            Self::IteratorStep(op) => f(op.name.id_str()),
+            Self::CallArgumentOp(op) => {
+                for name in op.read_names() {
+                    f(name.id_str());
+                }
+            }
             _ => {}
         }
     }
@@ -201,11 +226,19 @@ impl ScopeExprNode for InstrWithAwaitAndYield {
     fn walk_root_defined_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Store(op) = self {
             f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
+            f(op.name.id_str());
+        } else if let Self::CallArgumentOp(op) = self {
+            for name in op.written_names() {
+                f(name.id_str());
+            }
         }
     }
 
     fn walk_root_deleted_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Del(op) = self {
+            f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
             f(op.name.id_str());
         }
     }
@@ -217,7 +250,9 @@ impl ScopeExprNode for InstrWithAwaitAndYield {
                     f(name.as_str());
                 }
             }
-            Self::CellRefForName(op) => f(op.logical_name.as_str()),
+            // Exact lexical-owner operands already have a body/private/native
+            // storage projection. They are not requests for a public capture.
+            Self::CellRefForName(op) if op.lexical_scope.is_none() => f(op.logical_name.as_str()),
             _ => {}
         }
     }
@@ -250,6 +285,14 @@ impl ScopeExprNode for InstrWithYield {
                 }
             }
             Self::Load(op) => f(op.name.id_str()),
+            Self::TakeOperand(op) => f(op.name.id_str()),
+            Self::ComprehensionInsert(op) => f(op.container.id_str()),
+            Self::IteratorStep(op) => f(op.name.id_str()),
+            Self::CallArgumentOp(op) => {
+                for name in op.read_names() {
+                    f(name.id_str());
+                }
+            }
             _ => {}
         }
     }
@@ -257,11 +300,19 @@ impl ScopeExprNode for InstrWithYield {
     fn walk_root_defined_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Store(op) = self {
             f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
+            f(op.name.id_str());
+        } else if let Self::CallArgumentOp(op) = self {
+            for name in op.written_names() {
+                f(name.id_str());
+            }
         }
     }
 
     fn walk_root_deleted_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Del(op) = self {
+            f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
             f(op.name.id_str());
         }
     }
@@ -273,7 +324,7 @@ impl ScopeExprNode for InstrWithYield {
                     f(name.as_str());
                 }
             }
-            Self::CellRefForName(op) => f(op.logical_name.as_str()),
+            Self::CellRefForName(op) if op.lexical_scope.is_none() => f(op.logical_name.as_str()),
             _ => {}
         }
     }
@@ -309,6 +360,14 @@ where
                 }
             }
             Self::Load(op) => f(op.name.id_str()),
+            Self::TakeOperand(op) => f(op.name.id_str()),
+            Self::ComprehensionInsert(op) => f(op.container.id_str()),
+            Self::IteratorStep(op) => f(op.name.id_str()),
+            Self::CallArgumentOp(op) => {
+                for name in op.read_names() {
+                    f(name.id_str());
+                }
+            }
             _ => {}
         }
     }
@@ -316,11 +375,19 @@ where
     fn walk_root_defined_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Store(op) = self {
             f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
+            f(op.name.id_str());
+        } else if let Self::CallArgumentOp(op) = self {
+            for name in op.written_names() {
+                f(name.id_str());
+            }
         }
     }
 
     fn walk_root_deleted_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Del(op) = self {
+            f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
             f(op.name.id_str());
         }
     }
@@ -332,7 +399,7 @@ where
                     f(name.as_str());
                 }
             }
-            Self::CellRefForName(op) => f(op.logical_name.as_str()),
+            Self::CellRefForName(op) if op.lexical_scope.is_none() => f(op.logical_name.as_str()),
             _ => {}
         }
     }
@@ -365,6 +432,14 @@ impl ScopeExprNode for InstrResolved {
                 }
             }
             Self::Load(op) => f(op.name.id_str()),
+            Self::TakeOperand(op) => f(op.name.id_str()),
+            Self::ComprehensionInsert(op) => f(op.container.id_str()),
+            Self::IteratorStep(op) => f(op.name.id_str()),
+            Self::CallArgumentOp(op) => {
+                for name in op.read_names() {
+                    f(name.id_str());
+                }
+            }
             _ => {}
         }
     }
@@ -372,11 +447,19 @@ impl ScopeExprNode for InstrResolved {
     fn walk_root_defined_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Store(op) = self {
             f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
+            f(op.name.id_str());
+        } else if let Self::CallArgumentOp(op) = self {
+            for name in op.written_names() {
+                f(name.id_str());
+            }
         }
     }
 
     fn walk_root_deleted_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Del(op) = self {
+            f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
             f(op.name.id_str());
         }
     }
@@ -401,6 +484,14 @@ impl ScopeExprNode for super::InstrBlockPy {
                 }
             }
             Self::Load(op) => f(op.name.id_str()),
+            Self::TakeOperand(op) => f(op.name.id_str()),
+            Self::ComprehensionInsert(op) => f(op.container.id_str()),
+            Self::IteratorStep(op) => f(op.name.id_str()),
+            Self::CallArgumentOp(op) => {
+                for name in op.read_names() {
+                    f(name.id_str());
+                }
+            }
             _ => {}
         }
     }
@@ -408,11 +499,19 @@ impl ScopeExprNode for super::InstrBlockPy {
     fn walk_root_defined_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Store(op) = self {
             f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
+            f(op.name.id_str());
+        } else if let Self::CallArgumentOp(op) = self {
+            for name in op.written_names() {
+                f(name.id_str());
+            }
         }
     }
 
     fn walk_root_deleted_names(&self, f: &mut impl FnMut(&str)) {
         if let Self::Del(op) = self {
+            f(op.name.id_str());
+        } else if let Self::TakeOperand(op) = self {
             f(op.name.id_str());
         }
     }
@@ -471,13 +570,6 @@ where
     }
 }
 
-pub(crate) fn is_runtime_closure_name(name: &str) -> bool {
-    matches!(
-        name,
-        "_dp_pc" | "_dp_is_closed" | "_dp_yieldfrom" | "_dp_throw_context"
-    ) || name.starts_with("_dp_try_abrupt_kind_")
-}
-
 pub(crate) fn compute_make_function_capture_bindings_from_scope<P>(
     callable_def: &BlockPyFunction<P>,
 ) -> Vec<CellCaptureBinding>
@@ -507,6 +599,9 @@ where
         .map(|binding| {
             let logical_name = normalize_capture_name(binding.logical_name.as_str());
             CellCaptureBinding {
+                projection: callable_def
+                    .scope
+                    .cell_capture_projection(logical_name.as_str()),
                 source_name: callable_def
                     .scope
                     .cell_capture_source_name(logical_name.as_str()),
@@ -519,7 +614,6 @@ where
             .cell_ref_logical_names
             .iter()
             .map(|name| normalize_capture_name(name.as_str()))
-            .filter(|logical_name| !is_runtime_closure_name(logical_name.as_str()))
             .filter(|logical_name| !param_name_set.contains(logical_name.as_str()))
             .filter(|logical_name| {
                 let source_name = callable_def
@@ -533,6 +627,9 @@ where
                 !owned_cell_slot_names.contains(source_name.as_str())
             })
             .map(|logical_name| CellCaptureBinding {
+                projection: callable_def
+                    .scope
+                    .cell_capture_projection(logical_name.as_str()),
                 source_name: callable_def
                     .scope
                     .cell_capture_source_name(logical_name.as_str()),
@@ -589,17 +686,7 @@ where
 {
     capture_names.sort();
     capture_names.dedup();
-    let local_cell_slots = local_cell_slots
-        .iter()
-        .filter(|storage_name| {
-            let logical_name = callable_def
-                .scope
-                .logical_name_for_cell_storage(storage_name.as_str())
-                .unwrap_or_else(|| (*storage_name).clone());
-            !is_runtime_closure_name(logical_name.as_str())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let local_cell_slots = local_cell_slots.to_vec();
 
     if capture_names.is_empty() && local_cell_slots.is_empty() {
         return None;
@@ -620,7 +707,14 @@ where
                 .scope
                 .logical_name_for_cell_storage(storage_name.as_str())
                 .unwrap_or_else(|| storage_name.clone());
-            let init = if param_name_set.contains(logical_name.as_str()) {
+            let init = if callable_def
+                .scope
+                .class_bindings
+                .as_ref()
+                .is_some_and(|class| class.is_current_cell_binding(&storage_name))
+            {
+                ClosureInit::Deferred
+            } else if param_name_set.contains(logical_name.as_str()) {
                 ClosureInit::Parameter
             } else {
                 ClosureInit::EmptyCell
@@ -634,9 +728,13 @@ where
         .collect::<Vec<_>>();
 
     Some(StorageLayout {
+        class_bindings: None,
+        block_parameter_roles: Vec::new(),
+        generator_resume_abi: None,
         freevars,
         cellvars,
         preserved_slots: Vec::new(),
         stack_slots: Vec::new(),
+        expression_temporaries: Vec::new(),
     })
 }

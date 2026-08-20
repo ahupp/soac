@@ -1,20 +1,20 @@
 use crate::passes::{
-    ConstructorFieldValue, InlinePlanModule, compute_typed_function_local_must_bound_ins,
-    value_facts,
+    ConstructorFieldValue, InlineHandledContext, InlinePlanModule,
+    compute_typed_function_local_must_bound_ins, value_facts,
 };
 #[allow(unused_imports)]
 use soac_core::block_py;
 #[allow(unused_imports)]
 use soac_core::block_py::{
-    BinOpKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
-    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    BinOpKind, Block, BlockArg, BlockContext, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
+    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CalleeFunctionId, CellLocation, ChildVisitable, ClosureInit, ClosureSlot, ConstantExpr, Del,
-    HasMeta, HasSemanticInstrId, Instr, InstrId, InstrKey, InstrWithConstantNone, IntLiteral,
-    Literal, LiteralValue, Load, LocalLocation, MakeCell, MapInstr, Mappable, Meta, NameLike,
-    NameLocation, NumberLiteral, NumberLiteralValue, ParamKind, PreservedLocation,
-    PreservedSlotStorage, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName,
-    SetAttr, Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOpKind, Visit,
-    VisitMut, WithMeta,
+    FrameNamespace, GeneratorControlRole, GeneratorResumeParamRole, HasBlockContext, HasMeta,
+    HasSemanticInstrId, Instr, InstrId, InstrKey, InstrWithConstantNone, IntLiteral, Literal,
+    LiteralValue, Load, LocalLocation, MakeCell, MapInstr, Mappable, Meta, NameLike, NameLocation,
+    NumberLiteral, NumberLiteralValue, ParamKind, PreservedLocation, PreservedSlotStorage,
+    PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, Store,
+    TermIf, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
@@ -35,10 +35,12 @@ use soac_ir_typed::{
 use std::collections::{HashMap, HashSet};
 
 mod linearize;
+mod native_iterator;
 mod trusted_owner;
 mod virtual_objects;
 
 pub use linearize::*;
+pub use native_iterator::*;
 pub use trusted_owner::*;
 pub use virtual_objects::*;
 
@@ -160,6 +162,9 @@ fn annotate_typed_child_demands(expr: &mut InstrTyped) -> usize {
                 call.args.as_mut_slice(),
                 call.keywords.as_mut_slice(),
             );
+            if let Some(FrameNamespace::Mapping(namespace)) = &mut call.frame_namespace {
+                changed += annotate_pyobject_borrowed_input_demand(namespace.as_mut());
+            }
             changed
         }
         InstrTyped::GuardedCallableCallTyped(call) => {
@@ -235,11 +240,78 @@ fn annotate_typed_child_demands(expr: &mut InstrTyped) -> usize {
             annotate_pyobject_borrowed_input_demand(op.value.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.index.as_mut())
         }
-        InstrTyped::MakeFunctionWithClosure(op) => {
-            annotate_pyobject_borrowed_input_demand(op.captures.as_mut())
-                + annotate_pyobject_borrowed_input_demand(op.param_defaults.as_mut())
-                + annotate_pyobject_borrowed_input_demand(op.annotate_fn.as_mut())
+        InstrTyped::MakeFunctionWithClosure(op) => op
+            .operands_mut()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::ConstructClass(op) => op
+            .operands_mut()
+            .into_iter()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::PrepareClassDecorator(op) => op
+            .operands_mut()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::ApplyClassDecorator(op) => op
+            .operands_mut()
+            .into_iter()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::DiscardClassDecorator(op) => op
+            .operands_mut()
+            .into_iter()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::DiscardClassConstructionCaptures(op) => op
+            .operands_mut()
+            .into_iter()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::CompleteFunctionDefinition(op) => {
+            annotate_pyobject_borrowed_input_demand(&mut op.function)
         }
+        InstrTyped::ApplyFunctionDescriptor(op) => op
+            .operands_mut()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::RecordAnnotation(op) => {
+            annotate_pyobject_borrowed_input_demand(&mut op.indices)
+        }
+        InstrTyped::CheckAnnotationFormat(op) => {
+            annotate_pyobject_borrowed_input_demand(&mut op.format)
+        }
+        InstrTyped::SetupAnnotations(op) => op.namespace.as_mut().map_or(0, |namespace| {
+            annotate_pyobject_borrowed_input_demand(namespace)
+        }),
+        InstrTyped::CreateTypeAlias(op) => op
+            .operands_mut()
+            .into_iter()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::ConstructTypeParameterScope(op) => op
+            .operands_mut()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::SubscriptGeneric(op) => op
+            .operands_mut()
+            .into_iter()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::SetFunctionTypeParameters(op) => op
+            .operands_mut()
+            .into_iter()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::CreateTypeParameter(op) => op
+            .operands_mut()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
+        InstrTyped::SetTypeParameterDefault(op) => op
+            .operands_mut()
+            .into_iter()
+            .map(annotate_pyobject_borrowed_input_demand)
+            .sum(),
         _ => 0,
     }
 }
@@ -273,7 +345,7 @@ pub fn annotate_typed_function_result_demands(
                 changed += set_typed_instr_demand(&mut branch.index, TypedResultDemand::I64_INDEX);
                 changed += annotate_typed_child_demands(&mut branch.index);
             }
-            BlockTerm::Return(value) => {
+            BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
                 changed += set_typed_instr_demand(value, TypedResultDemand::PYOBJECT_BORROWED_OK);
                 changed += annotate_typed_child_demands(value);
             }
@@ -527,6 +599,19 @@ pub fn validate_typed_function_value_facts(
 
     impl Visit<InstrTyped> for Validator<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::Load(load) = expr {
+                if load.name.cell_location().is_some() != load.cell_binding.is_some()
+                    || load
+                        .cell_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.logical_name.as_str().is_empty())
+                {
+                    self.errors.push(format!(
+                        "typed load {:?} in function {} has inconsistent source cell-binding metadata",
+                        load.name, self.function.names.qualname,
+                    ));
+                }
+            }
             if let Some(instr_id) = expr.meta().instr_id {
                 if let Some(extra) = expr.typed_extra() {
                     if extra.result_facts().is_none() {
@@ -604,22 +689,36 @@ pub fn lower_typed_function_call_emission_plans(
                 return;
             }
             expr.visit_children_mut(self);
-            let InstrTyped::CallTyped(call) = expr else {
-                return;
+            let (instr_id, frame_sensitive) = match expr {
+                InstrTyped::CallTyped(call) => {
+                    (call.try_semantic_instr_id(), call.frame_namespace.is_some())
+                }
+                InstrTyped::GuardedMethodCallTyped(call) if call.method_guards.is_empty() => {
+                    (call.try_semantic_instr_id(), false)
+                }
+                _ => return,
             };
-            let Some(instr_id) = call.try_semantic_instr_id() else {
+            let Some(instr_id) = instr_id else {
                 return;
             };
             let Some(plan) = self.plans.by_source.get(&instr_id) else {
                 return;
             };
+            // A callee may be an alias of a frame-sensitive builtin. Keep its
+            // explicit class namespace on the public call path until a plan
+            // proves the selected target cannot consume the caller's frame.
+            if frame_sensitive {
+                return;
+            }
             if plan.is_empty() {
                 return;
             }
 
             let old_expr = std::mem::replace(expr, InstrTyped::constant_none());
-            let InstrTyped::CallTyped(call) = old_expr else {
-                unreachable!("checked call shape before replacing typed instruction")
+            let call = match old_expr {
+                InstrTyped::CallTyped(call) => call,
+                InstrTyped::GuardedMethodCallTyped(call) => call.into_typed_call(),
+                _ => unreachable!("checked call shape before replacing typed instruction"),
             };
             match plan {
                 TypedCallEmissionPlan::Callable { function_guards } => {
@@ -709,6 +808,10 @@ pub fn lower_typed_function_call_access_plan_instrs(
                 TypedCallAccessPlan::GuardedCallable { .. }
                     | TypedCallAccessPlan::GuardedMethod { .. }
             );
+            if call.frame_namespace.is_some() {
+                call.access = TypedCallAccessPlan::Generic;
+                return;
+            }
             if !should_lower {
                 return;
             }
@@ -794,6 +897,9 @@ pub struct TypedInlineRewriteStats {
     pub rewritten_returns: usize,
     pub skipped_candidates: usize,
     pub skipped_exception_edges: usize,
+    /// Calls retained because a distinct/dynamic handled activation is not
+    /// represented by this inline fragment's one-activation context.
+    pub unrepresented_handled_activation_calls: Vec<InstrId>,
     pub inline_instance_sources: Vec<TypedInlineInstanceSource>,
     pub materialized_generator_args: Vec<TypedInlineMaterializedGeneratorArg>,
     pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
@@ -1004,6 +1110,11 @@ fn transfer_typed_preserved_must_bound_through_block(
 ) -> HashSet<PreservedLocation> {
     let mut bound = incoming.clone();
     for instr in &block.body {
+        soac_core::block_py::visit_operand_takes(instr, |location| {
+            if let Some(location) = location.preserved_location() {
+                bound.remove(&location);
+            }
+        });
         match instr {
             InstrTyped::Store(store) => {
                 if let Some(location) = store.name.preserved_location() {
@@ -1015,9 +1126,23 @@ fn transfer_typed_preserved_must_bound_through_block(
                     bound.remove(&location);
                 }
             }
+            InstrTyped::CallArgumentOp(op) => {
+                // This summary also feeds exceptional edges; Finish may clear before failing.
+                for location in op
+                    .written_names()
+                    .filter_map(|name| name.preserved_location())
+                {
+                    bound.remove(&location);
+                }
+            }
             _ => {}
         }
     }
+    soac_core::block_py::visit_term_operand_takes(&block.term, |location| {
+        if let Some(location) = location.preserved_location() {
+            bound.remove(&location);
+        }
+    });
     bound
 }
 
@@ -1025,6 +1150,17 @@ fn update_typed_hoist_bound_locations(
     instr: &InstrTyped,
     bound_locations: &mut HashSet<TypedHoistBoundLocation>,
 ) {
+    soac_core::block_py::visit_operand_takes(instr, |location| {
+        let location = match location {
+            soac_core::block_py::OperandLocation::Local(location) => {
+                TypedHoistBoundLocation::Local(location)
+            }
+            soac_core::block_py::OperandLocation::Preserved(location) => {
+                TypedHoistBoundLocation::Preserved(location)
+            }
+        };
+        bound_locations.remove(&location);
+    });
     match instr {
         InstrTyped::Store(store) => {
             if let Some(location) = store.name.location.as_local() {
@@ -1040,6 +1176,16 @@ fn update_typed_hoist_bound_locations(
             }
             if let Some(location) = del.name.preserved_location() {
                 bound_locations.remove(&TypedHoistBoundLocation::Preserved(location));
+            }
+        }
+        InstrTyped::CallArgumentOp(op) => {
+            for name in op.written_names() {
+                if let Some(location) = name.local_location() {
+                    bound_locations.insert(TypedHoistBoundLocation::Local(location));
+                }
+                if let Some(location) = name.preserved_location() {
+                    bound_locations.insert(TypedHoistBoundLocation::Preserved(location));
+                }
             }
         }
         _ => {}
@@ -1527,7 +1673,11 @@ pub struct TypedExternalInlineCallee {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum TypedInlineUnsupportedReason {
+    UnrepresentedHandledActivation,
+    ClassConstructionExecutionContext,
+    FunctionDefinitionExecutionContext,
     MissingCallerStorageLayout,
+    InvalidOperandCall(String),
     MissingCalleeStorageLayout,
     MissingCalleeLocal(LocalLocation),
     MissingCalleeConstant(u32),
@@ -1553,6 +1703,7 @@ pub enum TypedInlineUnsupportedReason {
     TooManyCallerConstants,
     PreservedOwnerConflict,
     UnsupportedGeneratorClosureCapture,
+    UnsupportedPrivateCellEnvironment,
 }
 
 #[derive(Clone)]
@@ -1988,7 +2139,24 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
 ) -> TypedInlineBlockRewrite {
     let original_block = block.clone();
     let original_storage_layout = caller.storage_layout.clone();
+    // A later target can reject the entire candidate, including fragments
+    // already built for earlier guards. Publish only committed sidecars.
+    let mut pending_stats = TypedInlineRewriteStats::default();
     let original_exc_edge = block.exc_edge.clone();
+    let handled_context = InlineHandledContext::for_call_site(&block);
+    if matches!(candidate.call, TypedInlineCall::GeneratorResume(_))
+        || candidate.inline_plans.iter().any(|plan| {
+            typed_inline_callee(module, external_callees, plan.target)
+                .is_some_and(|callee| !handled_context.can_inline(callee.function))
+        })
+    {
+        stats.skipped_candidates += 1;
+        if let Some(source) = candidate.call.try_semantic_instr_id() {
+            stats.unrepresented_handled_activation_calls.push(source);
+        }
+        trace_builtin_implementation_inline_skip(&candidate, "unrepresented_handled_activation");
+        return TypedInlineBlockRewrite::Unchanged(block);
+    }
     if !candidate.call.keywords().is_empty() {
         stats.skipped_candidates += 1;
         trace_builtin_implementation_inline_skip(&candidate, "keywords");
@@ -2068,8 +2236,40 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
             return TypedInlineBlockRewrite::Unchanged(block);
         }
     };
+    let result_handoff = match &candidate.result {
+        TypedInlineResult::StoreTo(target)
+            if candidate.inline_plans.iter().any(|plan| {
+                typed_inline_callee(module, external_callees, plan.target).is_some_and(|callee| {
+                    callee
+                        .function
+                        .blocks
+                        .iter()
+                        .any(|block| block.handled_exception_params().next().is_some())
+                })
+            }) =>
+        {
+            Some(target.clone())
+        }
+        _ => None,
+    };
     let (return_target, discard_result) = match &candidate.result {
-        TypedInlineResult::StoreTo(target) => (target.clone(), None),
+        TypedInlineResult::StoreTo(target) => {
+            if result_handoff.is_some() {
+                // Rebinding the caller target may run the old value's finalizer.
+                // The result crosses out of the callee's handlers first, exactly
+                // as an ordinary function return does before its caller's store.
+                match try_allocate_typed_stack_temp(caller, "typed_inline_result") {
+                    Ok(temp) => (temp.resolved_name(), None),
+                    Err(_) => {
+                        stats.skipped_candidates += 1;
+                        caller.storage_layout = original_storage_layout;
+                        return TypedInlineBlockRewrite::Unchanged(block);
+                    }
+                }
+            } else {
+                (target.clone(), None)
+            }
+        }
         TypedInlineResult::EffectOnly => {
             let result_temp = match try_allocate_typed_stack_temp(caller, "typed_inline_result") {
                 Ok(temp) => temp,
@@ -2134,7 +2334,7 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
 
     let return_candidate = matches!(&candidate.result, TypedInlineResult::Return);
     let mut before = block.body;
-    let (after, continuation_term) = if return_candidate {
+    let (mut after, continuation_term) = if return_candidate {
         (
             Vec::new(),
             BlockTerm::Return(typed_load_temp(&return_target)),
@@ -2187,22 +2387,12 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
             let receiver_temp = receiver_temp
                 .as_ref()
                 .expect("method inline candidate should allocate receiver temp");
-            let mut receiver = receiver.clone();
-            if let Some(candidate_origins) = candidate
-                .call
-                .try_semantic_instr_id()
-                .and_then(|instr_id| trusted_direct_method_call_origin_candidates.get(&instr_id))
-                && let Some(extra) = receiver.typed_extra_mut()
-            {
-                extra.set_trusted_object_origin_candidates(candidate_origins.clone());
-                if let Some(function_id) = candidate
-                    .call
-                    .try_semantic_instr_id()
-                    .and_then(|instr_id| trusted_direct_method_call_resume_functions.get(&instr_id))
-                {
-                    extra.set_trusted_generator_resume_function(*function_id);
-                }
-            }
+            let receiver = typed_inline_receiver_with_facts(
+                receiver.clone(),
+                candidate.call.try_semantic_instr_id(),
+                trusted_direct_method_call_origin_candidates,
+                trusted_direct_method_call_resume_functions,
+            );
             before.push(
                 Store::new(receiver_temp.resolved_name(), receiver)
                     .with_meta(Meta::synthetic())
@@ -2229,7 +2419,7 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
                 has_closure_cell_bindings = closure_cell_bindings.is_some(),
                 "typed_generator_state_constructor_snapshot_from_inline_arg",
             );
-            stats
+            pending_stats
                 .materialized_generator_args
                 .push(TypedInlineMaterializedGeneratorArg {
                     generator_origin,
@@ -2289,7 +2479,7 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
             .copied()
             .or(generic_label)
             .expect("guarded inline candidate should have a fallback label");
-        blocks.push(Block::new_with_extra(
+        let mut guard = Block::new_with_extra(
             guard_label,
             Vec::new(),
             typed_inline_guard_term(
@@ -2304,7 +2494,9 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
             Vec::new(),
             original_exc_edge.clone(),
             TypedBlockExtra::default(),
-        ));
+        );
+        handled_context.preserve_caller(&mut guard);
+        blocks.push(guard);
     }
 
     for (plan, hot_label) in candidate.inline_plans.iter().zip(hot_labels) {
@@ -2425,7 +2617,7 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
             .checked_add(1)
             .expect("typed inline instance count should fit in u32");
         if let Some(source_instr_id) = candidate.call.try_semantic_instr_id() {
-            stats
+            pending_stats
                 .inline_instance_sources
                 .push(TypedInlineInstanceSource {
                     inline_instance,
@@ -2435,6 +2627,7 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
         let mut fragment = match build_typed_direct_call_inline_fragment_to_target(
             caller,
             callee.function,
+            &handled_context,
             cleanup_label,
             &bindings,
             &preassigned_locals,
@@ -2475,7 +2668,7 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
         }
         extra_cleanup_temps.extend(preserved_abi_temps);
         instr_id_mappings.extend(fragment.instr_id_mappings);
-        stats
+        pending_stats
             .synthetic_instr_ids
             .extend(fragment.synthetic_instr_ids.into_iter().map(|instr_id| {
                 TypedInlineSyntheticInstrId {
@@ -2483,13 +2676,15 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
                     instr_id,
                 }
             }));
-        stats.constant_mappings.extend(fragment.constant_mappings);
+        pending_stats
+            .constant_mappings
+            .extend(fragment.constant_mappings);
         local_mappings.extend(fragment.local_mappings);
         blocks.extend(fragment.blocks);
     }
 
     if let Some(generic_label) = generic_label {
-        blocks.push(Block::new_with_extra(
+        let mut fallback = Block::new_with_extra(
             generic_label,
             typed_inline_generic_fallback_body(
                 &candidate.call,
@@ -2503,7 +2698,9 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
             Vec::new(),
             original_exc_edge.clone(),
             TypedBlockExtra::default(),
-        ));
+        );
+        handled_context.preserve_caller(&mut fallback);
+        blocks.push(fallback);
     }
 
     let mut cleanup_body = Vec::new();
@@ -2518,25 +2715,34 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
         append_typed_cleanup_del_to_body(&mut cleanup_body, &callable_temp.resolved_name());
     }
     append_typed_cleanup_dels_to_body(&mut cleanup_body, &extra_cleanup_temps);
-    blocks.push(Block::new_with_extra(
+    let mut cleanup = Block::new_with_extra(
         cleanup_label,
         cleanup_body,
         BlockTerm::Jump(BlockEdge::new(continuation_label)),
         Vec::new(),
         original_exc_edge.clone(),
         TypedBlockExtra::default(),
-    ));
+    );
+    handled_context.preserve_caller(&mut cleanup);
+    blocks.push(cleanup);
     if cleanup_carries_hot_state {
         stats.hot_state_cleanup_labels.push(cleanup_label);
     }
-    blocks.push(Block::new_with_extra(
+    if let Some(target) = result_handoff {
+        let mut handoff = vec![typed_store_temp(target, typed_load_temp(&return_target))];
+        append_typed_cleanup_del_to_body(&mut handoff, &return_target);
+        after.splice(0..0, handoff);
+    }
+    let mut continuation = Block::new_with_extra(
         continuation_label,
         after,
         continuation_term,
         Vec::new(),
         original_exc_edge,
         TypedBlockExtra::default(),
-    ));
+    );
+    handled_context.preserve_caller(&mut continuation);
+    blocks.push(continuation);
 
     match candidate.result {
         TypedInlineResult::StoreTo(_) => stats.rewritten_stores += 1,
@@ -2545,6 +2751,30 @@ fn try_build_typed_direct_call_inline_rewrite_for_candidate(
     }
     stats.instr_id_mappings.extend(instr_id_mappings);
     stats.local_mappings.extend(local_mappings);
+    stats
+        .materialized_generator_args
+        .extend(pending_stats.materialized_generator_args);
+    stats
+        .inline_instance_sources
+        .extend(pending_stats.inline_instance_sources);
+    stats
+        .synthetic_instr_ids
+        .extend(pending_stats.synthetic_instr_ids);
+    stats
+        .constant_mappings
+        .extend(pending_stats.constant_mappings);
+    for plan in &candidate.inline_plans {
+        let callee = typed_inline_callee(module, external_callees, plan.target)
+            .expect("committed inline target was resolved while building its fragment");
+        tracing::info!(
+            target: "soac_typed_inline_bindings",
+            caller_function = ?caller.function_id,
+            source_instr_id = ?candidate.call.try_semantic_instr_id(),
+            callee_function = ?callee.function.function_id,
+            callee_qualname = %callee.function.names.qualname,
+            "typed_inline_fragment_committed",
+        );
+    }
     TypedInlineBlockRewrite::Rewritten(blocks)
 }
 
@@ -2602,6 +2832,7 @@ fn build_typed_constructor_init_body_inline_rewrite(
     stats: &mut TypedConstructorInitBodyInlineStats,
 ) -> TypedInlineBlockRewrite {
     let original_block = block.clone();
+    let handled_context = InlineHandledContext::for_call_site(&block);
     let original_storage_layout = caller.storage_layout.clone();
     let original_caller_module_constants = caller_module_constants.clone();
     let Some(candidate) = find_typed_constructor_init_body_candidate(
@@ -2623,6 +2854,14 @@ fn build_typed_constructor_init_body_inline_rewrite(
     let callee_module_constants = callee
         .module_constants
         .unwrap_or(module.module_constants.as_slice());
+    if !handled_context.can_inline(callee.function) {
+        stats.inline_stats.skipped_candidates += 1;
+        stats
+            .inline_stats
+            .unrepresented_handled_activation_calls
+            .push(candidate.instr_id);
+        return TypedInlineBlockRewrite::Unchanged(block);
+    }
     if !typed_function_returns_only_none(callee.function, callee_module_constants) {
         stats.inline_stats.skipped_candidates += 1;
         return TypedInlineBlockRewrite::Unchanged(block);
@@ -2661,6 +2900,7 @@ fn build_typed_constructor_init_body_inline_rewrite(
     let Ok(mut fragment) = build_typed_direct_call_inline_fragment_to_target(
         caller,
         callee.function,
+        &handled_context,
         continuation_label,
         &bindings,
         &HashMap::new(),
@@ -2725,14 +2965,16 @@ fn build_typed_constructor_init_body_inline_rewrite(
     let mut continuation_body = Vec::with_capacity(after.len() + 1);
     append_typed_cleanup_del_to_body(&mut continuation_body, &return_temp.resolved_name());
     continuation_body.extend(after);
-    blocks.push(Block::new_with_extra(
+    let mut continuation = Block::new_with_extra(
         continuation_label,
         continuation_body,
         block.term,
         Vec::new(),
         original_exc_edge,
         TypedBlockExtra::default(),
-    ));
+    );
+    handled_context.preserve_caller(&mut continuation);
+    blocks.push(continuation);
     stats.inline_stats.rewritten_stores += 1;
     stats
         .inlined_constructor_init_calls
@@ -2799,12 +3041,16 @@ fn typed_constructor_init_body_call_parts(
     TypedConstructorInitPlan,
 )> {
     match expr {
-        InstrTyped::CallTyped(call) if call.keywords.is_empty() => Some((
-            call.func.as_ref(),
-            &call.args,
-            call.try_semantic_instr_id()?,
-            call.extra.constructor_init_plan()?,
-        )),
+        InstrTyped::CallTyped(call)
+            if call.keywords.is_empty() && call.frame_namespace.is_none() =>
+        {
+            Some((
+                call.func.as_ref(),
+                &call.args,
+                call.try_semantic_instr_id()?,
+                call.extra.constructor_init_plan()?,
+            ))
+        }
         InstrTyped::DirectCallableCallTyped(call) => Some((
             call.func.as_ref(),
             &call.args,
@@ -2821,6 +3067,7 @@ fn typed_function_returns_only_none(
 ) -> bool {
     function.blocks.iter().all(|block| match &block.term {
         BlockTerm::Return(value) => typed_expr_is_known_none_value(value, module_constants),
+        BlockTerm::GeneratorReturn(_) => false,
         BlockTerm::Jump(_)
         | BlockTerm::IfTerm(_)
         | BlockTerm::BranchTable(_)
@@ -3420,7 +3667,8 @@ fn find_typed_alias_hot_continuation_split_candidate(
     let labels = typed_block_indices_by_label(function);
     let predecessors = typed_block_predecessors(function);
     let hot_predecessors = typed_hot_block_predecessors(function);
-    let none_placeholder_alias_targets = typed_none_placeholder_alias_target_locations(function);
+    let none_placeholder_alias_targets =
+        typed_none_placeholder_alias_target_locations(function, module_constants);
     let mut reachable_by_entry = HashMap::new();
     function.blocks.iter().find_map(|block| {
         if cyclic_hot_blocks.contains(&block.label) {
@@ -3777,7 +4025,7 @@ fn typed_generator_alias_source_locations(
     expr: &InstrTyped,
     module_constants: &[ConstantExpr],
 ) -> Vec<LocalLocation> {
-    if let Some(location) = typed_instr_local_load_location(expr) {
+    if let Some(location) = typed_generator_value_location(expr) {
         return vec![location];
     }
     let Some((func, args, keywords)) = typed_callable_call_parts(expr) else {
@@ -3790,7 +4038,7 @@ fn typed_generator_alias_source_locations(
     }
     match args {
         [CallArgPositional::Positional(owner)] => {
-            typed_instr_local_load_location(owner).into_iter().collect()
+            typed_generator_value_location(owner).into_iter().collect()
         }
         _ => Vec::new(),
     }
@@ -3876,10 +4124,10 @@ fn typed_generator_protocol_alias_use_locations_for_hot_continuation_split(
                 return;
             }
             self.locations.extend(args.iter().filter_map(|arg| {
-                let CallArgPositional::Positional(InstrTyped::Load(load)) = arg else {
+                let CallArgPositional::Positional(value) = arg else {
                     return None;
                 };
-                load.name.local_location()
+                typed_generator_value_location(value)
             }));
         }
     }
@@ -3895,6 +4143,9 @@ fn typed_generator_protocol_alias_use_locations_for_hot_continuation_split(
                 }
                 InstrTyped::DirectCallableCallTyped(call) => {
                     self.collect_protocol_alias_args(call.func.as_ref(), &call.args);
+                }
+                InstrTyped::IteratorStep(step) => {
+                    self.locations.extend(step.name.local_location());
                 }
                 _ => {}
             }
@@ -3933,6 +4184,7 @@ fn typed_block_local_alias_store_instr_ids(
 
 fn typed_none_placeholder_alias_target_locations(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
 ) -> HashSet<LocalLocation> {
     function
         .blocks
@@ -3943,10 +4195,12 @@ fn typed_none_placeholder_alias_target_locations(
                 return None;
             };
             let target = store.name.local_location()?;
-            let InstrTyped::Load(load) = store.value.as_ref() else {
-                return None;
-            };
-            (load.name.id_str() == "NONE").then_some(target)
+            typed_expr_is_runtime_name_load(
+                store.value.as_ref(),
+                RuntimeName::None,
+                module_constants,
+            )
+            .then_some(target)
         })
         .collect()
 }
@@ -4621,6 +4875,9 @@ fn update_typed_inline_linearized_get_attr_defs<'a>(
     defs: &mut TypedLinearizedGetAttrDefs<'a>,
     instr: &'a InstrTyped,
 ) {
+    soac_core::block_py::visit_operand_takes(instr, |location| {
+        defs.retain(|name, _| name.location != location.name_location());
+    });
     match instr {
         InstrTyped::Store(store) => {
             if let InstrTyped::GetAttrTyped(get_attr) = store.value.as_ref() {
@@ -4634,6 +4891,11 @@ fn update_typed_inline_linearized_get_attr_defs<'a>(
         }
         InstrTyped::Del(del) => {
             defs.remove(&del.name);
+        }
+        InstrTyped::CallArgumentOp(op) => {
+            for changed in op.written_names() {
+                defs.retain(|name, _| name.location != changed.location);
+            }
         }
         _ => {}
     }
@@ -4966,7 +5228,7 @@ fn typed_inline_candidate_for_direct_method_call(
     trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
     linearized_get_attrs: &TypedLinearizedGetAttrDefs<'_>,
 ) -> Option<TypedInlineStoreCandidate> {
-    if !matches!(call.access, TypedCallAccessPlan::Generic) {
+    if call.frame_namespace.is_some() || !matches!(call.access, TypedCallAccessPlan::Generic) {
         return None;
     }
     let instr_id = call.try_semantic_instr_id()?;
@@ -5001,6 +5263,9 @@ fn typed_inline_candidate_for_generator_resume_call(
     call: &TypedCall<InstrTyped>,
     caller_id: RuntimeFunctionId,
 ) -> Option<TypedInlineStoreCandidate> {
+    if call.frame_namespace.is_some() {
+        return None;
+    }
     let plan = call.extra.generator_resume_plan()?;
     if plan.function_id == caller_id || call.args.len() != 5 || !call.keywords.is_empty() {
         return None;
@@ -5044,6 +5309,9 @@ fn typed_inline_candidate_for_builtin_implementation_call(
     call: &TypedCall<InstrTyped>,
     caller_id: RuntimeFunctionId,
 ) -> Option<TypedInlineStoreCandidate> {
+    if call.frame_namespace.is_some() {
+        return None;
+    }
     let plan = call.extra.builtin_implementation_plan()?;
     if plan.function_id == caller_id || !call.keywords.is_empty() {
         return None;
@@ -5147,6 +5415,9 @@ fn typed_inline_candidate_for_runtime_protocol_call(
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     trusted_direct_method_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
 ) -> Option<TypedInlineStoreCandidate> {
+    if call.frame_namespace.is_some() {
+        return None;
+    }
     let instr_id = call.try_semantic_instr_id()?;
     let receiver = runtime_protocol_receiver(call)?.clone();
     typed_positional_arg_exprs(runtime_protocol_explicit_args(call)?.to_vec())?;
@@ -5609,6 +5880,24 @@ fn typed_inline_provided_values(
     values
 }
 
+fn typed_inline_receiver_with_facts(
+    mut receiver: InstrTyped,
+    source: Option<InstrId>,
+    origins: &HashMap<InstrId, Vec<InstrId>>,
+    resume_functions: &HashMap<InstrId, RuntimeFunctionId>,
+) -> InstrTyped {
+    if let Some(source) = source
+        && let Some(origins) = origins.get(&source)
+        && let Some(extra) = receiver.typed_extra_mut()
+    {
+        extra.set_trusted_object_origin_candidates(origins.clone());
+        if let Some(function) = resume_functions.get(&source) {
+            extra.set_trusted_generator_resume_function(*function);
+        }
+    }
+    receiver
+}
+
 fn bind_typed_direct_call_inline_values(
     callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     arg_plan: &TypedDirectCallArgPlan,
@@ -5672,7 +5961,13 @@ fn bind_typed_generator_resume_inline_values(
     let mut bindings = TypedInlineValueBindings::new();
     for (param, source) in callee.body_params().iter().zip(&arg_plan.sources) {
         let location = typed_parameter_local_location(callee, &param.name)?;
-        if needs_preserved_owner && matches!(param.name.as_str(), "_dp_self" | "_dp_state") {
+        if needs_preserved_owner
+            && callee_layout
+                .generator_resume_abi
+                .as_ref()
+                .and_then(|abi| abi.role_for_name(&param.name))
+                .is_some_and(GeneratorResumeParamRole::is_preserved_owner)
+        {
             let owner = allocate_typed_preserved_abi_local(caller)?;
             let value = typed_inline_value_for_arg_source(param.kind, source, values)?;
             prologue.push(typed_store_temp(owner.resolved_name(), value));
@@ -6320,6 +6615,7 @@ fn typed_parameter_local_location(
 fn build_typed_direct_call_inline_fragment_to_target(
     caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     callee: &BlockPyFunction<TypedBlockPyModuleShape>,
+    handled_context: &InlineHandledContext,
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     preassigned_locals: &HashMap<LocalLocation, TypedTempLocal>,
@@ -6331,8 +6627,11 @@ fn build_typed_direct_call_inline_fragment_to_target(
     allow_nonstack_storage: bool,
     closure_cell_bindings: Option<&HashMap<u32, CellLocation>>,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
-    if callee.blocks.len() == 1 {
-        return build_single_block_typed_inline_fragment_to_target(
+    if !handled_context.can_inline(callee) {
+        return Err(TypedInlineUnsupportedReason::UnrepresentedHandledActivation);
+    }
+    let mut fragment = if callee.blocks.len() == 1 {
+        build_single_block_typed_inline_fragment_to_target(
             caller,
             callee,
             continuation,
@@ -6345,22 +6644,27 @@ fn build_typed_direct_call_inline_fragment_to_target(
             callee_module_constants,
             allow_nonstack_storage,
             closure_cell_bindings,
-        );
+        )?
+    } else {
+        build_multi_block_typed_inline_fragment_to_target(
+            caller,
+            callee,
+            continuation,
+            value_bindings,
+            preassigned_locals,
+            return_target,
+            inline_instance,
+            instr_id_allocator,
+            caller_module_constants,
+            callee_module_constants,
+            allow_nonstack_storage,
+            closure_cell_bindings,
+        )?
+    };
+    for block in &mut fragment.blocks {
+        handled_context.compose_callee(block);
     }
-    build_multi_block_typed_inline_fragment_to_target(
-        caller,
-        callee,
-        continuation,
-        value_bindings,
-        preassigned_locals,
-        return_target,
-        inline_instance,
-        instr_id_allocator,
-        caller_module_constants,
-        callee_module_constants,
-        allow_nonstack_storage,
-        closure_cell_bindings,
-    )
+    Ok(fragment)
 }
 
 struct TypedInlineFragment {
@@ -6452,15 +6756,19 @@ fn build_single_block_typed_inline_fragment_to_target(
     ];
     body.push(return_store);
 
+    let mut block = Block::new_with_extra(
+        caller.name_gen.next_block_name(),
+        body,
+        BlockTerm::Jump(BlockEdge::new(continuation)),
+        Vec::new(),
+        None,
+        TypedBlockExtra::default(),
+    );
+    block
+        .extra
+        .set_block_context(callee_block.extra.block_context());
     Ok(TypedInlineFragment {
-        blocks: vec![Block::new_with_extra(
-            caller.name_gen.next_block_name(),
-            body,
-            BlockTerm::Jump(BlockEdge::new(continuation)),
-            Vec::new(),
-            None,
-            TypedBlockExtra::default(),
-        )],
+        blocks: vec![block],
         instr_id_mappings: instr_id_remapper.finish(),
         synthetic_instr_ids,
         constant_mappings: constant_scope.mappings(callee.function_id, inline_instance),
@@ -6617,6 +6925,13 @@ fn typed_inline_callee_has_nonstack_storage(
                     del.name.preserved_location().is_some()
                         || matches!(del.name.cell_location(), Some(CellLocation::Preserved(_)))
                 }
+                InstrTyped::TakeOperand(op) => op.name.preserved_location().is_some(),
+                InstrTyped::IteratorStep(op) => op.name.preserved_location().is_some(),
+                InstrTyped::ComprehensionInsert(op) => op.container.preserved_location().is_some(),
+                InstrTyped::CallArgumentOp(op) => op
+                    .read_names()
+                    .chain(op.written_names())
+                    .any(|name| name.preserved_location().is_some()),
                 InstrTyped::CellRef(cell_ref) => cell_ref.location.is_preserved(),
                 _ => false,
             };
@@ -6649,6 +6964,34 @@ fn allocate_typed_inline_locals(
             location,
             try_allocate_typed_stack_temp(caller, "typed_inline")?,
         );
+    }
+    // Preserve expression lifetimes in their explicit acquisition order, not
+    // by spelling or the callee's possibly remapped local slot numbering.
+    for location in &callee_layout.expression_temporaries {
+        // Preserved roles follow the separate explicit preserved-local mapping.
+        let Some(location) = location.local_location() else {
+            continue;
+        };
+        if let Some(temp) = locals.get(&location) {
+            caller
+                .storage_layout
+                .as_mut()
+                .expect("inline local allocation requires a caller layout")
+                .mark_expression_temporary(temp.location);
+        }
+    }
+    // These records follow the actual callee-local mapping. They do not turn
+    // the caller's owning scratch locals into borrowed function-entry ABI args.
+    for binding in &callee_layout.block_parameter_roles {
+        if let NameLocation::Local(source) = binding.location
+            && let Some(target) = locals.get(&source)
+        {
+            caller
+                .storage_layout
+                .as_mut()
+                .expect("inline local allocation requires a caller layout")
+                .record_block_parameter_role(NameLocation::Local(target.location), binding.role);
+        }
     }
     Ok(locals)
 }
@@ -6737,7 +7080,9 @@ fn typed_remap_inline_term_labels(
             BlockTerm::BranchTable(term)
         }
         BlockTerm::Raise(term) => BlockTerm::Raise(term),
-        BlockTerm::Return(_) => return Err(TypedInlineUnsupportedReason::NonReturnTerm),
+        BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {
+            return Err(TypedInlineUnsupportedReason::NonReturnTerm);
+        }
     })
 }
 
@@ -6961,6 +7306,9 @@ impl<'locals, 'bindings, 'constants, 'remapper, 'allocator>
                 .and_then(|bindings| bindings.get(&slot).copied())
                 .ok_or(TypedInlineUnsupportedReason::UnsupportedGeneratorClosureCapture),
             CellLocation::Owned(_) | CellLocation::Preserved(_) => Ok(location),
+            CellLocation::Private(_) => {
+                Err(TypedInlineUnsupportedReason::UnsupportedPrivateCellEnvironment)
+            }
         }
     }
 
@@ -6993,7 +7341,20 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
                 InstrTyped::CalleeFunctionId(op.try_map_children(self)?)
             }
             InstrTyped::CallTyped(op) => {
+                if op.frame_namespace.is_some() {
+                    return Err(TypedInlineUnsupportedReason::ClassConstructionExecutionContext);
+                }
                 let mut op = op.try_map_children(self)?;
+                if matches!(op.access, TypedCallAccessPlan::GuardedSealedMethod(_)) {
+                    // This is a call-boundary clone, not a same-frame CFG
+                    // clone. The selected slot belongs to the actual callee's
+                    // FunctionEnv, even if its template ID matches the caller.
+                    // Keep the ordinary call; no caller slot is inferred here.
+                    op.access = TypedCallAccessPlan::Generic;
+                }
+                // Parameter proofs belong to the actual calling activation,
+                // not an inlined callee's lexical source or old parameter map.
+                op.extra.source_call = None;
                 op.args = expand_synthetic_typed_starred_tuple_args(op.args);
                 InstrTyped::CallTyped(op)
             }
@@ -7047,6 +7408,36 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
                 InstrTyped::Del(op.try_map_children(self)?)
             }
             InstrTyped::MakeCell(op) => InstrTyped::MakeCell(op.try_map_children(self)?),
+            InstrTyped::NewAnnotationSet(op) => {
+                InstrTyped::NewAnnotationSet(op.try_map_children(self)?)
+            }
+            InstrTyped::SetupAnnotations(op) => {
+                InstrTyped::SetupAnnotations(op.try_map_children(self)?)
+            }
+            InstrTyped::ConstructTypeParameterScope(op) => {
+                InstrTyped::ConstructTypeParameterScope(op.try_map_children(self)?)
+            }
+            InstrTyped::SubscriptGeneric(op) => {
+                InstrTyped::SubscriptGeneric(op.try_map_children(self)?)
+            }
+            InstrTyped::SetFunctionTypeParameters(op) => {
+                InstrTyped::SetFunctionTypeParameters(op.try_map_children(self)?)
+            }
+            InstrTyped::CreateTypeAlias(op) => {
+                InstrTyped::CreateTypeAlias(op.try_map_children(self)?)
+            }
+            InstrTyped::CreateTypeParameter(op) => {
+                InstrTyped::CreateTypeParameter(op.try_map_children(self)?)
+            }
+            InstrTyped::SetTypeParameterDefault(op) => {
+                InstrTyped::SetTypeParameterDefault(op.try_map_children(self)?)
+            }
+            InstrTyped::CheckAnnotationFormat(op) => {
+                InstrTyped::CheckAnnotationFormat(op.try_map_children(self)?)
+            }
+            InstrTyped::RecordAnnotation(op) => {
+                InstrTyped::RecordAnnotation(op.try_map_children(self)?)
+            }
             InstrTyped::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
             InstrTyped::CellRef(mut op) => {
                 op.location = self.try_map_cell_location(op.location)?;
@@ -7054,6 +7445,28 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
             }
             InstrTyped::MakeFunctionWithClosure(op) => {
                 InstrTyped::MakeFunctionWithClosure(op.try_map_children(self)?)
+            }
+            InstrTyped::TakeOperand(op) => InstrTyped::TakeOperand(op.try_map_children(self)?),
+            InstrTyped::ComprehensionInsert(op) => {
+                InstrTyped::ComprehensionInsert(op.try_map_children(self)?)
+            }
+            InstrTyped::BuildCollection(op) => {
+                InstrTyped::BuildCollection(op.try_map_children(self)?)
+            }
+            InstrTyped::CallArgumentOp(op) => {
+                InstrTyped::CallArgumentOp(op.try_map_children(self)?)
+            }
+            InstrTyped::PreparedCall(op) => InstrTyped::PreparedCall(op.try_map_children(self)?),
+            InstrTyped::IteratorStep(op) => InstrTyped::IteratorStep(op.try_map_children(self)?),
+            InstrTyped::ConstructClass(_)
+            | InstrTyped::PrepareClassDecorator(_)
+            | InstrTyped::DiscardClassDecorator(_)
+            | InstrTyped::DiscardClassConstructionCaptures(_)
+            | InstrTyped::ApplyClassDecorator(_) => {
+                return Err(TypedInlineUnsupportedReason::ClassConstructionExecutionContext);
+            }
+            InstrTyped::CompleteFunctionDefinition(_) | InstrTyped::ApplyFunctionDescriptor(_) => {
+                return Err(TypedInlineUnsupportedReason::FunctionDefinitionExecutionContext);
             }
         };
         Ok(self.instr_id_remapper.remap_instr_id(mapped))
@@ -7214,6 +7627,13 @@ fn collect_replayable_typed_tuple_local_defs(
 
     for block in &function.blocks {
         for (index, instr) in block.body.iter().enumerate() {
+            soac_core::block_py::visit_operand_takes(instr, |location| {
+                let Some(location) = location.local_location() else {
+                    return;
+                };
+                invalid.insert(location);
+                candidates.remove(&location);
+            });
             match instr {
                 InstrTyped::Store(store) => {
                     let Some(location) = store.name.local_location() else {
@@ -7243,6 +7663,12 @@ fn collect_replayable_typed_tuple_local_defs(
                 }
                 InstrTyped::Del(del) => {
                     if let Some(location) = del.name.local_location() {
+                        invalid.insert(location);
+                        candidates.remove(&location);
+                    }
+                }
+                InstrTyped::CallArgumentOp(op) => {
+                    for location in op.written_names().filter_map(|name| name.local_location()) {
                         invalid.insert(location);
                         candidates.remove(&location);
                     }
@@ -7326,6 +7752,19 @@ fn collect_typed_loaded_local_locations(
                 && let Some(location) = load.name.local_location()
             {
                 self.locations.insert(location);
+            }
+            if let InstrTyped::TakeOperand(op) = expr {
+                self.locations.extend(op.name.local_location());
+            }
+            if let InstrTyped::ComprehensionInsert(op) = expr {
+                self.locations.extend(op.container.local_location());
+            }
+            if let InstrTyped::IteratorStep(op) = expr {
+                self.locations.extend(op.name.local_location());
+            }
+            if let InstrTyped::CallArgumentOp(op) = expr {
+                self.locations
+                    .extend(op.read_names().filter_map(|name| name.local_location()));
             }
             expr.visit_children(self);
         }
@@ -7903,6 +8342,20 @@ fn lower_typed_generator_state_origin_to_locals(
     let mut preserved_locals = HashMap::new();
     for (slot_index, slot) in public_layout.preserved_slots.iter().enumerate() {
         let temp = try_allocate_typed_stack_temp(function, "typed_gen_state").ok()?;
+        let preserved_location = PreservedLocation(u32::try_from(slot_index).ok()?);
+        if public_layout.is_expression_temporary(preserved_location) {
+            assert_eq!(slot.storage, PreservedSlotStorage::PyObjectOrNull);
+            assert_eq!(slot.init, ClosureInit::Deferred);
+            // A native operand has no value until its producer executes. None
+            // would be a new owning value and would permit an invalid early Take.
+            replacement.push(
+                Del::new(temp.resolved_name(), true)
+                    .with_meta(constructor_call.meta())
+                    .into(),
+            );
+            preserved_locals.insert(preserved_location, temp);
+            continue;
+        }
         let value = match (slot.storage, slot.init.clone()) {
             (PreservedSlotStorage::PyCellObject, soac_core::block_py::ClosureInit::Parameter) => {
                 let param_index = *public_param_indices.get(slot.logical_name.as_str())?;
@@ -7993,7 +8446,11 @@ fn lower_typed_generator_state_origin_to_locals(
             u32::try_from(slot_index).expect("preserved slot index should fit in u32"),
         );
         if slot.storage == PreservedSlotStorage::PyCellObject {
-            ensure_typed_owned_cell_alias_for_preserved_local(function, temp.resolved_name());
+            ensure_typed_owned_cell_alias_for_preserved_local(
+                function,
+                temp.resolved_name(),
+                &temp.name,
+            );
         }
         preserved_locals.insert(preserved_location, temp);
     }
@@ -8001,17 +8458,30 @@ fn lower_typed_generator_state_origin_to_locals(
         .iter()
         .map(|(location, local)| (*location, local.resolved_name()))
         .collect::<HashMap<_, _>>();
-    let preserved_locals_by_name = public_layout
+    record_typed_preserved_operand_roles(
+        function,
+        &public_layout.expression_temporaries,
+        &preserved_local_names,
+    );
+    if let Some(callee_layout) = &callee.storage_layout {
+        record_typed_preserved_block_parameter_roles(
+            function,
+            &callee_layout.block_parameter_roles,
+            &preserved_local_names,
+        );
+    }
+    let preserved_control_locals = public_layout
         .preserved_slots
         .iter()
         .enumerate()
         .filter_map(|(slot_index, slot)| {
+            let role = slot.generator_control?;
             preserved_locals
                 .get(&PreservedLocation(
                     u32::try_from(slot_index).expect("preserved slot index should fit in u32"),
                 ))
                 .map(TypedTempLocal::resolved_name)
-                .map(|local| (slot.logical_name.clone(), local))
+                .map(|local| (role, local))
         })
         .collect::<HashMap<_, _>>();
     append_typed_cleanup_dels_to_body(&mut replacement, &arg_temps);
@@ -8024,7 +8494,7 @@ fn lower_typed_generator_state_origin_to_locals(
         function,
         &alias_cleanup.alias_locations,
         &alias_cleanup.is_closed_value_locations,
-        &preserved_locals_by_name,
+        &preserved_control_locals,
     );
     let removed_owner_stores = if effective_plan.pending_alias_use_instr_ids.is_empty() {
         remove_typed_generator_alias_setup(function, module_constants, &alias_cleanup)
@@ -8369,7 +8839,6 @@ struct TypedGeneratorAliasCleanup {
 enum TypedGeneratorStateHelperKind {
     IsClosed,
     CurrentYieldFrom,
-    CurrentThrowContext,
 }
 
 impl TypedGeneratorStateHelperKind {
@@ -8377,16 +8846,14 @@ impl TypedGeneratorStateHelperKind {
         match name {
             "_is_generator_closed" => Some(Self::IsClosed),
             "_current_yieldfrom" => Some(Self::CurrentYieldFrom),
-            "_current_throw_context" => Some(Self::CurrentThrowContext),
             _ => None,
         }
     }
 
-    fn preserved_logical_name(self) -> &'static str {
+    fn control_role(self) -> GeneratorControlRole {
         match self {
-            Self::IsClosed => "_dp_is_closed",
-            Self::CurrentYieldFrom => "_dp_yieldfrom",
-            Self::CurrentThrowContext => "_dp_throw_context",
+            Self::IsClosed => GeneratorControlRole::IsClosed,
+            Self::CurrentYieldFrom => GeneratorControlRole::Delegate,
         }
     }
 }
@@ -8490,6 +8957,8 @@ fn typed_generator_alias_cleanup(
         state_value_locations: HashSet<LocalLocation>,
         is_closed_value_locations: HashSet<LocalLocation>,
         module_constants: &'a [ConstantExpr],
+        owner_parameter: Option<LocalLocation>,
+        state_parameter: Option<LocalLocation>,
         ignored_alias_use_instr_ids: &'a HashSet<InstrId>,
         current_top_level: Option<CurrentTopLevel<'a>>,
         residual: bool,
@@ -8510,6 +8979,16 @@ fn typed_generator_alias_cleanup(
                             &self.alias_locations,
                         ) =>
                 {
+                    return;
+                }
+                InstrTyped::TakeOperand(take)
+                    if take
+                        .name
+                        .local_location()
+                        .is_some_and(|location| self.alias_locations.contains(&location)) =>
+                {
+                    // A top-level take is the final discard of this compiler
+                    // owner. A take nested in a call/return remains a use.
                     return;
                 }
                 InstrTyped::Store(store)
@@ -8561,7 +9040,10 @@ fn typed_generator_alias_cleanup(
                     return;
                 }
                 InstrTyped::Store(store)
-                    if store.name.id_str() == "_dp_self"
+                    if store
+                        .name
+                        .local_location()
+                        .is_some_and(|location| Some(location) == self.owner_parameter)
                         && typed_generator_alias_expr(
                             store.value.as_ref(),
                             self.module_constants,
@@ -8574,7 +9056,10 @@ fn typed_generator_alias_cleanup(
                     return;
                 }
                 InstrTyped::Store(store)
-                    if store.name.id_str() == "_dp_state"
+                    if store
+                        .name
+                        .local_location()
+                        .is_some_and(|location| Some(location) == self.state_parameter)
                         && (typed_generator_alias_expr(
                             store.value.as_ref(),
                             self.module_constants,
@@ -8653,26 +9138,25 @@ fn typed_generator_alias_cleanup(
             }
             if matches!(
                 typed_generator_state_helper_alias_call(expr, &self.alias_locations),
-                Some(
-                    TypedGeneratorStateHelperKind::CurrentYieldFrom
-                        | TypedGeneratorStateHelperKind::CurrentThrowContext
-                )
+                Some(TypedGeneratorStateHelperKind::CurrentYieldFrom)
             ) {
                 return;
             }
-            if let InstrTyped::Load(load) = expr
-                && load.name.local_location().is_some_and(|location| {
-                    self.alias_locations.contains(&location)
-                        || self.resume_function_locations.contains(&location)
-                        || self.owner_locations.contains(&location)
-                        || self.state_locations.contains(&location)
-                        || self.state_value_locations.contains(&location)
-                        || self.is_closed_value_locations.contains(&location)
-                })
-            {
+            let local = match expr {
+                InstrTyped::IteratorStep(step) => step.name.local_location(),
+                _ => typed_generator_value_location(expr),
+            };
+            if local.is_some_and(|location| {
+                self.alias_locations.contains(&location)
+                    || self.resume_function_locations.contains(&location)
+                    || self.owner_locations.contains(&location)
+                    || self.state_locations.contains(&location)
+                    || self.state_value_locations.contains(&location)
+                    || self.is_closed_value_locations.contains(&location)
+            }) {
                 tracing::info!(
                     target: "soac_generator_state_lowering",
-                    alias_location = ?load.name.local_location(),
+                    alias_location = ?local,
                     top_level = ?self.current_top_level,
                     "typed_generator_state_lowering_residual_alias_use",
                 );
@@ -8683,18 +9167,25 @@ fn typed_generator_alias_cleanup(
         }
     }
 
-    let mut uses = Uses {
-        alias_locations,
-        resume_function_locations,
-        owner_locations: HashSet::new(),
-        state_locations: HashSet::new(),
-        state_value_locations,
-        is_closed_value_locations,
-        module_constants,
-        ignored_alias_use_instr_ids,
-        current_top_level: None,
-        residual: false,
-    };
+    let mut uses =
+        Uses {
+            alias_locations,
+            resume_function_locations,
+            owner_locations: HashSet::new(),
+            state_locations: HashSet::new(),
+            state_value_locations,
+            is_closed_value_locations,
+            module_constants,
+            owner_parameter: function.storage_layout.as_ref().and_then(|layout| {
+                layout.generator_resume_local(GeneratorResumeParamRole::SelfValue)
+            }),
+            state_parameter: function.storage_layout.as_ref().and_then(|layout| {
+                layout.generator_resume_local(GeneratorResumeParamRole::StateValue)
+            }),
+            ignored_alias_use_instr_ids,
+            current_top_level: None,
+            residual: false,
+        };
     for block in &function.blocks {
         if active_blocks.is_some_and(|active_blocks| !active_blocks.contains(&block.label)) {
             continue;
@@ -8734,12 +9225,19 @@ fn collect_typed_generator_alias_locations(
             let InstrTyped::Store(store) = instr else {
                 continue;
             };
-            if matches!(store.name.id_str(), "_dp_self" | "_dp_state") {
-                continue;
-            }
             let Some(target) = store.name.local_location() else {
                 continue;
             };
+            if function.storage_layout.as_ref().is_some_and(|layout| {
+                [
+                    GeneratorResumeParamRole::SelfValue,
+                    GeneratorResumeParamRole::StateValue,
+                ]
+                .into_iter()
+                .any(|role| layout.generator_resume_local(role) == Some(target))
+            }) {
+                continue;
+            }
             changed |= typed_generator_alias_expr(store.value.as_ref(), module_constants, &aliases)
                 && aliases.insert(target);
         }
@@ -8772,11 +9270,17 @@ fn collect_typed_local_copy_closure(
 }
 
 fn typed_generator_alias_load(expr: &InstrTyped, aliases: &HashSet<LocalLocation>) -> bool {
-    matches!(
-        expr,
-        InstrTyped::Load(load)
-            if load.name.local_location().is_some_and(|location| aliases.contains(&location))
-    )
+    typed_generator_value_location(expr).is_some_and(|location| aliases.contains(&location))
+}
+
+// Identity-only lookup. Unlike replayable-load helpers this accepts a move;
+// callers must preserve the original take or remove its fully eliminated owner.
+fn typed_generator_value_location(expr: &InstrTyped) -> Option<LocalLocation> {
+    match expr {
+        InstrTyped::Load(load) => load.name.local_location(),
+        InstrTyped::TakeOperand(take) => take.name.local_location(),
+        _ => None,
+    }
 }
 
 fn typed_generator_alias_expr(
@@ -9015,6 +9519,13 @@ fn remove_typed_generator_alias_setup(
                     {
                         true
                     }
+                    InstrTyped::TakeOperand(take)
+                        if take.name.local_location().is_some_and(|location| {
+                            cleanup.alias_locations.contains(&location)
+                        }) =>
+                    {
+                        true
+                    }
                     _ => false,
                 };
             !remove
@@ -9027,19 +9538,18 @@ fn rewrite_typed_generator_state_helper_calls(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     aliases: &HashSet<LocalLocation>,
     is_closed_value_locations: &HashSet<LocalLocation>,
-    preserved_locals_by_name: &HashMap<String, ResolvedName>,
+    preserved_control_locals: &HashMap<GeneratorControlRole, ResolvedName>,
 ) -> usize {
     struct Rewriter<'a> {
         aliases: &'a HashSet<LocalLocation>,
         is_closed_value_locations: &'a HashSet<LocalLocation>,
-        preserved_locals_by_name: &'a HashMap<String, ResolvedName>,
+        preserved_control_locals: &'a HashMap<GeneratorControlRole, ResolvedName>,
         changed: usize,
     }
 
     impl Rewriter<'_> {
         fn local_for(&self, helper: TypedGeneratorStateHelperKind) -> Option<&ResolvedName> {
-            self.preserved_locals_by_name
-                .get(helper.preserved_logical_name())
+            self.preserved_control_locals.get(&helper.control_role())
         }
     }
 
@@ -9069,8 +9579,7 @@ fn rewrite_typed_generator_state_helper_calls(
                 self.changed += 1;
                 return;
             }
-            if let Some(helper @ TypedGeneratorStateHelperKind::CurrentYieldFrom)
-            | Some(helper @ TypedGeneratorStateHelperKind::CurrentThrowContext) =
+            if let Some(helper @ TypedGeneratorStateHelperKind::CurrentYieldFrom) =
                 typed_generator_state_helper_alias_call(expr, self.aliases)
                 && let Some(local) = self.local_for(helper)
             {
@@ -9085,7 +9594,7 @@ fn rewrite_typed_generator_state_helper_calls(
     let mut rewriter = Rewriter {
         aliases,
         is_closed_value_locations,
-        preserved_locals_by_name,
+        preserved_control_locals,
         changed: 0,
     };
     rewriter.visit_fn_mut(function);
@@ -9096,7 +9605,7 @@ pub fn rewrite_lowered_typed_generator_state_helper_calls_with_existing_construc
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
     constructor: &TypedGeneratorStateConstructor,
-    preserved_locals_by_name: &HashMap<String, ResolvedName>,
+    preserved_control_locals: &HashMap<GeneratorControlRole, ResolvedName>,
     ignored_alias_use_instr_ids: &HashSet<InstrId>,
 ) -> usize {
     let Some(generator_location) = constructor.target.local_location() else {
@@ -9115,7 +9624,7 @@ pub fn rewrite_lowered_typed_generator_state_helper_calls_with_existing_construc
         function,
         &cleanup.alias_locations,
         &cleanup.is_closed_value_locations,
-        preserved_locals_by_name,
+        preserved_control_locals,
     )
 }
 
@@ -9190,6 +9699,45 @@ fn remap_typed_generator_preserved_instrs(
     remapped
 }
 
+fn record_typed_preserved_operand_roles(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    source_roles: &[soac_core::block_py::OperandLocation],
+    preserved_locals: &HashMap<PreservedLocation, ResolvedName>,
+) {
+    let Some(layout) = &mut function.storage_layout else {
+        return;
+    };
+    for role in source_roles {
+        let Some(source) = role.preserved_location() else {
+            continue;
+        };
+        if let Some(target) = preserved_locals.get(&source) {
+            layout.mark_expression_temporary(
+                target
+                    .local_location()
+                    .expect("preserved operand remap selects an active local owner"),
+            );
+        }
+    }
+}
+
+fn record_typed_preserved_block_parameter_roles(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    source_roles: &[soac_core::block_py::ResolvedBlockParameterRole],
+    preserved_locals: &HashMap<PreservedLocation, ResolvedName>,
+) {
+    let Some(layout) = &mut function.storage_layout else {
+        return;
+    };
+    for binding in source_roles {
+        if let NameLocation::Preserved(source) = binding.location
+            && let Some(target) = preserved_locals.get(&source)
+        {
+            layout.record_block_parameter_role(target.location, binding.role);
+        }
+    }
+}
+
 pub fn lower_typed_generator_resume_preserved_state_to_locals(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> TypedGeneratorResumeStateLoweringStats {
@@ -9232,7 +9780,11 @@ pub fn lower_typed_generator_resume_preserved_state_to_locals_and_collect_preser
             return TypedGeneratorResumeStateLoweringOutcome::default();
         };
         if slot.storage == PreservedSlotStorage::PyCellObject {
-            ensure_typed_owned_cell_alias_for_preserved_local(function, local.resolved_name());
+            ensure_typed_owned_cell_alias_for_preserved_local(
+                function,
+                local.resolved_name(),
+                &slot.logical_name,
+            );
         }
         lowered_slots.push((location, slot.storage_name.clone(), slot.storage, local));
     }
@@ -9244,6 +9796,17 @@ pub fn lower_typed_generator_resume_preserved_state_to_locals_and_collect_preser
         .iter()
         .map(|(location, _, _, local)| (*location, local.resolved_name()))
         .collect::<HashMap<_, _>>();
+    let source_roles = function
+        .storage_layout
+        .as_ref()
+        .map(|layout| layout.block_parameter_roles.clone())
+        .unwrap_or_default();
+    record_typed_preserved_block_parameter_roles(function, &source_roles, &preserved_locals);
+    record_typed_preserved_operand_roles(
+        function,
+        &public_layout.expression_temporaries,
+        &preserved_locals,
+    );
     let remapped_instrs =
         remap_typed_generator_preserved_instrs_everywhere(function, &preserved_locals);
     let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
@@ -9478,7 +10041,10 @@ fn typed_generator_resume_boundary_block(block: &TypedBlock) -> bool {
 }
 
 fn typed_generator_resume_terminal_boundary_block(block: &TypedBlock) -> bool {
-    matches!(block.term, BlockTerm::Raise(_)) && block.exc_edge.is_none()
+    matches!(
+        block.term,
+        BlockTerm::Raise(_) | BlockTerm::GeneratorReturn(_)
+    ) && block.exc_edge.is_none()
 }
 
 fn typed_preserved_delete_blocks(
@@ -9529,6 +10095,7 @@ fn typed_preserved_slot_name(storage_name: &str, location: PreservedLocation) ->
 fn ensure_typed_owned_cell_alias_for_preserved_local(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     local: ResolvedName,
+    logical_name: &str,
 ) -> CellLocation {
     let layout = function
         .storage_layout
@@ -9547,7 +10114,7 @@ fn ensure_typed_owned_cell_alias_for_preserved_local(
     let slot = u32::try_from(layout.cellvars.len())
         .expect("owned preserved-cell alias slot should fit in u32");
     layout.cellvars.push(ClosureSlot {
-        logical_name: local.id_str().to_string(),
+        logical_name: logical_name.to_owned(),
         storage_name: local.id_str().to_string(),
         init: ClosureInit::Deferred,
     });
@@ -9779,6 +10346,36 @@ impl TryMapInstr<InstrTyped, InstrTyped, ()> for TypedGeneratorPreservedLocalRem
             InstrTyped::Store(op) => InstrTyped::Store(op.try_map_children(self)?),
             InstrTyped::Del(op) => InstrTyped::Del(op.try_map_children(self)?),
             InstrTyped::MakeCell(op) => InstrTyped::MakeCell(op.try_map_children(self)?),
+            InstrTyped::NewAnnotationSet(op) => {
+                InstrTyped::NewAnnotationSet(op.try_map_children(self)?)
+            }
+            InstrTyped::SetupAnnotations(op) => {
+                InstrTyped::SetupAnnotations(op.try_map_children(self)?)
+            }
+            InstrTyped::ConstructTypeParameterScope(op) => {
+                InstrTyped::ConstructTypeParameterScope(op.try_map_children(self)?)
+            }
+            InstrTyped::SubscriptGeneric(op) => {
+                InstrTyped::SubscriptGeneric(op.try_map_children(self)?)
+            }
+            InstrTyped::SetFunctionTypeParameters(op) => {
+                InstrTyped::SetFunctionTypeParameters(op.try_map_children(self)?)
+            }
+            InstrTyped::CreateTypeAlias(op) => {
+                InstrTyped::CreateTypeAlias(op.try_map_children(self)?)
+            }
+            InstrTyped::CreateTypeParameter(op) => {
+                InstrTyped::CreateTypeParameter(op.try_map_children(self)?)
+            }
+            InstrTyped::SetTypeParameterDefault(op) => {
+                InstrTyped::SetTypeParameterDefault(op.try_map_children(self)?)
+            }
+            InstrTyped::CheckAnnotationFormat(op) => {
+                InstrTyped::CheckAnnotationFormat(op.try_map_children(self)?)
+            }
+            InstrTyped::RecordAnnotation(op) => {
+                InstrTyped::RecordAnnotation(op.try_map_children(self)?)
+            }
             InstrTyped::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
             InstrTyped::CellRef(op) if self.active => match op.location {
                 CellLocation::Preserved(slot) => self
@@ -9802,6 +10399,39 @@ impl TryMapInstr<InstrTyped, InstrTyped, ()> for TypedGeneratorPreservedLocalRem
             InstrTyped::CellRef(op) => InstrTyped::CellRef(op),
             InstrTyped::MakeFunctionWithClosure(op) => {
                 InstrTyped::MakeFunctionWithClosure(op.try_map_children(self)?)
+            }
+            InstrTyped::ConstructClass(op) => {
+                InstrTyped::ConstructClass(op.try_map_children(self)?)
+            }
+            InstrTyped::PrepareClassDecorator(op) => {
+                InstrTyped::PrepareClassDecorator(op.try_map_children(self)?)
+            }
+            InstrTyped::ApplyClassDecorator(op) => {
+                InstrTyped::ApplyClassDecorator(op.try_map_children(self)?)
+            }
+            InstrTyped::DiscardClassDecorator(op) => {
+                InstrTyped::DiscardClassDecorator(op.try_map_children(self)?)
+            }
+            InstrTyped::TakeOperand(op) => InstrTyped::TakeOperand(op.try_map_children(self)?),
+            InstrTyped::ComprehensionInsert(op) => {
+                InstrTyped::ComprehensionInsert(op.try_map_children(self)?)
+            }
+            InstrTyped::BuildCollection(op) => {
+                InstrTyped::BuildCollection(op.try_map_children(self)?)
+            }
+            InstrTyped::CallArgumentOp(op) => {
+                InstrTyped::CallArgumentOp(op.try_map_children(self)?)
+            }
+            InstrTyped::PreparedCall(op) => InstrTyped::PreparedCall(op.try_map_children(self)?),
+            InstrTyped::IteratorStep(op) => InstrTyped::IteratorStep(op.try_map_children(self)?),
+            InstrTyped::DiscardClassConstructionCaptures(op) => {
+                InstrTyped::DiscardClassConstructionCaptures(op.try_map_children(self)?)
+            }
+            InstrTyped::CompleteFunctionDefinition(op) => {
+                InstrTyped::CompleteFunctionDefinition(op.try_map_children(self)?)
+            }
+            InstrTyped::ApplyFunctionDescriptor(op) => {
+                InstrTyped::ApplyFunctionDescriptor(op.try_map_children(self)?)
             }
         };
         self.active = previous_active;
@@ -9869,6 +10499,14 @@ fn collect_typed_i64_constant_local_defs(
 
     for block in &function.blocks {
         for (index, instr) in block.body.iter().enumerate() {
+            soac_core::block_py::visit_operand_takes(instr, |location| {
+                let Some(location) = location.local_location() else {
+                    return;
+                };
+                invalid.insert(location);
+                candidates.remove(&location);
+                constant_values.remove(&location);
+            });
             match instr {
                 InstrTyped::Store(store) => {
                     let Some(location) = store.name.local_location() else {
@@ -9905,6 +10543,13 @@ fn collect_typed_i64_constant_local_defs(
                 }
                 InstrTyped::Del(del) => {
                     if let Some(location) = del.name.local_location() {
+                        invalid.insert(location);
+                        candidates.remove(&location);
+                        constant_values.remove(&location);
+                    }
+                }
+                InstrTyped::CallArgumentOp(op) => {
+                    for location in op.written_names().filter_map(|name| name.local_location()) {
                         invalid.insert(location);
                         candidates.remove(&location);
                         constant_values.remove(&location);
@@ -10240,12 +10885,23 @@ pub fn rewrite_typed_stop_iteration_raises_to_handler_jumps(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
 ) -> usize {
+    if !function
+        .blocks
+        .iter()
+        .any(|block| typed_block_term_is_stop_iteration_raise(&block.term, module_constants))
+    {
+        return 0;
+    }
+    // Inlining can introduce unnumbered stores/deletes. Ownership decisions
+    // use semantic sites, so assign those IDs before building the sidecar.
+    soac_ir_typed::assign_missing_typed_function_instr_ids(function);
     let labels = function
         .blocks
         .iter()
         .enumerate()
         .map(|(index, block)| (block.label, index))
         .collect::<HashMap<_, _>>();
+    let mut observation = None;
     let rewrite_edges = function
         .blocks
         .iter()
@@ -10254,10 +10910,13 @@ pub fn rewrite_typed_stop_iteration_raises_to_handler_jumps(
                 return None;
             }
             let dispatch = block.exc_edge.as_ref()?;
+            let observation = observation
+                .get_or_insert_with(|| StopIterationObservationPlan::for_function(function));
             let edge = stop_iteration_handler_jump_edge_for_raise(
                 function,
                 module_constants,
                 &labels,
+                observation,
                 block,
                 dispatch,
             )?;
@@ -10288,6 +10947,11 @@ fn typed_block_term_is_stop_iteration_raise(
     let BlockTerm::Raise(raise) = term else {
         return false;
     };
+    // This rewrite models source raise normalization. Internal propagation
+    // preserves an already-established exception/context instead.
+    if raise.disposition != soac_core::block_py::RaiseDisposition::Source {
+        return false;
+    }
     let Some(exc) = raise.exc.as_ref() else {
         return false;
     };
@@ -10312,6 +10976,7 @@ fn stop_iteration_handler_jump_edge_for_raise(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
     labels: &HashMap<BlockLabel, usize>,
+    observation: &StopIterationObservationPlan,
     raise_block: &TypedBlock,
     dispatch: &BlockEdge,
 ) -> Option<BlockEdge> {
@@ -10327,7 +10992,14 @@ fn stop_iteration_handler_jump_edge_for_raise(
     let handler_label =
         stop_iteration_match_handler_label(&dispatch_block.term, exception_name, module_constants)?;
     let handler_block = block_by_label(function, labels, handler_label)?;
-    if handler_region_uses_exception_value(function, labels, handler_label, exception_name) {
+    if handler_region_observes_exception(
+        function,
+        labels,
+        module_constants,
+        observation,
+        handler_label,
+        exception_name,
+    ) {
         return None;
     }
     let args = direct_handler_jump_args(raise_block, handler_block, exception_name)?;
@@ -10438,12 +11110,57 @@ fn typed_expr_loads_name(expr: &InstrTyped, name: &str) -> bool {
     load.name.id_str() == name
 }
 
-fn handler_region_uses_exception_value(
+/// The absent exception is valid only across operations that cannot inspect
+/// native handled state, raise a chained error, or run an owned-value finalizer.
+/// This is deliberately independent of whether source names mention the caught
+/// value. The selected CFG jump, not codegen, consumes this decision.
+struct StopIterationObservationPlan {
+    must_bound: HashMap<BlockLabel, HashSet<LocalLocation>>,
+    ownership: crate::passes::FunctionRefcountPlan,
+}
+
+impl StopIterationObservationPlan {
+    fn for_function(function: &BlockPyFunction<TypedBlockPyModuleShape>) -> Self {
+        Self {
+            must_bound: compute_typed_function_local_must_bound_ins(function),
+            ownership: crate::passes::plan_typed_function_refcounts(
+                function,
+                &FactStore::default(),
+                None,
+            ),
+        }
+    }
+}
+
+fn block_handles_exception(block: &TypedBlock, exception_name: &str) -> bool {
+    block
+        .handled_exception_params()
+        .any(|param| param.name == exception_name)
+}
+
+fn handler_region_observes_exception(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     labels: &HashMap<BlockLabel, usize>,
+    module_constants: &[ConstantExpr],
+    observation: &StopIterationObservationPlan,
     entry: BlockLabel,
     exception_name: &str,
 ) -> bool {
+    // The proposed edge supplies None for this exact exception parameter.
+    // Its compiler-owned retirement stores must not be mistaken for user
+    // finalizers. Prove that the slot remains None below; other owners still
+    // use the ordinary callback-sensitive refcount plan.
+    let absent_exception_location = function
+        .storage_layout()
+        .as_ref()
+        .and_then(|layout| {
+            layout
+                .stack_slots
+                .iter()
+                .position(|name| name == exception_name)
+        })
+        .and_then(|slot| u32::try_from(slot).ok())
+        .map(LocalLocation);
     let mut pending = vec![entry];
     let mut seen = HashSet::new();
     while let Some(label) = pending.pop() {
@@ -10451,17 +11168,143 @@ fn handler_region_uses_exception_value(
             continue;
         }
         let Some(block) = block_by_label(function, labels, label) else {
-            continue;
+            return true;
         };
-        if block.exception_param() != Some(exception_name) {
+        if !block_handles_exception(block, exception_name) {
             continue;
         }
         if typed_block_uses_name(block, exception_name) {
             return true;
         }
+        if block.body.iter().any(|instruction| {
+            matches!(instruction, InstrTyped::Store(store)
+                if store.name.local_location().is_some()
+                    && store.name.local_location() == absent_exception_location
+                    && !typed_expr_is_runtime_name_load(
+                        &store.value, RuntimeName::None, module_constants))
+        }) {
+            return true;
+        }
+        let Some(ownership) = observation.ownership.block(block.label) else {
+            return true;
+        };
+        // Departing a handled scope is resolved before edge/frame cleanup.
+        // A release while the scope remains active can invoke arbitrary Python.
+        let target_handles = |target| {
+            block_by_label(function, labels, target)
+                .is_none_or(|target| block_handles_exception(target, exception_name))
+        };
+        if ownership.actions.iter().any(|action| {
+            use crate::passes::{RefcountActionKind, RefcountReleaseReason};
+            let local = match &action.kind {
+                RefcountActionKind::RebindLocal { local, .. }
+                | RefcountActionKind::DeleteLocal { local, .. }
+                | RefcountActionKind::ReleaseLocal { local, .. } => local,
+            };
+            if Some(local.location) == absent_exception_location {
+                return false;
+            }
+            match &action.kind {
+                RefcountActionKind::RebindLocal { old_state, .. } => old_state.needs_decref(),
+                RefcountActionKind::DeleteLocal { old_state, .. } => old_state.needs_decref(),
+                RefcountActionKind::ReleaseLocal { state, reason, .. } if state.needs_decref() => {
+                    match reason {
+                        RefcountReleaseReason::Return
+                        | RefcountReleaseReason::Raise
+                        | RefcountReleaseReason::ExceptionEdge { .. } => false,
+                        RefcountReleaseReason::Jump { target }
+                        | RefcountReleaseReason::IfThen { target }
+                        | RefcountReleaseReason::IfElse { target }
+                        | RefcountReleaseReason::BranchCase { target }
+                        | RefcountReleaseReason::BranchDefault { target } => {
+                            target_handles(*target)
+                        }
+                    }
+                }
+                RefcountActionKind::ReleaseLocal { .. } => false,
+            }
+        }) {
+            return true;
+        }
+        let mut bound = observation
+            .must_bound
+            .get(&block.label)
+            .cloned()
+            .unwrap_or_default();
+        for instruction in &block.body {
+            let safe = match instruction {
+                InstrTyped::Store(store) => store.name.local_location().is_some_and(|location| {
+                    if !handled_state_unobservable_value(&store.value, &bound) {
+                        return false;
+                    }
+                    bound.insert(location);
+                    true
+                }),
+                InstrTyped::Del(delete) => delete
+                    .name
+                    .local_location()
+                    .is_some_and(|location| bound.remove(&location)),
+                InstrTyped::IncrementCounter(_) => true,
+                _ => handled_state_unobservable_value(instruction, &bound),
+            };
+            if !safe {
+                return true;
+            }
+        }
+        match &block.term {
+            BlockTerm::Return(value) if handled_state_unobservable_value(value, &bound) => {}
+            BlockTerm::Jump(edge) => {
+                let Some(target) = block_by_label(function, labels, edge.target) else {
+                    return true;
+                };
+                if block_handles_exception(target, exception_name) && !edge.args.is_empty() {
+                    let Some(index) = target
+                        .params
+                        .iter()
+                        .position(|param| param.name == exception_name)
+                    else {
+                        return true;
+                    };
+                    if !matches!(edge.args.get(index), Some(BlockArg::None))
+                        && !matches!(edge.args.get(index), Some(BlockArg::Name(name)) if name == exception_name)
+                    {
+                        return true;
+                    }
+                }
+                if !block_handles_exception(target, exception_name)
+                    && (target
+                        .params
+                        .iter()
+                        .any(|param| param.name == exception_name)
+                        || edge.args.iter().any(
+                            |arg| matches!(arg, BlockArg::Name(name) if name == exception_name),
+                        ))
+                {
+                    return true;
+                }
+            }
+            // Truthiness, arbitrary branching expressions, raising/chaining,
+            // suspension and every other effect need a separate proof.
+            _ => return true,
+        }
         pending.extend(typed_term_successors(&block.term).into_iter());
     }
     false
+}
+
+fn handled_state_unobservable_value(
+    expression: &InstrTyped,
+    bound: &HashSet<LocalLocation>,
+) -> bool {
+    let InstrTyped::Load(load) = expression else {
+        return false;
+    };
+    load.name.location.as_constant().is_some()
+        || load.name.runtime_name_id().is_some()
+        || load
+            .name
+            .local_location()
+            .is_some_and(|location| bound.contains(&location))
 }
 
 fn typed_block_uses_name(block: &TypedBlock, name: &str) -> bool {
@@ -10503,7 +11346,7 @@ fn typed_term_successors(term: &BlockTerm<InstrTyped>) -> Vec<BlockLabel> {
             labels.push(branch.default_label);
             labels
         }
-        BlockTerm::Raise(_) | BlockTerm::Return(_) => Vec::new(),
+        BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => Vec::new(),
     }
 }
 
@@ -10513,9 +11356,9 @@ fn direct_handler_jump_args(
     exception_name: &str,
 ) -> Option<Vec<BlockArg>> {
     let source_params = source_block.param_name_vec();
-    let source_has_owner = source_params
-        .iter()
-        .any(|param| param == "_dp_self" || param == "_dp_state");
+    let source_has_owner = source_block.params.iter().any(|param| {
+        matches!(param.role, BlockParamRole::GeneratorResume(role) if role.is_preserved_owner())
+    });
     target_block
         .params
         .iter()
@@ -10534,6 +11377,12 @@ fn direct_handler_jump_args(
 pub fn validate_typed_function_call_access_plans(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> Result<(), String> {
+    if let Some(layout) = &function.storage_layout {
+        layout.validate_block_parameter_roles()?;
+        layout.validate_block_parameter_declarations(
+            function.blocks.iter().flat_map(|block| &block.params),
+        )?;
+    }
     struct Validator {
         function_id: RuntimeFunctionId,
         error: Option<String>,
@@ -10624,8 +11473,31 @@ pub fn validate_typed_module_call_access_plans(
 }
 
 fn validate_typed_call_access_plan(call: &TypedCall<InstrTyped>) -> Result<(), String> {
+    if let Some(namespace) = &call.frame_namespace {
+        let resolved_namespace = match namespace {
+            FrameNamespace::ModuleGlobals => true,
+            FrameNamespace::Mapping(namespace) => {
+                matches!(namespace.as_ref(), InstrTyped::Load(load) if load.name.local_location().is_some())
+            }
+        };
+        if !matches!(call.access, TypedCallAccessPlan::Generic) || !resolved_namespace {
+            return Err(
+                "materialized-frame calls require their resolved namespace and public call boundary"
+                    .into(),
+            );
+        }
+    }
     match &call.access {
         TypedCallAccessPlan::Generic => Ok(()),
+        TypedCallAccessPlan::GuardedSealedMethod(plan) => {
+            validate_typed_call_simple_shape(call)?;
+            if plan.name.is_empty() || !matches!(call.func.as_ref(), InstrTyped::GetAttrTyped(_)) {
+                return Err("sealed method call requires its original named getter".into());
+            }
+            // Source identity/slot validation belongs to the authenticated
+            // runtime sidecar; ordinary typed IR cannot mint that authority.
+            Ok(())
+        }
         TypedCallAccessPlan::GuardedCallable { function_guards } => {
             validate_typed_call_simple_shape(call)?;
             for guard in function_guards {
@@ -10868,10 +11740,73 @@ impl TryMapInstr<InstrTyped, InstrBlockPy, String> for TypedToBlockPy {
             InstrTyped::Store(op) => InstrBlockPy::Store(op.try_map_children(self)?),
             InstrTyped::Del(op) => InstrBlockPy::Del(op.try_map_children(self)?),
             InstrTyped::MakeCell(op) => InstrBlockPy::MakeCell(op.try_map_children(self)?),
+            InstrTyped::NewAnnotationSet(op) => {
+                InstrBlockPy::NewAnnotationSet(op.try_map_children(self)?)
+            }
+            InstrTyped::SetupAnnotations(op) => {
+                InstrBlockPy::SetupAnnotations(op.try_map_children(self)?)
+            }
+            InstrTyped::ConstructTypeParameterScope(op) => {
+                InstrBlockPy::ConstructTypeParameterScope(op.try_map_children(self)?)
+            }
+            InstrTyped::SubscriptGeneric(op) => {
+                InstrBlockPy::SubscriptGeneric(op.try_map_children(self)?)
+            }
+            InstrTyped::SetFunctionTypeParameters(op) => {
+                InstrBlockPy::SetFunctionTypeParameters(op.try_map_children(self)?)
+            }
+            InstrTyped::CreateTypeAlias(op) => {
+                InstrBlockPy::CreateTypeAlias(op.try_map_children(self)?)
+            }
+            InstrTyped::CreateTypeParameter(op) => {
+                InstrBlockPy::CreateTypeParameter(op.try_map_children(self)?)
+            }
+            InstrTyped::SetTypeParameterDefault(op) => {
+                InstrBlockPy::SetTypeParameterDefault(op.try_map_children(self)?)
+            }
+            InstrTyped::CheckAnnotationFormat(op) => {
+                InstrBlockPy::CheckAnnotationFormat(op.try_map_children(self)?)
+            }
+            InstrTyped::RecordAnnotation(op) => {
+                InstrBlockPy::RecordAnnotation(op.try_map_children(self)?)
+            }
             InstrTyped::IncrementCounter(op) => InstrBlockPy::IncrementCounter(op),
             InstrTyped::CellRef(op) => InstrBlockPy::CellRef(op),
             InstrTyped::MakeFunctionWithClosure(op) => {
                 InstrBlockPy::MakeFunctionWithClosure(op.try_map_children(self)?)
+            }
+            InstrTyped::ConstructClass(op) => {
+                InstrBlockPy::ConstructClass(op.try_map_children(self)?)
+            }
+            InstrTyped::PrepareClassDecorator(op) => {
+                InstrBlockPy::PrepareClassDecorator(op.try_map_children(self)?)
+            }
+            InstrTyped::ApplyClassDecorator(op) => {
+                InstrBlockPy::ApplyClassDecorator(op.try_map_children(self)?)
+            }
+            InstrTyped::DiscardClassDecorator(op) => {
+                InstrBlockPy::DiscardClassDecorator(op.try_map_children(self)?)
+            }
+            InstrTyped::TakeOperand(op) => InstrBlockPy::TakeOperand(op.try_map_children(self)?),
+            InstrTyped::ComprehensionInsert(op) => {
+                InstrBlockPy::ComprehensionInsert(op.try_map_children(self)?)
+            }
+            InstrTyped::BuildCollection(op) => {
+                InstrBlockPy::BuildCollection(op.try_map_children(self)?)
+            }
+            InstrTyped::CallArgumentOp(op) => {
+                InstrBlockPy::CallArgumentOp(op.try_map_children(self)?)
+            }
+            InstrTyped::PreparedCall(op) => InstrBlockPy::PreparedCall(op.try_map_children(self)?),
+            InstrTyped::IteratorStep(op) => InstrBlockPy::IteratorStep(op.try_map_children(self)?),
+            InstrTyped::DiscardClassConstructionCaptures(op) => {
+                InstrBlockPy::DiscardClassConstructionCaptures(op.try_map_children(self)?)
+            }
+            InstrTyped::CompleteFunctionDefinition(op) => {
+                InstrBlockPy::CompleteFunctionDefinition(op.try_map_children(self)?)
+            }
+            InstrTyped::ApplyFunctionDescriptor(op) => {
+                InstrBlockPy::ApplyFunctionDescriptor(op.try_map_children(self)?)
             }
         })
     }
@@ -11247,6 +12182,7 @@ mod typed_codegen_tests {
         let next_id =
             blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
         let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
         let call_id;
         {
             let caller = typed_function_by_qualname_mut(&mut typed, "caller");
@@ -11267,7 +12203,15 @@ mod typed_codegen_tests {
                         },
                     }],
                 },
-                |call| call.args.len() == 1 && call.keywords.is_empty(),
+                |call| {
+                    call.args.len() == 1
+                        && call.keywords.is_empty()
+                        && typed_expr_is_runtime_name_load(
+                            &call.func,
+                            RuntimeName::Next,
+                            &module_constants,
+                        )
+                },
             );
         }
 
@@ -11292,9 +12236,86 @@ mod typed_codegen_tests {
     }
 
     #[test]
-    fn inlines_generator_resume_calls_with_isolated_preserved_resume_abi_storage() {
+    fn iterator_step_alias_cleanup_keeps_unselected_steps_and_escaping_moves() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-            "def values(limit):\n    yield limit\n\n\
+            "def caller(make):\n    generator = make()\n    for value in generator:\n        pass\n",
+        ).unwrap();
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let generator = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .find_map(|instr| match instr {
+                InstrTyped::Store(store) if store.name.id_str() == "generator" => {
+                    store.name.local_location()
+                }
+                _ => None,
+            })
+            .unwrap();
+        let (source, receiver) = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::IteratorStep(step) = store.value.as_ref() else {
+                    return None;
+                };
+                Some((step.try_semantic_instr_id().unwrap(), step.name.clone()))
+            })
+            .unwrap();
+        assert!(
+            typed_generator_alias_cleanup(caller, &constants, generator, &HashSet::new(), None,)
+                .is_none(),
+            "a still-materialized step is a real use of the generator alias"
+        );
+        let selected = HashSet::from([source]);
+        let cleanup = typed_generator_alias_cleanup(caller, &constants, generator, &selected, None)
+            .expect(
+                "a selected step and consuming loop retirement can eliminate the closed aliases",
+            );
+        assert!(
+            cleanup
+                .alias_locations
+                .contains(&receiver.local_location().unwrap())
+        );
+        let block = caller
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                matches!(block.term, BlockTerm::Return(_))
+                    && block.body.iter().any(|instr| {
+                        matches!(instr,
+                    InstrTyped::TakeOperand(take) if take.name.location == receiver.location)
+                    })
+            })
+            .unwrap();
+        let index = block
+            .body
+            .iter()
+            .position(|instr| {
+                matches!(instr,
+            InstrTyped::TakeOperand(take) if take.name.location == receiver.location)
+            })
+            .unwrap();
+        // Moving the same owner out to the caller is not a discard. The
+        // inliner must preserve materialization even when its step was selected.
+        block.term = BlockTerm::Return(block.body.remove(index));
+        assert!(
+            typed_generator_alias_cleanup(caller, &constants, generator, &selected, None,)
+                .is_none(),
+            "an escaping take must not be classified as loop cleanup"
+        );
+    }
+
+    #[test]
+    fn retains_generator_resume_calls_with_unrepresented_handled_activation() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(limit):\n    set_handled_exception(limit)\n    yield limit\n\n\
 def helper(fn, owner, state, value, exc):\n    return value\n\n\
 def caller(fn, owner, state):\n    return helper(fn, owner, state, None, None)\n",
         )
@@ -11328,8 +12349,31 @@ def caller(fn, owner, state):\n    return helper(fn, owner, state, None, None)\n
             function_id: values_id,
         }
         .visit_fn_mut(caller);
+        let original_storage = caller.storage_layout.clone();
+        let original_labels = caller
+            .blocks
+            .iter()
+            .map(|block| block.label)
+            .collect::<Vec<_>>();
 
         let callee_module = typed.clone();
+        let resume = callee_module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == values_id)
+            .expect("the actual suspended body is the resume target");
+        assert!(
+            resume
+                .blocks
+                .iter()
+                .filter(|block| {
+                    soac_core::block_py::HasBlockContext::block_context(&block.extra)
+                        .handled_exception
+                        == soac_core::block_py::HandledExceptionContext::Regions
+                })
+                .all(|block| block.handled_exception_params().next().is_none()),
+            "zero lexical handler entries do not prove that a C API callback cannot change the suspended item; normalized transport is not a handler entry"
+        );
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         let stats = inline_typed_function_direct_call_stores(
             caller,
@@ -11337,31 +12381,24 @@ def caller(fn, owner, state):\n    return helper(fn, owner, state, None, None)\n
             &HashMap::new(),
             &HashMap::new(),
         );
-        assert_eq!(stats.rewritten_returns, 1);
-        let layout = caller
-            .storage_layout
-            .as_ref()
-            .expect("inlined caller should keep a storage layout");
-        assert!(
-            layout
-                .stack_slots()
-                .iter()
-                .filter(|name| name.starts_with("_dp_typed_inline_preserved_abi_"))
-                .count()
-                >= 2,
-            "resume inlining should allocate isolated preserved-owner scratch locals"
+        assert_eq!(stats.rewritten_returns, 0);
+        assert_eq!(stats.unrepresented_handled_activation_calls, vec![call_id]);
+        assert_eq!(
+            caller.storage_layout, original_storage,
+            "retention must happen before allocating any inline storage"
         );
-        assert!(
+        assert_eq!(
             caller
                 .blocks
                 .iter()
-                .flat_map(|block| block.body.iter())
-                .any(|instr| matches!(
-                    instr,
-                    InstrTyped::Store(store)
-                        if store.name.id_str().starts_with("_dp_typed_inline_preserved_abi_")
-                )),
-            "resume inlining should seed the preserved ABI scratch locals before the inlined body"
+                .map(|block| block.label)
+                .collect::<Vec<_>>(),
+            original_labels
+        );
+        assert_eq!(
+            first_typed_call_instr_id(caller),
+            call_id,
+            "the real resume call retains its own native activation boundary"
         );
     }
 
@@ -11407,6 +12444,108 @@ def caller():\n    return None\n",
             first.len() + second.len(),
             "each inlined resume should get distinct owner/state scratch locals"
         );
+    }
+
+    #[test]
+    fn inline_candidate_sidecars_require_every_target_to_commit() {
+        for include_captured_target in [false, true] {
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+                r#"
+def plain(value):
+    return value, "plain"
+
+def outer(marker):
+    def captured(value):
+        return value, marker
+    return captured
+
+def caller(target, value):
+    return target(value)
+"#,
+            )
+            .expect("source should lower");
+            let plain_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "plain");
+            let captured_id =
+                blockpy_function_id_by_qualname(&lowered.blockpy_module, "outer.<locals>.captured");
+            let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+            let captured = typed
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == captured_id)
+                .expect("captured source helper should exist");
+            assert!(typed_inline_callee_has_nonstack_storage(
+                captured,
+                captured.storage_layout.as_ref().unwrap(),
+            ));
+            let arg_plan = TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            };
+            let mut targets = vec![(plain_id, arg_plan.clone())];
+            if include_captured_target {
+                targets.push((captured_id, arg_plan.clone()));
+            }
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            let call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: targets
+                        .iter()
+                        .map(|(function_id, arg_plan)| TypedDirectFunctionCallGuard {
+                            function_id: *function_id,
+                            arg_plan: arg_plan.clone(),
+                        })
+                        .collect(),
+                },
+                |_| true,
+            );
+            assert_eq!(lower_typed_function_call_access_plan_instrs(caller), 1);
+            let original_storage = caller.storage_layout.clone();
+            let original_block_labels = caller
+                .blocks
+                .iter()
+                .map(|block| block.label)
+                .collect::<Vec<_>>();
+            let callee_module = typed.clone();
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            let stats = inline_typed_function_direct_call_stores(
+                caller,
+                &callee_module,
+                &HashMap::new(),
+                &HashMap::from([(call_id, targets)]),
+            );
+            if include_captured_target {
+                assert_eq!(stats.rewritten_returns, 0);
+                assert!(stats.skipped_candidates > 0);
+                assert_eq!(caller.storage_layout, original_storage);
+                assert_eq!(
+                    caller
+                        .blocks
+                        .iter()
+                        .map(|block| block.label)
+                        .collect::<Vec<_>>(),
+                    original_block_labels,
+                );
+                assert!(caller.blocks.iter().any(|block| matches!(
+                    &block.term,
+                    BlockTerm::Return(InstrTyped::GuardedCallableCallTyped(call))
+                        if call.try_semantic_instr_id() == Some(call_id)
+                )));
+                assert!(
+                    stats.inline_instance_sources.is_empty(),
+                    "a first target's successful fragment is not a committed callsite: {stats:?}",
+                );
+                assert!(stats.synthetic_instr_ids.is_empty());
+                assert!(stats.constant_mappings.is_empty());
+                assert!(stats.materialized_generator_args.is_empty());
+                assert!(stats.instr_id_mappings.is_empty());
+                assert!(stats.local_mappings.is_empty());
+            } else {
+                assert_eq!(stats.rewritten_returns, 1);
+                assert_eq!(stats.skipped_candidates, 0);
+                assert_eq!(stats.inline_instance_sources.len(), 1);
+                assert_eq!(stats.inline_instance_sources[0].source_instr_id, call_id);
+            }
+        }
     }
 
     #[test]
@@ -11530,6 +12669,68 @@ def caller(value):\n    return list(value)\n",
     }
 
     #[test]
+    fn inline_cell_load_keeps_free_variable_error_when_storage_becomes_owned() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def holder(value):\n    def inner():\n        return value\n    return inner\n",
+        )
+        .expect("closure source lowers");
+        let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let holder = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "holder")
+            .unwrap();
+        let inner = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.fn_name == "inner")
+            .unwrap();
+        #[derive(Default)]
+        struct CellLoad(Option<Load<InstrTyped>>);
+        impl Visit<InstrTyped> for CellLoad {
+            fn visit_instr(&mut self, instr: &InstrTyped) {
+                if let InstrTyped::Load(load) = instr
+                    && load.name.cell_location().is_some()
+                {
+                    self.0 = Some(load.clone());
+                }
+                instr.visit_children(self);
+            }
+        }
+        let mut found = CellLoad::default();
+        found.visit_fn(inner);
+        let original = found.0.expect("inner reads the captured value");
+        let binding = original.cell_binding.as_ref().unwrap();
+        assert_eq!(binding.kind, soac_core::block_py::CellBindingKind::Capture);
+        assert_eq!(binding.logical_name.as_str(), "value");
+        let source_slot = original.name.cell_location().unwrap().slot();
+        for target in [CellLocation::Owned(12), CellLocation::Preserved(13)] {
+            let locals = HashMap::new();
+            let values = TypedInlineValueBindings::default();
+            let cells = HashMap::from([(source_slot, target)]);
+            let mut ids = TypedInlineInstrIdAllocator::from_function(holder);
+            let mut remap_ids = TypedInlineInstrIdRemapper::new(inner.function_id, 0, &mut ids);
+            let mut constants = TypedInlineConstantScope::SameModule;
+            let mut remapper = TypedInlineLocalRemapper::new(
+                inner.storage_layout.as_ref().unwrap(),
+                &locals,
+                &values,
+                Some(&cells),
+                &mut remap_ids,
+                &mut constants,
+            );
+            let InstrTyped::Load(remapped) = remapper
+                .try_map_instr(InstrTyped::Load(original.clone()))
+                .unwrap()
+            else {
+                panic!("inline remapping preserves the value load operation");
+            };
+            assert_eq!(remapped.name.cell_location(), Some(target));
+            assert_eq!(remapped.cell_binding.as_ref(), Some(binding));
+        }
+    }
+
+    #[test]
     fn normalized_inline_capture_loads_resolve_to_owned_cells() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "def holder(value):\n    def inner():\n        return value\n    return inner\n",
@@ -11592,27 +12793,15 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
             })
             .expect("caller should construct the generator");
         let remapped_instr_id = InstrId::new(900);
-        let state_location = {
-            let layout = caller
-                .storage_layout
-                .as_mut()
-                .expect("caller should have storage");
-            let location = LocalLocation(
-                u32::try_from(layout.stack_slots().len())
-                    .expect("test state slot index should fit in u32"),
-            );
-            layout.ensure_stack_slot("_dp_state");
-            location
-        };
+        let state_alias = try_allocate_typed_stack_temp(caller, "generator_alias")
+            .unwrap_or_else(|_| panic!("caller should allocate an ordinary alias"))
+            .resolved_name();
         let entry = caller
             .blocks
             .first_mut()
             .expect("caller should have an entry block");
         entry.body.push(typed_store_temp(
-            ResolvedName {
-                id: "_dp_state".into(),
-                location: NameLocation::Local(state_location),
-            },
+            state_alias.clone(),
             typed_load_temp(&generator_name),
         ));
         entry.body.push(
@@ -11653,7 +12842,10 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
         };
         let caller = &typed.callable_defs[caller_index];
         assert_eq!(stats.lowered_generators, 1);
-        assert_eq!(stats.removed_owner_stores, 1);
+        assert_eq!(
+            stats.removed_owner_stores, 0,
+            "a fresh caller-local alias is not a private resume ABI owner"
+        );
         assert!(
             caller
                 .blocks
@@ -11661,7 +12853,7 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
                 .flat_map(|block| block.body.iter())
                 .all(|instr| !matches!(
                     instr,
-                    InstrTyped::Store(store) if store.name.id_str() == "_dp_state"
+                    InstrTyped::Store(store) if store.name.local_location() == state_alias.local_location()
                 )),
             "scalarized generator state should not keep the preserved-state seed"
         );
@@ -12253,18 +13445,9 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
             .expect("caller should construct the generator");
         let remapped_instr_id = InstrId::new(901);
         let remapped_cell_name_instr_id = InstrId::new(902);
-        let state_location = {
-            let layout = caller
-                .storage_layout
-                .as_mut()
-                .expect("caller should have storage");
-            let location = LocalLocation(
-                u32::try_from(layout.stack_slots().len())
-                    .expect("test state slot index should fit in u32"),
-            );
-            layout.ensure_stack_slot("_dp_state");
-            location
-        };
+        let state_alias = try_allocate_typed_stack_temp(caller, "generator_alias")
+            .unwrap_or_else(|_| panic!("caller should allocate an ordinary alias"))
+            .resolved_name();
         let remapped_target = try_allocate_typed_stack_temp(caller, "typed_gen_cellref")
             .unwrap_or_else(|_| panic!("test should allocate a stack temp"))
             .resolved_name();
@@ -12277,10 +13460,7 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
             .first_mut()
             .expect("caller should have an entry block");
         entry.body.push(typed_store_temp(
-            ResolvedName {
-                id: "_dp_state".into(),
-                location: NameLocation::Local(state_location),
-            },
+            state_alias.clone(),
             typed_load_temp(&generator_name),
         ));
         entry.body.push(
@@ -12299,10 +13479,18 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
         entry.body.push(
             Store::new(
                 remapped_cell_name_target,
-                Box::new(InstrTyped::Load(Load::new(ResolvedName {
-                    id: "captured_cell".into(),
-                    location: NameLocation::Cell(CellLocation::Preserved(preserved_cell_slot)),
-                }))),
+                Box::new(InstrTyped::Load(
+                    Load::new(ResolvedName {
+                        id: "captured_cell".into(),
+                        location: NameLocation::Cell(CellLocation::Preserved(preserved_cell_slot)),
+                    })
+                    .with_cell_binding(Some(
+                        soac_core::block_py::CellLoadBinding {
+                            logical_name: "limit".into(),
+                            kind: soac_core::block_py::CellBindingKind::Owner,
+                        },
+                    )),
+                )),
             )
             .with_meta(Meta {
                 instr_id: Some(remapped_cell_name_instr_id),
@@ -12472,6 +13660,57 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
     }
 
     #[test]
+    fn resolved_block_parameter_roles_follow_active_resume_locals() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(work):\n    try:\n        yield work()\n        return work()\n    finally:\n        work()\n",
+        ).expect("pending suspended source");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let function = typed_function_by_qualname_mut(&mut typed, "values");
+        let before = function
+            .storage_layout
+            .as_ref()
+            .unwrap()
+            .block_parameter_roles
+            .clone();
+        assert!(
+            before
+                .iter()
+                .any(|binding| binding.role == BlockParamRole::AbruptKind
+                    && binding.location.as_preserved().is_some())
+        );
+        let outcome =
+            lower_typed_generator_resume_preserved_state_to_locals_and_collect_preserved_locals(
+                function,
+            );
+        assert_eq!(outcome.stats.lowered_functions, 1);
+        let layout = function.storage_layout.as_ref().unwrap();
+        layout.validate_block_parameter_roles().unwrap();
+        let mut mapped_controls = 0;
+        for binding in before {
+            let Some(source) = binding.location.as_preserved() else {
+                continue;
+            };
+            let Some(target) = outcome.preserved_locals.get(&source) else {
+                continue;
+            };
+            assert!(
+                layout
+                    .block_parameter_roles_at(target.location)
+                    .any(|role| role == binding.role)
+            );
+            assert!(
+                layout.block_parameter_roles.contains(&binding),
+                "boundary writeback storage still has its original role"
+            );
+            mapped_controls += 1;
+        }
+        assert!(
+            mapped_controls > 0,
+            "at least the actual abrupt-kind state is hydrated locally"
+        );
+    }
+
+    #[test]
     fn lowers_non_inlined_generator_resume_preserved_state_to_locals() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "def values(limit):\n    yield limit\n    return limit\n",
@@ -12485,10 +13724,7 @@ def caller(limit):\n    gen = values(limit)\n    return None\n",
             .expect("generator resume body should expose public preserved storage")
             .clone();
         let pc_location = public_layout
-            .preserved_slots
-            .iter()
-            .position(|slot| slot.logical_name == "_dp_pc")
-            .map(|slot| PreservedLocation(u32::try_from(slot).expect("pc slot should fit")))
+            .generator_control_slot(GeneratorControlRole::ProgramCounter)
             .expect("generator resume body should preserve its program counter");
         let limit_location = public_layout
             .preserved_slots
@@ -13125,6 +14361,141 @@ def caller(it):\n    return next(it)\n",
                 )
             })
             .count()
+    }
+
+    fn assert_concrete_field_owners_retained(
+        before: &BlockPyFunction<TypedBlockPyModuleShape>,
+        after: &BlockPyFunction<TypedBlockPyModuleShape>,
+    ) {
+        // Compare structured operation trees, physical owners and CFG inputs,
+        // not rendered IR or just allocation/scalarization counters.
+        #[derive(Debug, PartialEq)]
+        enum Row {
+            Instr(
+                std::mem::Discriminant<InstrTyped>,
+                Option<InstrId>,
+                Option<Box<TypedInstrExtra>>,
+            ),
+            Name(ResolvedName),
+            Store(block_py::StoreLifetime, block_py::StorePurpose),
+            Delete(bool),
+            Binary(BinOpKind),
+            Field(TypedAttrAccessPlan),
+            Term(std::mem::Discriminant<BlockTerm<InstrTyped>>),
+            Label(BlockLabel),
+            Arg(
+                std::mem::Discriminant<BlockArg>,
+                Option<String>,
+                Option<block_py::AbruptKind>,
+            ),
+            End,
+        }
+        #[derive(Default)]
+        struct Trace(Vec<Row>);
+        impl Visit<InstrTyped> for Trace {
+            fn visit_instr(&mut self, instr: &InstrTyped) {
+                self.0.push(Row::Instr(
+                    std::mem::discriminant(instr),
+                    instr.try_semantic_instr_id(),
+                    instr.typed_extra().cloned().map(Box::new),
+                ));
+                match instr {
+                    InstrTyped::Load(op) => self.0.push(Row::Name(op.name.clone())),
+                    InstrTyped::TakeOperand(op) => self.0.push(Row::Name(op.name.clone())),
+                    InstrTyped::Store(op) => {
+                        self.0.push(Row::Name(op.name.clone()));
+                        self.0.push(Row::Store(op.lifetime, op.purpose));
+                    }
+                    InstrTyped::Del(op) => {
+                        self.0.push(Row::Name(op.name.clone()));
+                        self.0.push(Row::Delete(op.quietly));
+                    }
+                    InstrTyped::BinOp(op) => self.0.push(Row::Binary(op.kind)),
+                    InstrTyped::GetAttrTyped(op) => self.0.push(Row::Field(op.access.clone())),
+                    InstrTyped::SetAttrTyped(op) => self.0.push(Row::Field(op.access.clone())),
+                    _ => {}
+                }
+                instr.visit_children(self);
+                self.0.push(Row::End);
+            }
+
+            fn visit_term(&mut self, term: &BlockTerm<InstrTyped>) {
+                self.0.push(Row::Term(std::mem::discriminant(term)));
+                block_py::walk_term(self, term);
+                self.0.push(Row::End);
+            }
+
+            fn visit_label(&mut self, label: &BlockLabel) {
+                self.0.push(Row::Label(*label));
+            }
+
+            fn visit_block_arg(&mut self, arg: &BlockArg) {
+                self.0.push(Row::Arg(
+                    std::mem::discriminant(arg),
+                    match arg {
+                        BlockArg::Name(name) => Some(name.clone()),
+                        _ => None,
+                    },
+                    match arg {
+                        BlockArg::AbruptKind(kind) => Some(*kind),
+                        _ => None,
+                    },
+                ));
+            }
+        }
+        assert_eq!(
+            before.storage_layout, after.storage_layout,
+            "no new scalar owners"
+        );
+        assert_eq!(before.blocks.len(), after.blocks.len());
+        for (before, after) in before.blocks.iter().zip(&after.blocks) {
+            assert_eq!(before.label, after.label);
+            assert_eq!(before.params, after.params);
+            assert_eq!(before.extra, after.extra);
+            assert_eq!(before.body.len(), after.body.len());
+            assert_eq!(before.exc_edge.is_some(), after.exc_edge.is_some());
+            let mut before_trace = Trace::default();
+            let mut after_trace = Trace::default();
+            before_trace.visit_block(before);
+            after_trace.visit_block(after);
+            assert_eq!(before_trace.0, after_trace.0, "block {:?}", before.label);
+        }
+    }
+
+    fn assert_consuming_field_values(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        module_constants: &[ConstantExpr],
+        expected_fields: &[&str],
+    ) {
+        let layout = function.storage_layout.as_ref().expect("resolved storage");
+        let mut fields = HashSet::new();
+        for block in &function.blocks {
+            for (index, instr) in block.body.iter().enumerate() {
+                let InstrTyped::SetAttrTyped(op) = instr else {
+                    continue;
+                };
+                let InstrTyped::TakeOperand(take) = op.replacement.as_ref() else {
+                    continue;
+                };
+                let field = typed_constant_string(op.attr.as_ref(), module_constants)
+                    .expect("original field spelling");
+                take.validate_resolved(layout)
+                    .expect("actual resolved Operand owner");
+                let InstrTyped::Store(producer) = &block.body[index.checked_sub(1).unwrap()] else {
+                    panic!("field {field} must keep its original evaluated-value owner");
+                };
+                assert_eq!(producer.name, take.name);
+                assert!(matches!(
+                    producer.lifetime,
+                    block_py::StoreLifetime::Operand { .. }
+                ));
+                fields.insert(field);
+            }
+        }
+        assert_eq!(
+            fields,
+            expected_fields.iter().copied().collect::<HashSet<_>>()
+        );
     }
 
     fn typed_test_local(name: &str, location: LocalLocation) -> ResolvedName {
@@ -14088,6 +15459,241 @@ def caller(it):\n    return it.__next__()\n",
     }
 
     #[test]
+    fn typed_inline_retains_callers_handled_regions_through_every_fragment_block() {
+        for body in [
+            "        return self.observe()\n",
+            "        try:\n            return self.observe()\n        except LookupError:\n            return 2\n",
+        ] {
+            let source = format!(
+                "class IterRange:\n    def __next__(self):\n{body}\n\
+def caller(it, first, second, value):\n    try:\n        raise first\n    except:\n        try:\n            raise second\n        except:\n            value = next(it)\n            return value\n"
+            );
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("source should lower");
+            let next_id =
+                blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+            let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+            let constants = typed.module_constants.clone();
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            let call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                    runtime_name: RuntimeName::Next,
+                    method_name: "__next__".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: next_id,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "__main__".to_string(),
+                            qualname: "IterRange".to_string(),
+                        },
+                        type_version: 1,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+                |call| typed_expr_is_runtime_name_load(&call.func, RuntimeName::Next, &constants),
+            );
+            let original_labels = caller
+                .blocks
+                .iter()
+                .map(|block| block.label)
+                .collect::<HashSet<_>>();
+            let source_block = caller
+                .blocks
+                .iter()
+                .find(|block| {
+                    block.body.iter().any(|instr| match instr {
+                        InstrTyped::Store(store) => {
+                            store.value.try_semantic_instr_id() == Some(call_id)
+                        }
+                        _ => instr.try_semantic_instr_id() == Some(call_id),
+                    })
+                })
+                .expect("next call has a source block");
+            let caller_regions = source_block
+                .handled_exception_params()
+                .map(|param| param.name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                caller_regions.len(),
+                2,
+                "fixture has nested caller handlers"
+            );
+            let callee_module = typed.clone();
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            let stats = inline_typed_function_direct_call_stores(
+                caller,
+                &callee_module,
+                &HashMap::new(),
+                &HashMap::from([(
+                    call_id,
+                    vec![(
+                        next_id,
+                        TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    )],
+                )]),
+            );
+            assert_eq!(stats.rewritten_stores, 1);
+            let layout = caller.storage_layout.as_ref().unwrap();
+            layout.validate_block_parameter_roles().unwrap();
+            // Composition changes Exception to EnclosingException (and pending
+            // payload extent likewise), not the physical control owner.
+            layout
+                .validate_block_parameter_declarations(
+                    caller.blocks.iter().flat_map(|block| &block.params),
+                )
+                .expect("inline declarations keep their exact physical control semantics");
+            let fragments = caller
+                .blocks
+                .iter()
+                .filter(|block| !original_labels.contains(&block.label))
+                .collect::<Vec<_>>();
+            assert!(
+                fragments.len() >= 4,
+                "guard, callee, cleanup and continuation are real blocks"
+            );
+            for block in fragments {
+                let regions = block
+                    .handled_exception_params()
+                    .map(|param| param.name.clone())
+                    .collect::<Vec<_>>();
+                assert!(
+                    regions.starts_with(&caller_regions),
+                    "inline block {:?} lost caller region prefix: {regions:?}",
+                    block.label
+                );
+                if block.body.iter().any(|instr|
+                    matches!(instr, InstrTyped::Store(store) if store.name.id_str() == "value")
+                ) {
+                    assert_eq!(regions, caller_regions,
+                        "replacing the caller value must run its finalizer after leaving callee handlers");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_inline_preserves_dynamic_callers_and_retains_unrepresentable_handlers() {
+        use soac_core::block_py::{BlockContext, HandledExceptionContext};
+
+        for context in [
+            HandledExceptionContext::Preserve,
+            HandledExceptionContext::Unwind,
+            HandledExceptionContext::Terminal,
+        ] {
+            for (body, has_handler) in [
+                ("    return value\n", false),
+                (
+                    "    try:\n        return value()\n    except LookupError:\n        return 2\n",
+                    true,
+                ),
+            ] {
+                let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&format!(
+                    "def helper(value):\n{body}\ndef caller(value):\n    return helper(value)\n"
+                ))
+                .expect("source should lower");
+                let helper_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "helper");
+                let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+                let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+                for block in &mut caller.blocks {
+                    block.extra.set_block_context(BlockContext {
+                        handled_exception: context,
+                        ..Default::default()
+                    });
+                }
+                let arg_plan = TypedDirectCallArgPlan {
+                    sources: vec![TypedDirectCallArgSource::Provided(0)],
+                };
+                let call_id = replace_first_typed_call_access_where(
+                    caller,
+                    TypedCallAccessPlan::GuardedCallable {
+                        function_guards: vec![TypedDirectFunctionCallGuard {
+                            function_id: helper_id,
+                            arg_plan: arg_plan.clone(),
+                        }],
+                    },
+                    |_| true,
+                );
+                assert_eq!(lower_typed_function_call_access_plan_instrs(caller), 1);
+                let original_storage = caller.storage_layout.clone();
+                let callee_module = typed.clone();
+                let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+                let stats = inline_typed_function_direct_call_stores(
+                    caller,
+                    &callee_module,
+                    &HashMap::new(),
+                    &HashMap::from([(call_id, vec![(helper_id, arg_plan)])]),
+                );
+                if has_handler {
+                    assert_eq!(stats.unrepresented_handled_activation_calls, vec![call_id]);
+                    assert_eq!(caller.storage_layout, original_storage);
+                    assert_eq!(stats.rewritten_returns, 0);
+                    assert!(caller.blocks.iter().any(|block|
+                        matches!(&block.term, BlockTerm::Return(InstrTyped::GuardedCallableCallTyped(call))
+                            if call.try_semantic_instr_id() == Some(call_id))
+                    ));
+                } else {
+                    assert_eq!(stats.rewritten_returns, 1);
+                    assert!(stats.unrepresented_handled_activation_calls.is_empty());
+                    assert!(
+                        caller.blocks.iter().all(|block| block
+                            .extra
+                            .block_context()
+                            .handled_exception
+                            != HandledExceptionContext::Regions),
+                        "ordinary no-handler calls must not clear the caller's dynamic item"
+                    );
+                    assert!(
+                        caller.blocks.iter().any(|block| block
+                            .extra
+                            .block_context()
+                            .handled_exception
+                            == HandledExceptionContext::Preserve),
+                        "inlined callee blocks must not finish the original caller's activation"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_inline_keeps_ordinary_calls_inside_suspended_bodies_eligible() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def helper(value):\n    return value\n\ndef caller(value):\n    result = helper(value)\n    yield result\n"
+        ).expect("source should lower");
+        let helper_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "helper");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let arg_plan = TypedDirectCallArgPlan {
+            sources: vec![TypedDirectCallArgSource::Provided(0)],
+        };
+        let call_id = replace_first_typed_call_access_where(
+            caller,
+            TypedCallAccessPlan::GuardedCallable {
+                function_guards: vec![TypedDirectFunctionCallGuard {
+                    function_id: helper_id,
+                    arg_plan: arg_plan.clone(),
+                }],
+            },
+            |call| matches!(call.func.as_ref(), InstrTyped::Load(load) if load.name.id_str() == "helper"),
+        );
+        assert_eq!(lower_typed_function_call_access_plan_instrs(caller), 1);
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(call_id, vec![(helper_id, arg_plan)])]),
+        );
+        assert_eq!(stats.rewritten_stores, 1);
+        assert!(stats.unrepresented_handled_activation_calls.is_empty());
+    }
+
+    #[test]
     fn typed_direct_call_inlining_rewrites_methods_under_exception_edges() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "class IterRange:\n    def __next__(self):\n        return 1\n\n\
@@ -14759,6 +16365,81 @@ def caller(it, flag):\n    result = it\n    while flag:\n        result = iter(r
     }
 
     #[test]
+    fn typed_alias_hot_continuation_split_uses_resolved_none_identity() {
+        for (placeholder, expected_placeholder) in [("None", true), ("NONE", false)] {
+            let source = format!(
+                "def caller(value, flag):\n    alias = {placeholder}\n    if flag:\n        alias = value\n    return alias\n"
+            );
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("the real source alias join should lower");
+            let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+            let module_constants = typed.module_constants.clone();
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            let initial_store = caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .find_map(|instr| {
+                    let InstrTyped::Store(store) = instr else {
+                        return None;
+                    };
+                    let InstrTyped::Load(load) = store.value.as_ref() else {
+                        return None;
+                    };
+                    (store.name.id_str() == "alias"
+                        && (load.name.location.as_constant().is_some()
+                            || load.name.location.is_global()))
+                    .then_some(store)
+                })
+                .expect("the initial source alias store must survive lowering");
+            let InstrTyped::Load(load) = initial_store.value.as_ref() else {
+                unreachable!();
+            };
+            if expected_placeholder {
+                assert!(load.name.location.as_constant().is_some());
+                assert!(typed_expr_is_runtime_name_load(
+                    initial_store.value.as_ref(),
+                    RuntimeName::None,
+                    &module_constants,
+                ));
+            } else {
+                assert!(load.name.location.is_global());
+                assert_eq!(load.name.id_str(), "NONE");
+            }
+            let alias = initial_store.name.local_location().unwrap();
+            let targets = typed_none_placeholder_alias_target_locations(caller, &module_constants);
+            assert_eq!(
+                targets.contains(&alias),
+                expected_placeholder,
+                "a same-spelled mutable global is not the native None singleton"
+            );
+            let alias_block = caller
+                .blocks
+                .iter()
+                .find(|block| {
+                    block.body.iter().any(|instr| {
+                        matches!(instr, InstrTyped::Store(store)
+                            if store.name.local_location() == Some(alias)
+                                && typed_instr_local_load_location(store.value.as_ref()).is_some())
+                    })
+                })
+                .expect("the source local-to-local alias must survive lowering");
+            assert_eq!(
+                typed_block_contains_none_placeholder_alias_store(
+                    alias_block,
+                    &targets,
+                    &module_constants,
+                ),
+                expected_placeholder,
+            );
+            // This fixture covers resolved singleton identity, not clone-region
+            // eligibility. The joined-successor and cyclic-region tests above
+            // exercise application; the JIT counter regression additionally
+            // proves fresh source-operation IDs after a real source None join.
+        }
+    }
+
+    #[test]
     fn typed_iter_local_alias_calls_count_as_alias_candidates() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
@@ -15008,6 +16689,351 @@ def caller(value):\n    obj = Box(value)\n    return obj.value\n",
         );
     }
 
+    fn typed_materialization_coordinate_case(
+        boundary: Option<TypedVirtualBoundaryKind>,
+    ) -> (
+        BlockPyFunction<TypedBlockPyModuleShape>,
+        Vec<ConstantExpr>,
+        TypedVirtualizationPlan,
+    ) {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class Box:\n    def __init__(self, value):\n        self.value = value\n\n\
+def caller(value):\n    obj = Box(value)\n    return value\n",
+        )
+        .expect("coordinate fixture should lower");
+        let init = blockpy_function_id_by_qualname(&lowered.blockpy_module, "Box.__init__");
+        let entry = constructor_entry_function_id_for_init(&lowered.blockpy_module, init).unwrap();
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let mut function = typed_function_by_qualname_mut(&mut typed, "caller").clone();
+        let args = TypedDirectCallArgPlan {
+            sources: vec![
+                TypedDirectCallArgSource::Provided(0),
+                TypedDirectCallArgSource::Provided(1),
+            ],
+        };
+        let call = first_typed_call_instr_id(&function);
+        replace_first_typed_call_access(
+            &mut function,
+            TypedCallAccessPlan::GuardedCallable {
+                function_guards: vec![TypedDirectFunctionCallGuard {
+                    function_id: entry,
+                    arg_plan: args.clone(),
+                }],
+            },
+        );
+        lower_typed_function_call_access_plan_instrs(&mut function);
+        let inlined = inline_typed_function_direct_call_stores(
+            &mut function,
+            &typed,
+            &HashMap::new(),
+            &HashMap::from([(call, vec![(entry, args)])]),
+        );
+        assert_eq!(inlined.rewritten_stores, 1);
+        let plans = typed_constructor_init_plans_from_inline_stats_with_external_callees(
+            &typed,
+            &typed.module_constants,
+            &HashMap::new(),
+            &inlined,
+        );
+        annotate_constructor_init_plans_for_test(&mut function, &plans);
+        let mut constants = typed.module_constants.clone();
+        let init_body = inline_typed_constructor_init_bodies_with_external_callees(
+            &mut function,
+            &typed,
+            &mut constants,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(init_body.inline_stats.rewritten_stores, 1);
+        assert_eq!(init_body.constructor_field_bindings.len(), 1);
+        assert!(mark_indexed_field_accesses_for_field(&mut function, &constants, "value") > 0);
+        let (block_index, store_index, root) = function
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block.body.iter().enumerate().find_map(|(index, instr)| {
+                    let InstrTyped::SetAttrTyped(op) = instr else {
+                        return None;
+                    };
+                    let InstrTyped::Load(root) = op.value.as_ref() else {
+                        return None;
+                    };
+                    (typed_constant_string(op.attr.as_ref(), &constants) == Some("value"))
+                        .then_some((block_index, index, root.name.clone()))
+                })
+            })
+            .unwrap();
+        if let Some(boundary) = boundary {
+            // Reuse the actual inlined allocation, init store and physical
+            // inputs. These synthetic escape/deopt probes exercise the existing
+            // IR materializer, not runtime class/layout authority.
+            let instr = match boundary {
+                TypedVirtualBoundaryKind::EscapingStore => InstrTyped::Store(Store::new(
+                    ResolvedName {
+                        id: "sink".to_string().into(),
+                        location: NameLocation::GlobalName,
+                    },
+                    typed_load_temp(&root),
+                )),
+                TypedVirtualBoundaryKind::DeoptResumeUse => {
+                    let mut guard = TypedDirectCallGuardTest::new(
+                        typed_load_temp(&root),
+                        TypedDirectCallGuardTestKind::RuntimeFunctionId {
+                            function_id: function.function_id,
+                        },
+                    );
+                    guard.extra.set_guard_miss_deopt_enabled(true);
+                    InstrTyped::DirectCallGuardTest(guard)
+                }
+                TypedVirtualBoundaryKind::ReturnUse => {
+                    function.blocks[block_index].term = BlockTerm::Return(typed_load_temp(&root));
+                    InstrTyped::constant_none()
+                }
+                _ => panic!("unsupported coordinate fixture"),
+            };
+            if boundary != TypedVirtualBoundaryKind::ReturnUse {
+                let mut ids = TypedInlineInstrIdAllocator::from_function(&function);
+                function.blocks[block_index].body.insert(
+                    store_index + 1,
+                    typed_instr_with_fresh_synthetic_instr_id(instr, &mut ids),
+                );
+            }
+        }
+        let plan = plan_typed_virtual_objects(
+            &function,
+            &constants,
+            &init_body.constructor_field_bindings,
+        );
+        if boundary.is_some() {
+            assert_eq!(plan.materializing_objects.len(), 1);
+            assert_eq!(plan.materialization_boundaries()[0].kind, boundary.unwrap());
+        } else {
+            assert_eq!(plan.objects.len(), 1);
+        }
+        (function, constants, plan)
+    }
+
+    fn materialize_typed_coordinate_case(
+        function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+        constants: &[ConstantExpr],
+        plan: &TypedVirtualizationPlan,
+        kind: TypedVirtualBoundaryKind,
+    ) -> TypedVirtualObjectLoweringStats {
+        let mut stats = TypedVirtualObjectLoweringStats::default();
+        match kind {
+            TypedVirtualBoundaryKind::ReturnUse => {
+                stats.return_materialization =
+                    materialize_typed_virtual_return_boundaries_with_plan(
+                        function, constants, plan,
+                    );
+            }
+            TypedVirtualBoundaryKind::EscapingStore => {
+                stats.store_materialization =
+                    materialize_typed_virtual_store_boundaries_with_plan(function, constants, plan);
+            }
+            TypedVirtualBoundaryKind::DeoptResumeUse => {
+                stats.body_materialization =
+                    materialize_typed_virtual_body_boundaries_with_plan(function, constants, plan);
+            }
+            _ => panic!("unsupported coordinate fixture"),
+        }
+        stats
+    }
+
+    #[test]
+    fn typed_virtual_erasure_refuses_stale_cfg_indices_and_duplicate_sites() {
+        let (function, constants, plan) = typed_materialization_coordinate_case(None);
+        let mut valid = function.clone();
+        let accepted =
+            virtualize_typed_hot_constructor_plans(&mut valid, &constants, &plan.objects);
+        assert_eq!(accepted.removed_materializations, 1);
+        let object = &plan.objects[0];
+        let block_index = function
+            .blocks
+            .iter()
+            .position(|block| block.label == object.materialization_block)
+            .unwrap();
+        for corrupt in 0..3 {
+            let mut probe = function.clone();
+            let mut objects = plan.objects.clone();
+            match corrupt {
+                0 => {
+                    let label = BlockLabel::from_index(
+                        probe
+                            .blocks
+                            .iter()
+                            .map(|block| block.label.index())
+                            .max()
+                            .unwrap()
+                            + 1,
+                    );
+                    probe.blocks.push(Block {
+                        label,
+                        body: Vec::new(),
+                        term: BlockTerm::Return(InstrTyped::constant_none()),
+                        params: Vec::new(),
+                        exc_edge: None,
+                        extra: TypedBlockExtra::default(),
+                    });
+                    // Every recorded label still exists, but the actual
+                    // continuation changed and must not borrow the old region.
+                    probe.blocks[block_index].term = BlockTerm::jump_term(label);
+                }
+                1 => probe.blocks[block_index]
+                    .body
+                    .insert(object.materialization_index, InstrTyped::constant_none()),
+                2 => objects.push(object.clone()),
+                _ => unreachable!(),
+            }
+            let before = probe.clone();
+            let stats = virtualize_typed_hot_constructor_plans(&mut probe, &constants, &objects);
+            assert!(!stats.changed(), "corruption {corrupt}");
+            assert_concrete_field_owners_retained(&before, &probe);
+        }
+    }
+
+    #[test]
+    fn typed_virtual_materializers_refuse_shifted_snapshots_and_preserve_boundary_identity() {
+        for kind in [
+            TypedVirtualBoundaryKind::EscapingStore,
+            TypedVirtualBoundaryKind::DeoptResumeUse,
+        ] {
+            let (mut function, constants, mut plan) =
+                typed_materialization_coordinate_case(Some(kind));
+            let TypedVirtualBoundaryLocation::BodyInstr { block, instr_index } =
+                plan.materialization_boundaries()[0].location
+            else {
+                panic!("body boundary")
+            };
+            let block_index = function
+                .blocks
+                .iter()
+                .position(|b| b.label == block)
+                .unwrap();
+            let boundary = function.blocks[block_index].body[instr_index].semantic_instr_id();
+            let lowered = lower_typed_virtual_fields_to_locals_with_plan(
+                &mut function,
+                &constants,
+                &mut plan,
+            );
+            assert!(lowered.inserted_scalar_stores > 0);
+            let shifted = function.blocks[block_index]
+                .body
+                .iter()
+                .position(|instr| instr.try_semantic_instr_id() == Some(boundary))
+                .unwrap();
+            assert_ne!(
+                shifted, instr_index,
+                "field lowering moved the actual snapshot point"
+            );
+            let before = function.clone();
+            let refused = materialize_typed_coordinate_case(&mut function, &constants, &plan, kind);
+            assert!(!refused.changed());
+            assert_concrete_field_owners_retained(&before, &function);
+
+            // Keep the positive control on the existing replayable parameter
+            // loads. Reanalyzing inserted scalar writes can conservatively drop
+            // their field-state association; that is not a materialization
+            // coordinate proof and must not be repaired by this test.
+            let (mut valid, constants, fresh) = typed_materialization_coordinate_case(Some(kind));
+            let object = &fresh.materializing_objects[0];
+            let TypedVirtualBoundaryLocation::BodyInstr { block, instr_index } =
+                fresh.materialization_boundaries()[0].location
+            else {
+                panic!("body boundary")
+            };
+            let block_index = valid.blocks.iter().position(|b| b.label == block).unwrap();
+            let boundary = valid.blocks[block_index].body[instr_index].semantic_instr_id();
+            let accepted = materialize_typed_coordinate_case(&mut valid, &constants, &fresh, kind);
+            assert!(accepted.changed());
+            assert_eq!(
+                accepted.store_materialization.inserted_allocations
+                    + accepted.body_materialization.inserted_allocations,
+                1,
+            );
+            let actual = valid.blocks[block_index]
+                .body
+                .iter()
+                .position(|instr| instr.try_semantic_instr_id() == Some(boundary))
+                .unwrap();
+            assert!(actual >= 2);
+            assert!(
+                matches!(&valid.blocks[block_index].body[actual - 2], InstrTyped::Store(store)
+                if matches!(store.value.as_ref(), InstrTyped::CallTyped(call)
+                    if call.try_semantic_instr_id() == Some(object.source)))
+            );
+            assert!(matches!(
+                &valid.blocks[block_index].body[actual - 1],
+                InstrTyped::SetAttrTyped(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn typed_virtual_materializers_refuse_ambiguous_boundaries_and_duplicate_allocations() {
+        for kind in [
+            TypedVirtualBoundaryKind::ReturnUse,
+            TypedVirtualBoundaryKind::EscapingStore,
+            TypedVirtualBoundaryKind::DeoptResumeUse,
+        ] {
+            // No scalar-slot rewrite is required for these direct-Load
+            // recipes: the original parameter value is still bound here.
+            let (mut function, constants, fresh) =
+                typed_materialization_coordinate_case(Some(kind));
+            assert_eq!(fresh.materializing_objects.len(), 1);
+            let mut valid = function.clone();
+            let accepted = materialize_typed_coordinate_case(&mut valid, &constants, &fresh, kind);
+            assert!(
+                accepted.changed(),
+                "valid {kind:?} control must reach insertion"
+            );
+            assert_eq!(
+                accepted.return_materialization.inserted_allocations
+                    + accepted.store_materialization.inserted_allocations
+                    + accepted.body_materialization.inserted_allocations,
+                1,
+            );
+            let mut duplicate = fresh.clone();
+            duplicate
+                .materializing_objects
+                .push(fresh.materializing_objects[0].clone());
+            let before = function.clone();
+            let refused =
+                materialize_typed_coordinate_case(&mut function, &constants, &duplicate, kind);
+            assert!(!refused.changed(), "duplicate allocation {kind:?}");
+            assert_concrete_field_owners_retained(&before, &function);
+            let TypedVirtualBoundaryLocation::BodyInstr { block, instr_index } =
+                fresh.materialization_boundaries()[0].location
+            else {
+                continue;
+            };
+            let block_index = function
+                .blocks
+                .iter()
+                .position(|b| b.label == block)
+                .unwrap();
+            for missing in [false, true] {
+                let mut probe = function.clone();
+                let original = probe.blocks[block_index].body[instr_index].clone();
+                if missing {
+                    let mut meta = original.meta();
+                    meta.instr_id = None;
+                    probe.blocks[block_index].body[instr_index] = original.with_meta(meta);
+                } else {
+                    probe.blocks[block_index]
+                        .body
+                        .insert(instr_index + 1, original);
+                }
+                let before = probe.clone();
+                let refused =
+                    materialize_typed_coordinate_case(&mut probe, &constants, &fresh, kind);
+                assert!(!refused.changed(), "missing={missing} {kind:?}");
+                assert_concrete_field_owners_retained(&before, &probe);
+            }
+        }
+    }
+
     #[test]
     fn typed_fully_virtual_lowering_erases_trusted_non_escaping_objects_without_materialization() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
@@ -15119,6 +17145,18 @@ def caller(value):\n    obj = Box(value)\n    return obj.value\n",
         assert_eq!(plan.objects.len(), 1);
         assert!(plan.materializing_objects.is_empty());
         assert!(plan.materialization_boundaries().is_empty());
+        let before = caller.clone();
+        let mut premature_erasure = caller.clone();
+        let premature = virtualize_typed_hot_constructor_plans(
+            &mut premature_erasure,
+            &module_constants,
+            &plan.objects,
+        );
+        assert!(
+            !premature.changed(),
+            "the actual field read still needs its owner"
+        );
+        assert_concrete_field_owners_retained(&before, &premature_erasure);
         let stats = lower_typed_fully_virtual_objects_to_locals_with_plan(
             caller,
             &module_constants,
@@ -15592,10 +17630,14 @@ def caller(stop):\n    obj = RangeLike(0, stop)\n    return obj.stop\n",
                     .map(|field| field.field_name.as_str())
             })
             .collect::<HashSet<_>>();
-        assert_eq!(
-            fields,
-            HashSet::from(["start", "stop", "step"]),
-            "non-straightline init body should expose constructor field bindings"
+        assert!(
+            fields.is_empty(),
+            "consumed start/stop/step operands are not replayable field bindings"
+        );
+        assert_consuming_field_values(
+            &typed.callable_defs[caller_index],
+            &typed.module_constants,
+            &["start", "stop", "step"],
         );
         assert!(
             constructor_call_plan_sources(&typed.callable_defs[caller_index]).contains(
@@ -15603,6 +17645,20 @@ def caller(stop):\n    obj = RangeLike(0, stop)\n    return obj.stop\n",
             ),
             "constructor_call should switch to allocation-only codegen once the init body is explicit"
         );
+        let caller = &mut typed.callable_defs[caller_index];
+        let before = caller.clone();
+        let mut plan = plan_typed_virtual_objects(
+            caller,
+            &typed.module_constants,
+            &init_body_stats.constructor_field_bindings,
+        );
+        let stats = lower_typed_virtual_objects_to_locals_with_plan(
+            caller,
+            &typed.module_constants,
+            &mut plan,
+        );
+        assert!(!stats.changed());
+        assert_concrete_field_owners_retained(&before, caller);
     }
 
     #[test]
@@ -16110,8 +18166,8 @@ def caller(resume, preserved_values):\n    gen = ClosureGenerator(resume, preser
             .collect::<HashSet<_>>();
         assert_eq!(
             fields,
-            HashSet::from(["_is_closed", "_preserved_values", "_resume_fn"]),
-            "generator-wrapper constructor fields should remain visible to virtualization"
+            HashSet::from(["_preserved_values", "_resume_fn"]),
+            "parameter loads remain useful bindings; consumed _is_closed does not become replayable"
         );
 
         let constructor_field_bindings = init_body_stats.constructor_field_bindings;
@@ -16151,11 +18207,12 @@ def caller(resume, preserved_values):\n    gen = ClosureGenerator(resume, preser
             &constructor_field_bindings,
             &trusted_sources,
         );
-        assert_eq!(
-            fully_virtual_plan.objects.len(),
-            1,
-            "trusted generated wrapper constructors should virtualize without waiting for indexed-field replay"
+        assert!(
+            fully_virtual_plan.objects.is_empty(),
+            "a trusted source does not make the consumed _is_closed field replayable"
         );
+        assert_consuming_field_values(caller, &module_constants, &["_is_closed"]);
+        let before = caller.clone();
         assert!(fully_virtual_plan.materialization_boundaries().is_empty());
         assert!(
             getattrs_for_field_in_reachable_blocks(
@@ -16171,21 +18228,16 @@ def caller(resume, preserved_values):\n    gen = ClosureGenerator(resume, preser
             &module_constants,
             &mut fully_virtual_plan,
         );
-        assert!(stats.changed());
-        assert_eq!(stats.field_lowering.seeded_objects, 1);
+        assert!(!stats.changed(), "decline before adding any scalar owners");
+        assert_concrete_field_owners_retained(&before, caller);
         assert!(
-            stats.virtualization.removed_materializations >= 1,
-            "trusted generated wrappers should lower to locals without leaving the hot allocation alive"
-        );
-        assert_eq!(
             getattrs_for_field_in_reachable_blocks(
                 caller,
                 split_stats.clones[0].cloned_entry,
                 &module_constants,
                 "_preserved_values",
-            ),
-            0,
-            "the hot cloned continuation should use the wrapper-state local after lowering"
+            ) > 0,
+            "the retained concrete wrapper must still supply its original field read"
         );
     }
 
@@ -16431,7 +18483,36 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             .objects
             .first()
             .cloned()
-            .expect("iterator hot path should discover a removable virtual object");
+            .expect("iterator hot path should discover a structural virtual-object candidate");
+        assert!(
+            virtualization_plan
+                .objects
+                .iter()
+                .all(|plan| plan.object_id == TypedVirtualObjectId(plan.source.index())),
+            "virtual object ids should remain tied to the stable allocation source"
+        );
+        assert_eq!(
+            removable_plan
+                .field_bindings
+                .fields
+                .iter()
+                .map(|field| field.field_name.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["current", "stop", "step"]),
+            "the parameter-valued init bindings remain represented"
+        );
+        assert_consuming_field_values(caller, &module_constants, &["current"]);
+        let concrete_before = caller.clone();
+        // An independently supplied structural plan must not erase the object
+        // while its field reads and consuming update still depend on it.
+        let mut erase_probe = caller.clone();
+        let erased = virtualize_typed_hot_constructor_plans(
+            &mut erase_probe,
+            &module_constants,
+            std::slice::from_ref(&removable_plan),
+        );
+        assert!(!erased.changed());
+        assert_concrete_field_owners_retained(&concrete_before, &erase_probe);
         let mut escaping_caller = caller.clone();
         let escaping_return = escaping_caller
             .blocks
@@ -16493,6 +18574,40 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             1,
             "the escaping store should still be recognized as a materialization boundary"
         );
+        // Even a stale field-state sidecar reporting all values available
+        // cannot authorize erasure while the actual reads/update survive.
+        // The materializer must not insert a second object after refusal.
+        let mut stale_store_plan = materializing_store_plan.clone();
+        let boundary = stale_store_plan.materialization_boundaries()[0];
+        let TypedVirtualBoundaryLocation::BodyInstr { block, instr_index } = boundary.location
+        else {
+            panic!("the actual escape is a body store");
+        };
+        let object = stale_store_plan.materializing_objects[0].clone();
+        let state = stale_store_plan
+            .field_states
+            .as_mut()
+            .unwrap()
+            .body_before_instr
+            .entry(TypedVirtualBodyInstr { block, instr_index })
+            .or_default();
+        for field in &object.field_bindings.fields {
+            state.fields.insert(
+                TypedVirtualFieldRef {
+                    object: object.object_id,
+                    field_name: field.field_name.clone(),
+                },
+                field.value.clone(),
+            );
+        }
+        let mut stale_store_probe = materializing_store_caller.clone();
+        let stale_stats = materialize_typed_virtual_store_boundaries_with_plan(
+            &mut stale_store_probe,
+            &module_constants,
+            &stale_store_plan,
+        );
+        assert!(!stale_stats.changed());
+        assert_concrete_field_owners_retained(&materializing_store_caller, &stale_store_probe);
         let materializing_store_scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
             &mut materializing_store_caller,
             &module_constants,
@@ -16656,14 +18771,16 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             TypedVirtualBoundaryKind::DeoptResumeUse,
             "deopt-enabled guards should become explicit virtual materialization boundaries"
         );
+        let deopt_before = deopt_body_caller.clone();
         let deopt_body_scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
             &mut deopt_body_caller,
             &module_constants,
             &mut deopt_body_plan,
         );
-        assert!(
-            deopt_body_scalar_stats.rewritten_loads >= 3,
-            "field lowering should still scalarize uses before the explicit deopt materialization boundary"
+        assert_eq!(
+            deopt_body_scalar_stats,
+            TypedFieldScalarizationStats::default(),
+            "the consuming backedge is unsupported even with an earlier deopt boundary"
         );
         let deopt_body_materialization_stats = materialize_typed_virtual_body_boundaries_with_plan(
             &mut deopt_body_caller,
@@ -16674,6 +18791,7 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             deopt_body_materialization_stats.materialized_objects, 0,
             "deopt-enabled guards before explicit init values exist should keep the concrete allocation"
         );
+        assert_concrete_field_owners_retained(&deopt_before, &deopt_body_caller);
         assert!(
             virtualization_plan
                 .objects
@@ -16712,153 +18830,41 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             &module_constants,
             &mut virtualization_plan,
         );
-        assert!(
-            virtualization_plan
-                .field_states
-                .as_ref()
-                .is_some_and(|states| {
-                    !states.block_in.is_empty()
-                        && !states.block_out.is_empty()
-                        && !states.edge_out.is_empty()
-                }),
-            "virtual-to-locals lowering should retain explicit block and edge virtual field state"
-        );
-        assert_eq!(scalar_stats.seeded_objects, 1);
-        assert_eq!(scalar_stats.scalar_slots, 3);
         assert_eq!(
-            scalar_stats.inserted_scalar_stores, 4,
-            "explicit inlined init-body stores plus the loop-carried current update should write scalars once each, without eager stores at allocation"
+            scalar_stats,
+            TypedFieldScalarizationStats::default(),
+            "decline the consuming continuation before inserting scalar owners or field stores"
         );
-        assert!(
-            scalar_stats.inserted_block_args >= scalar_stats.inserted_block_params,
-            "each synthesized virtual field param should receive explicit edge args: {scalar_stats:?}"
+        assert!(virtualization_plan.objects.is_empty());
+        assert!(virtualization_plan.materializing_objects.is_empty());
+        assert!(virtualization_plan.materialization_boundaries().is_empty());
+        assert!(virtualization_plan.field_states.is_none());
+        assert_concrete_field_owners_retained(&concrete_before, caller);
+        assert_eq!(
+            constructor_call_stores_in_virtual_plan(caller, &module_constants, &removable_plan),
+            1,
+            "surviving reads retain their actual constructor allocation"
         );
-        let virtual_field_param_names = caller
-            .blocks
-            .iter()
-            .flat_map(|block| block.params.iter())
-            .filter(|param| param.name.contains("_dp_vfield"))
-            .map(|param| param.name.clone())
-            .collect::<HashSet<_>>();
-        if !virtual_field_param_names.is_empty() {
+        for field in ["current", "stop", "step"] {
             assert!(
-                caller.blocks.iter().any(|block| {
-                    matches!(
-                        &block.term,
-                        BlockTerm::Jump(edge)
-                            if edge.args.iter().any(|arg| {
-                                matches!(
-                                    arg,
-                                    BlockArg::Name(name) if virtual_field_param_names.contains(name)
-                                )
-                            })
-                    )
-                }),
-                "loop-carried virtual field params should be fed by explicit jump edge args"
+                getattrs_for_field_in_virtual_plan(
+                    caller,
+                    &module_constants,
+                    &removable_plan,
+                    field,
+                ) > 0
             );
             assert!(
-                virtualization_plan
-                    .field_states
-                    .as_ref()
-                    .is_some_and(|states| {
-                        states.block_in.values().any(|state| {
-                            state
-                                .fields
-                                .values()
-                                .any(|value| value.id_str().contains("_dp_vfield"))
-                        })
-                    }),
-                "the analyzed virtual field state should re-enter loop headers through the synthesized params"
+                setattrs_for_field_in_virtual_plan(
+                    caller,
+                    &module_constants,
+                    &removable_plan,
+                    field,
+                ) > 0
             );
         }
-        assert!(
-            scalar_stats.rewritten_loads >= 3,
-            "current/stop/step loads in the hot iterator loop should scalarize: {scalar_stats:?}"
-        );
-        assert!(
-            hot_loop_clones.iter().any(|clone| {
-                ["current", "stop", "step"].iter().all(|field| {
-                    getattrs_for_field_in_hot_reachable_blocks(
-                        caller,
-                        clone.cloned_entry,
-                        &module_constants,
-                        field,
-                    ) == 0
-                })
-            }),
-            "at least one hot iterator loop clone should use scalar state for current/stop/step"
-        );
-        assert!(
-            virtualization_plan
-                .objects
-                .iter()
-                .all(|plan| plan.object_id == TypedVirtualObjectId(plan.source.index())),
-            "virtual object ids should remain tied to the stable allocation source"
-        );
-        let virtual_plan = virtualization_plan
-            .objects
-            .iter()
-            .find(|plan| {
-                constructor_call_stores_in_virtual_plan(caller, &module_constants, plan) > 0
-                    && direct_call_guards_in_virtual_plan(caller, plan) > 0
-            })
-            .cloned()
-            .expect("hot cloned iterator path should have a virtual constructor candidate");
-        assert_eq!(
-            virtual_plan
-                .field_bindings
-                .fields
-                .iter()
-                .map(|field| field.field_name.as_str())
-                .collect::<HashSet<_>>(),
-            HashSet::from(["current", "stop", "step"]),
-            "the virtualization artifact should carry constructor field bindings"
-        );
-        assert!(
-            virtual_plan
-                .field_bindings
-                .fields
-                .iter()
-                .all(|field| field.scalar.is_some()),
-            "virtual-to-locals lowering should populate field locals on the analysis artifact"
-        );
-        assert!(
-            setattrs_for_field_in_virtual_plan(caller, &module_constants, &virtual_plan, "current")
-                > 0,
-            "before virtualizing, the hot iterator clone should still store current on the object"
-        );
-        let virtual_stats = virtualize_typed_hot_constructor_plans(
-            caller,
-            &module_constants,
-            &virtualization_plan.objects,
-        );
-        assert!(
-            virtual_stats.removed_materializations >= 1,
-            "virtual constructor pass should remove the IterRange allocation: {virtual_stats:?}"
-        );
-        assert!(
-            virtual_stats.removed_field_stores >= 1,
-            "virtual constructor pass should remove scalarized field stores on the virtual object: {virtual_stats:?}"
-        );
-        assert!(
-            virtual_stats.removed_guards >= 1,
-            "virtual constructor pass should remove redundant method guards on the virtual object: {virtual_stats:?}"
-        );
-        assert_eq!(
-            constructor_call_stores_in_virtual_plan(caller, &module_constants, &virtual_plan),
-            0,
-            "the virtualized hot iterator path should not materialize IterRange"
-        );
-        assert_eq!(
-            setattrs_for_field_in_virtual_plan(caller, &module_constants, &virtual_plan, "current"),
-            0,
-            "the virtualized hot iterator path should update current through scalar state only"
-        );
-        assert_eq!(
-            direct_call_guards_in_virtual_plan(caller, &virtual_plan),
-            0,
-            "the virtualized hot iterator path should not need object-identity method guards"
-        );
+        assert!(direct_call_guards_in_virtual_plan(caller, &removable_plan) > 0);
+        assert_consuming_field_values(caller, &module_constants, &["current"]);
     }
 
     #[test]
@@ -16994,6 +19000,106 @@ def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n
     }
 
     #[test]
+    fn typed_stop_iteration_raise_rewrite_keeps_normalized_propagation() {
+        use soac_core::block_py::RaiseDisposition;
+
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration()\n        return self.current\n\n\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        );
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let mut source_control = caller.clone();
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(
+                &mut source_control,
+                &module_constants,
+            ),
+            1,
+            "the otherwise identical source raise remains eligible",
+        );
+        let block = caller
+            .blocks
+            .iter_mut()
+            .find(|block| typed_block_term_is_stop_iteration_raise(&block.term, &module_constants))
+            .expect("the inlined source contains one eligible StopIteration instance");
+        let label = block.label;
+        let BlockTerm::Raise(raise) = &mut block.term else {
+            unreachable!();
+        };
+        raise.disposition = RaiseDisposition::PropagateNormalized;
+
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+            0,
+            "normalized propagation must not acquire source-raise elision semantics",
+        );
+        let block = caller
+            .blocks
+            .iter()
+            .find(|block| block.label == label)
+            .unwrap();
+        assert!(matches!(&block.term, BlockTerm::Raise(raise)
+            if raise.disposition == RaiseDisposition::PropagateNormalized));
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_rewrite_does_not_erase_rebound_transport_values() {
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration\n        return self.current\n\n\
+def caller(it, token):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        );
+        let constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let mut unchanged = caller.clone();
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(&mut unchanged, &constants),
+            1
+        );
+        let token_slot = caller
+            .storage_layout()
+            .as_ref()
+            .unwrap()
+            .stack_slots
+            .iter()
+            .position(|name| name == "token")
+            .unwrap();
+        let token = typed_test_local("token", LocalLocation(u32::try_from(token_slot).unwrap()));
+        let handler = caller
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                block.handled_exception_params().next().is_some()
+                    && matches!(block.term, BlockTerm::Return(_))
+            })
+            .unwrap();
+        let exception = handler.exception_param().unwrap().to_string();
+        let retirement = handler
+            .body
+            .iter_mut()
+            .find_map(|instruction| {
+                if let InstrTyped::Store(store) = instruction {
+                    (store.name.id_str() == exception).then_some(store)
+                } else {
+                    None
+                }
+            })
+            .expect("the real handler explicitly retires its caught transport");
+        assert!(typed_expr_is_runtime_name_load(
+            &retirement.value,
+            RuntimeName::None,
+            &constants
+        ));
+        // A bound arbitrary object is not a None-only transport, even if no
+        // source expression explicitly reads the caught exception itself.
+        retirement.value = Box::new(Load::new(token).into());
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &constants),
+            0
+        );
+    }
+
+    #[test]
     fn typed_stop_iteration_raise_rewrite_keeps_value_constructor() {
         let mut typed = inline_next_protocol_call(
             "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration(41)\n        return self.current\n\n\\
@@ -17029,6 +19135,47 @@ def caller(it):\n    try:\n        value = next(it)\n    except StopIteration as
         assert_eq!(
             rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
             0
+        );
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_keeps_implicitly_observable_handler_state() {
+        for handler in [
+            "        return observe()\n",
+            "        return marker.value\n",
+            "        del marker\n        return 0\n",
+            "        raise RuntimeError('second')\n",
+            "        return missing_global\n",
+            "        try:\n            raise ValueError('inner')\n        except ValueError:\n            return observe()\n",
+        ] {
+            let source = format!(
+                "class IterRange:\n    def __next__(self):\n        if self.current:\n            raise StopIteration\n        return 1\n\ndef caller(it):\n    marker = make_marker()\n    try:\n        value = next(it)\n    except StopIteration:\n{handler}    return value\n"
+            );
+            let mut typed = inline_next_protocol_call(&source);
+            let module_constants = typed.module_constants.clone();
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+            assert_eq!(
+                rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+                0,
+                "a handler can expose sys.exception(), exception chaining, or finalizers without loading its exception parameter: {handler}",
+            );
+            assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+        }
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_keeps_potentially_unbound_handler_load() {
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current:\n            raise StopIteration\n        return 1\n\ndef caller(it, flag):\n    if flag:\n        marker = 7\n    try:\n        value = next(it)\n    except StopIteration:\n        return marker\n    return value\n",
+        );
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+            0,
+            "UnboundLocalError must retain the real StopIteration as its context",
         );
         assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
     }
@@ -17202,6 +19349,370 @@ def caller(a):\n    return add(a)\n",
         assert_eq!(counter.guarded_method_calls, 1);
     }
 
+    fn linearization_test_operand(
+        function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+        label: &str,
+    ) -> ResolvedName {
+        let temporary = try_allocate_typed_stack_temp(function, label).unwrap();
+        function
+            .storage_layout
+            .as_mut()
+            .unwrap()
+            .mark_expression_temporary(temporary.location);
+        temporary.resolved_name()
+    }
+
+    #[test]
+    fn linearization_comprehension_insert_keeps_owned_operands_atomic() {
+        use soac_core::block_py::{ComprehensionInsert, ComprehensionInsertKind, TakeOperand};
+        use soac_ir_typed::TypedCall;
+
+        let lowered =
+            soac_lowering::lower_python_to_blockpy_for_testing("def caller():\n    return None\n")
+                .unwrap();
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let container = linearization_test_operand(caller, "collection");
+        let key = linearization_test_operand(caller, "key");
+        let value = linearization_test_operand(caller, "value");
+        let insert = ComprehensionInsert::new(
+            ComprehensionInsertKind::DictSetItem,
+            container,
+            Some(Box::new(InstrTyped::TakeOperand(TakeOperand::new(
+                key.clone(),
+            )))),
+            Box::new(InstrTyped::CallTyped(TypedCall::generic(
+                InstrTyped::Load(Load::new(ResolvedName::runtime_name("tuple"))),
+                vec![CallArgPositional::Positional(InstrTyped::TakeOperand(
+                    TakeOperand::new(value.clone()),
+                ))],
+                vec![],
+            ))),
+        );
+        insert
+            .validate_resolved(caller.storage_layout.as_ref().unwrap())
+            .unwrap();
+        caller.blocks[0]
+            .body
+            .insert(0, InstrTyped::ComprehensionInsert(insert));
+        let owners = caller
+            .storage_layout
+            .as_ref()
+            .unwrap()
+            .expression_temporaries
+            .clone();
+        for _ in 0..2 {
+            assert_eq!(
+                linearize_typed_function_expressions(caller).unwrap(),
+                TypedExpressionLinearizationStats::default(),
+                "the insertion owns key/value evaluation and prefix cleanup",
+            );
+            let InstrTyped::ComprehensionInsert(insert) = &caller.blocks[0].body[0] else {
+                panic!("insertion must remain its own operation");
+            };
+            assert!(
+                matches!(insert.key.as_deref(), Some(InstrTyped::TakeOperand(take))
+                if take.name.local_location() == key.local_location())
+            );
+            let InstrTyped::CallTyped(call) = insert.value.as_ref() else {
+                panic!("nested value evaluation must not become a second owning temp");
+            };
+            assert!(matches!(call.args.as_slice(),
+                [CallArgPositional::Positional(InstrTyped::TakeOperand(take))]
+                if take.name.local_location() == value.local_location()));
+            assert_eq!(
+                caller
+                    .storage_layout
+                    .as_ref()
+                    .unwrap()
+                    .expression_temporaries,
+                owners
+            );
+        }
+    }
+
+    #[test]
+    fn linearization_captures_operand_move_before_later_effect_without_clone() {
+        use soac_core::block_py::TakeOperand;
+        use soac_ir_typed::TypedCall;
+
+        let lowered =
+            soac_lowering::lower_python_to_blockpy_for_testing("def caller():\n    return None\n")
+                .unwrap();
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let operand = linearization_test_operand(caller, "moved_argument");
+        let later = InstrTyped::CallTyped(TypedCall::generic(
+            InstrTyped::Load(Load::new(ResolvedName::runtime_name("tuple"))),
+            vec![],
+            vec![],
+        ));
+        let call = InstrTyped::CallTyped(TypedCall::generic(
+            InstrTyped::Load(Load::new(ResolvedName::runtime_name("map"))),
+            vec![
+                CallArgPositional::Positional(InstrTyped::TakeOperand(TakeOperand::new(
+                    operand.clone(),
+                ))),
+                CallArgPositional::Positional(later),
+            ],
+            vec![],
+        ));
+        caller.blocks[0].body.insert(0, call);
+        let stats = linearize_typed_function_expressions(caller).unwrap();
+        assert!(stats.lifted_nested_exprs > 0);
+        let body = &caller.blocks[0].body;
+        let (capture_index, captured) = body
+            .iter()
+            .enumerate()
+            .find_map(|(index, instr)| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                matches!(store.value.as_ref(), InstrTyped::TakeOperand(take)
+                if take.name.local_location() == operand.local_location())
+                .then_some((index, store.name.local_location().unwrap()))
+            })
+            .expect("earlier take must move into a capture before the later call");
+        let mut consumer_index = None;
+        let mut later_index = None;
+        for (index, instr) in body.iter().enumerate() {
+            let InstrTyped::Store(store) = instr else {
+                continue;
+            };
+            let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+                continue;
+            };
+            if call.args.is_empty() {
+                later_index = Some(index);
+            } else if matches!(call.args.first(),
+                Some(CallArgPositional::Positional(InstrTyped::TakeOperand(take)))
+                if take.name.local_location() == Some(captured))
+            {
+                consumer_index = Some(index);
+            }
+        }
+        assert!(capture_index < later_index.expect("later argument call"));
+        assert!(later_index.unwrap() < consumer_index.expect("consumer re-takes its capture"));
+        assert_eq!(
+            linearize_typed_function_expressions(caller).unwrap(),
+            TypedExpressionLinearizationStats::default(),
+            "already captured moves must not grow another owning temp on repeat",
+        );
+    }
+
+    #[test]
+    fn linearization_releases_expression_operands_at_each_consumer() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def caller(receiver, first, second):\n    return receiver().method(first(), second())\n",
+        )
+        .expect("source should lower");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let original_order = typed_semantic_evaluation_order(caller);
+        linearize_typed_function_expressions(caller).expect("expression should linearize");
+        assert_eq!(typed_semantic_evaluation_order(caller), original_order);
+
+        let layout = caller.storage_layout.as_ref().expect("caller storage");
+        let acquisition_order = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .filter_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let location = store.name.local_location()?;
+                layout.is_expression_temporary(location).then_some(location)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            acquisition_order
+                .into_iter()
+                .map(soac_core::block_py::OperandLocation::Local)
+                .collect::<Vec<_>>(),
+            layout.expression_temporaries
+        );
+        let mut checked_consumers = 0;
+        for block in &caller.blocks {
+            for (index, instr) in block.body.iter().enumerate() {
+                let InstrTyped::Store(store) = instr else {
+                    continue;
+                };
+                let operands = match store.value.as_ref() {
+                    InstrTyped::CallTyped(call) => std::iter::once(call.func.as_ref())
+                        .chain(call.args.iter().map(CallArgPositional::expr))
+                        .collect::<Vec<_>>(),
+                    InstrTyped::GetAttrTyped(attr) => vec![attr.value.as_ref(), attr.attr.as_ref()],
+                    _ => continue,
+                };
+                let operand_temps = operands
+                    .into_iter()
+                    .filter_map(|operand| {
+                        let InstrTyped::Load(load) = operand else {
+                            return None;
+                        };
+                        let location = load.name.local_location()?;
+                        layout.is_expression_temporary(location).then_some(location)
+                    })
+                    .collect::<Vec<_>>();
+                if operand_temps.is_empty() {
+                    continue;
+                }
+                assert!(
+                    layout
+                        .is_expression_temporary(store.name.local_location().expect("result temp"))
+                );
+                for (offset, expected) in operand_temps.iter().rev().enumerate() {
+                    assert!(
+                        matches!(
+                            block.body.get(index + offset + 1),
+                            Some(InstrTyped::Del(delete)) if delete.name.local_location() == Some(*expected)
+                        ),
+                        "operand cleanup must immediately follow its consumer"
+                    );
+                }
+                checked_consumers += 1;
+            }
+        }
+        assert!(
+            checked_consumers >= 2,
+            "both attribute lookup and final call must own cleanup"
+        );
+        assert!(
+            caller.blocks.iter().any(|block| matches!(
+                &block.term,
+                BlockTerm::Return(InstrTyped::Load(load)) if load.name.local_location()
+                    .is_some_and(|location| layout.is_expression_temporary(location))
+            )),
+            "return must retain only the completed result, not its operands"
+        );
+        assert_eq!(
+            linearize_typed_function_expressions(caller).expect("repeat"),
+            TypedExpressionLinearizationStats::default()
+        );
+    }
+
+    #[test]
+    fn linearization_preserves_name_read_order_across_lifted_siblings() {
+        for expression in [
+            "target(callback())",
+            "target(value, callback())",
+            "target(value, extra=callback())",
+            "value + callback()",
+            "(value, callback())",
+        ] {
+            let source = format!("def caller(callback):\n    return {expression}\n");
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("source should lower");
+            let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            let original_order = typed_semantic_evaluation_order(caller);
+
+            let stats = linearize_typed_function_expressions(caller)
+                .expect("typed expression linearization should succeed");
+
+            assert!(stats.lifted_nested_exprs > 0, "{expression}");
+            assert_eq!(
+                typed_semantic_evaluation_order(caller),
+                original_order,
+                "linearization must capture earlier reads before lifting later effects: {expression}",
+            );
+            assert_eq!(
+                linearize_typed_function_expressions(caller)
+                    .expect("repeated linearization should succeed"),
+                TypedExpressionLinearizationStats::default(),
+                "already captured reads must not create new temporaries: {expression}",
+            );
+        }
+    }
+
+    fn typed_semantic_evaluation_order(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    ) -> Vec<InstrId> {
+        #[derive(Default)]
+        struct Collector {
+            instructions: Vec<InstrId>,
+        }
+
+        impl Visit<InstrTyped> for Collector {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                expr.visit_children(self);
+                if let Some(source) = expr.try_semantic_instr_id() {
+                    self.instructions.push(source);
+                }
+            }
+        }
+
+        let mut collector = Collector::default();
+        collector.visit_fn(function);
+        collector.instructions
+    }
+
+    #[test]
+    fn linearization_keeps_direct_callable_validation_after_argument_effects() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def target(value):\n    return value\n\ndef caller(callback):\n    return target(callback())\n",
+        )
+        .expect("source should lower");
+        let target_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "target");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let call_id = first_typed_call_instr_id(caller);
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                call_id,
+                TypedCallEmissionPlan::DirectCallable {
+                    function_guard: TypedDirectFunctionCallGuard {
+                        function_id: target_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    },
+                },
+            )]),
+        };
+        lower_typed_function_call_emission_plans(caller, &plans)
+            .expect("direct-call plan should lower");
+        let original_order = typed_semantic_evaluation_order(caller);
+
+        linearize_typed_function_expressions(caller)
+            .expect("typed expression linearization should succeed");
+
+        assert_eq!(typed_semantic_evaluation_order(caller), original_order);
+        struct DirectCallFinder {
+            target: RuntimeFunctionId,
+            found: bool,
+        }
+        impl Visit<InstrTyped> for DirectCallFinder {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::DirectCallableCallTyped(call) = expr {
+                    let TypedDirectCallableCallGuard::Function(guard) = &call.guard;
+                    assert_eq!(guard.function_id, self.target);
+                    assert!(matches!(
+                        call.func.as_ref(),
+                        InstrTyped::Load(load) if load.name.local_location().is_some()
+                    ));
+                    assert!(matches!(
+                        call.args.as_slice(),
+                        [CallArgPositional::Positional(InstrTyped::Load(load))]
+                            if load.name.local_location().is_some()
+                    ));
+                    self.found = true;
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut finder = DirectCallFinder {
+            target: target_id,
+            found: false,
+        };
+        finder.visit_fn(caller);
+        assert!(
+            finder.found,
+            "the original direct-call plan must remain selected"
+        );
+    }
+
     #[test]
     fn linearized_method_emission_plan_leaves_generic_call_in_place() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
@@ -17339,6 +19850,94 @@ def caller(it):\n    return next(it)\n",
         counter.visit_fn(caller);
         assert_eq!(counter.typed_calls, 1);
         assert_eq!(counter.guarded_method_calls, 0);
+    }
+
+    #[test]
+    fn namespace_calls_keep_the_public_boundary_through_typed_planning() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "from builtins import locals as query\nmodule_snapshot = query()\nclass Box:\n    snapshot = query()\n",
+        )
+        .expect("source should lower");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        for scope in [
+            soac_core::block_py::CallableScopeKind::Module,
+            soac_core::block_py::CallableScopeKind::Class,
+        ] {
+            let caller = typed
+                .callable_defs
+                .iter_mut()
+                .find(|function| function.scope.scope_kind == scope)
+                .expect("source namespace body");
+
+            #[derive(Default)]
+            struct ContextCalls(Vec<(InstrId, Option<LocalLocation>)>);
+            impl Visit<InstrTyped> for ContextCalls {
+                fn visit_instr(&mut self, expr: &InstrTyped) {
+                    if let InstrTyped::CallTyped(call) = expr
+                        && let Some(namespace) = &call.frame_namespace
+                    {
+                        let location = match namespace {
+                            FrameNamespace::ModuleGlobals => None,
+                            FrameNamespace::Mapping(namespace) => {
+                                let InstrTyped::Load(load) = namespace.as_ref() else {
+                                    panic!("class context must remain an explicit binding")
+                                };
+                                Some(load.name.local_location().expect("physical namespace slot"))
+                            }
+                        };
+                        self.0.push((call.semantic_instr_id(), location));
+                    }
+                    expr.visit_children(self);
+                }
+            }
+            let mut before = ContextCalls::default();
+            before.visit_fn(caller);
+            assert!(!before.0.is_empty());
+            let guard = TypedDirectFunctionCallGuard {
+                function_id: RuntimeFunctionId::from_raw_parts(0, 9),
+                arg_plan: TypedDirectCallArgPlan { sources: vec![] },
+            };
+            let plans = TypedCallEmissionPlans {
+                by_source: before
+                    .0
+                    .iter()
+                    .map(|(source, _)| {
+                        (
+                            *source,
+                            TypedCallEmissionPlan::DirectCallable {
+                                function_guard: guard.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            assert_eq!(
+                lower_typed_function_call_emission_plans(caller, &plans)
+                    .expect("unsupported context plans decline locally"),
+                0
+            );
+            linearize_typed_function_expressions(caller).expect("context calls should linearize");
+            validate_typed_function_call_access_plans(caller)
+                .expect("public context calls are valid");
+            let mut after = ContextCalls::default();
+            after.visit_fn(caller);
+            assert_eq!(after.0, before.0);
+
+            // A stale access plan must not provide an alternate unchecked entry.
+            replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![guard],
+                },
+                |call| call.frame_namespace.is_some(),
+            );
+            assert!(validate_typed_function_call_access_plans(caller).is_err());
+            assert_eq!(lower_typed_function_call_access_plan_instrs(caller), 0);
+            validate_typed_function_call_access_plans(caller).expect("demoted public context call");
+            let mut restored = ContextCalls::default();
+            restored.visit_fn(caller);
+            assert_eq!(restored.0, before.0);
+        }
     }
 
     #[test]

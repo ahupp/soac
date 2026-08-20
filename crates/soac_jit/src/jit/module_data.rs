@@ -160,18 +160,6 @@ pub(super) fn direct_function_symbol_scope_for_shared_state(
     scope
 }
 
-pub(super) fn precompiled_direct_function_symbol_scope_for_shared_state(
-    shared_state: &SharedModuleState,
-    function_id: RuntimeFunctionId,
-) -> String {
-    let persistent = persistent_function_id_for_module_function(
-        shared_state.module_name.as_str(),
-        shared_state.source_hash(),
-        function_id.local_function_id(),
-    );
-    precompiled_direct_function_symbol_scope_for_persistent(&persistent)
-}
-
 fn module_content_id_for_module_identity(module_name: &str, source_hash: u64) -> ModuleContentId {
     ModuleContentId::new(module_name, source_hash)
 }

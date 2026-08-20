@@ -2,8 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::FunctionKind;
-use soac_driver::blockpy_cache::hash_module_source;
-use soac_jit::{module_type::indexed_module_info, plan_jit_typed_module};
+use soac_jit::plan_jit_typed_module;
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -59,21 +58,6 @@ fn python_runtime_test_lock() -> &'static Mutex<()> {
 
 fn initialize_test_python() {
     soac_cpython::initialize_test_python("soac_pyo3-test").expect("test Python should initialize");
-}
-
-unsafe fn class_dict_function(
-    owner_type: *mut pyo3::ffi::PyTypeObject,
-    name: &'static std::ffi::CStr,
-) -> *mut pyo3::ffi::PyObject {
-    let dict = (*owner_type).tp_dict;
-    assert!(!dict.is_null(), "owner type should have a tp_dict");
-    let function = pyo3::ffi::PyDict_GetItemString(dict, name.as_ptr());
-    assert!(
-        !function.is_null(),
-        "class dict should contain requested function"
-    );
-    pyo3::ffi::Py_INCREF(function);
-    function
 }
 
 #[test]
@@ -209,10 +193,10 @@ def f(x):
 }
 
 #[test]
-fn transformed_module_methods_register_owner_types_for_lookup() {
+fn unselected_module_delegates_without_registering_method_owners() {
     let _guard = python_runtime_test_lock().lock().unwrap();
     initialize_test_python();
-    Python::attach(|py| unsafe {
+    Python::attach(|py| {
         let ext = PyModule::new(py, "_soac_ext").expect("extension module should allocate");
         let sys = py.import("sys").expect("sys should import");
         let modules = sys.getattr("modules").expect("sys.modules should exist");
@@ -226,9 +210,6 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
         let module_spec = importlib
             .getattr("ModuleSpec")
             .expect("ModuleSpec should exist");
-        let spec = module_spec
-            .call1(("transformed_owner_lookup_test", py.None()))
-            .expect("ModuleSpec should instantiate");
         let source = "class C:\n    def __init__(self):\n        self.value = 1\n    def f(self):\n        return 1\n";
         let source_path = std::env::temp_dir().join(format!(
             "soac_create_module_test_{}_{}.py",
@@ -236,57 +217,92 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
             "owner_lookup"
         ));
         std::fs::write(&source_path, source).expect("test source file should be writable");
-        let module = ext
+        let path = source_path
+            .to_str()
+            .expect("test source path should be utf-8");
+        let original_loader = importlib
+            .getattr("SourceFileLoader")
+            .unwrap()
+            .call1(("transformed_owner_lookup_test", path))
+            .expect("ordinary source loader should instantiate");
+        let spec = module_spec
+            .call1(("transformed_owner_lookup_test", &original_loader))
+            .expect("ModuleSpec should instantiate");
+        let creation = ext
             .getattr("create_module")
             .expect("create_module should be exported")
-            .call1((
-                source_path
-                    .to_str()
-                    .expect("test source path should be utf-8"),
-                &spec,
-            ))
-            .expect("transformed module creation should succeed");
-        let module_info = indexed_module_info(module.as_any())
-            .expect("created module should expose SOAC module info");
-        assert_eq!(
-            module_info.hash,
-            hash_module_source(source),
-            "IndexedModuleType tail should store the source hash"
+            .call1((path, &spec))
+            .expect("unselected creation should delegate");
+        // A source file and an enabled extension are not strict authority.
+        // PEP451 leaves ordinary creation and execution with the real loader.
+        assert!(creation.is_none());
+        let module = py
+            .import("importlib.util")
+            .unwrap()
+            .call_method1("module_from_spec", (&spec,))
+            .expect("ordinary module creation should succeed");
+        assert!(
+            module.get_type().is(&py.get_type::<PyModule>()),
+            "unselected modules use the ordinary native module type"
         );
         assert!(
-            module_info.indexed_module_keys.iter().any(|key| key == "C"),
-            "IndexedModuleType tail should preserve Rust-owned module-key metadata: {module_info:?}"
+            !ext.getattr("exec_module")
+                .unwrap()
+                .call1((&module,))
+                .unwrap()
+                .extract::<bool>()
+                .unwrap()
         );
-        module
-            .getattr("__dict__")
-            .expect("module should expose __dict__")
-            .set_item("__package__", "")
-            .expect("module globals should accept __package__");
-        ext.getattr("exec_module")
-            .expect("exec_module should be exported")
-            .call1((&module,))
-            .expect("transformed module execution should succeed");
-
-        let cls = module
-            .getattr("C")
-            .expect("executed module should define C");
-        let owner_type = cls.as_ptr() as *mut pyo3::ffi::PyTypeObject;
-        let init_function = class_dict_function(owner_type, c"__init__");
-        let init_function_id = soac_jit::registered_clif_function_id(init_function)
-            .expect("registered __init__ function id lookup should succeed")
-            .expect("transformed __init__ should carry a RuntimeFunctionId");
-        let constructor_owners =
-            soac_jit::lookup_exact_owner_types_for_constructor(init_function_id)
-                .expect("exact constructor owner lookup should succeed");
+        assert!(!module.hasattr("C").unwrap());
+        original_loader
+            .call_method1("exec_module", (&module,))
+            .expect("the original loader should execute the unchanged source");
+        assert!(
+            ext.getattr("strict_module_diagnostics")
+                .unwrap()
+                .call1((&module,))
+                .unwrap()
+                .is_none()
+        );
+        let cls = module.getattr("C").unwrap();
+        for name in ["__init__", "f"] {
+            let function = cls.getattr(name).unwrap();
+            assert!(
+                unsafe { soac_jit::registered_clif_function_id(function.as_ptr()) }
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                ext.getattr("strict_function_diagnostics")
+                    .unwrap()
+                    .call1((&function,))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let instance = cls.call0().unwrap();
         assert_eq!(
-            constructor_owners.len(),
-            1,
-            "expected one constructor owner type for transformed C.__init__"
+            instance.getattr("value").unwrap().extract::<i32>().unwrap(),
+            1
         );
-        assert_eq!(constructor_owners[0].owner_type, owner_type);
-        assert_eq!(constructor_owners[0].init_function_obj, init_function);
-
-        pyo3::ffi::Py_DECREF(init_function);
+        assert_eq!(
+            instance
+                .call_method0("f")
+                .unwrap()
+                .extract::<i32>()
+                .unwrap(),
+            1
+        );
+        instance.setattr("value", "ordinary mutation").unwrap();
+        assert_eq!(
+            instance
+                .getattr("value")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "ordinary mutation"
+        );
+        std::fs::remove_file(&source_path).expect("remove this test's source fixture");
     });
 }
 

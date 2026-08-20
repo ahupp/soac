@@ -9,9 +9,15 @@ pub mod plan_v3;
 pub mod value_facts;
 
 mod instr_id;
+mod native_iterator;
 mod typed;
 
 pub use instr_id::assign_missing_typed_function_instr_ids;
+pub use native_iterator::{
+    NativeIteratorBuiltin, NativeIteratorCallee, NativeIteratorCalleeGuard,
+    NativeIteratorMaterializer, NativeIteratorMustEliminate, NativeIteratorStage,
+    TypedNativeIteratorPipelinePlan,
+};
 pub use typed::{
     InstrTyped, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockExtra,
     TypedBlockLayoutHint, TypedBlockPyModuleShape, TypedBuiltinImplementationPlan, TypedCall,
@@ -27,8 +33,9 @@ pub use typed::{
     TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource, TypedInstrExtra,
     TypedLateBoundOwnerFieldPlan, TypedOpaqueFusedEntryGuard, TypedOpaqueFusedGuardExpectation,
     TypedOpaqueFusedGuardOperand, TypedOpaqueFusedIterationPlan, TypedOpaqueFusedResult,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand, TypedSetAttr, TypedTruthy,
-    lower_blockpy_function_to_typed, lower_blockpy_module_to_typed,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand, TypedSealedFieldAccessPlan,
+    TypedSealedMethodAccessPlan, TypedSetAttr, TypedSourceBodyTarget, TypedSourceCallPlan,
+    TypedTruthy, lower_blockpy_function_to_typed, lower_blockpy_module_to_typed,
 };
 pub use value_facts::{
     BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore, I32Facts, I64Facts, NoneFact,

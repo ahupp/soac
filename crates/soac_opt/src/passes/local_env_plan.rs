@@ -8,16 +8,18 @@
 use crate::passes::ownership_effects::{
     LocalRefState, TypedModulePreciseImmortalLocalEntryStates,
     TypedPreciseImmortalLocalEntryStates, compute_function_local_live_ins,
-    compute_function_local_must_bound_ins, compute_typed_function_local_live_ins,
+    compute_function_local_may_bound_ins, compute_function_local_must_bound_ins,
+    compute_typed_function_local_live_ins, compute_typed_function_local_may_bound_ins,
     compute_typed_function_local_must_bound_ins,
     compute_typed_function_precise_immortal_local_entry_states,
     compute_typed_module_precise_immortal_local_entry_states,
 };
 use crate::passes::{BlockPyModuleShape, InstrBlockPy};
 use crate::typed::typed_expr_planned_pyobject_ownership;
+use soac_core::block_py::visit_operand_takes;
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrKey, InstrLocationMap,
-    LocalLocation, RuntimeFunctionId, current_instr_locations,
+    BlockLabel, BlockPyFunction, BlockPyModule, GeneratorResumeParamRole, HasSemanticInstrId,
+    InstrKey, InstrLocationMap, LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
 use soac_ir_typed::TypedPyObjectOwnershipPlan;
 use soac_ir_typed::{FactStore, InstrTyped, PyObjFacts, TypedBlockPyModuleShape};
@@ -87,17 +89,6 @@ impl BlockLocalPlan {
         self.entry_locals
             .iter()
             .find(|binding| binding.name == name)
-    }
-
-    pub fn binding_for_block_arg_name(&self, name: &str) -> Option<&PlannedLocalBinding> {
-        self.binding_for_name(name).or_else(|| {
-            if !is_try_exception_alias_name(name) {
-                return None;
-            }
-            self.entry_locals
-                .iter()
-                .find(|binding| is_try_exception_alias_name(binding.name.as_str()))
-        })
     }
 }
 
@@ -747,6 +738,7 @@ pub fn plan_function_locals(
     };
     let live_ins = compute_function_local_live_ins(function);
     let must_bound_ins = compute_function_local_must_bound_ins(function);
+    let may_bound_ins = compute_function_local_may_bound_ins(function);
     let preserved_state_location = preserved_state_location(storage_layout);
     let entry_label = function.entry_block().label;
     let mut blocks = HashMap::with_capacity(function.blocks.len());
@@ -777,6 +769,10 @@ pub fn plan_function_locals(
                         .iter()
                         .any(|param| param.name == name.as_str());
                 let is_must_bound_on_entry = must_bound_locations.contains(&location);
+                let is_may_bound_on_entry = is_must_bound_on_entry
+                    || may_bound_ins
+                        .get(&block.label)
+                        .is_some_and(|locations| locations.contains(&location));
                 let py_facts = entry_facts
                     .and_then(|env| env.local_pyobj_fact(location))
                     .filter(|_| is_must_bound_on_entry);
@@ -785,7 +781,7 @@ pub fn plan_function_locals(
                     PlannedLocalStorage::BlockParam
                 } else if is_function_param_on_entry {
                     PlannedLocalStorage::BlockParam
-                } else if is_live_in || is_must_bound_on_entry {
+                } else if is_live_in || is_may_bound_on_entry {
                     PlannedLocalStorage::BlockParam
                 } else {
                     PlannedLocalStorage::StackSlot
@@ -826,6 +822,7 @@ pub fn plan_function_locals(
                             explicit_param_names.contains(name.as_str())
                                 || is_function_param_on_entry,
                             is_must_bound_on_entry,
+                            is_may_bound_on_entry,
                             py_facts,
                         ),
                     },
@@ -873,6 +870,7 @@ fn plan_typed_function_locals_with_precise_immortal_states(
     };
     let live_ins = compute_typed_function_local_live_ins(function);
     let must_bound_ins = compute_typed_function_local_must_bound_ins(function);
+    let may_bound_ins = compute_typed_function_local_may_bound_ins(function);
     let preserved_state_location = preserved_state_location(storage_layout);
     let computed_precise_entry_states;
     let precise_entry_states = if let Some(states) = precise_immortal_entry_states {
@@ -911,6 +909,10 @@ fn plan_typed_function_locals_with_precise_immortal_states(
                         .iter()
                         .any(|param| param.name == name.as_str());
                 let is_must_bound_on_entry = must_bound_locations.contains(&location);
+                let is_may_bound_on_entry = is_must_bound_on_entry
+                    || may_bound_ins
+                        .get(&block.label)
+                        .is_some_and(|locations| locations.contains(&location));
                 let precise_entry_state = precise_entry_states
                     .get(&block.label)
                     .and_then(|states| states.get(&location))
@@ -923,7 +925,7 @@ fn plan_typed_function_locals_with_precise_immortal_states(
                     PlannedLocalStorage::BlockParam
                 } else if is_function_param_on_entry {
                     PlannedLocalStorage::BlockParam
-                } else if is_live_in || is_must_bound_on_entry {
+                } else if is_live_in || is_may_bound_on_entry {
                     PlannedLocalStorage::BlockParam
                 } else {
                     PlannedLocalStorage::StackSlot
@@ -964,6 +966,7 @@ fn plan_typed_function_locals_with_precise_immortal_states(
                             explicit_param_names.contains(name.as_str())
                                 || is_function_param_on_entry,
                             is_must_bound_on_entry,
+                            is_may_bound_on_entry,
                             py_facts,
                             precise_entry_state,
                         ),
@@ -1168,12 +1171,55 @@ fn resume_value_source_for_planned_local(
     }
 }
 
+fn transfer_call_argument_resume_state<
+    I: soac_core::block_py::Instr<Name = soac_core::block_py::ResolvedName>,
+>(
+    op: &soac_core::block_py::CallArgumentOp<I>,
+    locals: &mut [LocalEnvResumeBinding],
+) {
+    for name in op.written_names() {
+        let Some(location) = name.local_location() else {
+            // Preserved buffers are tracked by their payload slot.
+            continue;
+        };
+        if let Some(binding) = locals
+            .iter_mut()
+            .find(|binding| binding.location == location)
+        {
+            binding.binding = LocalEnvResumeBindingState::Bound;
+            binding.source = LocalEnvResumeValueSource::StackSlot(location);
+            binding.ownership = LocalRefKind::Owned;
+            binding.value = None;
+        }
+    }
+}
+
+fn retire_taken_operand(
+    locals: &mut [LocalEnvResumeBinding],
+    location: soac_core::block_py::OperandLocation,
+) {
+    let soac_core::block_py::OperandLocation::Local(location) = location else {
+        // Preserved owners are represented by the payload, not this local map.
+        return;
+    };
+    if let Some(binding) = locals
+        .iter_mut()
+        .find(|binding| binding.location == location)
+    {
+        binding.binding = LocalEnvResumeBindingState::Unbound;
+        binding.source = LocalEnvResumeValueSource::Unbound;
+        binding.ownership = LocalRefKind::Unbound;
+        binding.value = None;
+    }
+}
+
 fn transfer_resume_local_state(
     function_id: RuntimeFunctionId,
     instr: &InstrBlockPy,
     facts: &FactStore,
     locals: &mut [LocalEnvResumeBinding],
 ) {
+    visit_operand_takes(instr, |location| retire_taken_operand(locals, location));
     match instr {
         InstrBlockPy::Store(op) => {
             let Some(location) = op.name.local_location() else {
@@ -1212,6 +1258,7 @@ fn transfer_resume_local_state(
                 binding.value = None;
             }
         }
+        InstrBlockPy::CallArgumentOp(op) => transfer_call_argument_resume_state(op, locals),
         _ => {}
     }
 }
@@ -1222,6 +1269,7 @@ fn transfer_typed_resume_local_state(
     facts: &FactStore,
     locals: &mut [LocalEnvResumeBinding],
 ) {
+    visit_operand_takes(instr, |location| retire_taken_operand(locals, location));
     match instr {
         InstrTyped::Store(op) => {
             let Some(location) = op.name.local_location() else {
@@ -1267,6 +1315,7 @@ fn transfer_typed_resume_local_state(
                 binding.value = None;
             }
         }
+        InstrTyped::CallArgumentOp(op) => transfer_call_argument_resume_state(op, locals),
         _ => {}
     }
 }
@@ -1312,9 +1361,16 @@ fn local_ref_kind_for_block_entry(
     name: &str,
     is_explicit_block_param: bool,
     is_must_bound_on_entry: bool,
+    is_may_bound_on_entry: bool,
     facts: Option<PyObjFacts>,
 ) -> LocalRefKind {
-    if name == "_dp_self" || name == "_dp_state" {
+    if function
+        .storage_layout
+        .as_ref()
+        .and_then(|layout| layout.generator_resume_abi.as_ref())
+        .and_then(|abi| abi.role_for_name(name))
+        .is_some_and(GeneratorResumeParamRole::is_preserved_owner)
+    {
         return LocalRefKind::Borrowed;
     }
     let is_function_param = is_entry_block
@@ -1334,7 +1390,7 @@ fn local_ref_kind_for_block_entry(
     if is_must_bound_on_entry {
         return LocalRefKind::Owned;
     }
-    if is_explicit_block_param {
+    if is_explicit_block_param || is_may_bound_on_entry {
         return LocalRefKind::Unknown;
     }
     LocalRefKind::Unbound
@@ -1346,10 +1402,17 @@ fn local_ref_kind_for_typed_block_entry(
     name: &str,
     is_explicit_block_param: bool,
     is_must_bound_on_entry: bool,
+    is_may_bound_on_entry: bool,
     facts: Option<PyObjFacts>,
     precise_entry_state: Option<LocalRefState>,
 ) -> LocalRefKind {
-    if name == "_dp_self" || name == "_dp_state" {
+    if function
+        .storage_layout
+        .as_ref()
+        .and_then(|layout| layout.generator_resume_abi.as_ref())
+        .and_then(|abi| abi.role_for_name(name))
+        .is_some_and(GeneratorResumeParamRole::is_preserved_owner)
+    {
         return LocalRefKind::Borrowed;
     }
     if precise_entry_state == Some(LocalRefState::Immortal) {
@@ -1372,14 +1435,10 @@ fn local_ref_kind_for_typed_block_entry(
     if is_must_bound_on_entry {
         return LocalRefKind::Owned;
     }
-    if is_explicit_block_param {
+    if is_explicit_block_param || is_may_bound_on_entry {
         return LocalRefKind::Unknown;
     }
     LocalRefKind::Unbound
-}
-
-fn is_try_exception_alias_name(name: &str) -> bool {
-    name.starts_with("_dp_try_exc_")
 }
 
 fn preserved_state_location(
@@ -1388,11 +1447,7 @@ fn preserved_state_location(
     if storage_layout.preserved_slots.is_empty() {
         return None;
     }
-    storage_layout
-        .stack_slots()
-        .iter()
-        .position(|name| name == "_dp_state")
-        .map(|slot| LocalLocation(slot as u32))
+    storage_layout.generator_resume_local(GeneratorResumeParamRole::StateValue)
 }
 
 #[cfg(test)]
@@ -1443,9 +1498,9 @@ def f(flag):
     fn local_env_plan_uses_generator_body_params_for_entry_bindings() {
         let lowered = lower_python_to_blockpy_for_testing(
             r#"
-def gen(it):
+def gen(it, _dp_state, _dp_self):
     while True:
-        yield next(it)
+        yield next(it), _dp_state, _dp_self
 "#,
         )
         .expect("transform should succeed")
@@ -1461,8 +1516,15 @@ def gen(it):
             .function(function.function_id)
             .expect("generator should have a LocalEnv plan");
 
+        let state_name = function
+            .storage_layout
+            .as_ref()
+            .and_then(|layout| {
+                layout.generator_resume_parameter(GeneratorResumeParamRole::StateValue)
+            })
+            .expect("explicit state parameter role");
         for block in function_plan.blocks.values() {
-            let owner = block.binding_for_name("_dp_state").expect(
+            let owner = block.binding_for_name(state_name).expect(
                 "generator body state should stay materialized across preserved-state blocks",
             );
             assert_eq!(owner.storage, PlannedLocalStorage::BlockParam);
@@ -1472,6 +1534,82 @@ def gen(it):
             );
             assert_eq!(owner.param_facts.ownership, LocalRefKind::Borrowed);
         }
+    }
+
+    #[test]
+    fn local_env_source_resume_spellings_do_not_acquire_private_borrowed_ownership() {
+        let lowered = lower_python_to_blockpy_for_testing(
+            "def ordinary(value):\n    _dp_self = value\n    _dp_state = value\n    return _dp_self, _dp_state\n",
+        )
+        .expect("ordinary source-spelling fixture")
+        .blockpy_module;
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.display_name == "ordinary")
+            .unwrap();
+        let typed = soac_ir_typed::lower_blockpy_module_to_typed(lowered.clone());
+        let typed_function = typed
+            .callable_defs
+            .iter()
+            .find(|candidate| candidate.function_id == function.function_id)
+            .unwrap();
+        for name in ["_dp_self", "_dp_state"] {
+            assert_eq!(
+                local_ref_kind_for_block_entry(function, false, name, true, true, true, None),
+                LocalRefKind::Owned
+            );
+            assert_eq!(
+                local_ref_kind_for_typed_block_entry(
+                    typed_function,
+                    false,
+                    name,
+                    true,
+                    true,
+                    true,
+                    None,
+                    None
+                ),
+                LocalRefKind::Owned
+            );
+        }
+    }
+
+    #[test]
+    fn local_env_block_arguments_do_not_alias_an_unrelated_exception_spelling() {
+        let module = lower_python_to_blockpy_for_testing(
+            "def handled():\n    try:\n        raise ValueError()\n    except ValueError:\n        return None\n",
+        )
+        .expect("actual handled entry fixture")
+        .blockpy_module;
+        let function = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.display_name == "handled")
+            .unwrap();
+        let plan = plan_function_locals(function, &infer_module_value_facts(&module));
+        let handler = function
+            .blocks
+            .iter()
+            .find(|block| {
+                block.params.iter().any(|parameter| {
+                    parameter.role == soac_core::block_py::BlockParamRole::Exception
+                })
+            })
+            .expect("real compiler exception parameter");
+        let parameter = handler
+            .params
+            .iter()
+            .find(|parameter| parameter.role == soac_core::block_py::BlockParamRole::Exception)
+            .unwrap();
+        let entry = plan.block(handler.label).unwrap();
+        assert!(entry.binding_for_name(&parameter.name).is_some());
+        assert!(
+            entry
+                .binding_for_name("_dp_try_exc_absent_source")
+                .is_none(),
+            "an absent ordinary argument cannot borrow an unrelated caught exception binding"
+        );
     }
 
     #[test]

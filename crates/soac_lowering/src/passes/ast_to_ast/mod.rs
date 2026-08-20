@@ -10,5 +10,8 @@ pub(crate) mod rewrite_stmt;
 pub(crate) mod scope_helpers;
 pub(crate) mod semantic;
 pub(crate) mod simplify;
+mod source_origins;
+#[cfg(test)]
+pub(crate) use source_origins::SourceNameCatalog;
 pub(crate) mod string_templates;
 pub(crate) mod util;

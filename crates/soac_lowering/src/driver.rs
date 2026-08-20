@@ -14,14 +14,18 @@ use crate::passes::{
 use anyhow::Error as AnyhowError;
 use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::{parse_module, ParseError};
+use ruff_text_size::{Ranged, TextRange};
+use soac_contracts::{Fingerprint, SourceDialect, VerifiedModuleTypeFacts};
 use soac_core::block_py::{BlockPyModule, ModuleNameGen, PrettyPrint, PrettyPrinter};
 use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
 use soac_ir_blockpy::BlockPyModuleShape;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum LoweringError {
     Parse(ParseError),
+    StrictAuthentication(String),
     Other(AnyhowError),
 }
 
@@ -31,6 +35,7 @@ impl std::fmt::Display for LoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parse(err) => err.fmt(f),
+            Self::StrictAuthentication(message) => f.write_str(message),
             Self::Other(err) => err.fmt(f),
         }
     }
@@ -40,6 +45,7 @@ impl std::error::Error for LoweringError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Parse(err) => Some(err),
+            Self::StrictAuthentication(_) => None,
             Self::Other(err) => Some(err.as_ref()),
         }
     }
@@ -76,6 +82,91 @@ pub struct LoweringOptions {
     /// from `soac.runtime`, so using them while compiling `soac.runtime` itself
     /// would make module initialization circular.
     pub runtime_names_as_globals: bool,
+    /// Authenticated offline proposal for this exact source. This does not
+    /// grant any runtime layout, type-check, or call-target capability.
+    pub strict_facts: Option<Arc<VerifiedModuleTypeFacts>>,
+    /// Canonical future-annotation strings from the same native source parse
+    /// that the runtime subsequently matches against this lowered module.
+    /// These values carry no source-authentication or optimization authority.
+    pub canonical_annotations: Option<Arc<crate::CanonicalAnnotationStrings>>,
+    /// Value-only class cell and closure recipes from the same original native
+    /// tree. Source binding validates the optional input, not execution authority.
+    pub canonical_class_bindings: Option<Arc<crate::CanonicalClassBindings>>,
+}
+
+/// Syntax accepted by the pinned parser whose execution protocol has not yet
+/// been implemented in SOAC. Keep this check on the original AST, before any
+/// rewrite can erase the distinction from an eager import or comprehension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnsupportedSyntax {
+    LazyImport(TextRange),
+    UnpackingComprehension(TextRange),
+}
+
+impl std::fmt::Display for UnsupportedSyntax {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (feature, range) = match self {
+            Self::LazyImport(range) => ("lazy imports", range),
+            Self::UnpackingComprehension(range) => ("unpacking comprehensions", range),
+        };
+        write!(
+            formatter,
+            "SOAC does not yet support {feature} at source bytes {range:?}"
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedSyntax {}
+
+fn validate_supported_syntax(body: &mut Suite) -> std::result::Result<(), UnsupportedSyntax> {
+    use crate::transformer::{walk_expr, walk_stmt, Transformer};
+
+    #[derive(Default)]
+    struct Preflight {
+        error: Option<UnsupportedSyntax>,
+    }
+
+    impl Transformer for Preflight {
+        fn visit_stmt(&mut self, stmt: &mut Stmt) {
+            if self.error.is_some() {
+                return;
+            }
+            match stmt {
+                Stmt::Import(node) if node.is_lazy => {
+                    self.error = Some(UnsupportedSyntax::LazyImport(node.range));
+                }
+                Stmt::ImportFrom(node) if node.is_lazy => {
+                    self.error = Some(UnsupportedSyntax::LazyImport(node.range));
+                }
+                _ => walk_stmt(self, stmt),
+            }
+        }
+
+        fn visit_expr(&mut self, expr: &mut ast::Expr) {
+            if self.error.is_some() {
+                return;
+            }
+            let unpacking = match expr {
+                ast::Expr::DictComp(node) => node.key.is_none(),
+                ast::Expr::ListComp(node) => matches!(&*node.elt, ast::Expr::Starred(_)),
+                ast::Expr::SetComp(node) => matches!(&*node.elt, ast::Expr::Starred(_)),
+                ast::Expr::Generator(node) => matches!(&*node.elt, ast::Expr::Starred(_)),
+                _ => false,
+            };
+            if unpacking {
+                self.error = Some(UnsupportedSyntax::UnpackingComprehension(expr.range()));
+            } else {
+                walk_expr(self, expr);
+            }
+        }
+    }
+
+    let mut preflight = Preflight::default();
+    preflight.visit_body(body);
+    match preflight.error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn lower_python_to_blockpy_with_tracker<P>(
@@ -136,6 +227,7 @@ fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPa
 
     // Rewrite names like "__foo" in class bodies to "_<class_name>__foo"
     rewrite_class_def::private::rewrite_private_names(context, &mut module);
+    context.record_original_function_origins(&mut module);
 
     // Replace annotated assignments ("x: int = 1") with regular assignments,
     // and either drop the annotations (in functions) or generate an
@@ -146,7 +238,11 @@ fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPa
     // scoping semantics before the more direct BlockPy expr lowering boundary.
     rewrite_with_pass(context, None, Some(&ScopedHelperExprPass), &mut module);
 
-    let mut semantic_state = SemanticAstState::from_ruff(&mut module);
+    let mut semantic_state = SemanticAstState::from_ruff_with_lambda_bodies(
+        &mut module,
+        context.source_names(),
+        context.take_lowered_lambda_bodies(),
+    );
 
     /*
 
@@ -155,6 +251,9 @@ fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPa
     more complicated) class rewrite below, lets us only deal with functions throughout the rest of the pipeline.
      */
     wrap_module_init(&mut semantic_state, &mut module);
+    if let Some(Stmt::FunctionDef(module_init)) = module.first_mut() {
+        context.record_module_body_origin(module_init);
+    }
 
     rewrite_class_def::class_body::rewrite_class_body_scopes(
         context,
@@ -175,14 +274,102 @@ pub fn lower_source_to_blockpy_module_with_tracker(
     options: LoweringOptions,
 ) -> Result<BlockPyModule<BlockPyModuleShape>> {
     crate::namegen::reset_namegen_state();
-    let module =
-        pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
-            let mut module = parse_module(source).map(|module| module.into_syntax())?;
-            rewrite_future_annotations::rewrite(&mut module.body)?;
-            Ok(module)
+    let (module, original_body, future_annotations, original_tokens) =
+        pass_tracker.record_timing("parse", || -> Result<_> {
+            let parsed = parse_module(source)?;
+            soac_source::validate_source_literals(source, parsed.tokens())
+                .map_err(AnyhowError::new)?;
+            let original_tokens = options
+                .strict_facts
+                .as_ref()
+                .map(|_| parsed.tokens().clone());
+            let mut module = parsed.into_syntax();
+            validate_supported_syntax(&mut module.body).map_err(AnyhowError::new)?;
+            crate::passes::ast_to_ast::semantic::ensure_node_indices_for_suite(&mut module.body);
+            let original_body = module.body.clone();
+            if options
+                .canonical_annotations
+                .as_ref()
+                .is_some_and(|annotations| !annotations.matches_source(source))
+            {
+                return Err(LoweringError::StrictAuthentication(
+                    "native annotation strings do not match the actual source being lowered".into(),
+                ));
+            }
+            if options
+                .canonical_class_bindings
+                .as_ref()
+                .is_some_and(|bindings| !bindings.matches_source(source))
+            {
+                return Err(LoweringError::StrictAuthentication(
+                    "native class bindings do not match the actual source being lowered".into(),
+                ));
+            }
+            if options.strict_facts.is_some() && options.canonical_class_bindings.is_none() {
+                struct ClassDefinitions(bool);
+                impl crate::transformer::Transformer for ClassDefinitions {
+                    fn visit_stmt(&mut self, statement: &mut ast::Stmt) {
+                        if matches!(statement, ast::Stmt::ClassDef(_)) {
+                            self.0 = true;
+                        } else if !self.0 {
+                            crate::transformer::walk_stmt(self, statement);
+                        }
+                    }
+                }
+                let mut classes = ClassDefinitions(false);
+                crate::transformer::Transformer::visit_body(&mut classes, &mut module.body);
+                if classes.0 {
+                    return Err(LoweringError::StrictAuthentication(
+                        "strict class lowering requires source-bound native class bindings".into(),
+                    ));
+                }
+            }
+            let features = rewrite_future_annotations::rewrite(
+                &mut module.body,
+                options.canonical_annotations.as_deref(),
+            )?;
+            match (&options.strict_facts, features.contains("strict")) {
+                (None, true) => {
+                    return Err(LoweringError::StrictAuthentication(
+                        "strict source requires authenticated offline type facts".into(),
+                    ))
+                }
+                (Some(_), false) => {
+                    return Err(LoweringError::StrictAuthentication(
+                        "strict artifact cannot authorize ordinary source".into(),
+                    ))
+                }
+                (Some(verified), true) => {
+                    let facts = verified.facts();
+                    if facts.source_dialect != SourceDialect::SoacStrict
+                        || facts.source_digest != Fingerprint::digest(source.as_bytes())
+                        || facts.source_size as usize != source.len()
+                        || facts.module.source_hash
+                            != soac_contracts::legacy_source_hash(source.as_bytes())
+                    {
+                        return Err(LoweringError::StrictAuthentication(
+                            "strict artifact does not match the actual source being lowered".into(),
+                        ));
+                    }
+                }
+                (None, false) => {}
+            }
+            Ok((
+                module,
+                original_body,
+                features.contains("annotations"),
+                original_tokens,
+            ))
         })?;
 
-    let context = Context::new(source);
+    let mut context = Context::with_strict_facts(
+        source,
+        options.strict_facts.clone(),
+        &original_body,
+        future_annotations,
+        original_tokens.as_ref(),
+    )?;
+    context.set_canonical_class_bindings(options.canonical_class_bindings.clone());
 
     let AstToAstPassResult {
         module,
@@ -273,6 +460,16 @@ pub fn lower_source_to_blockpy_module_with_tracker(
        - locals are assigned stack slots, and become LoadLocation / StoreLocation / DelLocation with local-slot locations.
 
     */
+    // Source-backed cell operations must be represented before the infallible
+    // mapper chooses physical storage. Compiler-tail operations may have no
+    // original Name access receipt even though their class has a FREE slot.
+    pass_tracker.record_timing("validate_native_class_cells", || {
+        crate::passes::name_binding::validate_native_class_cell_operations(
+            &core_blockpy_without_await_or_yield,
+        )
+        .map_err(LoweringError::StrictAuthentication)
+    })?;
+
     // `soac.runtime` is compiled by the import hook too. While compiling that
     // module, runtime-name constants cannot be materialized by importing
     // `soac.runtime`, so the bootstrap mode leaves those loads as globals.
@@ -300,9 +497,11 @@ pub fn lower_source_to_blockpy_module_with_tracker(
     let blockpy: BlockPyModule<BlockPyModuleShape> = pass_tracker.run_pass("blockpy", || {
         let mut blockpy: BlockPyModule<BlockPyModuleShape> =
             crate::passes::blockpy_to_bb::strings::hoist_module_constants(&bb_prepared);
+        crate::passes::strict_construction::resolve_strict_construction(&mut blockpy);
         soac_ir_blockpy::ensure_constructor_entry_functions(&mut blockpy);
         crate::block_py::cfg::relabel_dense_bb_module(&mut blockpy);
-        soac_ir_blockpy::assign_blockpy_module_instr_ids(blockpy)
+        let blockpy = soac_ir_blockpy::assign_blockpy_module_instr_ids(blockpy);
+        blockpy
     });
     pass_tracker.record_timing("validate", || {
         crate::block_py::validate::validate_blockpy_module(&blockpy).map_err(anyhow::Error::msg)
@@ -326,5 +525,5 @@ def _dp_module_init():
     );
     semantic_state.synthesize_module_init_scope(&module_init);
 
-    *module = vec![Stmt::FunctionDef(module_init)];
+    *module = [Stmt::FunctionDef(module_init)].into();
 }

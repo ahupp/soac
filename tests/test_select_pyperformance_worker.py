@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -26,13 +27,55 @@ def worker_record(tmp_path: Path, name: str, *, stable_args, opt_mode="profile")
     work_dir = tmp_path / name
     work_dir.mkdir()
     (work_dir / "profile.bin").write_bytes(b"profile")
+    stock = work_dir / "stock"
+    stock.mkdir()
+    script = stock / "run_benchmark.py"
+    script.write_text(
+        'import pyperf\ndef workload():\n    return 42\nif __name__ == "__main__":\n    runner = pyperf.Runner()\n    runner.bench_func("sample", workload)\n'
+    )
+
+    def checker(command, **kwargs):
+        # A publication-shaped unit fixture only; never passed to native
+        # startup or treated as genuine runtime authority by these tests.
+        Path(command[command.index("--deployment") + 1]).write_text(
+            '{"fixture": true}\n'
+        )
+        return subprocess.CompletedProcess(
+            command, 0, '{"modules": 1, "generation": "fixture"}', ""
+        )
+
+    execution = (
+        load_select_pyperformance_worker()
+        ._source_tools()
+        .prepare_strict_benchmark(
+            script,
+            Path("/tmp/python"),
+            work_dir / "bundle",
+            Path("/tmp/checker"),
+            {},
+            run=checker,
+        )
+    )
+    source = execution["source"]
     return {
         "benchmark_name": "bm_nqueens",
-        "benchmark_script": "/tmp/run_benchmark.py",
+        "benchmark_script": str(script),
         "opt_mode": opt_mode,
         "python_executable": "/tmp/python",
         "stable_args": stable_args,
         "work_dir": str(work_dir),
+        "language": "strict",
+        "strict_bundle": execution["manifest_path"],
+        "strict_deployment": execution["deployment"],
+        "strict_script": source["strict_script"],
+        "strict_harness": source["harness_script"],
+        "strict_project": source["project"],
+        "strict_modules": source["modules"],
+        "strict_source_fingerprint": source["source_fingerprint"],
+        "stock_source_fingerprint": source["stock_source_fingerprint"],
+        "selection_policy": source["selection_policy"],
+        "harness_policy": source["harness_projection"]["policy"],
+        "artifact_generation": execution["publication"]["generation"],
     }
 
 
@@ -71,3 +114,21 @@ def test_select_worker_rejects_ambiguous_measured_workers(tmp_path):
         module.select_worker(manifest, "nqueens")
 
     assert module.select_worker(manifest, "nqueens", worker="second") == second
+
+
+@pytest.mark.parametrize("changed", ["ordinary", "authority", "source", "harness"])
+def test_replay_rejects_changed_or_ordinary_worker_provenance(tmp_path, changed):
+    module = load_select_pyperformance_worker()
+    record = worker_record(tmp_path, "selected", stable_args=["--worker-task=0"])
+    if changed == "ordinary":
+        record["language"] = "ordinary"
+    elif changed == "authority":
+        record["strict_deployment"] = "/other/deployment.json"
+    elif changed == "source":
+        Path(record["benchmark_script"]).write_text("changed = True\n")
+    else:
+        Path(record["strict_harness"]).write_text("changed = True\n")
+    manifest = tmp_path / "worker_manifest.jsonl"
+    write_manifest(manifest, [record])
+    with pytest.raises(ValueError):
+        module.select_worker(manifest, "nqueens")

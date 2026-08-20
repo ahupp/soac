@@ -319,6 +319,7 @@ impl<I: Instr> InlineFragment<I> {
                 ),
                 BlockTerm::Raise(_) => format!("{}: raise", block.label),
                 BlockTerm::Return(_) => format!("{}: return", block.label),
+                BlockTerm::GeneratorReturn(_) => format!("{}: generator return", block.label),
             })
             .collect::<Vec<_>>();
 
@@ -395,7 +396,7 @@ impl<I: Instr> InlineFragment<I> {
                         "branch default",
                     );
                 }
-                BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+                BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
             }
             if let Some(edge) = &block.exc_edge {
                 assert_target_present(
@@ -424,7 +425,7 @@ pub(crate) struct LoweredExpr<S: Instr, V = S> {
 
 pub(crate) fn rewrite_ast_to_core_blockpy_module_with_module(
     context: &Context,
-    module: Vec<Stmt>,
+    module: ast::Suite,
     semantic_state: &crate::passes::ast_to_ast::semantic::SemanticAstState,
     module_name_gen: crate::block_py::ModuleNameGen,
 ) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {

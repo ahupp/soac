@@ -200,12 +200,61 @@ pub(crate) fn record_class_static_attributes(context: &Context, body: &mut ast::
 
 fn class_def_to_create_class_fn<'a>(
     context: &Context,
+    semantic_state: &crate::passes::ast_to_ast::semantic::SemanticAstState,
     class_def: &mut ast::StmtClassDef,
     class_qualname: String,
     needs_class_cell: bool,
     class_scope: &SemanticScope,
     captures_outer_static_attributes: bool,
+    class_firstlineno: usize,
+    decorator_preparation: bool,
 ) -> (ast::StmtFunctionDef, ast::StmtFunctionDef, Expr, Expr) {
+    let native_class = context.native_class_plan(class_def.range);
+    let class_namespace = native_class
+        .as_ref()
+        .map_or("_dp_class_ns", |plan| plan.scope.namespace_binding.as_str());
+    let requires_class_dict_cell = native_class.as_ref().map_or_else(
+        || context.requires_class_dict_cell(class_def.range),
+        |plan| {
+            plan.scope.recipe.exports.iter().any(|export| {
+                export.kind == soac_core::block_py::ClassBindingExportKind::ClassDictCell
+            })
+        },
+    );
+    let needs_class_cell = native_class.as_ref().map_or(needs_class_cell, |plan| {
+        plan.scope
+            .recipe
+            .exports
+            .iter()
+            .any(|export| export.kind == soac_core::block_py::ClassBindingExportKind::ClassCell)
+    });
+    let entry = native_class.as_ref().map_or_else(
+        || vec![py_stmt!("_dp_classcell = _dp_classcell_arg")],
+        |plan| {
+            vec![context.native_class_phase_marker(
+                plan.scope.node.id,
+                soac_core::block_py::ClassBindingPhase::ClassEntry,
+                semantic_state,
+            )]
+        },
+    );
+    let header = native_class
+        .as_ref()
+        .map(|plan| {
+            context.native_class_phase_marker(
+                plan.scope.node.id,
+                soac_core::block_py::ClassBindingPhase::ClassHeaderComplete,
+                semantic_state,
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let completion = native_class
+        .as_ref()
+        .map(|plan| context.native_class_completion_marker(plan.scope.node.id, semantic_state))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let generic = context.generic_class(class_def.range);
     let static_attributes = context
         .class_static_attributes(class_def.range)
         .unwrap_or_else(|| {
@@ -231,8 +280,9 @@ fn class_def_to_create_class_fn<'a>(
             attributes = static_attributes
         ),
         Some(SemanticBindingKind::Local) | None => py_stmt!(
-            "_dp_class_ns[{name:literal}] = {attributes:expr}",
+            "{class_namespace:id}[{name:literal}] = {attributes:expr}",
             name = "__static_attributes__",
+            class_namespace = class_namespace,
             attributes = static_attributes
         ),
     };
@@ -250,7 +300,15 @@ fn class_def_to_create_class_fn<'a>(
     let mut body = std::mem::replace(body, empty_suite());
 
     let class_name = name.id.to_string();
-    let class_firstlineno = context.line_number_at(class_def.range.start().to_usize());
+    let first_line_store = if context.strict_source().is_some() {
+        vec![py_stmt!(
+            "{class_namespace:id}[\"__firstlineno__\"] = {line:literal}",
+            line = class_firstlineno,
+            class_namespace = class_namespace,
+        )]
+    } else {
+        Vec::new()
+    };
 
     let (docstring, stripped_body) = split_docstring(&body);
     body = stripped_body;
@@ -258,8 +316,9 @@ fn class_def_to_create_class_fn<'a>(
         body.insert(
             0,
             py_stmt!(
-                "_dp_class_ns[{name:literal}] = {value:literal}",
+                "{class_namespace:id}[{name:literal}] = {value:literal}",
                 name = "__doc__",
+                class_namespace = class_namespace,
                 value = docstring
             ),
         );
@@ -273,7 +332,21 @@ fn class_def_to_create_class_fn<'a>(
 
     let mut type_param_cleanup: Vec<Stmt> = Vec::new();
     let (type_param_bindings, mut type_param_statements, extra_bases) =
-        if let Some(type_params) = type_params {
+        if let Some(generic) = &generic {
+            assert!(
+                type_params.is_none(),
+                "strict type parameters must be constructed in their explicit scope"
+            );
+            (
+                vec![],
+                vec![py_stmt!(
+                    "{class_namespace:id}[\"__type_params__\"] = {parameters:id}",
+                    parameters = generic.type_parameters.as_str(),
+                    class_namespace = class_namespace,
+                )],
+                vec![py_expr!("{base:id}", base = generic.generic_base.as_str())],
+            )
+        } else if let Some(type_params) = type_params {
             let type_param_info = make_type_param_info(*type_params);
             let has_generic_base = arguments_has_generic(arguments.as_deref());
             let generic_param_base = make_generic_base(&type_param_info);
@@ -304,8 +377,9 @@ fn class_def_to_create_class_fn<'a>(
                 .type_params_tuple
                 .map(|tuple_expr| {
                     vec![py_stmt!(
-                        "_dp_class_ns[{name:literal}] = {tuple:expr}",
+                        "{class_namespace:id}[{name:literal}] = {tuple:expr}",
                         name = "__type_params__",
+                        class_namespace = class_namespace,
                         tuple = tuple_expr.clone()
                     )]
                 })
@@ -313,15 +387,17 @@ fn class_def_to_create_class_fn<'a>(
 
             for name in &type_param_info.param_names {
                 type_param_statements.push(py_stmt!(
-                    "_dp_class_ns[{name:literal}] = {name:id}",
+                    "{class_namespace:id}[{name:literal}] = {name:id}",
                     name = name.as_str(),
+                    class_namespace = class_namespace,
                 ));
                 type_param_cleanup.push(py_stmt!(
                     r#"
-if _dp_class_ns.get({name:literal}) is {name:id}:
-    del _dp_class_ns[{name:literal}]
+if {class_namespace:id}.get({name:literal}) is {name:id}:
+    del {class_namespace:id}[{name:literal}]
 "#,
                     name = name.as_str(),
+                    class_namespace = class_namespace,
                 ));
             }
 
@@ -332,8 +408,9 @@ if _dp_class_ns.get({name:literal}) is {name:id}:
 
     if let Some(orig_bases_expr) = orig_bases_expr {
         type_param_statements.push(py_stmt!(
-            "_dp_class_ns[{name:literal}] = {value:expr}",
+            "{class_namespace:id}[{name:literal}] = {value:expr}",
             name = "__orig_bases__",
+            class_namespace = class_namespace,
             value = orig_bases_expr
         ));
     }
@@ -344,19 +421,27 @@ if _dp_class_ns.get({name:literal}) is {name:id}:
 
     // type params are written as regular locals rather than direct assignments to _dp_class_ns
     // so they are visible to inner scopes
-    let class_ns_def: ast::StmtFunctionDef = py_stmt_typed!(
+    let mut class_ns_def: ast::StmtFunctionDef = py_stmt_typed!(
         r#"
-def _dp_class_ns_{class_name:id}(_dp_class_ns, _dp_classcell_arg):
-    _dp_classcell = _dp_classcell_arg
-    _dp_class_ns["__module__"] = __name__
-    _dp_class_ns["__qualname__"] = {class_qualname:literal}
+def _dp_class_ns_{class_name:id}({class_namespace:id}, _dp_classcell_arg):
+    {entry:stmt}
+    {class_namespace:id}["__module__"] = __name__
+    {class_namespace:id}["__qualname__"] = {class_qualname:literal}
+    {first_line_store:stmt}
     {type_param_bindings:stmt}
     {type_param_statements:stmt}
+    {header:stmt}
     {ns_body:stmt}
     {type_param_cleanup:stmt}
-    {static_attribute_store:stmt}"#,
+    {static_attribute_store:stmt}
+    {completion:stmt}"#,
         class_name = class_name.as_str(),
+        class_namespace = class_namespace,
+        entry = entry,
+        header = header,
+        completion = completion,
         class_qualname = class_qualname.as_str(),
+        first_line_store = first_line_store,
         ns_body = body,
         type_param_statements = type_param_statements,
         type_param_bindings = type_param_bindings.clone(),
@@ -364,7 +449,18 @@ def _dp_class_ns_{class_name:id}(_dp_class_ns, _dp_classcell_arg):
         static_attribute_store = static_attribute_store,
     );
 
-    let define_class_fn: ast::StmtFunctionDef = py_stmt_typed!(
+    if let Some(plan) = &native_class {
+        // Only these actual operands are provided by the authenticated binder.
+        // Native cell primaries are created by the explicit entry recipe.
+        let signature: ast::StmtFunctionDef = py_stmt_typed!(
+            "def _dp_namespace_signature({namespace:id}, {handle:id}): pass",
+            namespace = class_namespace,
+            handle = plan.execution_binding.as_str(),
+        );
+        class_ns_def.parameters = signature.parameters;
+    }
+
+    let mut define_class_fn: ast::StmtFunctionDef = py_stmt_typed!(
         r#"
 def _dp_define_class_{class_name:id}(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict):
     _dp_class_ns = _dp_class_ns_outer
@@ -379,12 +475,48 @@ def _dp_define_class_{class_name:id}(_dp_class_ns_fn, _dp_class_ns_outer, _dp_cl
     )
 "#,
         class_name = class_name.as_str(),
-        type_param_bindings = type_param_bindings.clone(),
         requires_class_cell = needs_class_cell,
         type_param_bindings = type_param_bindings,
         firstlineno = class_firstlineno,
     );
 
+    if context.strict_source().is_some() {
+        if decorator_preparation {
+            let signature: ast::StmtFunctionDef = py_stmt_typed!(
+                "def _dp_constructor_signature(_dp_class_ns_fn, _dp_class_ns_outer, _dp_class_bases, _dp_prepare_dict, _dp_decorator_preparation): pass"
+            );
+            define_class_fn.parameters = signature.parameters;
+        }
+        let Some(Stmt::Return(ast::StmtReturn {
+            value: Some(value), ..
+        })) = define_class_fn.body.last_mut()
+        else {
+            unreachable!("compiler class constructor must end with its native call")
+        };
+        let Expr::Call(call) = value.as_mut() else {
+            unreachable!("compiler class constructor must return its native call")
+        };
+        let mut arguments = call.arguments.args.to_vec();
+        arguments.insert(
+            5,
+            py_expr!("{required:literal}", required = requires_class_dict_cell),
+        );
+        if decorator_preparation {
+            arguments.push(py_expr!("_dp_decorator_preparation"));
+        }
+        call.arguments.args = arguments.into_boxed_slice();
+    }
+
+    context.record_class_helper_origin(
+        class_def.range,
+        &mut class_ns_def,
+        soac_core::block_py::CallableSourceRole::ClassNamespace,
+    );
+    context.record_class_helper_origin(
+        class_def.range,
+        &mut define_class_fn,
+        soac_core::block_py::CallableSourceRole::ClassConstruction,
+    );
     (class_ns_def, define_class_fn, bases_tuple, prepare_dict)
 }
 
@@ -541,7 +673,7 @@ pub(crate) fn class_call_arguments(
         for base in args.args.into_vec() {
             bases.push(base);
         }
-        for kw in args.keywords.into_vec() {
+        for kw in args.keywords {
             let value = kw.value;
             let key = kw
                 .arg

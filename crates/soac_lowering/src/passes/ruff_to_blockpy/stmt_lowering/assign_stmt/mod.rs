@@ -1,5 +1,5 @@
 use super::*;
-use crate::block_py::{Del, HasMeta, Meta, Store, WithMeta};
+use crate::block_py::{Del, HasMeta, Meta, Store, StoreLifetime, TakeOperand, WithMeta};
 use crate::passes::ast_to_ast::expr_utils::make_tuple;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
     try_lower_boolop_assign_direct, ScopedSetupExprLowerer,
@@ -21,18 +21,41 @@ pub(super) fn temp_load_expr<E: RuffToBlockPyExpr>(name: &str) -> E {
     )))
 }
 
+pub(super) fn take_temp<E: RuffToBlockPyExpr>(name: &str) -> E {
+    E::from_lowered_expr(
+        TakeOperand::<InstrRuff>::new(name)
+            .with_meta(Meta::synthetic())
+            .into(),
+    )
+}
+
 pub(super) fn bind_temp<E: RuffToBlockPyExpr>(
     out: &mut BlockPyStmtBuilder<E>,
     name: String,
     value: E,
 ) -> E {
+    let unwind_order = out.name_gen().next_temporary_sequence();
+    bind_temp_with_unwind_order(out, name, value, unwind_order)
+}
+
+pub(super) fn bind_temp_with_unwind_order<E: RuffToBlockPyExpr>(
+    out: &mut BlockPyStmtBuilder<E>,
+    name: String,
+    value: E,
+    unwind_order: u64,
+) -> E {
     let target = rhs_temp_name(&name);
     let meta = Meta::synthetic();
-    out.push_stmt(Store::new(target, value).with_meta(meta).into());
+    out.push_stmt(
+        Store::new(target, value)
+            .with_lifetime(StoreLifetime::Operand { unwind_order })
+            .with_meta(meta)
+            .into(),
+    );
     temp_load_expr(&name)
 }
 
-fn delete_temp<E: RuffToBlockPyExpr>(out: &mut BlockPyStmtBuilder<E>, name: String) {
+pub(super) fn delete_temp<E: RuffToBlockPyExpr>(out: &mut BlockPyStmtBuilder<E>, name: String) {
     let target = rhs_temp_name(&name);
     let meta = Meta::synthetic();
     out.push_stmt(Del::new(target, false).with_meta(meta).into());
@@ -87,14 +110,12 @@ where
                 is_forwardable_assignment_target_component(context, target.slice.as_ref());
             let object_value =
                 lower_target_object_with_setup(context, *target.value, out, loop_ctx)?;
-            let (object, object_temp_name) = if can_forward_object {
-                (object_value, None)
+            let object = if can_forward_object {
+                object_value
             } else {
                 let object_temp_name = context.fresh("assign_obj");
-                (
-                    bind_temp(out, object_temp_name.clone(), object_value),
-                    Some(object_temp_name),
-                )
+                bind_temp(out, object_temp_name.clone(), object_value);
+                take_temp(&object_temp_name)
             };
             let index_value =
                 crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
@@ -103,22 +124,17 @@ where
                     out,
                     loop_ctx,
                 )?;
-            let (index, index_temp_name) = if can_forward_index {
-                (index_value, None)
+            let index = if can_forward_index {
+                index_value
             } else {
                 let index_temp_name = context.fresh("assign_index");
-                (
-                    bind_temp(out, index_temp_name.clone(), index_value),
-                    Some(index_temp_name),
-                )
+                bind_temp(out, index_temp_name.clone(), index_value);
+                take_temp(&index_temp_name)
             };
+            // The native STORE_SUBSCR operation owns all three inputs. Move
+            // captured target operands now, so its key/container/RHS cleanup
+            // cannot leave extra temporary roots behind on either result edge.
             out.push_stmt(E::set_item(meta.node_index, meta.range, object, index, rhs));
-            if let Some(name) = index_temp_name {
-                delete_temp(out, name);
-            }
-            if let Some(name) = object_temp_name {
-                delete_temp(out, name);
-            }
             Ok(())
         }
         InstrRuff::ExprAttribute(target) => {
@@ -127,14 +143,12 @@ where
                 is_forwardable_assignment_target_component(context, target.value.as_ref());
             let object_value =
                 lower_target_object_with_setup(context, *target.value, out, loop_ctx)?;
-            let (object, object_temp_name) = if can_forward_object {
-                (object_value, None)
+            let object = if can_forward_object {
+                object_value
             } else {
                 let object_temp_name = context.fresh("assign_obj");
-                (
-                    bind_temp(out, object_temp_name.clone(), object_value),
-                    Some(object_temp_name),
-                )
+                bind_temp(out, object_temp_name.clone(), object_value);
+                take_temp(&object_temp_name)
             };
             out.push_stmt(E::set_attr(
                 meta.node_index,
@@ -143,9 +157,6 @@ where
                 target.attr.to_string(),
                 rhs,
             ));
-            if let Some(name) = object_temp_name {
-                delete_temp(out, name);
-            }
             Ok(())
         }
         InstrRuff::ExprName(name) => {
@@ -311,7 +322,7 @@ where
 {
     if let [InstrRuff::ExprName(target)] = stmt.targets.as_slice() {
         if let InstrRuff::ExprBoolOp(bool_op) = (*stmt.value).clone() {
-            let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
+            let lowerer = ScopedSetupExprLowerer::new(context);
             if let Some(lowered) = try_lower_boolop_assign_direct::<_, E>(
                 &lowerer,
                 out.name_gen(),
@@ -340,33 +351,35 @@ where
         name
     });
 
-    for target in stmt.targets.iter().cloned() {
-        lower_assignment_target_into(context, target, value.clone(), out, loop_ctx)?;
-    }
-    if let Some(name) = value_temp_name {
-        delete_temp(out, name);
+    for (index, target) in stmt.targets.iter().cloned().enumerate() {
+        let target_value = if let Some(name) = &value_temp_name {
+            if index + 1 == stmt.targets.len() {
+                take_temp(name)
+            } else {
+                // Native chained assignment executes COPY before evaluating
+                // each nonfinal target. Give that duplicate its own Operand
+                // primary so a borrowed target input cannot erase the edge.
+                let copy_name = context.fresh("assign_copy");
+                bind_temp(out, copy_name.clone(), value.clone());
+                take_temp(&copy_name)
+            }
+        } else {
+            value.clone()
+        };
+        lower_assignment_target_into(context, target, target_value, out, loop_ctx)?;
     }
 
     Ok(())
 }
 
-pub(crate) fn build_for_target_assign_body(
-    target: InstrRuff,
-    rhs: InstrRuff,
-    tmp_name: &str,
-) -> Vec<InstrRuff> {
-    let tmp_name_expr = |ctx| {
-        crate::passes::ast_to_instr::from_ast_expr(Expr::Name(ast::ExprName {
-            id: rhs_temp_name(tmp_name),
-            ctx,
-            range: Default::default(),
-            node_index: Default::default(),
-        }))
-    };
-    vec![
-        crate::block_py::StmtAssign::new(vec![target], rhs).into(),
-        crate::block_py::StmtDelete::new(vec![tmp_name_expr(ast::ExprContext::Del)]).into(),
-    ]
+pub(crate) fn build_for_target_assign_body(target: InstrRuff, tmp_name: &str) -> Vec<InstrRuff> {
+    // The assignment consumes the one fetched-item owner, including if its
+    // target raises. Loading then deleting would add a second callback-visible
+    // owner and leave an artificial frame root on target failure.
+    let rhs: InstrRuff = crate::block_py::TakeOperand::new(tmp_name)
+        .with_meta(Meta::synthetic())
+        .into();
+    vec![crate::block_py::StmtAssign::new(vec![target], rhs).into()]
 }
 
 pub(super) fn with_target_object_expr(value: Expr) -> Expr {

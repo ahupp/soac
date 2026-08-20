@@ -19,15 +19,10 @@ pub fn compute_soac_build_identity(repo_root: &std::path::Path) -> std::io::Resu
     }
 
     let mut paths = Vec::new();
-    for relative in [
-        "Cargo.toml",
-        "Cargo.lock",
-        "crates/soac_lowering",
-        "crates/soac_jit",
-        "crates/soac_macros",
-        "crates/soac_pyo3",
-        "crates/soac_jit_runtime",
-    ] {
+    // Cache/precompile identity must cover semantic decisions before codegen,
+    // including source validation and typed optimization. Enumerating a few
+    // codegen crates silently omitted new and existing compiler stages.
+    for relative in ["Cargo.toml", "Cargo.lock", "crates"] {
         collect_identity_paths(&repo_root.join(relative), &mut paths)?;
     }
     paths.sort();
@@ -76,7 +71,28 @@ pub fn find_vendored_python_shared_lib_name(
 }
 
 pub fn vendored_python_lib_dir(repo_root: &std::path::Path) -> std::path::PathBuf {
-    repo_root.join("vendor").join("cpython")
+    println!("cargo:rerun-if-env-changed=CPYTHON_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=CPYTHON_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=CPYTHON_SOURCE_DIR");
+    python_lib_dir_from_options(
+        repo_root,
+        std::env::var_os("CPYTHON_LIB_DIR"),
+        std::env::var_os("CPYTHON_BUILD_DIR"),
+        std::env::var_os("CPYTHON_SOURCE_DIR"),
+    )
+}
+
+fn python_lib_dir_from_options(
+    repo_root: &std::path::Path,
+    library_dir: Option<std::ffi::OsString>,
+    build_dir: Option<std::ffi::OsString>,
+    source_dir: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    library_dir
+        .or(build_dir)
+        .or(source_dir)
+        .map(|path| repo_root.join(path))
+        .unwrap_or_else(|| repo_root.join("vendor").join("cpython"))
 }
 
 fn find_python_shared_lib_name(dir: &std::path::Path) -> Option<String> {
@@ -168,7 +184,63 @@ impl StableHasher {
 
 #[cfg(test)]
 mod tests {
-    use super::find_python_shared_lib_name;
+    use super::{
+        compute_soac_build_identity, find_python_shared_lib_name, python_lib_dir_from_options,
+    };
+
+    #[test]
+    fn build_identity_tracks_source_validation_and_compiler_semantics() {
+        let repo = std::env::temp_dir().join(format!(
+            "soac-build-support-compiler-identity-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut previous = compute_soac_build_identity(&repo).unwrap();
+        for relative in [
+            "crates/soac_source/src/literals.rs",
+            "crates/soac_core/src/block_py/mod.rs",
+            "crates/soac_opt/src/typed/mod.rs",
+            "crates/soac_ir_typed/src/lib.rs",
+            "crates/soac_driver/src/blockpy_cache.rs",
+        ] {
+            let path = repo.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"first compiler implementation").unwrap();
+            let added = compute_soac_build_identity(&repo).unwrap();
+            assert_ne!(added, previous, "new compiler source {relative}");
+            std::fs::write(&path, b"changed compiler implementation").unwrap();
+            let changed = compute_soac_build_identity(&repo).unwrap();
+            assert_ne!(changed, added, "changed compiler source {relative}");
+            previous = changed;
+        }
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn resolves_out_of_tree_python_library_without_changing_source_defaults() {
+        let repo = std::path::Path::new("/shared/soac");
+        assert_eq!(
+            python_lib_dir_from_options(repo, None, None, None),
+            repo.join("vendor/cpython")
+        );
+        assert_eq!(
+            python_lib_dir_from_options(repo, None, Some("/guest/cpython-build".into()), None),
+            std::path::Path::new("/guest/cpython-build")
+        );
+        assert_eq!(
+            python_lib_dir_from_options(
+                repo,
+                Some("work/explicit-python".into()),
+                Some("/guest/cpython-build".into()),
+                Some("/shared/pinned-source".into()),
+            ),
+            repo.join("work/explicit-python")
+        );
+        assert_eq!(
+            python_lib_dir_from_options(repo, None, None, Some("/shared/pinned-source".into())),
+            std::path::Path::new("/shared/pinned-source")
+        );
+    }
 
     #[test]
     fn selects_versioned_libpython_instead_of_abi_compatibility_stub() {

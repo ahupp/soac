@@ -1,5 +1,6 @@
 #![deny(unreachable_pub)]
 
+use soac_core::block_py::{BuildCollection, CallArgumentOp, IteratorStep, PreparedCall};
 mod constructor_entries;
 mod instr_id;
 
@@ -8,10 +9,15 @@ pub(crate) mod block_py {
 }
 
 use crate::block_py::{
-    BinOp, Block, BlockPyFormat, Call, CellRef, ChildVisitable, ConstantExpr, Del, DelItem,
+    ApplyClassDecorator, ApplyFunctionDescriptor, BinOp, Block, BlockPyFormat, Call, CellRef,
+    CheckAnnotationFormat, ChildVisitable, CompleteFunctionDefinition, ComprehensionInsert,
+    ConstantExpr, ConstructClass, ConstructTypeParameterScope, CreateTypeAlias,
+    CreateTypeParameter, Del, DelItem, DiscardClassConstructionCaptures, DiscardClassDecorator,
     GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrWithConstantNone, Load, MakeCell,
-    MakeFunctionWithClosure, MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName,
-    SetAttr, SetItem, Store, TryMapInstr, Tuple, UnaryOp, WithMeta,
+    MakeFunctionWithClosure, MapInstr, Mappable, Meta, ModuleShape, NameLike, NewAnnotationSet,
+    PrepareClassDecorator, RecordAnnotation, ResolvedName, SetAttr, SetFunctionTypeParameters,
+    SetItem, SetTypeParameterDefault, SetupAnnotations, Store, SubscriptGeneric, TakeOperand,
+    TryMapInstr, Tuple, UnaryOp, WithMeta,
 };
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
 
@@ -61,10 +67,42 @@ pub enum InstrBlockPy {
     Load(#[rkyv(omit_bounds)] Load<Self>),
     Store(#[rkyv(omit_bounds)] Store<Self>),
     Del(#[rkyv(omit_bounds)] Del<Self>),
+    TakeOperand(#[rkyv(omit_bounds)] TakeOperand<Self>),
+    ComprehensionInsert(#[rkyv(omit_bounds)] ComprehensionInsert<Self>),
+    BuildCollection(#[rkyv(omit_bounds)] BuildCollection<Self>),
+    CallArgumentOp(#[rkyv(omit_bounds)] CallArgumentOp<Self>),
+    PreparedCall(#[rkyv(omit_bounds)] PreparedCall<Self>),
+    IteratorStep(#[rkyv(omit_bounds)] IteratorStep<Self>),
     MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
+    NewAnnotationSet(#[rkyv(omit_bounds)] NewAnnotationSet<Self>),
+    SetupAnnotations(#[rkyv(omit_bounds)] SetupAnnotations<Self>),
+    ConstructTypeParameterScope(#[rkyv(omit_bounds)] ConstructTypeParameterScope<Self>),
+    SubscriptGeneric(#[rkyv(omit_bounds)] SubscriptGeneric<Self>),
+    SetFunctionTypeParameters(#[rkyv(omit_bounds)] SetFunctionTypeParameters<Self>),
+    CreateTypeAlias(#[rkyv(omit_bounds)] CreateTypeAlias<Self>),
+    CreateTypeParameter(#[rkyv(omit_bounds)] CreateTypeParameter<Self>),
+    SetTypeParameterDefault(#[rkyv(omit_bounds)] SetTypeParameterDefault<Self>),
+    CheckAnnotationFormat(#[rkyv(omit_bounds)] CheckAnnotationFormat<Self>),
+    RecordAnnotation(#[rkyv(omit_bounds)] RecordAnnotation<Self>),
     IncrementCounter(IncrementCounter),
     CellRef(CellRef),
     MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
+    CompleteFunctionDefinition(#[rkyv(omit_bounds)] CompleteFunctionDefinition<Self>),
+    ApplyFunctionDescriptor(#[rkyv(omit_bounds)] ApplyFunctionDescriptor<Self>),
+    PrepareClassDecorator(#[rkyv(omit_bounds)] PrepareClassDecorator<Self>),
+    ApplyClassDecorator(#[rkyv(omit_bounds)] ApplyClassDecorator<Self>),
+    DiscardClassDecorator(#[rkyv(omit_bounds)] DiscardClassDecorator<Self>),
+    DiscardClassConstructionCaptures(#[rkyv(omit_bounds)] DiscardClassConstructionCaptures<Self>),
+    ConstructClass(#[rkyv(omit_bounds)] ConstructClass<Self>),
+}
+
+impl soac_core::block_py::TakeOperandInstruction for InstrBlockPy {
+    fn as_take_operand(&self) -> Option<&TakeOperand<Self>> {
+        match self {
+            Self::TakeOperand(op) => Some(op),
+            _ => None,
+        }
+    }
 }
 
 impl Instr for InstrBlockPy {
@@ -85,7 +123,7 @@ pub struct BlockPyModuleShape;
 impl ModuleShape for BlockPyModuleShape {
     type Instr = InstrBlockPy;
     type ModuleConstant = ConstantExpr;
-    type BlockExtra = ();
+    type BlockExtra = soac_core::block_py::BlockContext;
 }
 
 impl BlockPyFormat for BlockPyModuleShape {

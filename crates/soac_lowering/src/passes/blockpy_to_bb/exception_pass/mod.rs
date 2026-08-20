@@ -4,6 +4,11 @@ use crate::block_py::{
 use crate::passes::ruff_to_blockpy::populate_exception_edge_args;
 use crate::passes::ResolvedStorageModuleShape;
 
+mod operand_cleanup;
+mod pending_cleanup;
+mod transport_lifetime;
+mod transport_storage;
+
 pub(crate) fn lower_try_jump_exception_flow(
     module: &BlockPyModule<ResolvedStorageModuleShape>,
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
@@ -15,6 +20,7 @@ pub(crate) fn lower_try_jump_exception_flow(
         .collect();
     BlockPyModule {
         module_name_gen: module.module_name_gen.clone(),
+        strict_source: module.strict_source.clone(),
         global_names: module.global_names.clone(),
         callable_defs,
         module_constants: module.module_constants.clone(),
@@ -46,6 +52,15 @@ fn lower_function_try_jump_exception_flow(
     // allows the JIT fast path to dispatch exceptions directly from each step.
     split_exception_blocks_for_expr_checks(&mut function);
     populate_exception_edge_args(&mut function.blocks);
+    pending_cleanup::materialize_pending_payload_unwinds(&mut function);
+    // A return operand may have moved into an explicit store before its
+    // pending-payload unwind. New edges already carry their complete args.
+    split_exception_blocks_for_expr_checks(&mut function);
+    operand_cleanup::materialize_operand_unwinds(&mut function);
+    // Pending-unwind construction can add an explicit escaping exception
+    // parameter. Record it before the transport pass retires/consumes copies.
+    crate::passes::block_parameter_roles::record_resolved_block_parameter_roles(&mut function);
+    transport_lifetime::retire_exception_transports(&mut function);
 
     function
 }
@@ -73,13 +88,15 @@ fn split_exception_blocks_for_expr_checks(
 
             if ends_segment {
                 let next_label = function.name_gen.next_block_name();
+                let mut prefix_context = block.extra;
+                prefix_context.suspension_resume = None;
                 out.push(ResolvedStorageBlock {
                     label: current_label,
                     body: std::mem::take(&mut segment_ops),
                     term: BlockTerm::Jump(BlockEdge::new(next_label)),
                     params: segment_params.clone(),
                     exc_edge: exc_edge.clone(),
-                    extra: Default::default(),
+                    extra: prefix_context,
                 });
                 current_label = next_label;
             }
@@ -91,7 +108,7 @@ fn split_exception_blocks_for_expr_checks(
                     term: block.term.clone(),
                     params: segment_params.clone(),
                     exc_edge: exc_edge.clone(),
-                    extra: Default::default(),
+                    extra: block.extra,
                 });
             }
         }
@@ -101,7 +118,10 @@ fn split_exception_blocks_for_expr_checks(
 }
 
 fn op_updates_exception_state(op: &InstrResolved) -> bool {
-    matches!(op, InstrResolved::Store(_) | InstrResolved::Del(_))
+    matches!(
+        op,
+        InstrResolved::Store(_) | InstrResolved::Del(_) | InstrResolved::TakeOperand(_)
+    )
 }
 
 #[cfg(test)]

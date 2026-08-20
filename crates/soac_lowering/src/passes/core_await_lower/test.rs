@@ -20,9 +20,10 @@ fn lowers_await_to_yield_from_await_iter() {
         )),
         params: Vec::new(),
         exc_edge: None,
-        extra: (),
+        extra: soac_core::block_py::BlockContext::default(),
     };
     let module = BlockPyModule {
+        strict_source: None,
         module_name_gen: crate::block_py::ModuleNameGen::new(0),
         global_names: Vec::new(),
         callable_defs: vec![BlockPyFunction {

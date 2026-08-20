@@ -19,7 +19,7 @@ use crate::plan_v3::{
     OpaqueFusedGuardInput, OpaqueFusedSite, OpaqueFusedSiteOwner, OpaqueFusedYieldEdgePlan,
     OpaqueFusedYieldTarget,
 };
-use soac_core::block_py::{InstrId, SerializedFunctionId};
+use soac_core::block_py::{CellLoadBinding, InstrId, ResolvedName, SerializedFunctionId};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -59,6 +59,11 @@ pub struct MechanicalRegionInput<'a> {
 pub enum MechanicalRegionInputSource<'a> {
     FunctionParam {
         name: &'a str,
+    },
+    CellValue {
+        source: InstrId,
+        name: &'a ResolvedName,
+        binding: &'a CellLoadBinding,
     },
     ModuleConstant {
         index: u32,
@@ -414,6 +419,19 @@ pub fn mechanical_region_inputs<'a>(
                 name: Some(name), ..
             } if input.value.rep == Rep::PyObjectBorrowed => {
                 MechanicalRegionInputSource::FunctionParam { name }
+            }
+            RegionInputSource::CellValue {
+                source,
+                name,
+                binding,
+            } if matches!(input.value.rep, Rep::PyObjectBorrowed | Rep::PyObjectOwned)
+                && name.cell_location().is_some() =>
+            {
+                MechanicalRegionInputSource::CellValue {
+                    source: *source,
+                    name,
+                    binding,
+                }
             }
             RegionInputSource::ModuleConstant { index } => {
                 if input.value.rep != Rep::PyObjectBorrowed {
@@ -1029,6 +1047,9 @@ fn validate_region_inputs_supported_by_current_lowering_v3(
                 if input.value.rep == Rep::PyObjectBorrowed || input.value.rep == Rep::I64 => {}
             RegionInputSource::ModuleConstant { .. }
                 if input.value.rep == Rep::PyObjectBorrowed => {}
+            RegionInputSource::CellValue { name, .. }
+                if matches!(input.value.rep, Rep::PyObjectBorrowed | Rep::PyObjectOwned)
+                    && name.cell_location().is_some() => {}
             RegionInputSource::IndexedGlobal { .. }
                 if input.value.rep == Rep::PyObjectBorrowed
                     || input.value.rep == Rep::PyObjectOwned => {}
@@ -1043,7 +1064,7 @@ fn validate_region_inputs_supported_by_current_lowering_v3(
             }
             source => {
                 return Err(format!(
-                    "function {function} region {:?} input {:?} has unsupported source {source:?}; current mechanical lowering only supports named function-param inputs, module constants, indexed globals, and indexed fields",
+                    "function {function} region {:?} input {:?} has unsupported source {source:?}; current mechanical lowering only supports named function-param inputs, resolved cell values, module constants, indexed globals, and indexed fields",
                     region.id, input.value.id
                 ));
             }

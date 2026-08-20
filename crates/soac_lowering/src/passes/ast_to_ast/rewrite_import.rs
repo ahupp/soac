@@ -31,7 +31,7 @@ pub(crate) fn rewrite(ast::StmtImport { names, .. }: ast::StmtImport) -> Rewrite
                     .expect("failed to parse rewritten dotted import")
                     .into_syntax()
                     .body;
-                body
+                Vec::from(body)
             } else {
                 vec![py_stmt!(
                     "{name:id} = __soac__.import_({module:literal}, globals())",
@@ -64,7 +64,7 @@ pub(crate) fn rewrite_from(context: &Context, import_from: ast::StmtImportFrom) 
             .expect("failed to parse rewritten import-star")
             .into_syntax()
             .body;
-        return Rewrite::Walk(body);
+        return Rewrite::Walk(body.into());
     }
     let module_name = module.as_ref().map(|n| n.id.as_str()).unwrap_or("");
     let temp_binding = context.fresh("import");

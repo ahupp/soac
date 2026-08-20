@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import os
@@ -7,18 +6,30 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from math import ceil
 from pathlib import Path
 from threading import Lock
 
-
 REPO_ROOT = Path(os.environ["REPO_ROOT"])
 VENV_PYTHON = Path(os.environ["VENV_DIR"]) / "bin" / "python"
 LOGS_DIR = REPO_ROOT / "work" / "logs"
-MIN_BATCH_NODEIDS = 16
+MAX_BATCH_NODEIDS = 4
+# These reviewed compatibility tests run several subprocess phases or validate
+# multiple authenticated modules per node. Give each selected node its own
+# unchanged batch timeout instead of sharing it with neighboring tests.
+SINGLETON_NODE_GROUPS = frozenset(
+    {
+        "tests/test_counter_dump_file.py::"
+        "test_profiled_full_nqueens_slice_preserves_results_mutations_and_ordinary_tracing",
+        "tests/test_counter_dump_file.py::"
+        "test_profiled_pyperformance_nqueens_preserves_rebinding_and_ordinary_tracing",
+        "tests/test_closed_iterator_pipeline.py::"
+        "test_reviewed_closed_pipelines_use_authenticated_entries",
+    }
+)
 
 
 @dataclass
@@ -48,17 +59,60 @@ class ActiveBatch:
 class BatchMonitor:
     def __init__(self) -> None:
         self._active: dict[int, ActiveBatch] = {}
+        self._processes: dict[int, subprocess.Popen[str]] = {}
         self._lock = Lock()
+        self._process_lock = Lock()
+        self.cancelled = False
+        self.interrupted_by: int | None = None
 
-    def start(self, batch: ActiveBatch) -> None:
-        with self._lock:
-            self._active[batch.batch_id] = batch
+    def request_cancel(self, signum: int | None = None) -> None:
+        # The signal handler must not wait for a worker's in-flight Popen.
+        self.cancelled = True
+        if signum is not None and self.interrupted_by is None:
+            self.interrupted_by = signum
+
+    def launch(
+        self, cmd: list[str], batch: PytestBatch, batch_id: int, start_s: float
+    ) -> subprocess.Popen[str] | None:
+        # Serialize the cancellation boundary with process publication. A launch
+        # already in progress must publish its group before stop() can finish.
+        with self._process_lock:
+            if self.cancelled:
+                return None
+            proc = subprocess.Popen(
+                cmd,
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            self._processes[batch_id] = proc
+            with self._lock:
+                self._active[batch_id] = ActiveBatch(
+                    batch_id, batch.label, len(batch.selectors), proc.pid, start_s
+                )
+            return proc
 
     def finish(self, batch_id: int) -> None:
-        with self._lock:
-            self._active.pop(batch_id, None)
+        with self._process_lock:
+            proc = self._processes.pop(batch_id, None)
+        try:
+            if proc is not None:
+                terminate_process_group(proc)
+        finally:
+            with self._lock:
+                self._active.pop(batch_id, None)
+
+    def stop(self) -> None:
+        self.request_cancel()
+        with self._process_lock:
+            processes = list(self._processes.values())
+            self._processes.clear()
+        terminate_process_groups(processes)
 
     def snapshot(self) -> list[ActiveBatch]:
+        # Progress reporting must not block on a worker launching a process.
         with self._lock:
             return sorted(self._active.values(), key=lambda batch: batch.start_s)
 
@@ -112,6 +166,7 @@ def collect_test_nodeids(args: list[str]) -> tuple[int, list[str], str]:
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        check=False,
     )
     output = proc.stdout + proc.stderr
     if proc.returncode != 0:
@@ -190,6 +245,10 @@ def make_file_batches(
         current_selectors.clear()
 
     for unit in units:
+        if node_group_key(unit.selectors[0]) in SINGLETON_NODE_GROUPS:
+            flush_current_batch()
+            batches.extend(PytestBatch(nodeid, [nodeid]) for nodeid in unit.selectors)
+            continue
         if (
             current_selectors
             and len(current_selectors) + len(unit.selectors) > target_batch_size
@@ -203,7 +262,10 @@ def make_file_batches(
 
 
 def make_nodeid_batches(nodeids: list[str], jobs: int) -> list[PytestBatch]:
-    target_batch_size = max(MIN_BATCH_NODEIDS, ceil(len(nodeids) / jobs))
+    # A suite-wide proportional batch grows without bound as tests are added.
+    # Keep the timeout's unit bounded independently of the collected suite;
+    # small selections may still use smaller batches to occupy the workers.
+    target_batch_size = min(MAX_BATCH_NODEIDS, max(1, ceil(len(nodeids) / jobs)))
     file_nodeids: dict[str, list[str]] = {}
     for nodeid in nodeids:
         file_nodeids.setdefault(node_file_path(nodeid), []).append(nodeid)
@@ -227,26 +289,49 @@ def pytest_cmd(args: list[str]) -> list[str]:
     ]
 
 
-def terminate_process_group(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
+def signal_process_group(proc: subprocess.Popen[str], signum: int) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(proc.pid, signum)
     except ProcessLookupError:
-        return
-    except PermissionError:
-        proc.terminate()
-    try:
-        proc.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
     except PermissionError:
-        proc.kill()
+        proc.send_signal(signum)
+
+
+def process_group_exists(proc: subprocess.Popen[str]) -> bool:
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def terminate_process_groups(processes: list[subprocess.Popen[str]]) -> None:
+    # A leader may already have exited while descendants still own the pipes.
+    # Signal every group before waiting, so cancellation has one grace period,
+    # not one grace period per worker.
+    for proc in processes:
+        signal_process_group(proc, signal.SIGTERM)
+    remaining = processes
+    deadline = time.monotonic() + 5
+    while remaining:
+        for proc in remaining:
+            proc.poll()
+        remaining = [proc for proc in remaining if process_group_exists(proc)]
+        delay = deadline - time.monotonic()
+        if not remaining or delay <= 0:
+            break
+        time.sleep(min(0.05, delay))
+    for proc in remaining:
+        signal_process_group(proc, signal.SIGKILL)
+    for proc in processes:
+        proc.wait()
+
+
+def terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    terminate_process_groups([proc])
 
 
 def process_exists(pid: int) -> bool:
@@ -320,7 +405,11 @@ def run_gdb_stack_capture(pid: int) -> tuple[int, str]:
     if gdb is None:
         return 127, "gdb not found; install gdb before capturing native stacks\n"
 
-    python_gdb = REPO_ROOT / "vendor" / "cpython" / "python-gdb.py"
+    python_gdb = (
+        REPO_ROOT
+        / os.environ.get("CPYTHON_SOURCE_DIR", "vendor/cpython")
+        / "Tools" / "gdb" / "libpython.py"
+    )
     commands = [
         "set pagination off",
         "set confirm off",
@@ -346,9 +435,15 @@ def run_gdb_stack_capture(pid: int) -> tuple[int, str]:
             capture_output=True,
             text=True,
             timeout=20,
+            check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
+        # TimeoutExpired retains partial bytes even when text=True. A timeout
+        # can also split an encoded character, so diagnostics must be tolerant.
+        output = "".join(
+            part.decode("utf-8", errors="replace") if isinstance(part, bytes) else part or ""
+            for part in (exc.stdout, exc.stderr)
+        )
         output += "\ngdb stack capture timed out after 20s\n"
         return 124, output
     return proc.returncode, proc.stdout + proc.stderr
@@ -407,26 +502,12 @@ def run_pytest(
     batch_id: int,
     timeout_s: float,
     monitor: BatchMonitor,
-) -> RunResult:
+) -> RunResult | None:
     cmd = pytest_cmd(args)
     start = time.monotonic()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=REPO_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    monitor.start(
-        ActiveBatch(
-            batch_id=batch_id,
-            label=batch.label,
-            selector_count=len(batch.selectors),
-            pid=proc.pid,
-            start_s=start,
-        )
-    )
+    proc = monitor.launch(cmd, batch, batch_id, start)
+    if proc is None:
+        return None
     timed_out = False
     try:
         stdout, stderr = proc.communicate(timeout=timeout_s if timeout_s > 0 else None)
@@ -438,7 +519,7 @@ def run_pytest(
             stack_path = capture_timeout_stacks(proc.pid, batch.label, timeout_s)
         except Exception as exc:  # noqa: BLE001 - timeout diagnostics must be best-effort.
             stack_error = f"{type(exc).__name__}: {exc}"
-        terminate_process_group(proc)
+        monitor.finish(batch_id)
         stdout, stderr = proc.communicate()
     finally:
         elapsed_s = time.monotonic() - start
@@ -489,12 +570,25 @@ def print_running_batches(active: list[ActiveBatch], now_s: float) -> None:
 
 
 def main(argv: list[str]) -> int:
+    require_batches = "--require-batch-runner" in argv
+    argv = [arg for arg in argv if arg != "--require-batch-runner"]
+    jobs_env = os.environ.get("PYTEST_NUMPROCS", "auto")
+    if require_batches and (
+        not argv
+        or any(not is_simple_selector(arg) for arg in argv)
+        or parse_jobs(jobs_env, 1) == 0
+    ):
+        print(
+            "[diet-python pytest] --require-batch-runner requires the batch runner: "
+            "pass file/node selectors without pytest options and enable PYTEST_NUMPROCS",
+            file=sys.stderr,
+        )
+        return 2
     if not argv:
         cmd = [str(VENV_PYTHON), "-m", "pytest", "--help"]
-        return subprocess.run(cmd, cwd=REPO_ROOT).returncode
+        return subprocess.run(cmd, cwd=REPO_ROOT, check=False).returncode
 
     tb = os.environ.get("PYTEST_TB", "native")
-    jobs_env = os.environ.get("PYTEST_NUMPROCS", "auto")
     batch_timeout_s = parse_nonnegative_float_env("SOAC_PYTEST_BATCH_TIMEOUT", 300.0)
     progress_interval_s = parse_nonnegative_float_env(
         "SOAC_PYTEST_PROGRESS_INTERVAL", 10.0
@@ -504,6 +598,7 @@ def main(argv: list[str]) -> int:
         return subprocess.run(
             pytest_cmd([f"--tb={tb}", *argv]),
             cwd=REPO_ROOT,
+            check=False,
         ).returncode
 
     collect_code, nodeids, collect_output = collect_test_nodeids([f"--tb={tb}", *argv])
@@ -511,9 +606,18 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(collect_output)
         return collect_code
     if not nodeids:
+        if require_batches:
+            sys.stdout.write(collect_output)
+            print(
+                "[diet-python pytest] --require-batch-runner requires the batch runner, "
+                "but collection produced no test nodeids",
+                file=sys.stderr,
+            )
+            return 5
         return subprocess.run(
             pytest_cmd([f"--tb={tb}", *argv]),
             cwd=REPO_ROOT,
+            check=False,
         ).returncode
 
     jobs = parse_jobs(jobs_env, max(1, len(nodeids)))
@@ -521,6 +625,7 @@ def main(argv: list[str]) -> int:
         return subprocess.run(
             pytest_cmd([f"--tb={tb}", *argv]),
             cwd=REPO_ROOT,
+            check=False,
         ).returncode
 
     batches = make_nodeid_batches(nodeids, jobs)
@@ -542,42 +647,73 @@ def main(argv: list[str]) -> int:
 
     results: list[RunResult] = []
     monitor = BatchMonitor()
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures: dict[Future[RunResult], PytestBatch] = {
-            pool.submit(
+    pool: ThreadPoolExecutor | None = None
+    futures: dict[Future[RunResult | None], PytestBatch] = {}
+    reported: set[Future[RunResult | None]] = set()
+    completed = False
+
+    def request_interruption(signum: int, _frame: object) -> None:
+        monitor.request_cancel(signum)
+
+    def report_result(future: Future[RunResult | None], *, cancelled: bool = False) -> None:
+        reported.add(future)
+        result = future.result()
+        if result is None:
+            return
+        results.append(result)
+        status = (
+            "CANCELLED"
+            if cancelled
+            else "TIMEOUT"
+            if result.timed_out
+            else "PASS"
+            if result.returncode == 0
+            else "FAIL"
+        )
+        print(f"[{status}] {result.selector} ({result.elapsed_s:.2f}s)")
+        if cancelled:
+            sys.stdout.write(result.output)
+            if result.output and not result.output.endswith("\n"):
+                print()
+        elif result.returncode != 0:
+            print_failure(result)
+
+    previous_handlers = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, request_interruption)
+        pool = ThreadPoolExecutor(max_workers=jobs)
+        for batch_id, batch in enumerate(batches):
+            if monitor.cancelled:
+                break
+            future = pool.submit(
                 run_pytest,
                 [f"--tb={tb}", *batch.selectors],
                 batch,
                 batch_id,
                 batch_timeout_s,
                 monitor,
-            ): batch
-            for batch_id, batch in enumerate(batches)
-        }
+            )
+            futures[future] = batch
         pending = set(futures)
         next_progress_s = time.monotonic() + progress_interval_s
-        while pending:
-            wait_timeout = None
+        while pending and not monitor.cancelled:
+            # Signals only latch cancellation; keep this wait bounded even when
+            # progress output is disabled so main can perform orderly shutdown.
+            wait_timeout = 0.1
             if progress_interval_s > 0:
-                wait_timeout = max(0.0, next_progress_s - time.monotonic())
+                wait_timeout = min(
+                    wait_timeout, max(0.0, next_progress_s - time.monotonic())
+                )
             done, pending = wait(
                 pending,
                 timeout=wait_timeout,
                 return_when=FIRST_COMPLETED,
             )
+            if monitor.cancelled:
+                break
             for future in done:
-                result = future.result()
-                results.append(result)
-                status = (
-                    "TIMEOUT"
-                    if result.timed_out
-                    else "PASS"
-                    if result.returncode == 0
-                    else "FAIL"
-                )
-                print(f"[{status}] {result.selector} ({result.elapsed_s:.2f}s)")
-                if result.returncode != 0:
-                    print_failure(result)
+                report_result(future)
             if progress_interval_s <= 0 or not pending:
                 continue
             now_s = time.monotonic()
@@ -585,6 +721,51 @@ def main(argv: list[str]) -> int:
                 print_running_batches(monitor.snapshot(), now_s)
                 while next_progress_s <= now_s:
                     next_progress_s += progress_interval_s
+        completed = not monitor.cancelled
+    finally:
+        cancelled = not completed or monitor.cancelled
+        # Close the launch gate before cancelling queued futures: a thread may
+        # already have taken a future out of the executor's queue.
+        monitor.request_cancel()
+        try:
+            if cancelled:
+                try:
+                    print("[diet-python pytest] stopping worker groups", flush=True)
+                except (OSError, ValueError):
+                    # A broken output pipe must not bypass process cleanup.
+                    pass
+            try:
+                if pool is not None:
+                    pool.shutdown(wait=False, cancel_futures=True)
+            finally:
+                try:
+                    monitor.stop()
+                finally:
+                    if pool is not None:
+                        pool.shutdown(wait=True, cancel_futures=True)
+            for future in futures:
+                if future in reported or future.cancelled():
+                    continue
+                try:
+                    report_result(future, cancelled=cancelled)
+                except Exception as exc:
+                    if not cancelled:
+                        raise
+                    # Keep the original main-thread exception or signal status,
+                    # while retaining any additional worker diagnostic.
+                    try:
+                        print(
+                            f"[diet-python pytest] worker error: {type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
+                    except (OSError, ValueError):
+                        pass
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+
+    if monitor.interrupted_by is not None:
+        return 128 + monitor.interrupted_by
 
     failed = [result for result in results if result.returncode != 0]
     passed = len(results) - len(failed)

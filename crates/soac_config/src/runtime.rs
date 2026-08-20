@@ -131,7 +131,6 @@ pub struct SoacEnvConfig {
     background_jit_enabled: bool,
     jit_bb_map_enabled: bool,
     jit_perf_helper_frames_enabled: bool,
-    precompiled_library_path: Option<PathBuf>,
     soac_exec_trace: Option<ExecTraceConfig>,
     soac_log: SoacLogConfig,
     soac_log_explicit: bool,
@@ -194,6 +193,11 @@ pub fn init_logging_with_config(config: &SoacEnvConfig) -> Result<(), String> {
 
 impl SoacEnvConfig {
     pub fn from_env() -> Result<Self, String> {
+        if env::var_os(SOAC_PRECOMPILED_LIBRARY_ENV).is_some() {
+            return Err(format!(
+                "{SOAC_PRECOMPILED_LIBRARY_ENV} is no longer supported; unset it: legacy AOT libraries do not authenticate strict template, policy, or native ABI identity"
+            ));
+        }
         let cranelift_opt_level = parse_optional_cranelift_opt_level(
             env_string(SOAC_CRANELIFT_OPT_LEVEL_ENV)?.as_deref(),
         )?;
@@ -212,7 +216,6 @@ impl SoacEnvConfig {
         let background_jit_enabled = env_bool(SOAC_BACKGROUND_JIT_ENV, true)?;
         let jit_bb_map_enabled = env_bool(SOAC_JIT_BB_MAP_ENV, false)?;
         let jit_perf_helper_frames_enabled = env_bool(SOAC_JIT_PERF_HELPER_FRAMES_ENV, false)?;
-        let precompiled_library_path = env_path(SOAC_PRECOMPILED_LIBRARY_ENV)?;
         let soac_exec_trace = env_string(SOAC_EXEC_TRACE_ENV)?
             .as_deref()
             .and_then(ExecTraceConfig::from_env_value);
@@ -234,7 +237,6 @@ impl SoacEnvConfig {
             background_jit_enabled,
             jit_bb_map_enabled,
             jit_perf_helper_frames_enabled,
-            precompiled_library_path,
             soac_exec_trace,
             soac_log,
             soac_log_explicit,
@@ -339,10 +341,6 @@ impl SoacEnvConfig {
         self.jit_perf_helper_frames_enabled
     }
 
-    pub fn precompiled_library_path(&self) -> Option<&Path> {
-        self.precompiled_library_path.as_deref()
-    }
-
     pub fn soac_exec_trace(&self) -> Option<&ExecTraceConfig> {
         self.soac_exec_trace.as_ref()
     }
@@ -375,7 +373,6 @@ impl Default for SoacEnvConfig {
             background_jit_enabled: true,
             jit_bb_map_enabled: false,
             jit_perf_helper_frames_enabled: false,
-            precompiled_library_path: None,
             soac_exec_trace: None,
             soac_log: SoacLogConfig {
                 filter: String::new(),
@@ -773,17 +770,15 @@ mod tests {
     }
 
     #[test]
-    fn env_config_loads_precompiled_library_path() {
+    fn env_config_rejects_retired_precompiled_library() {
         let _lock = env_lock().lock().unwrap();
         let _guards = clear_soac_config_env();
-        let _path = EnvVarGuard::set(SOAC_PRECOMPILED_LIBRARY_ENV, "/tmp/libsoac-precompiled.so");
-
-        let config = SoacEnvConfig::from_env().unwrap();
-
-        assert_eq!(
-            config.precompiled_library_path(),
-            Some(Path::new("/tmp/libsoac-precompiled.so"))
-        );
+        for value in ["/tmp/libsoac-precompiled.so", ""] {
+            let _path = EnvVarGuard::set(SOAC_PRECOMPILED_LIBRARY_ENV, value);
+            let error = SoacEnvConfig::from_env().unwrap_err();
+            assert!(error.contains(SOAC_PRECOMPILED_LIBRARY_ENV));
+            assert!(error.contains("no longer supported"));
+        }
     }
 
     #[test]

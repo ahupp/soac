@@ -384,6 +384,7 @@ impl ConstructorBuilder<'_> {
                 BlockTerm::Jump(_)
                 | BlockTerm::IfTerm(_)
                 | BlockTerm::BranchTable(_)
+                | BlockTerm::GeneratorReturn(_)
                 | BlockTerm::Raise(_) => {
                     self.reject("straightline field initializer used non-return terminator");
                 }
@@ -398,7 +399,9 @@ impl ConstructorBuilder<'_> {
                 .exc
                 .as_ref()
                 .is_some_and(|exc| self.instr_uses_self_or_alias(exc)),
-            BlockTerm::Return(value) => self.instr_uses_self_or_alias(value),
+            BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
+                self.instr_uses_self_or_alias(value)
+            }
         };
         if uses_self {
             self.reject("self used in terminator");
@@ -610,6 +613,7 @@ mod tests {
             RecordingPassTracker::new(),
             LoweringOptions {
                 runtime_names_as_globals: true,
+                ..Default::default()
             },
         )
         .expect("transform should succeed")

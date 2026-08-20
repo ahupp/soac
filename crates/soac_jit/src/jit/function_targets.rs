@@ -58,6 +58,15 @@ pub(super) fn collect_typed_call_direct_targets(
             {
                 self.out.insert(plan.init_function_id);
             }
+            if let InstrTyped::CallTyped(call) = expr
+                && let Some(target) = call
+                    .extra
+                    .source_call
+                    .as_ref()
+                    .and_then(|plan| plan.body_target.as_ref())
+            {
+                self.out.insert(target.function_id);
+            }
             if let InstrTyped::DirectCallableCallTyped(call) = expr {
                 match &call.guard {
                     TypedDirectCallableCallGuard::Function(guard) => {

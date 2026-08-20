@@ -10,8 +10,14 @@ use crate::passes::{BlockPyModuleShape, InstrBlockPy};
 use crate::typed::typed_expr_planned_pyobject_ownership;
 use soac_core::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
-    ChildVisitable, HasSemanticInstrId, InstrKey, LocalLocation, RuntimeFunctionId, Visit,
+    ChildVisitable, HasSemanticInstrId, InstrKey, LocalLocation, ModuleShape, RuntimeFunctionId,
+    Visit,
 };
+use soac_core::block_py::{visit_operand_takes, visit_term_operand_takes};
+// This lattice describes active Local owners only. Preserved owners retain
+// their distinct payload indices and are cleared by the shared move/cleanup
+// operations; never reinterpret those indices as local refcount slots.
+
 use soac_ir_typed::plan_v3::{IndexedFieldReceiverSource, RegionInputSource, RegionPlan};
 use soac_ir_typed::{
     FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockPyModuleShape,
@@ -23,6 +29,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub enum LocalRefState {
     Unbound,
     Borrowed,
+    /// The binding owns its value when non-null. Definite binding is a separate
+    /// fact: joining an owned value with an unbound path still needs cleanup.
     Owned,
     Immortal,
 }
@@ -37,6 +45,9 @@ impl LocalRefState {
 pub struct RefcountLocal {
     pub location: LocalLocation,
     pub name: String,
+    /// Expression-stack temporaries unwind before source locals, in reverse
+    /// acquisition order. Ordinary locals retain their existing slot order.
+    pub cleanup_order: (bool, u32),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -381,6 +392,7 @@ fn validate_function_refcount_plan(
                 RefcountLocal {
                     location,
                     name: name.clone(),
+                    cleanup_order: storage_layout.local_cleanup_order_key(location),
                 },
             )
         })
@@ -396,6 +408,7 @@ fn validate_function_refcount_plan(
         .collect::<HashMap<_, _>>();
     let local_liveness = compute_local_liveness(function, &location_by_name);
     let local_must_bound = compute_local_must_bound(function, &location_by_name);
+    let local_may_bound = compute_local_may_bound(function, &location_by_name);
     let owned_cell_locations = owned_cell_locations(function, &location_by_name);
     let block_labels = function
         .blocks
@@ -432,6 +445,7 @@ fn validate_function_refcount_plan(
             &target_params,
             &local_liveness,
             &local_must_bound,
+            &local_may_bound,
             block.label == entry_label,
             errors,
         );
@@ -474,6 +488,7 @@ fn validate_typed_function_refcount_plan(
                 RefcountLocal {
                     location,
                     name: name.clone(),
+                    cleanup_order: storage_layout.local_cleanup_order_key(location),
                 },
             )
         })
@@ -488,7 +503,10 @@ fn validate_typed_function_refcount_plan(
         .map(|block| (block.label, block.param_name_vec()))
         .collect::<HashMap<_, _>>();
     let local_liveness = compute_typed_local_liveness(function, &location_by_name);
-    let local_must_bound = compute_typed_local_must_bound(function, &location_by_name);
+    let local_must_bound =
+        compute_typed_local_must_bound(function, &location_by_name, &local_liveness);
+    let local_may_bound =
+        compute_typed_local_may_bound(function, &location_by_name, &local_liveness);
     let owned_cell_locations = typed_owned_cell_locations(function, &location_by_name);
     let computed_precise_entry_states;
     let precise_entry_states = if let Some(states) = precise_immortal_entry_states {
@@ -539,6 +557,7 @@ fn validate_typed_function_refcount_plan(
             &target_params,
             &local_liveness,
             &local_must_bound,
+            &local_may_bound,
             block.label == entry_label,
             precise_entry_states.get(&block.label),
             errors,
@@ -565,6 +584,7 @@ fn plan_function_refcounts(
                 RefcountLocal {
                     location,
                     name: name.clone(),
+                    cleanup_order: storage_layout.local_cleanup_order_key(location),
                 },
             )
         })
@@ -581,6 +601,7 @@ fn plan_function_refcounts(
         .collect::<HashMap<_, _>>();
     let local_liveness = compute_local_liveness(function, &location_by_name);
     let local_must_bound = compute_local_must_bound(function, &location_by_name);
+    let local_may_bound = compute_local_may_bound(function, &location_by_name);
     let owned_cell_locations = owned_cell_locations(function, &location_by_name);
 
     let blocks = function
@@ -599,6 +620,7 @@ fn plan_function_refcounts(
                     &target_params,
                     &local_liveness,
                     &local_must_bound,
+                    &local_may_bound,
                     block.label == entry_label,
                 ),
             )
@@ -607,7 +629,7 @@ fn plan_function_refcounts(
     FunctionRefcountPlan { blocks }
 }
 
-fn plan_typed_function_refcounts(
+pub(crate) fn plan_typed_function_refcounts(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
     precise_immortal_entry_states: Option<&TypedPreciseImmortalLocalEntryStates>,
@@ -627,6 +649,7 @@ fn plan_typed_function_refcounts(
                 RefcountLocal {
                     location,
                     name: name.clone(),
+                    cleanup_order: storage_layout.local_cleanup_order_key(location),
                 },
             )
         })
@@ -642,7 +665,10 @@ fn plan_typed_function_refcounts(
         .map(|block| (block.label, block.param_name_vec()))
         .collect::<HashMap<_, _>>();
     let local_liveness = compute_typed_local_liveness(function, &location_by_name);
-    let local_must_bound = compute_typed_local_must_bound(function, &location_by_name);
+    let local_must_bound =
+        compute_typed_local_must_bound(function, &location_by_name, &local_liveness);
+    let local_may_bound =
+        compute_typed_local_may_bound(function, &location_by_name, &local_liveness);
     let owned_cell_locations = typed_owned_cell_locations(function, &location_by_name);
     let computed_precise_entry_states;
     let precise_entry_states = if let Some(states) = precise_immortal_entry_states {
@@ -675,6 +701,7 @@ fn plan_typed_function_refcounts(
                     &target_params,
                     &local_liveness,
                     &local_must_bound,
+                    &local_may_bound,
                     block.label == entry_label,
                     precise_entry_states.get(&block.label),
                 ),
@@ -827,6 +854,12 @@ fn transfer_typed_precise_immortal_state_through_block(
 ) -> HashMap<LocalLocation, LocalRefState> {
     let mut state = entry_state.clone();
     for instr in &block.body {
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            state.remove(&location);
+        });
         match instr {
             InstrTyped::Store(op) => {
                 let Some(location) = typed_store_binding_location(op, owned_cell_locations) else {
@@ -843,9 +876,22 @@ fn transfer_typed_precise_immortal_state_through_block(
                     state.remove(&location);
                 }
             }
+            InstrTyped::CallArgumentOp(op) => {
+                for name in op.written_names() {
+                    if let Some(location) = name.local_location() {
+                        state.remove(&location);
+                    }
+                }
+            }
             _ => {}
         }
     }
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        state.remove(&location);
+    });
     state
 }
 
@@ -1039,7 +1085,164 @@ pub fn compute_typed_function_local_must_bound_ins(
         .iter()
         .map(|block| block.label)
         .collect::<Vec<_>>();
-    compute_typed_local_must_bound(function, &location_by_name).into_hash_map(&labels)
+    let live_ins = compute_typed_local_liveness(function, &location_by_name);
+    compute_typed_local_must_bound(function, &location_by_name, &live_ins).into_hash_map(&labels)
+}
+
+pub(super) fn compute_function_local_may_bound_ins(
+    function: &BlockPyFunction<BlockPyModuleShape>,
+) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
+    let Some(layout) = function.storage_layout().as_ref() else {
+        return HashMap::new();
+    };
+    let locations = layout
+        .stack_slots()
+        .iter()
+        .enumerate()
+        .map(|(slot, name)| {
+            (
+                name.clone(),
+                LocalLocation(u32::try_from(slot).expect("local slot fits u32")),
+            )
+        })
+        .collect();
+    compute_local_may_bound(function, &locations)
+        .into_iter()
+        .map(|(label, state)| (label, state.to_hash_set()))
+        .collect()
+}
+
+pub(super) fn compute_typed_function_local_may_bound_ins(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
+    let Some(layout) = function.storage_layout().as_ref() else {
+        return HashMap::new();
+    };
+    let locations = layout
+        .stack_slots()
+        .iter()
+        .enumerate()
+        .map(|(slot, name)| {
+            (
+                name.clone(),
+                LocalLocation(u32::try_from(slot).expect("local slot fits u32")),
+            )
+        })
+        .collect();
+    let live_ins = compute_typed_local_liveness(function, &locations);
+    compute_typed_local_may_bound(function, &locations, &live_ins)
+        .into_iter()
+        .map(|(label, state)| (label, state.to_hash_set()))
+        .collect()
+}
+
+fn transfer_call_argument_ref_state<
+    I: soac_core::block_py::Instr<Name = soac_core::block_py::ResolvedName>,
+>(
+    op: &soac_core::block_py::CallArgumentOp<I>,
+    state: &mut HashMap<LocalLocation, LocalRefState>,
+) {
+    // Buffer replacement is atomic backend ownership, not an inserted rebind.
+    for name in op.written_names() {
+        if let Some(location) = name.local_location() {
+            state.insert(location, LocalRefState::Owned);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LocalBindingEffect {
+    Set(LocalLocation, bool),
+}
+
+impl LocalBindingEffect {
+    fn apply(self, state: &mut LocalBitSet) {
+        let Self::Set(target, bound) = self;
+        if bound {
+            state.insert(target);
+        } else {
+            state.remove(target);
+        }
+    }
+}
+
+fn join_operand_prefix_state(left: LocalRefState, right: LocalRefState) -> LocalRefState {
+    match (left, right) {
+        (LocalRefState::Owned, _) | (_, LocalRefState::Owned) => LocalRefState::Owned,
+        (LocalRefState::Unbound, state) | (state, LocalRefState::Unbound) => state,
+        (LocalRefState::Immortal, LocalRefState::Immortal) => LocalRefState::Immortal,
+        _ => LocalRefState::Borrowed,
+    }
+}
+
+fn remember_operand_failure_prefix(
+    location: LocalLocation,
+    env: &HashMap<LocalLocation, LocalRefState>,
+    prefixes: &mut HashMap<LocalLocation, LocalRefState>,
+) {
+    let state = env
+        .get(&location)
+        .copied()
+        .unwrap_or(LocalRefState::Unbound);
+    prefixes
+        .entry(location)
+        .and_modify(|old| *old = join_operand_prefix_state(*old, state))
+        .or_insert(state);
+}
+
+/// Only consumed Operand slots need this additional prefix join. An earlier
+/// sibling can fail before its take, even when the successful expression clears
+/// it. Never replace the ordinary source-binding ownership state with a broad
+/// join of borrowed entry parameters and later owned source assignments.
+fn exception_env_with_operand_prefixes(
+    env: &HashMap<LocalLocation, LocalRefState>,
+    prefixes: &HashMap<LocalLocation, LocalRefState>,
+) -> HashMap<LocalLocation, LocalRefState> {
+    let mut exceptional = env.clone();
+    for (&location, &prefix) in prefixes {
+        exceptional
+            .entry(location)
+            .and_modify(|state| *state = join_operand_prefix_state(*state, prefix))
+            .or_insert(prefix);
+    }
+    exceptional
+}
+
+fn typed_location_requires_operand_owner(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    location: LocalLocation,
+) -> bool {
+    struct Find {
+        location: LocalLocation,
+        found: bool,
+    }
+    impl Visit<InstrTyped> for Find {
+        fn visit_instr(&mut self, instr: &InstrTyped) {
+            if self.found {
+                return;
+            }
+            self.found = match instr {
+                InstrTyped::TakeOperand(op) => op.name.local_location() == Some(self.location),
+                InstrTyped::ComprehensionInsert(op) => {
+                    op.container.local_location() == Some(self.location)
+                }
+                InstrTyped::IteratorStep(op) => op.name.local_location() == Some(self.location),
+                InstrTyped::CallArgumentOp(op) => op
+                    .read_names()
+                    .any(|name| name.local_location() == Some(self.location)),
+                _ => false,
+            };
+            if !self.found {
+                instr.visit_children(self);
+            }
+        }
+    }
+    let mut find = Find {
+        location,
+        found: false,
+    };
+    find.visit_fn(function);
+    find.found
 }
 
 fn plan_block_refcounts(
@@ -1052,11 +1255,15 @@ fn plan_block_refcounts(
     target_params: &HashMap<BlockLabel, Vec<String>>,
     local_liveness: &LocalLiveness,
     local_must_bound: &LocalMustBound,
+    local_may_bound: &LocalMayBound,
     is_entry_block: bool,
 ) -> BlockRefcountPlan {
     let empty_must_bound = LocalBitSet::empty(locals.len());
     let must_bound_on_entry = local_must_bound
         .live_in(block.label)
+        .unwrap_or(&empty_must_bound);
+    let may_bound_on_entry = local_may_bound
+        .get(&block.label)
         .unwrap_or(&empty_must_bound);
     let mut env = initial_block_env(
         function,
@@ -1065,11 +1272,25 @@ fn plan_block_refcounts(
         locals,
         location_by_name,
         must_bound_on_entry,
+        may_bound_on_entry,
         is_entry_block,
     );
     let mut actions = Vec::new();
 
+    let mut operand_failure_prefixes = HashMap::new();
     for instr in &block.body {
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            remember_operand_failure_prefix(location, &env, &mut operand_failure_prefixes);
+        });
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            env.insert(location, LocalRefState::Unbound);
+        });
         match instr {
             InstrBlockPy::Store(op) => {
                 let Some(location) = store_binding_location(op, owned_cell_locations) else {
@@ -1110,15 +1331,32 @@ fn plan_block_refcounts(
                 });
                 env.insert(location, LocalRefState::Unbound);
             }
+            InstrBlockPy::CallArgumentOp(op) => {
+                transfer_call_argument_ref_state(op, &mut env);
+            }
             _ => {}
         }
     }
 
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        remember_operand_failure_prefix(location, &env, &mut operand_failure_prefixes);
+    });
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        env.insert(location, LocalRefState::Unbound);
+    });
+
+    let exceptional_env = exception_env_with_operand_prefixes(&env, &operand_failure_prefixes);
     if let Some(edge) = &block.exc_edge {
         release_unforwarded_locals(
             function.function_id,
             block.label,
-            &env,
+            &exceptional_env,
             locals,
             preserved_locations(
                 edge.target,
@@ -1232,7 +1470,7 @@ fn plan_block_refcounts(
             RefcountReleaseReason::Raise,
             &mut actions,
         ),
-        BlockTerm::Return(_) => release_all_live_locals(
+        BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => release_all_live_locals(
             function.function_id,
             block.label,
             &env,
@@ -1259,12 +1497,16 @@ fn plan_typed_block_refcounts(
     target_params: &HashMap<BlockLabel, Vec<String>>,
     local_liveness: &LocalLiveness,
     local_must_bound: &LocalMustBound,
+    local_may_bound: &LocalMayBound,
     is_entry_block: bool,
     precise_entry_states: Option<&HashMap<LocalLocation, LocalRefState>>,
 ) -> BlockRefcountPlan {
     let empty_must_bound = LocalBitSet::empty(locals.len());
     let must_bound_on_entry = local_must_bound
         .live_in(block.label)
+        .unwrap_or(&empty_must_bound);
+    let may_bound_on_entry = local_may_bound
+        .get(&block.label)
         .unwrap_or(&empty_must_bound);
     let mut env = initial_typed_block_env(
         function,
@@ -1273,13 +1515,28 @@ fn plan_typed_block_refcounts(
         locals,
         location_by_name,
         must_bound_on_entry,
+        may_bound_on_entry,
         is_entry_block,
     );
     apply_precise_immortal_overrides(&mut env, precise_entry_states);
     let mut borrow_owners = initial_typed_borrow_owners(function, location_by_name, is_entry_block);
     let mut actions = Vec::new();
 
+    let mut operand_failure_prefixes = HashMap::new();
     for (instr_index, instr) in block.body.iter().enumerate() {
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            remember_operand_failure_prefix(location, &env, &mut operand_failure_prefixes);
+        });
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            env.insert(location, LocalRefState::Unbound);
+            borrow_owners.remove(&location);
+        });
         match instr {
             InstrTyped::Store(op) => {
                 let Some(location) = typed_store_binding_location(op, owned_cell_locations) else {
@@ -1344,15 +1601,38 @@ fn plan_typed_block_refcounts(
                 env.insert(location, LocalRefState::Unbound);
                 borrow_owners.remove(&location);
             }
+            InstrTyped::CallArgumentOp(op) => {
+                transfer_call_argument_ref_state(op, &mut env);
+                for name in op.written_names() {
+                    if let Some(location) = name.local_location() {
+                        borrow_owners.remove(&location);
+                    }
+                }
+            }
             _ => {}
         }
     }
 
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        remember_operand_failure_prefix(location, &env, &mut operand_failure_prefixes);
+    });
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        env.insert(location, LocalRefState::Unbound);
+        borrow_owners.remove(&location);
+    });
+
+    let exceptional_env = exception_env_with_operand_prefixes(&env, &operand_failure_prefixes);
     if let Some(edge) = &block.exc_edge {
         release_unforwarded_locals(
             function.function_id,
             block.label,
-            &env,
+            &exceptional_env,
             locals,
             preserved_locations(
                 edge.target,
@@ -1466,7 +1746,7 @@ fn plan_typed_block_refcounts(
             RefcountReleaseReason::Raise,
             &mut actions,
         ),
-        BlockTerm::Return(_) => release_all_live_locals(
+        BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => release_all_live_locals(
             function.function_id,
             block.label,
             &env,
@@ -1497,13 +1777,32 @@ fn typed_local_store_borrow_owner(
     local_liveness: &LocalLiveness,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> Option<LocalLocation> {
+    let source_location = typed_local_load_location(value)?;
+    if function
+        .storage_layout()
+        .as_ref()
+        .is_some_and(|layout| layout.is_expression_temporary(target_location))
+        && typed_location_requires_operand_owner(function, target_location)
+    {
+        return None;
+    }
+    if let Some(layout) = function.storage_layout().as_ref() {
+        if let Some(class) = &layout.class_bindings {
+            if class
+                .slots
+                .iter()
+                .any(|slot| slot.storage.raw_local(layout) == Some(target_location))
+            {
+                return None;
+            }
+        }
+    }
     if locals
         .get(&target_location)
         .is_none_or(|local| local.name.starts_with("_dp_"))
     {
         return None;
     }
-    let source_location = typed_local_load_location(value)?;
     if source_location == target_location {
         return None;
     }
@@ -1672,6 +1971,10 @@ fn typed_instr_rebinds_or_deletes_location(
             .name
             .local_location()
             .is_some_and(|deleted_location| deleted_location == location),
+        InstrTyped::TakeOperand(op) => op.name.local_location() == Some(location),
+        InstrTyped::CallArgumentOp(op) => op
+            .written_names()
+            .any(|name| name.local_location() == Some(location)),
         _ => false,
     }
 }
@@ -1711,7 +2014,7 @@ fn typed_successor_edges(block: &TypedBlock) -> Vec<(BlockLabel, Option<&[BlockA
             successors.extend(branch.targets.iter().copied().map(|target| (target, None)));
             successors.push((branch.default_label, None));
         }
-        BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
     }
     successors
 }
@@ -1728,6 +2031,7 @@ fn validate_block_refcount_plan(
     target_params: &HashMap<BlockLabel, Vec<String>>,
     local_liveness: &LocalLiveness,
     local_must_bound: &LocalMustBound,
+    local_may_bound: &LocalMayBound,
     is_entry_block: bool,
     errors: &mut Vec<String>,
 ) {
@@ -1750,6 +2054,9 @@ fn validate_block_refcount_plan(
     let must_bound_on_entry = local_must_bound
         .live_in(block.label)
         .unwrap_or(&empty_must_bound);
+    let may_bound_on_entry = local_may_bound
+        .get(&block.label)
+        .unwrap_or(&empty_must_bound);
     let mut env = initial_block_env(
         function,
         block,
@@ -1757,10 +2064,24 @@ fn validate_block_refcount_plan(
         locals,
         location_by_name,
         must_bound_on_entry,
+        may_bound_on_entry,
         is_entry_block,
     );
 
+    let mut operand_failure_prefixes = HashMap::new();
     for instr in &block.body {
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            remember_operand_failure_prefix(location, &env, &mut operand_failure_prefixes);
+        });
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            env.insert(location, LocalRefState::Unbound);
+        });
         match instr {
             InstrBlockPy::Store(op) => {
                 let site = RefcountSite::Instr(instr.semantic_instr_key(function.function_id));
@@ -1847,6 +2168,9 @@ fn validate_block_refcount_plan(
                 );
                 env.insert(location, LocalRefState::Unbound);
             }
+            InstrBlockPy::CallArgumentOp(op) => {
+                transfer_call_argument_ref_state(op, &mut env);
+            }
             _ => {}
         }
     }
@@ -1857,12 +2181,26 @@ fn validate_block_refcount_plan(
     };
     let mut term_actions = actions_by_site.remove(&term_site).unwrap_or_default();
 
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        remember_operand_failure_prefix(location, &env, &mut operand_failure_prefixes);
+    });
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        env.insert(location, LocalRefState::Unbound);
+    });
+
+    let exceptional_env = exception_env_with_operand_prefixes(&env, &operand_failure_prefixes);
     if let Some(edge) = &block.exc_edge {
         validate_release_actions(
             function,
             block.label,
             &mut term_actions,
-            &env,
+            &exceptional_env,
             locals,
             preserved_locations(
                 edge.target,
@@ -1983,7 +2321,7 @@ fn validate_block_refcount_plan(
             RefcountReleaseReason::Raise,
             errors,
         ),
-        BlockTerm::Return(_) => validate_release_actions(
+        BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => validate_release_actions(
             function,
             block.label,
             &mut term_actions,
@@ -2023,6 +2361,7 @@ fn validate_typed_block_refcount_plan(
     target_params: &HashMap<BlockLabel, Vec<String>>,
     local_liveness: &LocalLiveness,
     local_must_bound: &LocalMustBound,
+    local_may_bound: &LocalMayBound,
     is_entry_block: bool,
     precise_entry_states: Option<&HashMap<LocalLocation, LocalRefState>>,
     errors: &mut Vec<String>,
@@ -2037,6 +2376,7 @@ fn validate_typed_block_refcount_plan(
         target_params,
         local_liveness,
         local_must_bound,
+        local_may_bound,
         is_entry_block,
         precise_entry_states,
     );
@@ -2055,6 +2395,7 @@ fn initial_block_env(
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
     must_bound_on_entry: &LocalBitSet,
+    may_bound_on_entry: &LocalBitSet,
     is_entry_block: bool,
 ) -> HashMap<LocalLocation, LocalRefState> {
     let mut env = locals
@@ -2098,7 +2439,7 @@ fn initial_block_env(
     } else {
         HashSet::new()
     };
-    for location in must_bound_on_entry.locations() {
+    for location in may_bound_on_entry.locations() {
         if entry_param_locations.contains(&location) {
             continue;
         }
@@ -2142,6 +2483,7 @@ fn initial_typed_block_env(
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
     must_bound_on_entry: &LocalBitSet,
+    may_bound_on_entry: &LocalBitSet,
     is_entry_block: bool,
 ) -> HashMap<LocalLocation, LocalRefState> {
     let mut env = locals
@@ -2185,7 +2527,7 @@ fn initial_typed_block_env(
     } else {
         HashSet::new()
     };
-    for location in must_bound_on_entry.locations() {
+    for location in may_bound_on_entry.locations() {
         if entry_param_locations.contains(&location) {
             continue;
         }
@@ -2281,6 +2623,8 @@ impl LocalLiveness {
 struct LocalMustBound {
     must_bound_in_by_block: HashMap<BlockLabel, LocalBitSet>,
 }
+
+type LocalMayBound = HashMap<BlockLabel, LocalBitSet>;
 
 impl LocalMustBound {
     fn live_in(&self, label: BlockLabel) -> Option<&LocalBitSet> {
@@ -2589,6 +2933,219 @@ fn compute_local_must_bound(
     }
 }
 
+fn compute_local_may_bound(
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    location_by_name: &HashMap<String, LocalLocation>,
+) -> LocalMayBound {
+    let owned_cells = owned_cell_locations(function, location_by_name);
+    compute_local_may_bound_with_effects(function, location_by_name, |instr| match instr {
+        InstrBlockPy::Store(store) => store_binding_location(store, &owned_cells)
+            .map(|location| LocalBindingEffect::Set(location, true)),
+        InstrBlockPy::Del(del) => del
+            .name
+            .local_location()
+            .map(|location| LocalBindingEffect::Set(location, false)),
+        InstrBlockPy::CallArgumentOp(op) => op
+            .written_names()
+            .next()
+            .and_then(|name| name.local_location())
+            .map(|location| LocalBindingEffect::Set(location, true)),
+        _ => None,
+    })
+}
+
+fn compute_typed_local_may_bound(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    local_liveness: &LocalLiveness,
+) -> LocalMayBound {
+    let owned_cells = typed_owned_cell_locations(function, location_by_name);
+    let mut states =
+        compute_local_may_bound_with_effects(function, location_by_name, |instr| match instr {
+            InstrTyped::Store(store) => typed_store_binding_location(store, &owned_cells)
+                .map(|location| LocalBindingEffect::Set(location, true)),
+            InstrTyped::Del(del) => del
+                .name
+                .local_location()
+                .map(|location| LocalBindingEffect::Set(location, false)),
+            InstrTyped::CallArgumentOp(op) => op
+                .written_names()
+                .next()
+                .and_then(|name| name.local_location())
+                .map(|location| LocalBindingEffect::Set(location, true)),
+            _ => None,
+        });
+    retain_live_typed_operand_bindings(function, location_by_name, local_liveness, &mut states);
+    states
+}
+
+/// Frame bindings keep owning their values after their last read. An explicit
+/// expression operand instead belongs to the operation that consumes it. In
+/// particular, a failing operation bypasses its normal cleanup deletes; those
+/// acquired operands must unwind at the failure site, not become handler roots
+/// merely because a predecessor can have bound them.
+///
+/// Keep operands used by a successor (including hidden typed-plan inputs) and
+/// explicit block parameters. The same lifetime restriction applies to MAY and
+/// MUST facts, so ownership, entry materialization, and unchecked-load planning
+/// cannot disagree about an operand that the incoming edge has retired.
+fn retain_live_typed_operand_bindings(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    local_liveness: &LocalLiveness,
+    states: &mut HashMap<BlockLabel, LocalBitSet>,
+) {
+    let Some(layout) = function.storage_layout().as_ref() else {
+        return;
+    };
+    let operands = location_by_name
+        .values()
+        .copied()
+        .filter(|location| layout.is_expression_temporary(*location))
+        .collect::<Vec<_>>();
+    if operands.is_empty() {
+        return;
+    }
+    for block in &function.blocks {
+        let Some(state) = states.get_mut(&block.label) else {
+            continue;
+        };
+        let explicit_params = block
+            .param_names()
+            .filter_map(|name| location_by_name.get(name).copied())
+            .collect::<HashSet<_>>();
+        let live_in = local_liveness.live_in(block.label);
+        for location in &operands {
+            if !explicit_params.contains(location)
+                && !live_in.is_some_and(|live| live.contains(*location))
+            {
+                state.remove(*location);
+            }
+        }
+    }
+}
+
+/// An ownership obligation survives a join if any incoming path can hold a
+/// value. MUST-bound remains the independent proof for unchecked local loads.
+/// Exception edges see every evaluated prefix, not only the final state after
+/// a later delete: an earlier call can raise while that local still owns a value.
+fn compute_local_may_bound_with_effects<P: ModuleShape>(
+    function: &BlockPyFunction<P>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    binding_effect: impl Fn(&P::Instr) -> Option<LocalBindingEffect>,
+) -> LocalMayBound
+where
+    P::Instr: soac_core::block_py::TakeOperandInstruction<Name = soac_core::block_py::ResolvedName>,
+{
+    if function.blocks.is_empty() {
+        return HashMap::new();
+    }
+    let local_count = location_by_name.len();
+    let indices = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label, index))
+        .collect::<HashMap<_, _>>();
+    let effects = function
+        .blocks
+        .iter()
+        .map(|block| {
+            let mut effects = block
+                .param_names()
+                .filter_map(|name| location_by_name.get(name).copied())
+                .map(|location| LocalBindingEffect::Set(location, true))
+                .collect::<Vec<_>>();
+            for instr in &block.body {
+                visit_operand_takes(instr, |location| {
+                    let soac_core::block_py::OperandLocation::Local(location) = location else {
+                        return;
+                    };
+                    effects.push(LocalBindingEffect::Set(location, false));
+                });
+                effects.extend(binding_effect(instr));
+            }
+            visit_term_operand_takes(&block.term, |location| {
+                let soac_core::block_py::OperandLocation::Local(location) = location else {
+                    return;
+                };
+                effects.push(LocalBindingEffect::Set(location, false));
+            });
+            effects
+        })
+        .collect::<Vec<_>>();
+    let successors = function
+        .blocks
+        .iter()
+        .map(|block| {
+            let mut edges = Vec::new();
+            if let Some(edge) = &block.exc_edge {
+                edges.push((indices[&edge.target], true));
+            }
+            let mut normal = |label| edges.push((indices[&label], false));
+            match &block.term {
+                BlockTerm::Jump(edge) => normal(edge.target),
+                BlockTerm::IfTerm(branch) => {
+                    normal(branch.then_label);
+                    normal(branch.else_label);
+                }
+                BlockTerm::BranchTable(branch) => {
+                    for label in &branch.targets {
+                        normal(*label);
+                    }
+                    normal(branch.default_label);
+                }
+                BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
+            }
+            edges
+        })
+        .collect::<Vec<_>>();
+    let entry = indices[&function.entry_block().label];
+    let mut states = vec![LocalBitSet::empty(local_count); function.blocks.len()];
+    states[entry] = LocalBitSet::from_locations(
+        local_count,
+        function
+            .body_params()
+            .iter()
+            .filter_map(|param| location_by_name.get(&param.name).copied()),
+    );
+    let mut reached = vec![false; function.blocks.len()];
+    let mut queued = vec![false; function.blocks.len()];
+    reached[entry] = true;
+    queued[entry] = true;
+    let mut pending = VecDeque::from([entry]);
+    while let Some(source) = pending.pop_front() {
+        queued[source] = false;
+        let mut normal = states[source].clone();
+        let mut exceptional = normal.clone();
+        for &effect in &effects[source] {
+            effect.apply(&mut normal);
+            exceptional.union_with(&normal);
+        }
+        for &(target, exception_edge) in &successors[source] {
+            let incoming = if exception_edge {
+                &exceptional
+            } else {
+                &normal
+            };
+            let previous = states[target].clone();
+            states[target].union_with(incoming);
+            let changed = !reached[target] || states[target] != previous;
+            reached[target] = true;
+            if changed && !queued[target] {
+                queued[target] = true;
+                pending.push_back(target);
+            }
+        }
+    }
+    function
+        .blocks
+        .iter()
+        .map(|block| block.label)
+        .zip(states)
+        .collect()
+}
+
 fn compute_typed_local_liveness(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
@@ -2659,6 +3216,7 @@ fn compute_typed_local_liveness(
 fn compute_typed_local_must_bound(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
+    local_liveness: &LocalLiveness,
 ) -> LocalMustBound {
     let owned_cell_locations = typed_owned_cell_locations(function, location_by_name);
     let local_count = location_by_name.len();
@@ -2760,10 +3318,16 @@ fn compute_typed_local_must_bound(
         }
     }
 
-    let must_bound_in_by_block = labels
+    let mut must_bound_in_by_block = labels
         .into_iter()
         .zip(must_bound_in_by_index)
         .collect::<HashMap<_, _>>();
+    retain_live_typed_operand_bindings(
+        function,
+        location_by_name,
+        local_liveness,
+        &mut must_bound_in_by_block,
+    );
     LocalMustBound {
         must_bound_in_by_block,
     }
@@ -2791,6 +3355,12 @@ fn transfer_must_bound_through_block(
         }
     }
     for instr in &block.body {
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            must_bound.remove(location);
+        });
         match instr {
             InstrBlockPy::Store(op) => {
                 if let Some(location) = store_binding_location(op, owned_cell_locations) {
@@ -2802,9 +3372,24 @@ fn transfer_must_bound_through_block(
                     must_bound.remove(location);
                 }
             }
+            InstrBlockPy::CallArgumentOp(op) => {
+                // This summary also feeds exceptional edges. Finish clears
+                // before allocation; normalizers may fail before publishing.
+                for name in op.written_names() {
+                    if let Some(location) = name.local_location() {
+                        must_bound.remove(location);
+                    }
+                }
+            }
             _ => {}
         }
     }
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        must_bound.remove(location);
+    });
     must_bound
 }
 
@@ -2830,6 +3415,12 @@ fn transfer_typed_must_bound_through_block(
         }
     }
     for instr in &block.body {
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            must_bound.remove(location);
+        });
         match instr {
             InstrTyped::Store(op) => {
                 if let Some(location) = typed_store_binding_location(op, owned_cell_locations) {
@@ -2841,9 +3432,24 @@ fn transfer_typed_must_bound_through_block(
                     must_bound.remove(location);
                 }
             }
+            InstrTyped::CallArgumentOp(op) => {
+                // This summary also feeds exceptional edges. Finish clears
+                // before allocation; normalizers may fail before publishing.
+                for name in op.written_names() {
+                    if let Some(location) = name.local_location() {
+                        must_bound.remove(location);
+                    }
+                }
+            }
             _ => {}
         }
     }
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        must_bound.remove(location);
+    });
     must_bound
 }
 
@@ -2867,6 +3473,12 @@ fn block_local_effects(
             owned_cell_locations,
             &mut effects.uses,
         );
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            effects.defs.insert(location);
+        });
         match instr {
             InstrBlockPy::Store(op) => {
                 if let Some(location) = op.name.local_location() {
@@ -2878,6 +3490,9 @@ fn block_local_effects(
                     effects.defs.insert(location);
                 }
             }
+            InstrBlockPy::CallArgumentOp(op) => effects
+                .defs
+                .extend(op.written_names().filter_map(|name| name.local_location())),
             _ => {}
         }
     }
@@ -2889,6 +3504,12 @@ fn block_local_effects(
         owned_cell_locations,
         &mut effects.uses,
     );
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        effects.defs.insert(location);
+    });
     effects
 }
 
@@ -2912,6 +3533,12 @@ fn typed_block_local_effects(
             owned_cell_locations,
             &mut effects.uses,
         );
+        visit_operand_takes(instr, |location| {
+            let soac_core::block_py::OperandLocation::Local(location) = location else {
+                return;
+            };
+            effects.defs.insert(location);
+        });
         match instr {
             InstrTyped::Store(op) => {
                 if let Some(location) = op.name.local_location() {
@@ -2923,6 +3550,9 @@ fn typed_block_local_effects(
                     effects.defs.insert(location);
                 }
             }
+            InstrTyped::CallArgumentOp(op) => effects
+                .defs
+                .extend(op.written_names().filter_map(|name| name.local_location())),
             _ => {}
         }
     }
@@ -2934,6 +3564,12 @@ fn typed_block_local_effects(
         owned_cell_locations,
         &mut effects.uses,
     );
+    visit_term_operand_takes(&block.term, |location| {
+        let soac_core::block_py::OperandLocation::Local(location) = location else {
+            return;
+        };
+        effects.defs.insert(location);
+    });
     effects
 }
 
@@ -3085,6 +3721,28 @@ fn collect_local_reads(
                 InstrBlockPy::CellRef(op) => {
                     mark_cell_use(op.location, self.defs, self.owned_cell_locations, self.uses)
                 }
+                InstrBlockPy::TakeOperand(op) => {
+                    if let Some(location) = op.name.local_location() {
+                        mark_local_use(location, self.defs, self.uses);
+                    }
+                }
+                InstrBlockPy::ComprehensionInsert(op) => {
+                    if let Some(location) = op.container.local_location() {
+                        mark_local_use(location, self.defs, self.uses);
+                    }
+                }
+                InstrBlockPy::CallArgumentOp(op) => {
+                    for name in op.read_names() {
+                        if let Some(location) = name.local_location() {
+                            mark_local_use(location, self.defs, self.uses);
+                        }
+                    }
+                }
+                InstrBlockPy::IteratorStep(op) => {
+                    if let Some(location) = op.name.local_location() {
+                        mark_local_use(location, self.defs, self.uses);
+                    }
+                }
                 _ => {}
             }
             expr.visit_children(self);
@@ -3169,7 +3827,7 @@ fn block_successors(block: &Block<InstrBlockPy>) -> Vec<BlockLabel> {
             successors.extend(branch.targets.iter().copied());
             successors.push(branch.default_label);
         }
-        BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
     }
     successors
 }
@@ -3192,6 +3850,17 @@ fn collect_typed_local_reads(
         fn mark_exact_int_region_input_reads(&mut self, regions: [&RegionPlan; 2]) {
             for region in regions {
                 for input in &region.inputs {
+                    if let RegionInputSource::CellValue { name, .. } = &input.source {
+                        if let Some(location) = name.cell_location() {
+                            mark_cell_use(
+                                location,
+                                self.defs,
+                                self.owned_cell_locations,
+                                self.uses,
+                            );
+                        }
+                        continue;
+                    }
                     let name = match &input.source {
                         RegionInputSource::FunctionParam {
                             name: Some(name), ..
@@ -3263,6 +3932,28 @@ fn collect_typed_local_reads(
                 }
                 InstrTyped::CellRef(op) => {
                     mark_cell_use(op.location, self.defs, self.owned_cell_locations, self.uses)
+                }
+                InstrTyped::TakeOperand(op) => {
+                    if let Some(location) = op.name.local_location() {
+                        mark_local_use(location, self.defs, self.uses);
+                    }
+                }
+                InstrTyped::ComprehensionInsert(op) => {
+                    if let Some(location) = op.container.local_location() {
+                        mark_local_use(location, self.defs, self.uses);
+                    }
+                }
+                InstrTyped::CallArgumentOp(op) => {
+                    for name in op.read_names() {
+                        if let Some(location) = name.local_location() {
+                            mark_local_use(location, self.defs, self.uses);
+                        }
+                    }
+                }
+                InstrTyped::IteratorStep(op) => {
+                    if let Some(location) = op.name.local_location() {
+                        mark_local_use(location, self.defs, self.uses);
+                    }
                 }
                 _ => {}
             }
@@ -3348,7 +4039,7 @@ fn typed_block_successors(block: &TypedBlock) -> Vec<BlockLabel> {
             successors.extend(branch.targets.iter().copied());
             successors.push(branch.default_label);
         }
-        BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
     }
     successors
 }
@@ -3407,7 +4098,7 @@ fn release_unforwarded_locals(
     reason: RefcountReleaseReason,
     actions: &mut Vec<RefcountAction>,
 ) {
-    for (location, state) in sorted_live_releases(env) {
+    for (location, state) in sorted_live_releases(env, locals) {
         if forwarded.contains(&location) {
             continue;
         }
@@ -3431,7 +4122,7 @@ fn release_all_live_locals(
     reason: RefcountReleaseReason,
     actions: &mut Vec<RefcountAction>,
 ) {
-    for (location, state) in sorted_live_releases(env) {
+    for (location, state) in sorted_live_releases(env, locals) {
         push_release_action(
             function_id,
             block_label,
@@ -3446,12 +4137,18 @@ fn release_all_live_locals(
 
 fn sorted_live_releases(
     env: &HashMap<LocalLocation, LocalRefState>,
+    locals: &HashMap<LocalLocation, RefcountLocal>,
 ) -> Vec<(LocalLocation, LocalRefState)> {
     let mut releases = env
         .iter()
         .filter_map(|(location, state)| state.needs_decref().then_some((*location, *state)))
         .collect::<Vec<_>>();
-    releases.sort_by_key(|(location, _)| location.slot());
+    releases.sort_by_key(|(location, _)| {
+        locals
+            .get(location)
+            .map(|local| local.cleanup_order)
+            .unwrap_or((true, location.slot()))
+    });
     releases
 }
 
@@ -3549,7 +4246,7 @@ fn expected_release_actions(
     forwarded: HashSet<LocalLocation>,
     reason: RefcountReleaseReason,
 ) -> Vec<RefcountActionKind> {
-    sorted_live_releases(env)
+    sorted_live_releases(env, locals)
         .into_iter()
         .filter(|(location, _)| !forwarded.contains(location))
         .filter_map(|(location, state)| {
@@ -3570,6 +4267,7 @@ mod tests {
     use super::{
         LocalRefState, RefcountActionKind, RefcountReleaseReason, compute_function_local_live_ins,
         compute_function_local_must_bound_ins, compute_typed_function_local_live_ins,
+        compute_typed_function_local_may_bound_ins, compute_typed_function_local_must_bound_ins,
         compute_typed_function_precise_immortal_local_entry_states, forwarded_locations,
         plan_ownership_effects, plan_typed_ownership_effects, validate_ownership_effects,
         validate_typed_ownership_effects,
@@ -3633,6 +4331,150 @@ mod tests {
             })
             .collect();
         (function, actions)
+    }
+
+    #[test]
+    fn operand_take_preserves_exception_prefix_ownership_but_not_normal_cleanup() {
+        use soac_core::block_py::{
+            BlockEdge, Call, CallArgPositional, ComprehensionInsert, ComprehensionInsertKind,
+            InstrWithConstantNone, Load, NameLocation, ResolvedName, Store, StoreLifetime,
+            TakeOperand,
+        };
+        use soac_ir_blockpy::InstrBlockPy;
+        use soac_ir_blockpy::assign_blockpy_module_instr_ids;
+        for in_term in [false, true] {
+            let mut module = lower_python_to_blockpy_for_testing(
+                "def f(raiser):\n    collection = {}\n    payload = []\n    return None\n",
+            )
+            .unwrap()
+            .blockpy_module;
+            let function = module
+                .callable_defs
+                .iter_mut()
+                .find(|function| function.names.qualname == "f")
+                .unwrap();
+            let creates = ["collection", "payload"].map(|name| {
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.body)
+                    .find_map(|instr| match instr {
+                        InstrBlockPy::Store(store) if store.name.id.as_str() == name => {
+                            Some((*store.value).clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            });
+            let layout = function.storage_layout.as_mut().unwrap();
+            let base = layout.stack_slots.len() as u32;
+            layout.ensure_stack_slot("collection_operand");
+            layout.ensure_stack_slot("payload_operand");
+            let collection = ResolvedName {
+                id: "collection_operand".into(),
+                location: NameLocation::Local(LocalLocation(base)),
+            };
+            let payload = ResolvedName {
+                id: "payload_operand".into(),
+                location: NameLocation::Local(LocalLocation(base + 1)),
+            };
+            let raiser = ResolvedName {
+                id: "raiser".into(),
+                location: NameLocation::Local(LocalLocation(
+                    layout
+                        .stack_slots
+                        .iter()
+                        .position(|name| name == "raiser")
+                        .unwrap() as u32,
+                )),
+            };
+            layout.mark_expression_temporary(collection.local_location().unwrap());
+            layout.mark_expression_temporary(payload.local_location().unwrap());
+            let take = TakeOperand::<InstrBlockPy>::new(payload.clone());
+            take.validate_resolved(layout).unwrap();
+            let key = Call::new(Box::new(Load::new(raiser.clone()).into()), vec![], vec![]).into();
+            let insert = ComprehensionInsert::new(
+                ComprehensionInsertKind::DictSetItem,
+                collection.clone(),
+                Some(Box::new(key)),
+                Box::new(take.clone().into()),
+            );
+            insert.validate_resolved(layout).unwrap();
+            let mut entry = function.entry_block().clone();
+            let mut failure = entry.clone();
+            failure.label = function.name_gen.next_block_name();
+            failure.body.clear();
+            failure.params.clear();
+            failure.exc_edge = None;
+            failure.term = BlockTerm::Return(InstrBlockPy::constant_none());
+            entry.exc_edge = Some(BlockEdge::new(failure.label));
+            entry.body = vec![
+                Store::new(collection.clone(), Box::new(creates[0].clone()))
+                    .with_lifetime(StoreLifetime::Operand { unwind_order: 0 })
+                    .into(),
+                Store::new(payload.clone(), Box::new(creates[1].clone()))
+                    .with_lifetime(StoreLifetime::Operand { unwind_order: 1 })
+                    .into(),
+            ];
+            if in_term {
+                let first_argument: InstrBlockPy =
+                    Call::new(Box::new(Load::new(raiser.clone()).into()), vec![], vec![]).into();
+                entry.term = BlockTerm::Return(
+                    Call::new(
+                        Box::new(Load::new(raiser).into()),
+                        vec![
+                            CallArgPositional::Positional(first_argument),
+                            CallArgPositional::Positional(take.into()),
+                        ],
+                        vec![],
+                    )
+                    .into(),
+                );
+            } else {
+                entry.body.push(insert.into());
+                entry.term = BlockTerm::Return(InstrBlockPy::constant_none());
+            }
+            let function_id = function.function_id;
+            let entry_label = entry.label;
+            let failure_label = failure.label;
+            function.blocks = vec![entry, failure];
+            let module = assign_blockpy_module_instr_ids(module);
+            let facts = infer_module_value_facts(&module);
+            let plan = plan_ownership_effects(&module, &facts);
+            validate_ownership_effects(&module, &facts, &plan).unwrap();
+            let typed = lower_blockpy_module_to_typed(module);
+            let typed_plan = plan_typed_ownership_effects(&typed, &facts);
+            validate_typed_ownership_effects(&typed, &facts, &typed_plan).unwrap();
+            for plan in [&plan, &typed_plan] {
+                let actions = &plan
+                    .function(function_id)
+                    .unwrap()
+                    .block(entry_label)
+                    .unwrap()
+                    .actions;
+                assert!(actions.iter().any(|action| matches!(&action.kind,
+                    RefcountActionKind::ReleaseLocal {
+                        local, state: LocalRefState::Owned,
+                        reason: RefcountReleaseReason::ExceptionEdge { target },
+                    } if local.location == payload.local_location().unwrap() && *target == failure_label
+                )), "an earlier sibling can fail while the not-yet-taken operand still owns its value");
+                assert!(
+                    !actions.iter().any(|action| matches!(&action.kind,
+                        RefcountActionKind::ReleaseLocal {
+                            local, reason: RefcountReleaseReason::Return, ..
+                        } if local.location == payload.local_location().unwrap()
+                    )),
+                    "successful take leaves no old operand owner for normal return cleanup"
+                );
+                assert!(
+                    !actions.iter().any(|action| matches!(&action.kind,
+                        RefcountActionKind::DeleteLocal { local, .. }
+                        if local.location == payload.local_location().unwrap()
+                    )),
+                    "a consuming read is not a callback-capable deletion"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3706,6 +4548,56 @@ def f():
                 } if local.name == "x"
             )),
             "owned local bindings should be released by return cleanup"
+        );
+    }
+
+    #[test]
+    fn refcount_plan_releases_expression_temporaries_before_source_locals() {
+        let mut module = lower_python_to_blockpy_for_testing(
+            "def f():\n    source_first = []\n    older = []\n    source_second = []\n    newer = []\n    return None\n",
+        )
+        .expect("fixture should lower")
+        .blockpy_module;
+        let function = module
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "f")
+            .unwrap();
+        let function_id = function.function_id;
+        let layout = function.storage_layout.as_mut().unwrap();
+        for name in ["older", "newer"] {
+            let slot = layout
+                .stack_slots()
+                .iter()
+                .position(|slot| slot == name)
+                .unwrap();
+            layout.mark_expression_temporary(LocalLocation(u32::try_from(slot).unwrap()));
+        }
+        let facts = infer_module_value_facts(&module);
+        let plan = plan_ownership_effects(&module, &facts);
+        validate_ownership_effects(&module, &facts, &plan).expect("ordered plan should validate");
+        let function = module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .unwrap();
+        let function_plan = plan.function(function_id).unwrap();
+        let released = function
+            .blocks
+            .iter()
+            .flat_map(|block| &function_plan.block(block.label).unwrap().actions)
+            .filter_map(|action| match &action.kind {
+                RefcountActionKind::ReleaseLocal {
+                    local,
+                    reason: RefcountReleaseReason::Return,
+                    ..
+                } => Some(local.name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            released,
+            ["newer", "older", "source_first", "source_second"]
         );
     }
 
@@ -3789,25 +4681,122 @@ def f(flag):
 
     #[test]
     fn refcount_plan_keeps_loop_iterator_live_across_check_jump() {
-        let (_function, actions) = refcount_actions_for_function(
+        use crate::passes::InstrBlockPy;
+        use soac_core::block_py::instr_any;
+
+        let module = lower_python_to_blockpy_for_testing(
             r#"
 def f(cls):
     for item in cls.__mro__:
         item.__name__
 "#,
-        );
+        )
+        .expect("loop fixture must lower")
+        .blockpy_module;
+        let function = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .unwrap();
+        let facts = infer_module_value_facts(&module);
+        let plan = plan_ownership_effects(&module, &facts);
+        validate_ownership_effects(&module, &facts, &plan).expect("loop ownership must validate");
+        let function_plan = plan.function(function.function_id).unwrap();
 
+        let mut next_sites = Vec::new();
+        for block in &function.blocks {
+            for instr in &block.body {
+                instr_any(instr, |instr| {
+                    let InstrBlockPy::IteratorStep(step) = instr else {
+                        return false;
+                    };
+                    next_sites.push((block.label, step.name.local_location().unwrap()));
+                    false
+                });
+            }
+        }
+        let [(check, iterator)] = next_sites.as_slice() else {
+            panic!("fixture must have exactly one source next operation: {next_sites:?}");
+        };
+
+        // Exception-retirement bridges can release the iterator on their way
+        // out of the function. Only normal edges in the next-operation's
+        // cycle are loop-carried edges, including any split check prefixes.
+        let edges = function
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                let targets = match &block.term {
+                    BlockTerm::Jump(edge) => vec![edge.target],
+                    BlockTerm::IfTerm(branch) => vec![branch.then_label, branch.else_label],
+                    BlockTerm::BranchTable(branch) => branch
+                        .targets
+                        .iter()
+                        .copied()
+                        .chain([branch.default_label])
+                        .collect(),
+                    BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) | BlockTerm::Raise(_) => {
+                        vec![]
+                    }
+                };
+                targets.into_iter().map(move |target| (block.label, target))
+            })
+            .collect::<Vec<_>>();
+        let reachable = |reverse: bool| {
+            let mut seen = HashSet::new();
+            let mut pending = vec![*check];
+            while let Some(label) = pending.pop() {
+                if !seen.insert(label) {
+                    continue;
+                }
+                pending.extend(edges.iter().filter_map(|&(source, target)| {
+                    let (source, target) = if reverse {
+                        (target, source)
+                    } else {
+                        (source, target)
+                    };
+                    (source == label).then_some(target)
+                }));
+            }
+            seen
+        };
+        let from_check = reachable(false);
+        let to_check = reachable(true);
+        let cycle = from_check
+            .intersection(&to_check)
+            .copied()
+            .collect::<HashSet<_>>();
+        let loop_jumps = function
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.term {
+                BlockTerm::Jump(edge)
+                    if cycle.contains(&block.label) && cycle.contains(&edge.target) =>
+                {
+                    Some((block, edge.target))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert!(
-            !actions.iter().any(|action| matches!(
-                action,
-                RefcountActionKind::ReleaseLocal {
-                    local,
-                    reason: RefcountReleaseReason::Jump { .. },
-                    ..
-                } if local.name.starts_with("_dp_iter_")
-            )),
-            "loop iterator slot should stay live across jumps back to the loop check: {actions:#?}"
+            !loop_jumps.is_empty(),
+            "the source loop must have a normal backedge"
         );
+        for (block, target) in loop_jumps {
+            let block_plan = function_plan.block(block.label).unwrap();
+            assert!(
+                !block_plan.actions.iter().any(|action| matches!(
+                    &action.kind,
+                    RefcountActionKind::ReleaseLocal {
+                        local,
+                        reason: RefcountReleaseReason::Jump { target: released_target },
+                        ..
+                    } if local.location == *iterator && *released_target == target
+                )),
+                "iterator {iterator:?} must survive loop edge {} -> {target}: {block_plan:#?}",
+                block.label
+            );
+        }
     }
 
     #[test]
@@ -4041,6 +5030,21 @@ def f(h, flag):
                 } else {
                     "named local input"
                 },
+            );
+            function
+                .storage_layout
+                .as_mut()
+                .unwrap()
+                .mark_expression_temporary(h_location);
+            assert!(
+                compute_typed_function_local_may_bound_ins(function)[&target_label]
+                    .contains(&h_location),
+                "hidden plan inputs are live operand bindings"
+            );
+            assert!(
+                compute_typed_function_local_must_bound_ins(function)[&target_label]
+                    .contains(&h_location),
+                "hidden plan inputs retain their definite-binding proof"
             );
         }
     }

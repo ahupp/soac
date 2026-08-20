@@ -6,6 +6,56 @@ use ruff_text_size::{Ranged, TextRange};
 use std::collections::HashMap;
 use std::fmt;
 
+/// Source ranges are semantic anchors for authenticated offline operation
+/// facts. Ruff's process-local node indexes are still omitted from archives,
+/// but dropping ranges would silently disable those decisions on cache hits.
+pub(super) struct ArchivedSourceRange;
+
+impl rkyv::with::ArchiveWith<TextRange> for ArchivedSourceRange {
+    type Archived = rkyv::Archived<[u32; 2]>;
+    type Resolver = rkyv::Resolver<[u32; 2]>;
+
+    fn resolve_with(field: &TextRange, resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+        rkyv::Archive::resolve(
+            &[field.start().to_u32(), field.end().to_u32()],
+            resolver,
+            out,
+        );
+    }
+}
+
+impl<S> rkyv::with::SerializeWith<TextRange, S> for ArchivedSourceRange
+where
+    S: rkyv::rancor::Fallible + ?Sized,
+    [u32; 2]: rkyv::Serialize<S>,
+{
+    fn serialize_with(field: &TextRange, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        rkyv::Serialize::serialize(&[field.start().to_u32(), field.end().to_u32()], serializer)
+    }
+}
+
+impl<D> rkyv::with::DeserializeWith<rkyv::Archived<[u32; 2]>, TextRange, D> for ArchivedSourceRange
+where
+    D: rkyv::rancor::Fallible + ?Sized,
+    D::Error: rkyv::rancor::Source,
+    rkyv::Archived<[u32; 2]>: rkyv::Deserialize<[u32; 2], D>,
+{
+    fn deserialize_with(
+        field: &rkyv::Archived<[u32; 2]>,
+        deserializer: &mut D,
+    ) -> Result<TextRange, D::Error> {
+        use rkyv::rancor::Source;
+        let [start, end] = rkyv::Deserialize::deserialize(field, deserializer)?;
+        if start > end {
+            return Err(D::Error::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "archived source range starts after its end",
+            )));
+        }
+        Ok(TextRange::new(start.into(), end.into()))
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -209,7 +259,7 @@ pub struct Meta {
     #[rkyv(with = rkyv::with::Skip)]
     pub node_index: ast::AtomicNodeIndex,
     pub instr_id: Option<InstrId>,
-    #[rkyv(with = rkyv::with::Skip)]
+    #[rkyv(with = ArchivedSourceRange)]
     pub range: TextRange,
 }
 
@@ -262,5 +312,23 @@ where
 {
     fn meta(&self) -> Meta {
         Meta::new(self.node_index().clone(), self.range())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archived_metadata_preserves_authenticated_source_site_ranges() {
+        let meta = Meta {
+            instr_id: Some(InstrId::new(17)),
+            range: TextRange::new(23.into(), 51.into()),
+            ..Meta::default()
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&meta).unwrap();
+        let restored = rkyv::from_bytes::<Meta, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(restored.instr_id, meta.instr_id);
+        assert_eq!(restored.range, meta.range);
     }
 }

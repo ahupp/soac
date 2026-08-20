@@ -42,6 +42,25 @@ def test_code_with_freevars_preserves_requested_freevar_order():
     } == captured_by_name
 
 
+def test_code_with_freevars_preserves_native_type_parameter_capture():
+    names = ("outer", ".type_params")
+    code = runtime.code_with_freevars(names, False, False)
+
+    assert code.co_freevars == names
+    assert runtime.code_with_freevars(names, False, False) is code
+    closure = (_make_cell("outer-value"), _make_cell((int,)))
+    wrapped = types.FunctionType(code, globals(), closure=closure)
+    assert wrapped.__closure__ == closure
+    with pytest.raises(RuntimeError, match="CLIF entry executed without vectorcall interception"):
+        wrapped()
+
+
+@pytest.mark.parametrize("name", ("arbitrary.name", "class"))
+def test_code_with_freevars_rejects_unrecognized_source_names(name):
+    with pytest.raises(ValueError, match="invalid freevar name"):
+        runtime.code_with_freevars((name,), False, False)
+
+
 def test_code_with_freevars_builds_sync_wrapper():
     wrapped = _build_wrapped(("x", "y"), False, False)
 

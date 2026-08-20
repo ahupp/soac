@@ -1445,6 +1445,11 @@ struct ExactStrCompareReturnShape {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PyObjectRegionInputSource {
     LocalName(String),
+    CellValue {
+        source: InstrId,
+        name: soac_core::block_py::ResolvedName,
+        binding: soac_core::block_py::CellLoadBinding,
+    },
     ModuleConstant(u32),
     IndexedField {
         source: InstrId,
@@ -1880,9 +1885,13 @@ impl ExtractedRegionExt for ExtractedRegion {
     ) -> Option<PyObjectRegionInputSource> {
         let value = self.value(value)?;
         match &value.kind {
-            ExtractedValueKind::LoadName { name } => {
-                self.load_name_pyobject_input_source(value, name, indexed_global_loads_by_source)
-            }
+            ExtractedValueKind::LoadName { name, cell_binding } => self
+                .load_name_pyobject_input_source(
+                    value,
+                    name,
+                    cell_binding.as_ref(),
+                    indexed_global_loads_by_source,
+                ),
             ExtractedValueKind::GetAttr {
                 value: receiver,
                 attr: _,
@@ -1914,12 +1923,18 @@ impl ExtractedRegion {
         &self,
         value: &ExtractedValue,
         name: &soac_core::block_py::ResolvedName,
+        cell_binding: Option<&soac_core::block_py::CellLoadBinding>,
         indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
     ) -> Option<PyObjectRegionInputSource> {
         match name.location {
-            NameLocation::Local(_) | NameLocation::Cell(_) => Some(
-                PyObjectRegionInputSource::LocalName(name.id_str().to_string()),
-            ),
+            NameLocation::Local(_) => Some(PyObjectRegionInputSource::LocalName(
+                name.id_str().to_string(),
+            )),
+            NameLocation::Cell(_) => Some(PyObjectRegionInputSource::CellValue {
+                source: value.source?,
+                name: name.clone(),
+                binding: cell_binding?.clone(),
+            }),
             NameLocation::Constant(index) => Some(PyObjectRegionInputSource::ModuleConstant(index)),
             NameLocation::Global(slot) => {
                 let source = value.source?;
@@ -1943,11 +1958,8 @@ impl ExtractedRegion {
     fn local_name_input_source(&self, value: ExtractedValueId) -> Option<String> {
         let value = self.value(value)?;
         match &value.kind {
-            ExtractedValueKind::LoadName { name }
-                if matches!(
-                    name.location,
-                    NameLocation::Local(_) | NameLocation::Cell(_)
-                ) =>
+            ExtractedValueKind::LoadName { name, .. }
+                if matches!(name.location, NameLocation::Local(_)) =>
             {
                 Some(name.id_str().to_string())
             }
@@ -1965,6 +1977,15 @@ fn region_pyobject_input(
         PyObjectRegionInputSource::LocalName(name) => RegionInputSource::FunctionParam {
             index,
             name: Some(name),
+        },
+        PyObjectRegionInputSource::CellValue {
+            source,
+            name,
+            binding,
+        } => RegionInputSource::CellValue {
+            source,
+            name,
+            binding,
         },
         PyObjectRegionInputSource::ModuleConstant(index) => {
             RegionInputSource::ModuleConstant { index }
@@ -1999,7 +2020,8 @@ fn region_pyobject_input(
 
 fn fallback_pyobject_input_value(id: u32, source: &PyObjectRegionInputSource) -> PlanValue {
     let rep = match source {
-        PyObjectRegionInputSource::IndexedField { .. }
+        PyObjectRegionInputSource::CellValue { .. }
+        | PyObjectRegionInputSource::IndexedField { .. }
         | PyObjectRegionInputSource::IndexedGlobal { .. } => Rep::PyObjectOwned,
         PyObjectRegionInputSource::LocalName(_) | PyObjectRegionInputSource::ModuleConstant(_) => {
             Rep::PyObjectBorrowed
@@ -2927,6 +2949,31 @@ mod tests {
     }
 
     #[test]
+    fn exact_int_cell_receiver_declines_only_unmodeled_indexed_field_region() {
+        let mut region = compact_int_compare_branch_with_indexed_fields_region(BinOpKind::Lt);
+        for value in &mut region.values {
+            if let ExtractedValueKind::LoadName { name, cell_binding } = &mut value.kind
+                && name.local_location().is_some()
+            {
+                name.location = NameLocation::closure_cell(0);
+                *cell_binding = Some(soac_core::block_py::CellLoadBinding {
+                    logical_name: name.id.clone(),
+                    kind: soac_core::block_py::CellBindingKind::Capture,
+                });
+            }
+        }
+        let mut request = module_request(region, facts_for_compact_field_compare_region());
+        add_test_indexed_field(&mut request, 10, "current", 0);
+        add_test_indexed_field(&mut request, 11, "stop", 1);
+        let plan = plan_module_optimization_v3(&AlternativeCatalog::default_v3(), request);
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.regions.is_empty());
+        assert_eq!(function.indexed_fields.len(), 2);
+        assert_eq!(function.diagnostics.len(), 1);
+    }
+
+    #[test]
     fn preserves_indexed_field_getattrs_in_compact_int_return_regions() {
         let catalog = AlternativeCatalog::default_v3();
         let mut request = module_request(
@@ -3162,6 +3209,55 @@ mod tests {
                 ),
                 "{kind:?}"
             );
+        }
+    }
+
+    #[test]
+    fn exact_int_cell_input_keeps_location_and_owns_fallback_value() {
+        use soac_core::block_py::{CellBindingKind, CellLoadBinding, CellLocation};
+        for (location, kind) in [
+            (CellLocation::Owned(2), CellBindingKind::Owner),
+            (CellLocation::Preserved(3), CellBindingKind::Owner),
+            (CellLocation::Closure(4), CellBindingKind::Capture),
+            (CellLocation::CapturedSource(5), CellBindingKind::Capture),
+            // Inlining can remap a free-variable load to caller-owned storage.
+            (CellLocation::Owned(6), CellBindingKind::Capture),
+        ] {
+            let mut region = compact_int_binary_return_region(BinOpKind::Add);
+            let ExtractedValueKind::LoadName { name, cell_binding } = &mut region.values[0].kind
+            else {
+                panic!("the arithmetic fixture starts with a resolved load");
+            };
+            name.location = NameLocation::Cell(location);
+            let binding = CellLoadBinding {
+                logical_name: name.id.clone(),
+                kind,
+            };
+            *cell_binding = Some(binding.clone());
+            let cell_name = name.clone();
+            let plan = plan_module_optimization_v3(
+                &AlternativeCatalog::default_v3(),
+                module_request(region, facts_for_compact_region()),
+            );
+            validate_module_plan_v3(&plan).unwrap();
+            let function = &plan.functions[0];
+            assert!(function.diagnostics.is_empty());
+            assert_eq!(function.regions.len(), 2);
+            for region in &function.regions {
+                assert_eq!(
+                    region.inputs[0].source,
+                    RegionInputSource::CellValue {
+                        source: InstrId::new(0),
+                        name: cell_name.clone(),
+                        binding: binding.clone(),
+                    },
+                );
+            }
+            assert_eq!(
+                function.regions[0].inputs[0].value.rep,
+                Rep::PyObjectBorrowed
+            );
+            assert_eq!(function.regions[1].inputs[0].value.rep, Rep::PyObjectOwned);
         }
     }
 

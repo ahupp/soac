@@ -1,9 +1,10 @@
 use super::backend::{define_prepared_function, register_jit_signal_diagnostics};
 use super::codegen_env::{FuncBuildImports, JitCodegenEnv, declare_local_fn};
 use super::imports::{
-    DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT, DP_JIT_DECREF_IMPORT,
-    DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT,
-    DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
+    DP_JIT_CHECKED_FUNCTION_METADATA_IMPORT, DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
+    DP_JIT_DECREF_IMPORT, DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
+    DP_JIT_RETIRE_STRICT_CALL_ARGUMENTS_IMPORT, DP_JIT_STRICT_FINISH_CALL_IMPORT,
+    DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT, DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
     DP_JIT_VECTORCALL_PREVIOUS_FOR_CHANGED_CODE_IMPORT, ModuleFuncImports,
     PY_THREAD_STATE_GET_UNCHECKED_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
 };
@@ -12,7 +13,7 @@ use super::runtime_context::{
     FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DIRECT_CODE_PTR_OFFSET,
     PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET, PY_FUNCTION_CODE_OFFSET, PY_FUNCTION_DEFAULTS_OFFSET,
     PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET, PY_FUNCTION_KWDEFAULTS_OFFSET,
-    PY_THREAD_STATE_BASE_FRAME_OFFSET, load_function_env_obj, load_py_function_soac_metadata_obj,
+    PY_THREAD_STATE_BASE_FRAME_OFFSET, load_function_env_obj,
 };
 use super::{
     RuntimeFunctionId, SoacEnvConfig, VectorcallEntryFn,
@@ -150,6 +151,11 @@ pub(super) fn define_shared_vectorcall_trampoline(
         let kwnames_val = fb.block_params(entry)[3];
 
         let mut func_imports = FuncBuildImports::new(&mut module_imports);
+        let metadata_ref = func_imports.get_or_panic(
+            jit_module,
+            &mut fb.func,
+            &DP_JIT_CHECKED_FUNCTION_METADATA_IMPORT,
+        );
         let bind_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -160,6 +166,8 @@ pub(super) fn define_shared_vectorcall_trampoline(
             &mut fb.func,
             &DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
         );
+        let strict_finish_ref =
+            func_imports.get_or_panic(jit_module, &mut fb.func, &DP_JIT_STRICT_FINISH_CALL_IMPORT);
         let previous_vectorcall_ref = func_imports.get_or_panic(
             jit_module,
             &mut fb.func,
@@ -194,7 +202,8 @@ pub(super) fn define_shared_vectorcall_trampoline(
         };
 
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
-        let function_extra_val = load_py_function_soac_metadata_obj(&mut fb, ptr_ty, callable_val);
+        let metadata_inst = fb.ins().call(metadata_ref, &[callable_val]);
+        let function_extra_val = fb.inst_results(metadata_inst)[0];
         let function_extra_missing =
             fb.ins()
                 .icmp_imm(ir::condcodes::IntCC::Equal, function_extra_val, 0);
@@ -214,6 +223,15 @@ pub(super) fn define_shared_vectorcall_trampoline(
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(function_extra_ok);
+        let strict_owner_flag = fb.ins().load(
+            ir::types::I8,
+            ir::MemFlags::trusted(),
+            function_extra_val,
+            crate::PY_FUNCTION_JIT_EXTRA_STRICT_OWNER_OFFSET,
+        );
+        let has_strict_owner =
+            fb.ins()
+                .icmp_imm(ir::condcodes::IntCC::NotEqual, strict_owner_flag, 0);
         let current_code = fb.ins().load(
             ptr_ty,
             ir::MemFlags::trusted(),
@@ -374,12 +392,19 @@ pub(super) fn define_shared_vectorcall_trampoline(
             Some(fb.create_sized_stack_slot(ir::StackSlotData::new(
                 ir::StackSlotKind::ExplicitSlot,
                 (param_count * std::mem::size_of::<u64>()) as u32,
-                0,
+                std::mem::align_of::<u64>().trailing_zeros() as u8,
             )))
         };
 
         let generic_bind_block = fb.create_block();
+        let activation_slot = fb.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            std::mem::size_of::<usize>() as u32,
+            std::mem::align_of::<usize>().trailing_zeros() as u8,
+        ));
         let direct_call_block = fb.create_block();
+        fb.append_block_param(direct_call_block, ptr_ty);
+        fb.append_block_param(direct_call_block, ptr_ty);
         fb.append_block_param(direct_call_block, ptr_ty);
         for _ in 0..param_count {
             fb.append_block_param(direct_call_block, ptr_ty);
@@ -454,6 +479,12 @@ pub(super) fn define_shared_vectorcall_trampoline(
                 .band(defaults_are_current, kwdefaults_are_immutable);
             let shape_and_defaults_match = fb.ins().band(shape_matches, defaults_are_safe);
             let mut fast_path_matches = fb.ins().band(shape_and_defaults_match, core_is_ready);
+            // The source-selected public boundary also authenticates its
+            // execution owner. Exact arity does not justify eliding it.
+            let no_strict_owner =
+                fb.ins()
+                    .icmp_imm(ir::condcodes::IntCC::Equal, strict_owner_flag, 0);
+            fast_path_matches = fb.ins().band(fast_path_matches, no_strict_owner);
             if param_count != 0 {
                 let arguments_are_present =
                     fb.ins()
@@ -502,8 +533,10 @@ pub(super) fn define_shared_vectorcall_trampoline(
                     Some(PyObjFacts::unknown().with_non_null_ref()),
                 );
             }
-            let mut fast_call_args = Vec::with_capacity(param_count + 1);
+            let mut fast_call_args = Vec::with_capacity(param_count + 3);
             fast_call_args.push(ir::BlockArg::Value(core_callee_ptr));
+            fast_call_args.push(ir::BlockArg::Value(function_env_val));
+            fast_call_args.push(ir::BlockArg::Value(null_ptr));
             fast_call_args.extend(exact_args.into_iter().map(ir::BlockArg::Value));
             fb.ins().jump(direct_call_block, &fast_call_args);
         } else {
@@ -518,6 +551,7 @@ pub(super) fn define_shared_vectorcall_trampoline(
             null_ptr
         };
         let out_len = fb.ins().iconst(i64_ty, param_count as i64);
+        let activation_output = fb.ins().stack_addr(ptr_ty, activation_slot, 0);
         let bind_inst = fb.ins().call(
             bind_ref,
             &[
@@ -528,10 +562,11 @@ pub(super) fn define_shared_vectorcall_trampoline(
                 function_extra_val,
                 bound_args_ptr,
                 out_len,
+                activation_output,
             ],
         );
-        let bind_ok = fb.inst_results(bind_inst)[0];
-        let bind_failed = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, bind_ok, 0);
+        let bound_env = fb.inst_results(bind_inst)[0];
+        let bind_failed = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, bound_env, 0);
         let fail_block = fb.create_block();
         let ok_block = fb.create_block();
         fb.ins().brif(bind_failed, fail_block, &[], ok_block, &[]);
@@ -542,8 +577,11 @@ pub(super) fn define_shared_vectorcall_trampoline(
         fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(ok_block);
-        let mut generic_call_args = Vec::with_capacity(param_count + 1);
+        let mut generic_call_args = Vec::with_capacity(param_count + 3);
         generic_call_args.push(ir::BlockArg::Value(callee_ptr));
+        generic_call_args.push(ir::BlockArg::Value(bound_env));
+        let activation = fb.ins().stack_load(ptr_ty, activation_slot, 0);
+        generic_call_args.push(ir::BlockArg::Value(activation));
         if let Some(slot) = bound_args_slot {
             for index in 0..param_count {
                 let value =
@@ -557,19 +595,28 @@ pub(super) fn define_shared_vectorcall_trampoline(
 
         fb.switch_to_block(direct_call_block);
         let selected_callee_ptr = fb.block_params(direct_call_block)[0];
-        let owned_args = fb.block_params(direct_call_block)[1..].to_vec();
+        let selected_env = fb.block_params(direct_call_block)[1];
+        let activation = fb.block_params(direct_call_block)[2];
+        let owned_args = fb.block_params(direct_call_block)[3..].to_vec();
         let direct_sig_ref = fb.import_signature(direct_sig);
         let mut call_args = Vec::with_capacity(param_count + 2);
-        call_args.push(function_env_val);
+        call_args.push(selected_env);
         call_args.push(thread_state_val);
         call_args.extend(owned_args.iter().copied());
         let call_inst = fb
             .ins()
             .call_indirect(direct_sig_ref, selected_callee_ptr, &call_args);
         let result = fb.inst_results(call_inst)[0];
+        let retire_ref = func_imports.get(
+            jit_module,
+            fb.func,
+            &DP_JIT_RETIRE_STRICT_CALL_ARGUMENTS_IMPORT,
+        )?;
+        fb.ins().call(retire_ref, &[activation]);
         let result_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
         let direct_null_block = fb.create_block();
         let direct_ok_block = fb.create_block();
+        let finish_block = fb.create_block();
         fb.ins()
             .brif(result_is_null, direct_null_block, &[], direct_ok_block, &[]);
         fb.seal_block(direct_null_block);
@@ -583,12 +630,31 @@ pub(super) fn define_shared_vectorcall_trampoline(
         }
         fb.ins()
             .call(set_raised_exception_ref, &[thread_state_val, error_value]);
-        fb.ins().return_(&[result]);
+        fb.ins().jump(finish_block, &[]);
 
         fb.switch_to_block(direct_ok_block);
         for value in owned_args {
             fb.ins().call(decref_ref, &[thread_state_val, value]);
         }
+        fb.ins().jump(finish_block, &[]);
+        fb.seal_block(finish_block);
+        fb.switch_to_block(finish_block);
+        let strict_return_block = fb.create_block();
+        let ordinary_return_block = fb.create_block();
+        fb.ins().brif(
+            has_strict_owner,
+            strict_return_block,
+            &[],
+            ordinary_return_block,
+            &[],
+        );
+        fb.seal_block(strict_return_block);
+        fb.seal_block(ordinary_return_block);
+        fb.switch_to_block(strict_return_block);
+        let checked = fb.ins().call(strict_finish_ref, &[activation, result]);
+        let checked = fb.inst_results(checked)[0];
+        fb.ins().return_(&[checked]);
+        fb.switch_to_block(ordinary_return_block);
         fb.ins().return_(&[result]);
         fb.seal_all_blocks();
         fb.finalize();

@@ -7,7 +7,9 @@ use tracing::{enabled, trace, Level};
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::ast_to_ast::context::{Context, ScopeFrame};
 use crate::passes::ast_to_ast::scope_helpers::ScopeKind;
+use crate::passes::ast_to_ast::semantic::{ensure_node_indices_for_suite, LoweredLambdaBody};
 use crate::ruff_ast::ruff_ast_to_string;
+use crate::template::{py_expr, py_stmt};
 use crate::transformer::{walk_expr, walk_stmt, Transformer};
 
 pub(crate) enum Rewrite {
@@ -64,6 +66,8 @@ pub(crate) fn rewrite_with_pass<'a>(
     expr_pass: Option<&'a dyn ExprRewritePass>,
     body: &mut Suite,
 ) {
+    // Source lambdas keep this identity when their body needs statements.
+    ensure_node_indices_for_suite(body);
     let pass_name = "rewrite_with_pass";
     let mut iteration = 0usize;
     loop {
@@ -118,6 +122,42 @@ pub(crate) trait ExprRewritePass {
 }
 
 impl<'a> RewriteLoop<'a> {
+    fn visit_lambda(&mut self, lambda: &mut ast::ExprLambda) {
+        // Defaults execute at the containing expression site, not in the body.
+        if let Some(parameters) = &mut lambda.parameters {
+            self.visit_parameters(parameters);
+        }
+        let node = lambda.node_index.load();
+        let mut body = self
+            .context
+            .take_lowered_lambda_body(node)
+            .unwrap_or_else(|| {
+                let value = std::mem::replace(&mut *lambda.body, py_expr!("None"));
+                LoweredLambdaBody {
+                    statements: [py_stmt!("return {value:expr}", value = value)].into(),
+                }
+            });
+        self.context.push_scope(ScopeFrame::new(
+            ScopeKind::Function,
+            HashSet::new(),
+            HashSet::new(),
+        ));
+        // visit_body owns a separate statement buffer, so a comprehension's
+        // helper definition cannot escape into the lambda's enclosing function.
+        self.visit_body(&mut body.statements);
+        self.context.pop_scope();
+        if body.statements.len() == 1 {
+            let Stmt::Return(returned) = body.statements.pop().unwrap() else {
+                panic!("a statement-free lambda body must remain a return");
+            };
+            lambda.body = returned
+                .value
+                .expect("a lambda always returns its expression");
+        } else {
+            self.context.record_lowered_lambda_body(node, body);
+        }
+    }
+
     fn flush_buffered(&mut self, mut stmt: Stmt, output: &mut Vec<Stmt>) {
         match &mut stmt {
             Stmt::FunctionDef(func_def) => {
@@ -220,7 +260,7 @@ impl<'a> Transformer for RewriteLoop<'a> {
     fn visit_body(&mut self, body: &mut Suite) {
         let saved_buf = take(&mut self.buf);
         let stmts = take(body);
-        *body = self.process_statements(stmts);
+        *body = self.process_statements(stmts.into()).into();
         self.buf = saved_buf;
     }
 
@@ -273,7 +313,11 @@ impl<'a> Transformer for RewriteLoop<'a> {
         if !modified_any {
             trace!("walk_expr: {}", ruff_ast_to_string(&current).trim_end());
 
-            walk_expr(self, &mut current);
+            if let Expr::Lambda(lambda) = &mut current {
+                self.visit_lambda(lambda);
+            } else {
+                walk_expr(self, &mut current);
+            }
         }
         *expr_input = current;
     }
@@ -345,7 +389,13 @@ fn apply_expr_range(expr: &mut Expr, range: TextRange) {
         Expr::Yield(node) => node.range = range,
         Expr::YieldFrom(node) => node.range = range,
         Expr::Compare(node) => node.range = range,
-        Expr::Call(node) => node.range = range,
+        Expr::Call(node) => {
+            node.range_start = range.start();
+            node.arguments.range = ruff_text_size::TextRange::new(
+                node.arguments.range.start().min(range.end()),
+                range.end(),
+            );
+        }
         Expr::FString(node) => node.range = range,
         Expr::TString(node) => node.range = range,
         Expr::StringLiteral(node) => node.range = range,

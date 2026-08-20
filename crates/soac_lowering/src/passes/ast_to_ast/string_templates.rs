@@ -42,7 +42,7 @@ fn rewrite_interpolation(interp: &ast::InterpolatedElement, is_raw: bool) -> Vec
     let mut value = (*interp.expression).clone();
     let conversion = if let Some(debug) = &interp.debug_text {
         let has_format_spec = interp.format_spec.is_some();
-        let trailing_has_format = debug.trailing.contains(':');
+        let trailing_has_format = debug.trailing().contains(':');
         if matches!(interp.conversion, ast::ConversionFlag::None) && !has_format_spec {
             ast::ConversionFlag::Repr
         } else if matches!(interp.conversion, ast::ConversionFlag::Repr)
@@ -71,8 +71,8 @@ fn rewrite_interpolation(interp: &ast::InterpolatedElement, is_raw: bool) -> Vec
         let expr_text = crate::ruff_ast::ruff_ast_to_string(&*interp.expression)
             .trim_end()
             .to_string();
-        let trailing = strip_debug_comment(debug.trailing.as_str());
-        let debug_text = format!("{}{}{}", debug.leading, expr_text, trailing);
+        let trailing = strip_debug_comment(debug.trailing());
+        let debug_text = format!("{}{}{}", debug.leading(), expr_text, trailing);
         if !debug_text.is_empty() {
             parts.push(py_expr!("{literal:literal}", literal = debug_text.as_str()));
         }

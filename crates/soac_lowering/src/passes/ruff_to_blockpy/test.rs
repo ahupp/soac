@@ -2,7 +2,8 @@ use super::*;
 
 use crate::block_py::{
     instr_any, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
-    FunctionKind, InstrWithAwaitAndYield, ModuleShape, NameLike, ScopeExprNode, TermRaise,
+    FunctionKind, InstrWithAwaitAndYield, MapTerm, ModuleShape, NameLike, RaiseDisposition,
+    ScopeExprNode, TermRaise, TryMapTerm,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::pass_tracker::LoweringPassTrackerInternalExt;
@@ -75,7 +76,9 @@ where
                     .exc
                     .as_ref()
                     .is_some_and(|exc| instr_any(exc, &mut predicate)),
-                BlockTerm::Return(value) => instr_any(value, &mut predicate),
+                BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
+                    instr_any(value, &mut predicate)
+                }
                 BlockTerm::Jump(_) => false,
             }
     })
@@ -156,7 +159,146 @@ def f(x, ys):
 }
 
 #[test]
+fn caught_handler_return_uses_a_distinct_finally_exception_region() {
+    let source = r#"
+def f(work, outer_probe, handler_probe, finally_probe):
+    try:
+        raise KeyError('outer')
+    except KeyError:
+        outer_probe()
+        try:
+            work()
+        except ValueError:
+            handler_probe()
+            return 73
+        finally:
+            finally_probe()
+"#;
+    let lowered = lower_python_to_blockpy_for_testing(source).unwrap();
+    let blockpy = lowered
+        .pass_tracker
+        .pass_core_blockpy_with_await_and_yield()
+        .unwrap();
+    let function = function_by_name(&blockpy, "f");
+    let probe_block = |name: &str| {
+        let mut matches = function.blocks.iter().filter(|block| {
+            block.body.iter().any(|instr| {
+                instr_any(instr, &mut |expr: &InstrWithAwaitAndYield| {
+                    expr.root_name_id() == Some(name)
+                })
+            })
+        });
+        let block = matches.next().expect("the source probe is represented");
+        assert!(matches.next().is_none(), "the probe belongs to one region");
+        block
+    };
+    let outer = probe_block("outer_probe");
+    let handler = probe_block("handler_probe");
+    let finally = probe_block("finally_probe");
+    let outer_region = outer.exception_param().expect("outer handler region");
+    let handler_region = handler
+        .exception_param()
+        .expect("caught inner handler region");
+    let finally_region = finally
+        .exception_param()
+        .expect("exceptional finally region");
+    assert_ne!(
+        handler_region, finally_region,
+        "normal return from a caught handler must pop its handled item before the associated finally"
+    );
+    for block in [handler, finally] {
+        assert!(block.params.iter().any(|param| {
+            param.role == BlockParamRole::EnclosingException && param.name == outer_region
+        }));
+    }
+    assert!(finally
+        .params
+        .iter()
+        .all(|param| param.name != handler_region));
+    assert_all_block_targets_present(&function.blocks);
+
+    // The later physical argument completion must not undo the distinct
+    // region decision by forwarding a different parameter with the same role.
+    let bound = lowered.pass_tracker.pass_name_binding().unwrap();
+    let function = function_by_name(bound, "f");
+    let mut normal_entries = 0;
+    for block in &function.blocks {
+        let BlockTerm::Jump(edge) = &block.term else {
+            continue;
+        };
+        let target = function
+            .blocks
+            .iter()
+            .find(|candidate| candidate.label == edge.target)
+            .unwrap();
+        let Some(index) = target
+            .params
+            .iter()
+            .position(|param| param.name == finally_region)
+        else {
+            continue;
+        };
+        if block
+            .params
+            .iter()
+            .any(|param| param.name == finally_region)
+        {
+            continue;
+        }
+        assert_eq!(edge.args.len(), target.params.len());
+        assert!(
+            matches!(edge.args[index], crate::block_py::BlockArg::None),
+            "a new normal finally entry has no escaping exception; another handler's role is not its identity: {:?}",
+            edge.args[index]
+        );
+        normal_entries += 1;
+    }
+    assert!(
+        normal_entries > 0,
+        "the fixture must exercise a fresh normal finally edge"
+    );
+}
+
+#[test]
+fn for_loop_ir_operand_statements_preserve_store_purpose_and_lifetime() {
+    use crate::block_py::{HasMeta, Store, StoreLifetime, StorePurpose, TakeOperand, WithMeta};
+    let context = test_context();
+    let name_gen = test_name_gen();
+    let value = instr_expr(py_expr!("value"));
+    let meta = value.meta();
+    let store: InstrRuff = Store::new("operand", value)
+        .with_lifetime(StoreLifetime::Operand { unwind_order: 17 })
+        .with_purpose(StorePurpose::BlockParameterTransport)
+        .with_meta(meta.clone())
+        .into();
+    let take: InstrRuff = TakeOperand::new("operand").with_meta(meta.clone()).into();
+    let mut out = InlineBlockBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
+    for instr in [store, take] {
+        assert!(matches!(
+            plan_instr_sequence_head(&context, &instr),
+            StmtSequenceHeadPlan::Linear(_)
+        ));
+        lower_instr_for_test(&context, &instr, &name_gen, &mut out, None)
+            .expect("compiler operand statements must stay in IR");
+    }
+    let fragment = out.finish();
+    let [InstrWithAwaitAndYield::Store(store), InstrWithAwaitAndYield::TakeOperand(take)] =
+        fragment.entry.body.as_slice()
+    else {
+        panic!("the statement bridge must preserve the store and consuming discard")
+    };
+    assert!(matches!(
+        store.lifetime,
+        StoreLifetime::Operand { unwind_order: 17 }
+    ));
+    assert_eq!(store.purpose, StorePurpose::BlockParameterTransport);
+    assert_eq!(store.meta().range, meta.range);
+    assert_eq!(store.name.id_str(), take.name.id_str());
+}
+
+#[test]
 fn for_loop_simple_target_does_not_self_store_generated_next_temp() {
+    use crate::block_py::{CallArgPositional, HandledExceptionContext, HasMeta, StoreLifetime};
     let blockpy = wrapped_core_blockpy_with_await_and_yield(
         r#"
 def f(xs):
@@ -166,30 +308,313 @@ def f(xs):
     );
     let function = function_by_name(&blockpy, "f");
 
-    assert!(function_has_root_load(function, "next"));
+    let mut steps = Vec::new();
+    function_instr_any(function, |expr| {
+        if let InstrWithAwaitAndYield::IteratorStep(op) = expr {
+            steps.push(op.name.id_str().to_owned());
+        }
+        false
+    });
+    let [iterator] = steps.as_slice() else {
+        panic!("one explicit loop step")
+    };
+    let mut iterator_store = None;
+    let mut item_store = None;
+    function_instr_any(function, |expr| {
+        if let InstrWithAwaitAndYield::Store(store) = expr {
+            if store.name.id_str() == iterator {
+                iterator_store = Some(store.clone());
+            }
+            if matches!(
+                store.value.as_ref(),
+                InstrWithAwaitAndYield::IteratorStep(_)
+            ) {
+                item_store = Some(store.clone());
+            }
+        }
+        false
+    });
+    let iterator_store = iterator_store.expect("loop iterator acquisition");
+    let item_store = item_store.expect("fetched item acquisition");
+    assert!(
+        !item_store.meta().range.is_empty(),
+        "real iterator errors must retain the original for-statement source range"
+    );
+    let StoreLifetime::Operand {
+        unwind_order: iterator_order,
+    } = iterator_store.lifetime
+    else {
+        panic!("iterator must remain an expression operand, not an ordinary local owner")
+    };
+    let StoreLifetime::Operand {
+        unwind_order: item_order,
+    } = item_store.lifetime
+    else {
+        panic!("fetched item must unwind on target failure")
+    };
+    assert!(iterator_order < item_order);
+    let InstrWithAwaitAndYield::Call(acquire) = iterator_store.value.as_ref() else {
+        panic!("canonical iterator acquisition")
+    };
+    let [CallArgPositional::Positional(InstrWithAwaitAndYield::TakeOperand(iterable))] =
+        acquire.args.as_slice()
+    else {
+        panic!("GetIter consumes its evaluated iterable")
+    };
+    assert!(function_has_instr(function, |expr| matches!(expr,
+        InstrWithAwaitAndYield::Store(store)
+        if store.name.id_str() == iterable.name.id_str()
+            && matches!(store.lifetime, StoreLifetime::Operand { unwind_order } if unwind_order < iterator_order)
+    )));
+    assert!(function_has_instr(function, |expr| matches!(expr,
+        InstrWithAwaitAndYield::Store(store)
+        if store.name.id_str() == "item"
+            && matches!(store.value.as_ref(), InstrWithAwaitAndYield::TakeOperand(take)
+                if take.name.id_str() == item_store.name.id_str())
+    )));
+    assert!(!function_has_root_load(function, "next"));
     assert!(function_has_root_load(function, "exception_matches"));
     assert!(function_has_root_load(function, "StopIteration"));
     assert!(!function_has_root_load(function, "object"));
+    let cleanups = function
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.body.iter().any(|instr|
+        matches!(instr, InstrWithAwaitAndYield::TakeOperand(take) if take.name.id_str() == iterator)
+    )
+        })
+        .collect::<Vec<_>>();
+    let normal = cleanups
+        .iter()
+        .find(|block| matches!(block.term, BlockTerm::Return(_)))
+        .expect("normal exhaustion must consume the iterator before returning");
+    // The ordinary CFG pass folds this cleanup's jump to the empty implicit
+    // return block. Assert the resulting semantic exit, not the pre-fold jump.
     assert!(
-        blocks_store_to_prefix(&function.blocks, "_dp_tmp_"),
-        "for lowering should still hold the next() result in a cleanup-visible temp: {:#?}",
-        function.blocks
+        matches!(&normal.term, BlockTerm::Return(InstrWithAwaitAndYield::Load(load))
+        if load.name.runtime_name_id() == Some(crate::block_py::RuntimeName::None))
     );
-    assert!(
-        blocks_store_to_prefix(&function.blocks, "_dp_iterable_"),
-        "for lowering should expose the iterable expression in its own temp before iter(): {:#?}",
-        function.blocks
+    let error = cleanups.iter().find(|block| matches!(&block.term,
+        BlockTerm::Raise(raise) if raise.disposition == RaiseDisposition::PropagateNormalized
+    )).expect("loop error exits consume the owner before forwarding");
+    assert_eq!(
+        error.extra.handled_exception,
+        HandledExceptionContext::Unwind
     );
-    assert!(
-        blocks_delete_to_prefix(&function.blocks, "_dp_iterable_"),
-        "for lowering should clean up the iterable temp after iter(): {:#?}",
-        function.blocks
+    assert!(error.exception_param().is_some());
+    let fetch_block = function
+        .blocks
+        .iter()
+        .find(|block| {
+            block.body.iter().any(|instr| {
+                instr_any(instr, |expr| {
+                    matches!(expr, InstrWithAwaitAndYield::IteratorStep(_))
+                })
+            })
+        })
+        .expect("the iterator fetch is emitted directly into a BlockPy block");
+    let dispatch_label = fetch_block.exc_edge.as_ref().unwrap().target;
+    let dispatch = function
+        .blocks
+        .iter()
+        .find(|block| block.label == dispatch_label)
+        .unwrap();
+    assert_eq!(
+        dispatch.extra.handled_exception,
+        HandledExceptionContext::Unwind
     );
-    assert!(
-        !blocks_self_store_to_prefix(&function.blocks, "_dp_tmp_"),
-        "for lowering should not re-store the generated temp into itself: {:#?}",
-        function.blocks
+    let BlockTerm::IfTerm(branch) = &dispatch.term else {
+        panic!("only a failed fetch tests the native exhaustion exception")
+    };
+    assert_eq!(branch.then_label, normal.label);
+    assert_eq!(branch.else_label, error.label);
+    assert!(instr_any(&branch.test, |expr| expr.root_name_id()
+        == Some("exception_matches")));
+    let body_block = function
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .body
+                .iter()
+                .any(|instr| instr_any(instr, |expr| expr.root_name_id() == Some("sink")))
+        })
+        .expect("the source loop body must be present");
+    assert_eq!(
+        body_block.exc_edge.as_ref().unwrap().target,
+        error.label,
+        "body errors must not be mistaken for iterator exhaustion"
     );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn for_loop_direct_fetch_region_preserves_async_and_fallible_target_shapes() {
+    use crate::block_py::StoreLifetime;
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def assign_target(xs, target):
+    for target.item in xs:
+        body()
+    else:
+        finished()
+
+async def async_target(xs, target):
+    async for target.item in xs:
+        body()
+    else:
+        finished()
+"#,
+    );
+    for (name, stop_exception, asynchronous) in [
+        ("assign_target", "StopIteration", false),
+        ("async_target", "StopAsyncIteration", true),
+    ] {
+        let function = function_by_name(&blockpy, name);
+        assert!(function_has_root_load(function, stop_exception));
+        assert!(function_has_root_load(function, "finished"));
+        assert_eq!(
+            function_has_instr(function, |expr| matches!(
+                expr,
+                InstrWithAwaitAndYield::IteratorStep(_)
+            )),
+            !asynchronous
+        );
+        assert_eq!(
+            function_has_instr(function, |expr| matches!(
+                expr,
+                InstrWithAwaitAndYield::Await(_)
+            )),
+            asynchronous
+        );
+        let (target_block, target_index, target) = function
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block.body.iter().enumerate().find_map(|(index, instr)| {
+                    let InstrWithAwaitAndYield::SetAttr(target) = instr else {
+                        return None;
+                    };
+                    Some((block, index, target))
+                })
+            })
+            .expect("the original attribute target must be emitted");
+        let InstrWithAwaitAndYield::TakeOperand(replacement) = target.replacement.as_ref() else {
+            panic!("assignment consumes its staged RHS after evaluating the fallible target")
+        };
+        let handoff = target_block.body[..target_index]
+            .iter()
+            .find_map(|instr| match instr {
+                InstrWithAwaitAndYield::Store(store)
+                    if store.name.id_str() == replacement.name.id_str() =>
+                {
+                    Some(store)
+                }
+                _ => None,
+            })
+            .expect("the target replacement must use the staged fetched item");
+        let InstrWithAwaitAndYield::TakeOperand(item) = handoff.value.as_ref() else {
+            panic!("staging must consume, not clone, the fetched-item owner")
+        };
+        let StoreLifetime::Operand {
+            unwind_order: handoff_order,
+        } = handoff.lifetime
+        else {
+            panic!("the assignment RHS must retire on target failure")
+        };
+        assert!(function_has_instr(function, |expr| matches!(expr,
+            InstrWithAwaitAndYield::Store(store)
+                if store.name.id_str() == item.name.id_str()
+                    && matches!(store.lifetime, StoreLifetime::Operand { unwind_order }
+                        if unwind_order < handoff_order)
+                    && matches!(store.value.as_ref(),
+                        InstrWithAwaitAndYield::IteratorStep(_) | InstrWithAwaitAndYield::Await(_))
+        )));
+        assert!(!target_block.body[target_index + 1..].iter().any(|instr| matches!(instr,
+            InstrWithAwaitAndYield::Del(del) if del.name.id_str() == replacement.name.id_str()
+        )), "SetAttr must not retain a second staged RHS owner for later cleanup");
+        assert!(
+            !function_has_instr(function, |expr| matches!(expr,
+                InstrWithAwaitAndYield::Load(load) if load.name.id_str() == item.name.id_str()
+            )),
+            "the fetched-item binding must not acquire a second owner through Load"
+        );
+        assert_all_block_targets_present(&function.blocks);
+    }
+}
+
+#[test]
+fn for_loop_return_cleanup_is_outside_inner_handlers_and_after_return_evaluation() {
+    use crate::block_py::{HandledExceptionContext, StoreLifetime};
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(xs, observe):
+    for item in xs:
+        try:
+            raise ValueError('inner')
+        except ValueError:
+            return observe()
+
+def explicit_next(iterator):
+    return next(iterator)
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+    let mut iterator = None;
+    function_instr_any(function, |expr| {
+        if let InstrWithAwaitAndYield::IteratorStep(step) = expr {
+            iterator = Some(step.name.id_str().to_owned());
+        }
+        false
+    });
+    let iterator = iterator.unwrap();
+    let cleanup = function
+        .blocks
+        .iter()
+        .find(|block| {
+            matches!(
+                &block.term,
+                BlockTerm::Return(InstrWithAwaitAndYield::TakeOperand(_))
+            ) && block.body.iter().any(|expr| {
+                matches!(expr,
+                InstrWithAwaitAndYield::TakeOperand(take) if take.name.id_str() == iterator)
+            })
+        })
+        .expect("return must pass through the loop owner cleanup");
+    assert_eq!(
+        cleanup.extra.handled_exception,
+        HandledExceptionContext::Regions
+    );
+    assert_eq!(cleanup.handled_exception_params().count(), 0);
+    let BlockTerm::Return(InstrWithAwaitAndYield::TakeOperand(returned)) = &cleanup.term else {
+        unreachable!()
+    };
+    let predecessors = function
+        .blocks
+        .iter()
+        .filter(|block| {
+            matches!(&block.term,
+                BlockTerm::Jump(edge) if edge.target == cleanup.label
+            )
+        })
+        .collect::<Vec<_>>();
+    let [producer] = predecessors.as_slice() else {
+        panic!("one captured return operand")
+    };
+    assert!(producer.handled_exception_params().count() > 0);
+    assert!(producer.body.iter().any(|expr| matches!(expr,
+        InstrWithAwaitAndYield::Store(store)
+        if store.name.id_str() == returned.name.id_str()
+            && matches!(store.lifetime, StoreLifetime::Operand { .. })
+            && instr_any(store.value.as_ref(), |input| input.root_name_id() == Some("observe"))
+    )));
+    let ordinary_call = function_by_name(&blockpy, "explicit_next");
+    assert!(function_has_root_load(ordinary_call, "next"));
+    assert!(!function_has_instr(ordinary_call, |expr| matches!(
+        expr,
+        InstrWithAwaitAndYield::IteratorStep(_)
+    )));
     assert_all_block_targets_present(&function.blocks);
 }
 
@@ -1017,6 +1442,7 @@ fn sequence_raise_helper_emits_raise_block() {
         &test_name_gen(),
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         TermRaise {
+            disposition: RaiseDisposition::Source,
             exc: Some(crate::passes::ast_to_instr::from_ast_expr(py_expr!("exc"))),
         },
         None,
@@ -1030,7 +1456,7 @@ fn sequence_raise_helper_emits_raise_block() {
     assert_eq!(blocks.len(), 1);
     assert!(matches!(
         blocks[0].term,
-        BlockTerm::Raise(TermRaise { exc: Some(_) })
+        BlockTerm::Raise(TermRaise { exc: Some(_), .. })
     ));
 }
 
@@ -1070,6 +1496,7 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
         &name_gen,
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         TermRaise {
+            disposition: RaiseDisposition::Source,
             exc: Some(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
                 "a() < b() < c()"
             ))),
@@ -1085,7 +1512,7 @@ fn sequence_raise_helper_lowers_compare_chain_via_inline_fragment() {
     assert!(blocks.len() > 1, "{blocks:#?}");
     assert!(blocks
         .iter()
-        .any(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_) }))));
+        .any(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_), .. }))));
 }
 
 fn assert_all_block_targets_present<E: Instr>(blocks: &[Block<E>]) {
@@ -1114,7 +1541,7 @@ fn assert_all_block_targets_present<E: Instr>(blocks: &[Block<E>]) {
                 }
                 check(branch.default_label, "branch default");
             }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
         }
         if let Some(edge) = &block.exc_edge {
             check(edge.target, "exception");
@@ -1128,34 +1555,6 @@ fn blocks_store_to_prefix(blocks: &[TestBlock], prefix: &str) -> bool {
             matches!(
                 stmt,
                 InstrWithAwaitAndYield::Store(store) if store.name.id_str().starts_with(prefix)
-            )
-        })
-    })
-}
-
-fn blocks_delete_to_prefix(blocks: &[TestBlock], prefix: &str) -> bool {
-    blocks.iter().any(|block| {
-        block.body.iter().any(|stmt| {
-            matches!(
-                stmt,
-                InstrWithAwaitAndYield::Del(del) if del.name.id_str().starts_with(prefix)
-            )
-        })
-    })
-}
-
-fn blocks_self_store_to_prefix(blocks: &[TestBlock], prefix: &str) -> bool {
-    blocks.iter().any(|block| {
-        block.body.iter().any(|stmt| {
-            matches!(
-                stmt,
-                InstrWithAwaitAndYield::Store(store)
-                    if store.name.id_str().starts_with(prefix)
-                        && matches!(
-                            store.value.as_ref(),
-                            InstrWithAwaitAndYield::Load(load)
-                                if load.name.id_str() == store.name.id_str()
-                        )
             )
         })
     })
@@ -1341,7 +1740,7 @@ def f(exc, fallback):
         function
             .blocks
             .iter()
-            .filter(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_) })))
+            .filter(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_), .. })))
             .count()
             >= 2,
         "{:#?}",
@@ -1665,6 +2064,7 @@ fn sequence_raise_helper_keeps_direct_if_expr_setup_reachable_after_linear_prefi
         &name_gen,
         vec![instr_stmt(py_stmt!("prefix = 0"))],
         TermRaise {
+            disposition: RaiseDisposition::Source,
             exc: Some(crate::passes::ast_to_instr::from_ast_expr(py_expr!(
                 "value if cond else other"
             ))),
@@ -1680,7 +2080,7 @@ fn sequence_raise_helper_keeps_direct_if_expr_setup_reachable_after_linear_prefi
     assert!(blocks.len() > 1, "{blocks:#?}");
     assert!(blocks
         .iter()
-        .any(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_) }))));
+        .any(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_), .. }))));
     assert!(
         !blocks_store_to_prefix(&blocks, "_dp_tmp_"),
         "direct raise should not materialize a conditional expression temp: {blocks:#?}"
@@ -2228,32 +2628,29 @@ async def outer(inner):
         return ("StopIteration", True)
 "#,
     );
-    let rendered = crate::block_py::blockpy_module_to_string(&blockpy);
     let resume = function_by_name(&blockpy, "outer");
-    let stop_iteration_raise_labels = resume
+    let completion_blocks = resume
         .blocks
         .iter()
-        .filter_map(|block| match &block.term {
-            BlockTerm::Raise(TermRaise { exc: Some(exc) })
-                if crate::block_py::bb_expr_text(exc).contains("StopIteration") =>
-            {
-                Some(block.label.clone())
-            }
-            _ => None,
-        })
+        .filter(|block| matches!(block.term, BlockTerm::GeneratorReturn(_)))
         .collect::<Vec<_>>();
     assert!(
-        !stop_iteration_raise_labels.is_empty(),
-        "missing synthetic StopIteration blocks in:\n{rendered}"
+        !completion_blocks.is_empty(),
+        "coroutine completion must use its explicit terminal operation"
     );
-    for label in stop_iteration_raise_labels {
+    for block in completion_blocks {
+        assert_eq!(
+            block.extra.handled_exception,
+            soac_core::block_py::HandledExceptionContext::Terminal,
+            "completion cleanup runs outside the suspended activation"
+        );
         assert_eq!(
             lowered_exception_edges(&resume.blocks)
-                .get(&label)
+                .get(&block.label)
                 .cloned()
                 .flatten(),
             None,
-            "synthetic completion should bypass user handlers for {label}:\n{rendered}"
+            "generator completion must bypass source exception handlers"
         );
     }
 }
@@ -2326,10 +2723,11 @@ def f(x):
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None)
         .expect("augassign lowering should succeed");
     let fragment = out.finish();
-    assert!(matches!(
-        fragment.entry.body.as_slice(),
-        [_, InstrWithAwaitAndYield::Store(_)]
-    ));
+    assert!(fragment.entry.body.iter().any(|instr| {
+        matches!(instr, InstrWithAwaitAndYield::Store(store)
+            if matches!(store.value.as_ref(), InstrWithAwaitAndYield::BinOp(op)
+                if op.kind == crate::block_py::BinOpKind::InplaceAdd))
+    }));
 }
 
 #[test]
@@ -2499,7 +2897,7 @@ def f():
     let fragment = out.finish();
     assert!(matches!(
         fragment.entry.term,
-        BlockTerm::Raise(TermRaise { exc: Some(_) })
+        BlockTerm::Raise(TermRaise { exc: Some(_), .. })
     ));
 }
 
@@ -2522,4 +2920,179 @@ fn panics_if_while_reaches_stmt_list_lowering() {
     );
     let stmt = crate::passes::ast_to_instr::from_ast_stmt(Stmt::While(while_stmt.clone()));
     lower_instr_for_test(&context, &stmt, &name_gen, &mut out, None).unwrap();
+}
+
+#[test]
+fn raise_disposition_survives_compat_expression_and_core_mapping() {
+    for disposition in [
+        RaiseDisposition::Source,
+        RaiseDisposition::PropagateNormalized,
+        RaiseDisposition::SourceNormalized,
+    ] {
+        for expression in [
+            None,
+            Some(py_expr!("exc")),
+            Some(py_expr!("build_error()")),
+            Some(py_expr!("left if condition else right")),
+            Some(py_expr!("left and middle or right")),
+            Some(py_expr!("a() < b() < c()")),
+        ] {
+            if expression.is_none() && disposition.is_normalized() {
+                continue;
+            }
+            let mut blocks = Vec::new();
+            emit_sequence_raise_block_with_expr_setup_and_expr::<InstrWithAwaitAndYield>(
+                &Context::new(""),
+                &mut blocks,
+                &test_name_gen(),
+                Vec::new(),
+                TermRaise {
+                    exc: expression.map(crate::passes::ast_to_instr::from_ast_expr),
+                    disposition,
+                },
+                None,
+            )
+            .expect("raise expression should lower with its operation unchanged");
+            let raises = blocks
+                .iter()
+                .filter(|block| matches!(block.term, BlockTerm::Raise(_)))
+                .collect::<Vec<_>>();
+            assert!(!raises.is_empty());
+            for block in raises {
+                let mut infallible = |instruction: InstrWithAwaitAndYield| instruction;
+                let mapped = infallible.map_term(block.term.clone());
+                let mut fallible = |instruction: InstrWithAwaitAndYield| Ok::<_, ()>(instruction);
+                let try_mapped = fallible.try_map_term(block.term.clone()).unwrap();
+                for term in [&block.term, &mapped, &try_mapped] {
+                    let BlockTerm::Raise(raise) = term else {
+                        panic!("raise shape changed");
+                    };
+                    assert_eq!(raise.disposition, disposition);
+                    if disposition.is_normalized() {
+                        assert!(raise.exc.is_some());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn raise_disposition_rejects_normalized_propagation_without_an_operand() {
+    let original = lower_python_to_blockpy_for_testing("def source_bare_raise():\n    raise\n")
+        .expect("source bare raise is valid syntax")
+        .blockpy_module;
+    crate::block_py::validate::validate_blockpy_module(&original)
+        .expect("ordinary source bare raise remains valid IR");
+    for disposition in [
+        RaiseDisposition::PropagateNormalized,
+        RaiseDisposition::SourceNormalized,
+    ] {
+        let mut module = original.clone();
+        let function = module
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.bind_name == "source_bare_raise")
+            .unwrap();
+        let raise = function
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                BlockTerm::Raise(raise) if raise.exc.is_none() => Some(raise),
+                _ => None,
+            })
+            .expect("actual bare source raise");
+        assert_eq!(raise.disposition, RaiseDisposition::Source);
+        raise.disposition = disposition;
+        assert!(crate::block_py::validate::validate_blockpy_module(&module).is_err());
+    }
+}
+
+fn canonical_class_function(
+    module: &BlockPyModule<soac_ir_blockpy::BlockPyModuleShape>,
+) -> &BlockPyFunction<soac_ir_blockpy::BlockPyModuleShape> {
+    let mut classes = module
+        .callable_defs
+        .iter()
+        .filter(|function| function.scope.class_bindings.is_some());
+    let class = classes.next().expect("canonical namespace function");
+    assert!(classes.next().is_none(), "fixture has one original class");
+    class
+}
+
+#[test]
+fn canonical_class_namespace_uses_the_actual_mapping_and_native_slot_owners() {
+    use crate::block_py::{ClassBindingStorage, ClosureInit};
+
+    let module = crate::test::strict_source::lower_verified(concat!(
+        "from __future__ import strict\n",
+        "def fail_class():\n",
+        "    class Broken:\n",
+        "        value = payload()\n",
+        "        raise ValueError('namespace failure')\n",
+    ))
+    .unwrap();
+    let function = canonical_class_function(&module);
+    let class = function.scope.class_bindings.as_ref().unwrap();
+    let layout = function.storage_layout.as_ref().unwrap();
+    let projection = layout.class_bindings.as_ref().unwrap();
+    projection.validate(class, layout, &function.scope).unwrap();
+    assert_eq!(
+        function.params.params.len(),
+        2,
+        "namespace and execution handle only"
+    );
+    assert_eq!(function.params.params[0].name, class.namespace_binding);
+    assert_eq!(
+        layout.stack_slots[projection.namespace.slot() as usize],
+        class.namespace_binding
+    );
+    assert_eq!(projection.slots.len(), class.node.slots.len());
+    for slot in &projection.slots {
+        let local = slot.storage.raw_local(layout).unwrap();
+        assert!(!layout.is_expression_temporary(local));
+        if let ClassBindingStorage::Cell(crate::block_py::CellLocation::Owned(index)) = slot.storage
+        {
+            assert_eq!(layout.cellvars[index as usize].init, ClosureInit::Deferred);
+        }
+    }
+}
+
+#[test]
+fn canonical_class_provider_keeps_firstline_separate_from_native_scope_span() {
+    use crate::block_py::{AnnotationProviderKind, CallableSourceRole};
+
+    let source = concat!(
+        "from __future__ import strict\n",
+        "class C:\n",
+        "    prefix = 1\n",
+        "    annotated: int\n",
+    );
+    let module = crate::test::strict_source::lower_verified(source).unwrap();
+    let provider = module
+        .callable_defs
+        .iter()
+        .find(|function| {
+            function
+                .scope
+                .source_origin
+                .as_ref()
+                .is_some_and(|origin| origin.role == CallableSourceRole::AnnotationProvider)
+                && function
+                    .scope
+                    .annotation_provider
+                    .as_ref()
+                    .is_some_and(|provider| provider.kind == AnnotationProviderKind::Dictionary)
+        })
+        .expect("actual native class annotation provider");
+    let metadata = provider.scope.annotation_provider.as_ref().unwrap();
+    assert_eq!(metadata.native_first_line, 2);
+    let start = source.find(": int").unwrap() + 2;
+    assert_eq!(
+        metadata.native_range,
+        Some(soac_contracts::SourceRange::new(
+            start as u32,
+            (start + 3) as u32
+        ))
+    );
 }

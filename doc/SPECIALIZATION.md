@@ -7,12 +7,623 @@ title: "Specialization"
 This document describes the runtime specializations that SOAC currently
 implements for JIT codegen.
 
+Existing sections also record historical optimizations and measurements from
+before the strict-only optimization policy in `OPT_GOAL.md`. Those records do
+not establish current optimization admission or require retaining a separate
+ordinary-SOAC mode. New optimizer work targets authenticated strict
+modules and strict workloads; ordinary Python remains a stock-compatible
+interoperability boundary. An existing assumption described as "strict" is
+not a valid optimization fact merely because the checker recorded it. Only
+enforced module/class/field invariants, actual callable ownership, and emitted
+runtime guards can authorize the corresponding operation; function signatures
+do not promise runtime argument or result types.
+
 For each specialization, this covers:
 
 - what profiling input is recorded
 - what specialized code is emitted on the second pass
 - current limitations, soundness boundaries, and likely extensions
 
+## Authenticated strict construction and source-owned entries
+
+The strict pipeline keeps source proposals separate from runtime authority.
+The CPython backend enforces the shared contracts on original frames without
+lowering or JIT; the lowering machinery below describes the retained SOAC path.
+The offline `ty` artifact is verified against the startup deployment, actual
+source bytes, dependency observations, interpreter, and ABI before strict
+lowering. `BlockPyModule.strict_source` and each callable's `source_origin`
+preserve that identity through lowering; neither metadata nor a copied future
+flag is an independently usable runtime capability.
+
+Function-definition lowering records each generated creation node in a
+compiler-owned sidecar keyed by a fresh AST node identity allocated from the
+semantic state's shared index space. After ordinary expression lowering, a
+resolver validates that site's callee and operand shape before selecting
+`MakeFunction`; a user-written `__soac__.make_function(...)` call, even with a
+literal function ID and identical arguments, remains a call through the public
+boundary. The sidecar is consumed before name binding; codegen does not infer
+this authority from helper names. BlockPy cache version 57 excludes older
+decorator operand shapes, class-cell decisions, suspended-cell cleanup,
+class-construction and private lexical capture operands, explicit enclosing
+exception contexts, pre-validation source literals, and annotation-provider projections that
+did not retain the actual definition-header line independently of its
+decorators. It also carries resolved operand-unwind order, explicit
+`GeneratorReturn` completion, generator-expression code-exposure ranges, and
+the distinction between module globals and an explicit class-frame mapping,
+enclosing pending-abrupt payload extents, and trim-only handled-exception
+unwind transitions.
+Parser tokens supply source lines and ranges before rewrites; runtime code
+matching does not guess them from names or decorator locations.
+
+Name binding marks its actual block-parameter copies with
+`StorePurpose::BlockParameterTransport`, independently of source-value lifetime.
+The exception-transport pass follows resolved local/preserved owners and treats
+a tagged copy as a use only when its destination is required. Dead copies carry
+`None`, not an uninitialized operand; semantic source aliases and cell writes
+remain ordinary uses. The marker is consumed before optimization. Suspended
+throw handling reads the existing owned exception item through a read-only
+capsule projection instead of keeping a second throw-context snapshot. These
+changes first used cache version 32 with the removed snapshot slot.
+
+The current layout carries generator controls and the private resume ABI as
+explicit roles, with names allocated outside the original source inventory.
+Resolved block-parameter roles survive parameter removal, transport-copy
+retirement, inlining and preserved-to-local remapping. Exception carriers,
+pending payloads and abrupt-kind defaults are selected from their physical
+locations, not `_dp_try_*` spelling. An absent source local keeps its checked
+unbound-load path; only an actual abrupt-kind role permits a fallthrough
+default. The layout validator rejects incompatible or out-of-range roles and
+overlap with original source owners. This producer/consumer extension is under
+integration; compiler and runtime evidence are recorded separately in the
+strategy ledger.
+
+The execution-lifetime and frame-inspection amendments remove native opcode,
+cleanup-schedule and locals-plus correspondence prerequisites for retained
+SOAC execution. Eager comprehensions use ordinary lexical helpers, including
+in class bodies. The parent evaluates the first iterable; the helper owns
+iteration bindings and captures genuine enclosing cells. The class namespace
+uses only its selected lexical cells and exports, not an inventory of native
+iteration slots. Compiler-created empty sets use literal collection lowering,
+so a legal source binding named `set` cannot redirect a set comprehension;
+cache 57 rejects the former source-constructor call.
+
+Native scope schema 7 retains source, slot, touched-carrier, capture and access
+identities needed to authenticate actual classes and annotation providers. It
+does not retain restore-row inventories or restoration-completeness flags.
+The original-code Store/CALL table still authenticates actual CPython
+publication and call sites; none of this metadata prescribes SOAC execution.
+These are enforcement/compatibility changes, not a new optimization or a
+completed runtime validation result; see the strict-contract strategy ledger
+for matched source, binary and test status.
+
+The native generator-family consumer uses the authenticated factory snapshot
+to construct exact generators, coroutines, and async generators. Its
+preserved-state record owns a one-use native resume permit: even an unrelated
+compiler helper plus a GC-discovered capsule cannot enter the body outside the
+native operation. Native delegation runs before the suspended handled item is
+linked. `GeneratorResumeDelivery` explicitly selects ordinary delivery, a
+normalized source injection, or the existing yield-from exception edge; the
+last case does not call the delegate a second time. A new delegation begins
+with `next`, independently of the previous suspension's send/throw operands.
+
+`SourceNormalized` and `PropagateNormalized` restore an existing exception
+without normalization or new context chaining. The former records semantic
+resume injection; neither reconstructs a traceback or carries an execution
+frame position. Compiler-only classification/extraction/forwarding blocks use
+`HandledExceptionContext::Preserve`, not a synthesized Python handler. Their
+caught-object parameters transport values without replacing `sys.exception()`.
+JIT and entry execution retain exception identity and source handler behavior.
+Prepared typed CFG validation still compares the semantic raise disposition.
+
+Cache version 35 introduced these exceptional-resume branches and the source
+async-yield wrapping operation. The native token is allocated before suspension,
+under the source exception edge. Async-generator completion is a distinct
+`GeneratorReturn(None)`; source StopIteration/StopAsyncIteration use the
+appropriate PEP 479 error. Terminal cleanup passes the actual preserved owner
+explicitly to the native closed-state notification before handled/local
+finalizers. A failed protocol notification is owned until the outer resume
+returns an error; it cannot leak a successful value with a pending exception.
+
+The 2026-08-25 (PDT) traceback/frame amendment removes native lifetime
+frames, `SourceFrameBindings`/projections, source-parent links, terminal frame
+handoffs, locals-plus correspondence and source-frame-specific boxing/inline
+restrictions. BlockPy cache 53 invalidates those serialized fields. Actual
+source identities and lexical cells remain, as do suspension ownership and
+ordinary local/operand cleanup. State promotion still transfers owned values
+between active and preserved storage and retains suspension writeback; it has
+no traceback-retention inventory to remap or prove.
+
+Strict source names, including initially unshadowed builtins, remain indexed
+global loads. The source-builtin constant rewrite is disabled for these modules:
+each lookup checks the live module slot and then the function's actual captured
+builtin mapping. Explicit compiler runtime operations remain intrinsics. Cache
+version 54 invalidates earlier name-binding decisions that incorrectly
+snapshotted builtin fallbacks. Version 55 also invalidates cached lambda-default
+bindings: defaults execute in the enclosing scope, including walrus stores in
+comprehensions, while lambda body assignments stay local. These are correctness
+repairs, not check removal or new specialization.
+
+Exception-edge preparation is also an ownership operation. Generated failure
+contexts capture raw typed local values, then acquire forwarded references and
+box scalar values inside the cold error block, after the source operation has
+failed. The handled-region selector follows this rule as well. Preparing those
+owners on the successful path leaks them even when the generated failure
+cleanup itself is correct. Cold blocks are emitted after the producer's
+terminator and drained until materialization-failure handoffs are complete.
+This is general edge lowering, not a generator-specific optimization.
+
+The exception-dispatch plan records each target argument's ownership demand.
+Borrowed block parameters can use borrowed-only transport only when every
+consumer is borrowed and no slot write or release needs an owner. Stack-slot
+and cleanup-root transport remains owning. Mixed targets acquire one owned
+transport, clone only additional owning consumers, and leave borrowed aliases
+unchanged. Validation rederives these demands from the actual parameter and
+storage plans; a scalar or owned temporary is not a borrowed-source proof.
+During fallible forwarding, a prepared-prefix ledger distinguishes newly
+acquired clones and boxes from original owners. A later boxing failure
+releases only that acquired prefix, preserving the pending exception and
+leaving original owners to their normal cleanup path. Structured planning
+tests and emitted fault-injection kernels exercise both forwarding loops.
+
+The subsequent 2026-08-25 (PDT) observer amendment also removes dedicated
+tracing/profiling/monitoring reservations, setter interception and refusal-only
+or fallback gates. SOAC event coverage may be absent or incomplete. Ordinary
+CPython observers are unchanged, and no observer-compatibility proof is needed
+to execute otherwise admitted code. Actual construction/metadata guards,
+recursion safety and SOAC's internal compiler counters/logs remain independent.
+
+A generator expression has a parser-owned `GeneratorExpressionCode` scope
+projection, not a fabricated SourceFunction identity. A separate native
+catalogue maps its exact first-iterable position, expression bounds, code kind,
+and `.0` ABI to one original code object in the verified source tree. The map
+controls public `gi_code/ag_code` and names only; the helper's execution code,
+closure ABI, and rooted compiler-creation witness remain distinct. An ownerless
+function made from that exposed strict code gains no callable authority.
+
+Method-only field annotations can require a lexical type binding that CPython
+does not put in the method's public closure. An explicit
+`ClassConstructionScope` records the signed field-leaf indices, their actual
+lexical binding owners, and the class namespace template. `MakeFunction` carries
+the actual namespace function and original `CellRef` operands; catalogue
+validation checks these against the resolved producer storage. Only internal
+body storage is promoted to cells. Original source code and public closure
+metadata stay unchanged, and generators keep the same complete physical
+preserved-slot layout.
+
+Before a helper's CREATE observers run, the runtime pins those cell identities.
+It installs a GC-visible, one-use carrier only on the exact created helper and
+weakly pairs it with the actual namespace function and its native owner.
+`ConstructClass` consumes that carrier before callbacks, then field binding
+samples the cells after namespace execution. The class keeps selected type
+values, not the helper, namespace, or cells. An explicit
+`DiscardClassConstructionCaptures` finally operation releases unused carriers
+after argument or construction failures.
+
+The forwarding producer distinguishes three explicit lexical transports. An
+existing source-function capture uses its active native closure slot after
+argument binding, preserving allowed pre-seal closure replacement. A binding
+absent from an intervening source function's public closure uses a private
+creation operand and GC-visible owner edge; it retains the original cell, not
+an early snapshot of its value. A class namespace receives private cells only
+through its exact, one-use construction handle. Consuming or dropping that
+handle clears all of its edges, even if Python kept the handle itself alive.
+Active and suspended frames own their private slots explicitly. None of these
+transports adds public `co_freevars`, `co_cellvars`, or `__closure__` entries.
+Source-level type-parameter wrappers and other intervening roles without an
+explicit transport remain unresolved. The inliner also rejects private-cell
+environment remapping until it has an explicit caller/callee environment plan;
+ordinary calls retain the actual callee environment.
+
+Capture selection follows enabled field-write predicates. A selected dataclass
+field still needs its actual declaration binding when `init=False`; inherited
+storage reuses the original declaring field owner. `InitVar`, parameter and
+return annotations create no runtime value obligations or private lifetime
+edges. Statically dynamic classes and disabled field policies remain outside
+this capture selection.
+
+Compiler-owned namespace/construction helpers and verified generator-expression
+helpers without original execution code use a private denial-only code clone at
+creation. Its strict future bit prevents an early CREATE observer from executing
+uninitialized closure bytecode; it does not provide a source identity or runtime
+authority. Generator expressions require their explicit code projection, current
+rooted template, and separate code-exposure entry; function kind or name alone
+does not select this path. Original source code and ordinary bootstrap code are
+not changed. Authenticated entry installation remains a separate step. Structured tests cover synchronous, generator, and
+coroutine storage. The first actual same-scope producer checkpoint passes both
+source-function modes for early CREATE denial, enabled field checks,
+different-namespace replay rejection, and failed-argument cleanup. This does
+not establish private forwarding through other lexical scopes. The general
+forwarding implementation has a separate structured and actual-runtime gate;
+its runtime checkpoint is pending on the coherent v15 extension.
+
+`Call.frame_namespace` is selected by semantic source scope and retained in typed
+IR, including when the callee is an unknown alias. `FrameNamespace::ModuleGlobals`
+uses the defining module's actual environment; `Mapping` carries the resolved
+class-namespace operand and its ordinary ownership/cleanup. Function calls carry
+neither: function locals are not materialized. The normal call boundary passes
+actual globals, captured builtins and the selected namespace to native
+contextual-call APIs; native builtin identity selects `locals`, zero-argument
+`vars`/`dir`, or `globals` behavior.
+Shadowed names and other callables still use their ordinary call protocol, and
+callbacks do not inherit ambient context. Every call selects its own context,
+including clearing an enclosing mapping for unmaterialized function calls.
+Context-bearing calls remain on this public boundary so their actual namespace
+and construction authority remain
+explicit; this is not a frame-layout proof. Original argument evaluation and
+binding precede the call. Function-local inspection is outside the current
+compatibility contract.
+
+Generated annotation providers likewise receive an explicit
+`AnnotationProvider` role for their actual module/class/function definition.
+Function providers are attached through a recorded target identity, not an
+`_dp_annotate_func_*` prefix. Class-owned providers are adopted only by a
+participating actual class; the module's pending-object drain does not freeze
+providers belonging to a dynamic framework class. Provider ownership and lazy
+cache publication remain separate from offline value-type checks.
+An unannotated class's native `__annotate_func__ = None` cache is an absence
+marker, not a foreign callable provider. Post-construction validation and
+adoption preserve that ordinary introspection result without granting it
+function authority.
+
+Class annotation/global lookup follows the selected namespace/global operation.
+It does not scan class values or `__type_params__` attributes to guess lexical
+bindings. Actual generic parameters use resolved cells; arbitrary framework
+members must not run hooks merely because an unrelated annotation names `int`.
+
+Strict class rewrites resolve to `ConstructClass`, with an explicit source
+definition, construction-function ID, and original construction operands. Only the
+compiler-assigned `ClassConstruction` source role can introduce that operation.
+The typed and generic emitters mechanically call `soac_jit_construct_class`;
+the entry/deoptimization interpreter uses the same helper. The helper checks
+the actual namespace function's native owner and execution before preparing
+the class. Strict namespace helpers receive `(namespace, execution_handle)`
+and consume the private single-use handle before running their body.
+The active `FunctionEnv` carries its Rust-only
+identity explicitly into `MakeFunction`; each newly created method/provider
+records that identity. Type admission compares actual creation identities, so
+borrowing a same-source method from an earlier class-factory execution does not
+silently freeze that earlier dynamic class's implementation. Ordinary method
+calls never reactivate their creation identity. CPython performs base
+resolution, metaclass preparation, class-cell completion, and final cell
+validation. Both source backends attach native ABI4 Pending state before Ready
+callbacks and preserve the actual source-requested layout. The copied namespace
+and actual source-function owners are authenticated before callbacks, but
+instances and destination `__class__` assignment stay barred until final
+selected-result admission. A provisional state is not a permanent type policy;
+once a permanent contract is installed, no fallback may remove it.
+
+The strict compiler exports versioned, source-bound class metadata alongside
+the same privately owned native code tree used for admission. Lowering selects
+only the actual class cells required by initialization, source accesses, child
+captures and cell exports. A CELL and a FREE slot with the same spelling remain
+distinct. `ConstructClass` cell flags assert the actual native export recipe
+and never authorize preallocation outside the class body.
+
+Class comprehensions use ordinary lexical helpers; their iteration bindings
+and captured cells do not reproduce CPython's inlined locals-plus layout.
+There are no class-region save/restore instructions, native-slot coverage
+requirements, or saved-slot projection proofs. The class namespace and genuine
+class cells keep explicit owned storage, with incoming FREE ordinals and
+source-bound capture identities validated independently. Class metadata neither
+grants source-function execution authority nor constructs traceback frames.
+
+Construction is not replay-safe and cannot currently be inlined across an
+execution environment. Its result is an ordinary owned Python object, not a
+claim of a frozen type or method table. Unsupported actual metaclasses, bases,
+descriptors, and decorators decline before installation. A single signed
+`staticmethod`, `classmethod`, or getter-only `property` decorator resolves to
+`ApplyFunctionDescriptor`, retaining its already-evaluated factory, original
+`MakeFunction` result, definition identity, and actual frame namespace. It is
+not replay-safe or inlineable across definition environments. Both emitters
+and the entry interpreter invoke one five-operand native boundary; a rebound
+factory is called once ordinarily and acquires no descriptor birth.
+
+The runtime requires the canonical immutable builtin, the actual newly created
+function/code/owner, and its active namespace execution. Its native birth owns
+an inert Rust execution witness and a weak code reference, not extra function,
+globals, or class roots. Immediately after the original constructor returns,
+before another callback, the witness records its non-reused native birth ID.
+Reusing an exposed witness in another C-API construction creates a different
+birth, even if an object address is reused; the ID alone grants no authority.
+Admission distinguishes the input, copied pre-Ready, before-transform, and
+adopted namespaces. Actual source-component checks are active before callbacks;
+permanent descriptor adoption and metadata freezing complete on the selected
+type before its Pending barrier opens. Native implicit wrappers remain
+separately authenticated by type construction. A copied component or
+same-source descriptor from another execution cannot acquire that birth.
+
+Getter properties retain data-descriptor access, including ordinary read-only
+assignment/deletion errors; they do not gain physical field slots or
+protected-instance-method assignment policy. Decorator chains, setter/deleter
+properties, and cached-property participation remain dynamic. A supported
+dataclass Apply result is an explicit completion boundary: original and slots
+replacement have distinct linked Pending states, and only the selected result
+receives permanent constraints. The resolved native lineage may dispose the
+unselected original only if it never received a permanent contract.
+
+Public strict calls perform ordinary binding and preserve body results and
+exceptions without runtime parameter/return type checks. The binder owns
+selected defaults as argument slots, and the activation pins actual closure
+cells for that invocation, rather than retaining stale default/cell snapshots
+in idle metadata. Class preparation
+authenticates actual source functions before callbacks; metadata freezing is a
+separate adoption step. No required-call flags or per-call nominal snapshots
+remain. An active call does not acquire new semantics when its class or module
+seals. General direct/inline paths still cannot bypass source ownership, actual
+callee/body guards, binding, recursion or cleanup. Static annotations and
+successful calls supply no argument/result-type proof.
+
+Required field predicates use the type held by each signed declaration operand,
+including ordinary imported types and dynamically managed framework classes.
+Native membership avoids custom metaclass and `__class__` hooks; installed field
+targets remain fixed despite later annotation-cell writes. An independent
+guarded field/method request retains only the targets needed by that capability,
+and declines if they cannot be authenticated. It creates no call restriction.
+The CPython interpreter backend publishes no JIT capability.
+
+Checked-field planning separates normalized source requirements from actual
+write policies. Storage inherits GC-owned declaration/check owners by identity,
+not by equality of a source type. Own direct-Self requirements remain reserved
+through callbacks and slots replacement, then bind exactly once to the selected
+final class before native admission opens instances. Inherited owners retain
+their actual declaring targets. Generated constructors check only actual writes
+to selected fields; `InitVar` supplies no storage obligation. Missing required field captures fail
+closed, never by name inference. Neither these mandatory predicates nor early
+native sealing add a trusted result type or indexed storage proof to a field
+load. Ordinary referent type/MRO changes still require their later checks.
+Historical pre-Pending runtime checkpoints do not validate the ABI4 join.
+
+Suspended-frame cleanup distinguishes a cell's storage from its contents.
+Terminal cleanup releases the frame's preserved cell reference, leaving escaped
+closures' references intact. An explicit source-level `del` still empties the
+shared cell. The same name-binding rule applies to generators, coroutines, and
+async generators; none is excluded from closure ownership or specialization.
+
+Call-target counters use a separate observational identity authenticated from
+the actual strict function owner (or a bound method's actual function). They do
+not read the native unchecked-entry token, which may remain zero. Ordinary
+callbacks, copied functions, changed code and terminal owners supply no strict
+target evidence. Protocol observations inspect exact string keys without
+invoking descriptor, hash or equality callbacks. Counter evidence still cannot
+authorize a direct body or inline plan that bypasses source ownership or guards.
+
+The construction operation and boundary plumbing have focused native and
+structured lowering tests. Actual class construction, checked fields,
+suspended frames, source ownership, and annotation replay have passing
+strict-admission checkpoints. An eager-preparation bug was found to override
+the tests' requested entry-interpreter mode; those earlier paired passes do not
+prove distinct execution paths. Preparation now preserves that choice, and
+new tests require the authenticated actual-entry diagnostic before and after
+validation. The corrected source-entry and simple-module cohorts pass with
+exact observed entries. Complete dataclass adoption, the full compatibility gate,
+and benchmark acceptance remain work in progress; see the tracked
+[strategy evidence](optimization-attempts/2026-08-21-type-driven-strict-contracts.md).
+
+
+## Sealed indexed-field requests
+
+The guarded field consumer uses authenticated attribute-site identities, not a
+profiled dictionary index. The typed plan carries the original function and
+expression range, receiver-class proposal, name, and a deterministic per-function
+capability slot. It contains no native offset and proves no field value type.
+Only synchronous source functions are currently selected. Local participating
+storage candidates and foreign non-callable member proposals can request a
+slot. A signed declaring-class proposal can select a guard
+even when a receiver's relational type is unsupported. Open-world families and
+unknown field value types do not invalidate a guarded structural load: none of
+those predictions is consumed as a runtime proof. Missing receiver/member
+owners, suspended functions, and previously stronger
+value/access plans retain their existing generic or guarded behavior.
+
+Mandatory selected-result admission does not publish optional field witnesses.
+Retained function publication requires finalized metadata, final module
+bindings, and no pending module nominal leaves; the class needs its independent
+native/Rust seal. Source ORDINARY dictionaries deliberately yield no indexed
+capability. Actual source-requested object slots can still qualify through the
+separate physical proof. Finalized free functions use their authenticated
+nominal operands, including imports, never a predicted type or arbitrary
+same-source factory result. Publication fills only absent slots and preserves
+earlier owners and active snapshots. Each public activation captures its
+capability array before argument callbacks, separately from post-binder nominal
+targets. Inherited methods retain their declaring owner's environment. No
+optional witness retains a Python class, default, function, or module object.
+
+Module sealing has a second, cold publication phase in the existing pending
+registry. Its callback-free weak references are GC-visible and upgraded one at
+a time, after mandatory admission and module-final nominal completion. This
+permits eligible retained witnesses without a hot-call capability refresh, a
+hidden class root, or rebinding a source-equal replacement. A new target created
+by a GC callback is drained through the same phases before module sealing ends.
+
+Codegen mechanically checks the active array pointer, bounds, non-null slot,
+actual native owner and construction identity. The raw capability format still
+distinguishes `IndexedDictionary` from `NativeObjectMember`. Its indexed kernel
+requires actual fixed-prefix policy, reloads storage after changes, and rejects
+alias-sensitive lookup; source ORDINARY dictionaries cannot mint that witness.
+Missing capabilities, ordinary subclasses, UNSET fields,
+new descriptors, and failed lookup guards use original Python attribute lookup.
+A borrowed hit is incremented before releasing receiver/name inputs; an error
+from the authority guard preserves the exception instead of running fallback.
+
+The native-member variant is reserved for actual source-requested slots and a
+recognized dataclass replacement's own physical construction. CPython creates
+ordinary `T_OBJECT_EX` members for the requested slots; final selected admission
+validates those actual descriptors and binds the recorded offsets before
+Enforced. Optional publication additionally verifies the first visible MRO
+descriptor. Dictionary-prefix indices are not member offsets. The raw member
+load bypasses a dictionary even for a dictionary-bearing descendant; hidden
+dictionary entries remain separate values, never member mirrors. Original and
+replacement construction witnesses stay distinct, even when they share source
+functions; a disposed unselected original supplies no permanent capability.
+Earlier fixed-prefix results are not evidence for the coordinated Pending ABI4
+path, whose runtime gates remain separate.
+
+The final prepared typed function is validated immediately before emission,
+including the source range, attribute name, class proposal and slot catalogue.
+The retained source field catalogue follows a constant class-namespace key
+through a local `TakeOperand` only when the actual `StorageLayout` validates
+that operand's physical owner and the local has one constant producer. Missing
+layout, nonoperand storage, mismatched owners and duplicate producers decline
+the catalogue entry. This identifies an existing declaration; it grants neither
+replayable storage nor a runtime layout capability.
+Its result facts remain explicitly unknown through fact synchronization; a
+storage contract cannot authorize unboxing or checked-boundary elimination.
+Structured events `soac.strict_field_codegen` report committed guarded sites and
+native-code size; `soac.strict_field_capabilities` reports actual function-owner
+publication and separate `native_object_slot_count` and
+`indexed_dictionary_slot_count` values. Existing `field_access` counters keep
+their historical `indexed_hit` / `indexed_fallback` names for both storage
+kinds. They distinguish execution from code availability; the binding event
+identifies the physical kind. The native capability primitives and the real
+checker-to-profile/apply consumer test pass on the v7 development runtime;
+separate verify runs exercise both capability hits and ordinary fallback,
+including independent executions of one class factory. Virtual dispatch and
+final direct calls are separate capabilities and are not established by this
+field path.
+
+Retained virtual-object lowering distinguishes replayable local loads from
+consuming operand ownership. Candidates whose actual continuation crosses an
+existing field-state reset are declined before scalar slots or stores are
+added. Allocation erasure independently refuses surviving concrete field reads,
+nonreplayable field writes, and identity uses outside the proven region. A
+candidate plan or scalarization counter is not permission to remove an owner.
+
+The retained materializers recheck the actual allocation coordinate and hot
+reachable block set. A body snapshot must still identify its original boundary
+at the recorded index, with a unique semantic instruction ID and one boundary
+row for that source. Missing, duplicated or shifted coordinates refuse rather
+than repair the plan. Once a nonempty insertion set passes preflight, deletion
+and insertion run on a Rust IR clone: every planned allocation must be removed
+exactly once, and original boundaries must survive uniquely before insertion
+and publication. Body insertion finds the unchanged instruction ID after
+deletion instead of reusing its old index. A refused transaction leaves the
+concrete IR unchanged. No runtime owner, replay storage, layout capability or
+new optimization strategy is introduced; replay/lifetime extensions remain
+deferred.
+
+## Sealed method-family requests
+
+The in-progress method consumer uses a separate `TypedSealedMethodAccessPlan`
+and per-function slot catalogue. A checker-owned method site proposes a local
+plain instance method or a foreign callable member; it does not prove the
+receiver, target, arguments, or return type. Known local callable instance fields
+are excluded from method slots. A foreign callable field cannot supply a native
+method-family witness and therefore uses ordinary lookup/call fallback.
+Selection happens before expression linearization: lookup, argument
+evaluation, and invocation remain one explicit typed region, so an argument
+callback cannot run before lookup or cause lookup to be replayed.
+
+Source-resolved immediate method calls are also made explicit before apply
+rewrites. Their lookup region owns temporary-receiver release even when a
+descriptor returns an independent callable. The generic fallback cannot keep
+that receiver alive through argument evaluation or invocation. Complete scalar
+branch plans are attached before the same linearization boundary so their
+comparison retains its semantic identity; unresolved indexed-field regions do
+not acquire that atomic treatment merely from a proposal.
+Existing selected indexed-field guards are resolved before callee snapshots
+and refreshed after instruction remapping, before scalar attachment and
+linearization. The shared compile-time
+`soac_opt::passes::typed_exact_int_region_matches_field_expression` matcher
+recognizes a matching resolved ordinary indexed field or late-bound split
+field inside the selected expression. This preserves the region; final
+all-input guard validation and missing/colliding-plan rejection still apply.
+
+Only eligible retained class finalization publishes an immutable family and
+rows for participating families in its actual MRO. Early mandatory admission is
+insufficient: the actual declaring functions must also have final module
+bindings and authenticated actual targets needed by the requested capability,
+including inherited methods. Rows
+contain the
+receiver's resolved implementation, not the ancestor's exact-receiver witness.
+Compatible overrides select their own function and source-owned entry; inherited
+methods retain their original environment. Repeated class-factory executions
+have different identities despite equal source ranges. Missing families,
+callable-field overrides, ordinary subclasses, and ambiguous source matches
+take ordinary lookup. Family witnesses own only Rust metadata, not Python
+classes, functions, defaults, or modules.
+
+The generated region guards the active capability slot and actual receiver,
+then retains the selected callable before evaluating arguments. Fallback uses
+ordinary method lookup once and retains that result instead. After arguments,
+the region compares the callable's current public vectorcall pointer with the
+source entry recovered from private SOAC metadata. A supported C setter may
+change that public pointer: mismatch invokes the same captured callable through
+its public boundary without repeating lookup. A hit normally invokes the
+native trampoline with the actual callable and receiver, preserving binding,
+defaults, ordinary results, recursion and cleanup. The separately validated
+source-call plan below can instead prepare that actual native body;
+the method-family witness itself grants no value or unchecked-entry proof.
+
+`soac.strict_method_capabilities` reports actual owner publication and
+`soac.strict_method_codegen` reports emitted site and code-size metadata.
+Verify-mode `method_dispatch` branches distinguish family hit/fallback and
+checked-entry hit/fallback; these names describe source-owned entry guards, not
+function type checks. On the historical v8 development runtime, the genuine
+checker/profile/apply/verify test exercises both family branches and checked
+entries, with committed native-code evidence. Actual entry-kind witnesses also
+pass for overrides, ordinary descriptors, independent factories, supported C
+vectorcall replacement, and captured-callable cleanup after argument failure.
+All nine method-dispatch cases passed on fixed v8, including both actual
+entry paths, continued execution, old-local finalizers, and body/argument
+errors. The 81 strict Rust units and two cell-lifetime cases also passed. These
+are historical focused results, not the current full gate. The source-body path
+below has separate source/ABI selection and actual-body guards.
+
+### Guarded source-body calls
+
+`TypedSourceCallPlan` is separate from lookup and storage capabilities. The
+source-authenticated planner records the exact caller identity, full bound
+argument count, and an optional `TypedSourceBodyTarget`. It records no
+parameter predicate, argument-value identity, or return-type promise. Sealed
+method calls count the receiver at position zero; an exact unbound source call
+must match the caller, module digest, expression range, unique source target,
+and fixed-positional native ABI. Validation repeats the same selection before
+emission, and foreign inlining clears the source-call plan.
+
+The mechanical consumer retains the actual callee before argument callbacks
+and rechecks its current public/private entry after those effects. It then
+requests the fixed-positional native-body ABI through
+`dp_jit_prepare_strict_direct_call`. For an exact unbound site, supplied
+argument count and full output capacity are distinct: the ordinary binder
+loads omitted values from the actual function's current defaults.
+Zero-argument bodies use the same path. Unsupported shapes, unavailable
+bodies, or public overrides keep the captured callable's ordinary public path.
+Method default expansion, keywords and variadics are not fixed-body plans.
+A binding error never retries the public call.
+
+Successful preparation binds arguments once and owns the actual invocation's
+function environment and compiled body. It preserves the native recursion
+guard, source-owner authentication, closure selection, body result/exception,
+and binder cleanup. It performs no argument or return type checks.
+`dp_jit_retire_strict_call_arguments` clears the activation's borrowed entry
+view before releasing bound argument references;
+`dp_jit_finish_strict_direct_call` then retires the activation. No reusable
+argument proof or private unchecked-call token is exposed through Python.
+
+`TypedSourceBodyTarget` identifies a compatible same-module native body by its
+complete source identity and bound arity, never by spelling or profile evidence
+alone. A fixed direct call additionally compares its expected body address with
+the actual activation's pinned body after binding. An override or different
+compiled body invokes that same prepared activation indirectly, without
+repeating lookup, argument evaluation or binding. Independent factory
+executions may share code but use their own actual environments and method
+families. Final methods follow the same guards; `typing.final` does not close
+the subclass world. Every result remains an ordinary Python value unless an
+independent operation executes its own value guard.
+
+Read-only `strict_function_call_statistics` reports only
+`direct_body_calls` and `fixed_body_calls`; performed/discharged type-check
+counters have been removed. The plan stays boxed in typed-instruction metadata
+to avoid enlarging every recursive expression. Cache epoch 52 rejects the old
+argument-proof layout.
+
+The earlier check-elision implementation, v9/v10 focused outcomes, initial
+fixed-target/unbound-default failures, and recursive-IR boxing regression are
+preserved in the
+[strict-contract strategy ledger](optimization-attempts/2026-08-21-type-driven-strict-contracts.md).
+Those historical results do not validate this field-only contract revision.
+Its matched native/checker/runtime and combined gate remain separately recorded
+there. This change adds no optimization or benchmark claim.
 
 ## Optimizer v3 Status
 
@@ -39,25 +650,18 @@ an implicit leading type argument, so class calls can reuse the ordinary
 guarded direct-call target model. Type registration only attaches that
 metadata for safe default constructor shapes, so unsupported Python type-call
 cases stay generic and do not enter the synthetic target.
-Typed planning can also add static call plans when the callee binding is
-compiler-owned rather than profile-discovered. Runtime constructor names such as
-`RuntimeName::Range`, `RuntimeName::IterRange`, `RuntimeName::ClosureGenerator`,
-and `RuntimeName::ClosureAsyncGenerator` resolve directly to the corresponding
-`soac.runtime` constructor-entry targets, and lowered module globals that have
-one module-init binding with no later in-module stores or deletes are treated as
-static function targets under SOAC's strict-module assumption. Runtime
-constructors such as `IterRange(...)` and compiler-generated
-`ClosureGenerator(...)` calls can therefore lower as unconditional direct
-callable calls. User-module constructors additionally need their synthetic
-constructor identity registered immediately after their class is created:
-module-level calls can run before the final owner-type registration sweep.
-Early registration is only eligibility evidence, not proof that eager apply
-planning has selected or emitted a direct constructor edge. The optimization
-currently assumes, but does not yet
-runtime-enforce, the strict-module rule that outside code cannot later replace
-those final globals. The static path is apply/verify-only; profile mode keeps the
-original call graph so nested protocol sites still collect ordinary evidence
-before later rewrites inline them.
+Static binding analysis supplies candidates, not unchecked call authority.
+Authenticated strict-source modules retain their source-owned public boundaries
+and are excluded from unchecked static, inline and constructor candidates.
+Public registration exposes no unchecked target ID. Retained direct-call nodes
+evaluate and guard the actual runtime callee and registered code/default
+snapshots, with generic fallback. Compiler-owned runtime constructors have
+separate trusted paths; static constructor discovery is restricted to
+`soac.runtime`, not user-module classes. Final module bindings are enforced by
+native policy on the actual globals dictionary, while explicitly mutable
+bindings remain mutable. Sealing alone does not authorize unchecked function
+or constructor calls. Existing profile collection remains independent of
+contract admission and does not grant these capabilities.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan and lowered
@@ -151,6 +755,13 @@ replay. In particular, cloning a continuation during profiling would
 renumber its hot instructions without moving their source-keyed counter
 definitions, leaving executed operators, calls, attributes, item accesses,
 and branches incorrectly unobserved.
+
+Apply-mode alias continuation selection resolves a `None` placeholder through
+the actual runtime-name/module-constant identity. It does not recognize an
+ordinary global merely because it is spelled `NONE`. Its structured regression
+uses a real source `None`/object join, checks original counter IDs in Profile,
+and checks cloned semantic operation IDs in Apply rather than net block growth
+after pruning.
 
 Skipping optimization rewrites in profile mode does not skip the ordinary
 typed runtime preparation, counter instrumentation, ownership/value analysis,
@@ -294,6 +905,26 @@ Normal multi-pass runs use one work directory and one mode:
   - emit no specialization-input counter dump
   - keep in-process `deopt_entry_guard_miss` counters so apply-mode event
     logs can report which planned source point entered `dp_jit_deopt_resume`
+
+Deoptimization-entry counters are cold-path diagnostics, not profile inputs or
+machine-code guard counters. After a function and its default adapter compile,
+the actual immutable resume table registers one module-owned atomic counter per
+validated deopt point. Each compilation receives a distinct append-only ID
+range after the module's existing counter definitions; published scalar-counter
+storage never moves or grows. IDs are local to that module instance, while the
+function and resolved source point identify the semantic site. The table and
+module share only the counter definitions and atomic values, so retaining past
+counts does not keep Python functions, captures, or compiled tables alive.
+
+`dp_jit_deopt_resume` increments the selected counter only after validating the
+table, ordinal, and incoming buffer shape, before interpreter admission. This
+records a real native handoff, including an admission failure, without adding
+an allocation, lock, callback, or hot-guard increment. Apply/verify logs and the
+existing structured counter dump snapshot these late counters alongside the
+original definitions. Dumps retain their existing once-per-path flush semantics;
+they are not live telemetry and do not promise to include calls after a path
+has been flushed. Recompilation can leave a zero-valued diagnostic set if later
+publication fails, but cannot record an execution that never happened.
 
 The JIT loads hot profile input from `$SOAC_WORK_DIR/profile.bin` in
 apply/verify mode:
@@ -458,6 +1089,17 @@ takes **79.97 seconds**. See
   expression may reuse the enclosing instruction/term boundary when a
   conservative evaluation-order scan proves that deopting there cannot replay
   an earlier side effect; otherwise they keep the local slow path.
+- The deopt live-value buffer contains only Python object pointers (or null for
+  an unbound local). Exact integer and `I32Bool01` locals retain scalar JIT
+  transport but materialize at this boundary; Boolean scalars select the
+  canonical Python `True`/`False` objects, never widened integer addresses.
+- A cold exit also satisfies the resume plan's reference-ownership obligations.
+  A borrowed SSA stack mirror does not prove that its native slot owns a
+  reference: unchanged arguments may still borrow from the active call binder.
+  The exact-point cleanup-root plan selects either acquisition of the missing
+  owner or transfer of an existing root. A nullable root handles a merge of
+  borrowed and rebound-owned paths without consuming the binder's reference or
+  leaking an extra copy of the owned path.
 - Indexed-global loads selected as v3 exact-operator or exact-comparison region
   inputs use the same module-dict guard, but a hot miss branches to that
   region's local generic fallback rather than to an instruction-level load
@@ -499,9 +1141,19 @@ takes **79.97 seconds**. See
 - In v3 planning, the optimizer consumes raw
   `type_keys` plus lowered constant-attribute `GetAttr`/`SetAttr` sites and
   emits matching indexed-field selections into the v3 plan.
-- Codegen resolves a recorded owner name to the currently imported type,
-  then rejects the specialization if a class binding/descriptor for that
-  attribute is present.
+- Codegen resolves a recorded owner name through live module/type namespaces,
+  keeping the actual type owned while deriving its guard. This field-only
+  lookup scans exact Unicode dictionary keys without Python attribute lookup,
+  hashing, rich comparison, or descriptor invocation. Unsupported namespaces,
+  metaclasses, or unanchored registry addresses decline to ordinary access.
+  Actual MRO dictionaries must contain no class binding/descriptor for the
+  selected attribute.
+- Owners with a native ordinary-dictionary write policy (including inherited
+  or terminal policies) decline resolved indexed-field guards for loads,
+  stores, and scalar inputs. A callback-free native type/MRO query makes this
+  decision; generic attribute access retains all installed field predicates
+  and storage revalidation. A profile and matching key index are not write
+  authority. Unchecked ordinary storage remains eligible.
 - In verify mode, each `GetAttr`/`SetAttr` also gets
   `field_indexed_hit` and `field_indexed_fallback` scalar counters.
 - Verify mode preserves profiled indexed field accesses when their counters
@@ -512,7 +1164,8 @@ takes **79.97 seconds**. See
 ### Codegen
 
 - Constant-string `GetAttr` sites with a recorded key index get a
-  guard on exact owner type and owner type version.
+  guard on exact owner type and owner type version, then compare the actual
+  source attribute name with the current shared-key entry at that index.
 - With a v3 indexed-field plan, those recorded key indexes come from validated
   mechanical indexed-field emissions.
 - V3 indexed-field emissions remain separate from legacy per-instruction field
@@ -523,8 +1176,6 @@ takes **79.97 seconds**. See
   candidate. If a v3 indexed-field input cannot resolve a usable
   owner-type/version guard in the current compile context, typed lowering keeps
   the original generic attribute operation as the local fallback for that site.
-  By-attribute layout availability is still shared with the existing constructor
-  initializer fast path until that family has its own v3 plan node.
 - After codegen-to-typed lowering, these sites are represented as
   `GetAttrTyped` / `SetAttrTyped` operations annotated with a profiled
   indexed-field access plan. The typed plan carries the selected
@@ -559,13 +1210,14 @@ takes **79.97 seconds**. See
 - `SetAttr` sites use generic attribute set in profile mode.
 - In `verify`/`apply` mode, constant-string `SetAttr` sites with a
   recorded key index get the same exact-owner/version guard.
-- When loading those specializations, SOAC best-effort primes the owner
-  type's shared-key layout from the recorded `type_keys` stream so fresh
-  instances in apply/verify mode already have the expected split-key
-  slots.
+- Resolving or predeclaring field guards never allocates a sample instance,
+  invokes its constructor, writes sample fields, or primes a shared-key layout.
+  A profile proposes an index; only the current runtime key/name guard makes
+  that index usable. Normal source execution establishes missing keys.
 - After the guard, codegen stores directly into the expected inline-values slot.
   First inserts update the split-values insertion order when the class layout
-  has already been primed.
+  already contains the actual key. Selected scalar-region field inputs use the
+  same live key/name guard; all misses retain the existing generic fallback.
 - In `verify`/`apply` mode, store guard misses or inline-values misses for
   planned deopt points use a cold `dp_jit_deopt_resume` continuation
   when the receiver, attribute key, and replacement operands are safe to
@@ -624,6 +1276,14 @@ layouts is intentional; because PyO3's weakref declaration is `repr(Rust)`,
 generated code uses an explicit minimal C-layout `RawPyWeakRefForJit` prefix
 instead. No user callbacks or user-defined descriptor invocations are used to
 prime a cell.
+
+The same native ordinary-dictionary policy query declines both own and
+inherited late-bound cell publication. The shared raw object-slot resolver also
+declines an actual native slot policy, including inherited policies; this
+covers its late-bound-field and generator-factory consumers. New policy
+installation invalidates the actual native type version, so any cell published
+before admission also misses its existing version guard. These raw access
+paths do not replace native field-value checks.
 
 **Guard lifetime:** every access remains valid only while the owner weakref
 still points to the receiver's exact live class and its current nonzero
@@ -1061,9 +1721,21 @@ expression linearization and retained atomically; otherwise a hoisted getter
 could run before its guard and a miss would invoke observable subclass or
 descriptor hooks twice. One exact-match seeded/remapped-plan helper handles
 original and same-module-inlined instructions, continuation clones, and
-fixpoint/remap/late phases; unrelated generic and ordinary indexed trees keep
-their normal linearization. Same-module inlining preserves callee module and
+fixpoint/remap/late phases. Selected ordinary indexed-field scalar regions
+use the same exact-match boundary; unrelated and unselected trees keep their
+normal linearization. Same-module inlining preserves callee module and
 original instruction identity.
+
+The retained late-attachment check uses the same all-input indexed-field guard
+predicate as final validation. If a generic field tree was not selected before
+linearization, its comparison may survive only as a producer, not an `IfTerm`
+test. An unattached branch or return proposal with missing or mismatched field
+guards then declines without changing the generic operation. Missing or
+colliding nodes for otherwise eligible proposals still fail. Present plans
+continue through existing constructor virtualization and final guard validation;
+parameter-only scalar plans do not acquire a field-guard requirement. This is
+compatibility handling for a declined existing proposal, not new eligibility or
+an optimization claim.
 
 Constructor continuation cloning can retain ordinary indexed fields at new
 instruction IDs while their counters remain defined at the original callee
@@ -1121,9 +1793,8 @@ stock-performance target remains unmet.
   base-class field fast paths active on subclasses.
 - Direct field stores remain a verify/apply-mode behavior change. They still
   bypass CPython watcher and version bookkeeping on the raw slot-store
-  path, and owner types that cannot be safely primed still fall back on
-  the first store until normal CPython execution establishes the shared
-  key layout.
+  path. An absent or mismatched shared key falls back until normal CPython
+  execution establishes the actual layout; compilation never primes it.
 - Class attributes and descriptors are excluded by compile-time owner
   inspection. Runtime type-version guards are the fallback if a later
   class mutation invalidates that inspection.
@@ -1202,6 +1873,11 @@ test phase takes **157.448 seconds**.
 
 ### Guarded Eager Comprehension Callable Elision
 
+This pre-existing ordinary-module path is not used for authenticated strict
+modules. Its retained implementation does not test observer configuration or
+promise SOAC frame/event compatibility. The measurements below are historical;
+the current enforcement work adds no optimization or benchmark result.
+
 Stock CPython's PEP 709 eager list/set/dict comprehensions do not create a
 `PyFunction` or emit synthetic `code.__new__` audit events. SOAC can restore
 that observable behavior without moving the comprehension into its parent's
@@ -1224,9 +1900,8 @@ Runtime initialization captures the immutable original bootstrap factory
 code and exact original private cache before module-body execution. Every
 candidate rechecks live `sys.modules`, canonical runtime owner/type
 version, bootstrap aliases, current factory/code, cache identity, exact
-captured builtins, forced-interpreter state, and parent source tracing /
-profiling / local/global monitoring. Factory/cache replacement, cache
-subclasses or reentry, changed code/module, monitoring, custom builtin
+captured builtins and forced-interpreter state. Factory/cache replacement, cache
+subclasses or reentry, changed code/module, custom builtin
 mappings, source/lazy shapes, or interpreted mode fall back unchanged.
 **Arbitrary in-place entries of the original private cache are not
 checked**; only the approved original-cache identity/subclass boundary is
@@ -1240,8 +1915,9 @@ globals, builtins, and existing capture tuples. The callback uses a bounded
 stack `FunctionEnvAbiHeader` with a NULL default slot, borrowed validated
 closure cells, existing late-owner/deoptimization pointers, panic
 containment, and normal CPython recursion / `tp_call` behavior. Thus
-vectorcall, generic call, deoptimization, lifetime, cycles, and finalizer
-ordering remain valid without hidden Python roots or changed parent cleanup.
+vectorcall, generic call, deoptimization, ownership, cycles and required cleanup
+remain valid without hidden Python roots. Transient reference counts and
+implicit-finalizer schedules need not match CPython.
 No public API, global mutable state, runtime-helper symbol, generated-child
 ABI, or new IR concept is added.
 
@@ -1284,6 +1960,15 @@ counter-dump batch takes **80.81 seconds**. The full-suite **1.10x stock**
 target remains unmet.
 
 ### Guarded Builtin Consumption of Source Generators
+
+**Historical strategy; runtime shortcut retired.** Generic calls now use
+`PySoac_VectorcallWithContext` / `PySoac_ObjectCallWithContext`, with explicit
+caller globals and locals. The obsolete generic-call wrapper, callable-kind
+classifier, and its `next`, `any`, `all`, and `StopIteration` fast paths have
+been removed along with their private template caches. The measurements below
+describe the earlier implementation, not the current call path. This cleanup
+does not replace the still-used generator factory or typed iterator plans, and
+does not claim a new performance result.
 
 Canonical exact `METH_O` builtins `any` and `all` can consume a compiler-
 owned source generator through its already compiled resume entry while
@@ -1679,9 +2364,9 @@ is preserved.
 Each evaluation still receives a fresh function, independent closure cells,
 and a fresh lazy generator; `send`, `throw`, `close`, finalizer behavior,
 current runtime globals, and helper/factory mutation remain observable.
-Pinned CPython thread/code prefixes check tracing, profiling, global
-`sys.monitoring`, and code-local `sys.monitoring`; any active observer
-forces the complete original interpreted path. The selected scope is only
+The 2026-08-25 (PDT) observer amendment removes the former tracing/profiling/
+monitoring fallback gate; this path does not promise observer-event coverage.
+The selected scope is only
 trusted canonical source-backed generator expressions; ordinary named
 generators, coroutines, async generators, and unrelated dynamic factories
 are not admitted as special cases. No public API is added.
@@ -1746,22 +2431,23 @@ bounds checks, owned-reference cleanup, repeated clear/destructor calls,
 resurrection, and both existing construction paths remain sound.
 
 For the exact canonical generator class, the existing factory can use
-`GenericAlloc` and initialize **eight checked slots** directly. Admission
-checks the live class/type version, original initializer function and code,
-initializer vectorcall, allocator / `__new__`, descriptors and hooks,
-recursion, source-function watcher, and active local/global monitoring,
-tracing, or profiling. A monitored initializer is observable in Apply
-mode even though the retained Profile-mode baseline emits no initializer
-`PY_START`; direct allocation falls back whenever the existing callback
-must remain visible. Live initializer/class/code/slot mutation,
+`GenericAlloc` and initialize **seven resolved object fields** directly:
+`_resume_function`, `_preserved_values`, `_yield_from_slot`, `_closed_slot`,
+`__name__`, `__qualname__`, and `gi_code`. Admission checks the live class/type
+version, original initializer function and code, initializer vectorcall,
+allocator / `__new__`, descriptors and hooks. Direct allocation retains the
+recursion check. The 2026-08-25 (PDT) observer amendment removed monitoring,
+tracing and profiling fallback checks; this path promises no SOAC observer
+coverage. Live initializer/class/code/slot mutation,
 replacement subclasses, forced interpretation, dynamic hooks, and unsafe
 layouts retain the complete original class-call path. Real generator
-identity, laziness, captures, `send` / `throw` / `close`, and finalizer
-ordering remain unchanged. This changes no public API, global, runtime
-helper inventory, IR operation, or native direct-function body. The
-existing successful generator event gains one **new**
-`constructor_path='direct_slots'` / `'python_class'` field; no new event or
-helper is introduced.
+identity, laziness, captures, `send` / `throw` / `close`, safe ownership and
+required cleanup remain unchanged. The existing successful generator event
+records `constructor_path='direct_slots'` / `'python_class'`.
+
+The following validation and measurements describe the historical revision,
+including its then-present observer guards; they do not establish current
+observer compatibility.
 
 A genuine unchanged-production real stock/transformed cycle regression
 turns **RED → GREEN: 1 passed in 5.93 seconds** across
@@ -1827,15 +2513,65 @@ selections in the v3 plan, and validates that selected inline bodies can be
 constructed from the cached target module. The JIT loads the plan, lowers the
 cached pre-optimization module to `InstrTyped`, embeds the selected direct-call
 or inline shape in typed IR, then builds value facts, locals, refcount
-ownership, and deopt resume tables from the typed result. It does not build
-owner-attribute guard maps or rewrite method calls from profile evidence.
+ownership, and deopt resume tables from the typed result.
 
-Current live v3 direct-call support covers ordinary function targets with
-validated positional/default argument plans and synthetic constructor-entry
-targets whose argument plan does not require default refresh. Runtime-guarded
-receiver-method plans are intentionally disabled for now; if such plans appear
-in v3 plan/emission data, specialization-input preparation rejects them because
-their owner/type guard payload is not yet a static mechanical JIT input.
+Typed expression linearization preserves name-read order when it hoists later
+operand expressions. A non-constant callable, earlier argument, or other name
+read is captured before a later sibling that can execute Python or raise. The
+resulting direct-call operation still validates the captured function's current
+identity/code/defaults after argument effects; a miss invokes that captured
+callable, without repeating its lookup or argument evaluation. The structured
+linearization tests cover the ordered IR and repeated-pass stability, and
+`tests/test_regression_function_mutation.py` covers code/default replacement
+during argument evaluation through independent profile/apply processes. This
+preserves an interoperability boundary; it does not establish a sealed target.
+
+Compiler-owned language operations are not Python callable lookups.
+`RuntimeName::is_language_intrinsic` keeps `Globals` and `UnpackFixed` explicit
+through name binding and typed expression linearization, including when a later
+argument is lifted. Capturing either as an ordinary local would lose the
+operation identity and incorrectly make it depend on a replaceable runtime
+helper. Ordinary callable/global/closure reads still retain their original
+evaluation order. Structured tests exercise the actual profile-planning path;
+the fixed-sequence-unpacking integration case also replaces the ordinary helper
+and checks nested and context-manager targets in profile and apply modes.
+
+Expression values also carry an explicit acquisition-ordered lifetime category
+in `StorageLayout`. Linearization releases each operation's captured operands
+immediately after that operation, newest first, before the result is assigned
+to a source local or returned. An error unwinds still-live expression operands
+before source locals; it does not retire them into long-lived frame roots.
+Inlining remaps the lifetime category and its order along with local locations.
+Final emission rejects a prepared function whose storage/lifetime layout differs
+from the function used for ownership and cleanup planning. No generated-name
+prefix grants expression lifetime semantics, and source-local cleanup order is
+unchanged.
+
+Local ownership and definite binding are separate dataflow facts. A local
+assigned on only some incoming paths still owns its non-null value and must
+be released on deletion or exit. MAY-bound propagation joins those ownership
+obligations, including every possible exception prefix; MUST-bound alone
+permits an unchecked local load. Maybe-bound values retain nullable owned
+transport and checked-load semantics rather than becoming known-empty locals.
+Conversely, a source-block location proved unbound receives an explicit
+`PlannedLocalEnvEntrySource::Unbound` materialization when no runtime parameter
+or stack seed already supplies it. This lets an exception before a temporary's
+producer forward null to a nullable successor. The source proof and exact
+materialization are validated before emission; codegen does not reinterpret
+an arbitrary missing local as null. These constant entries own no reference
+and do not allocate frame-root storage.
+
+The same raw `call_hot_targets` evidence also selects constant-name receiver
+methods and compiler-owned runtime protocol methods. Ordinary method plans
+carry their selected name, validated receiver-plus-positional argument plan,
+exact owner-type reference, and current type-version guard; typed planning
+resolves each admitted owner into an explicit `TypedDirectMethodCallGuard`.
+Runtime protocol methods use the same owner-guard path when their selected
+body is inlineable. Missing owner metadata, unsupported argument shapes,
+unsafe descriptor/receiver behavior, and unmatched targets retain generic
+Python dispatch. Ordinary function targets preserve their existing validated
+positional/default argument plans; synthetic constructor-entry targets remain
+limited to argument plans that do not require default refresh.
 
 ### Immediate Zero-Argument and Positional Method Dispatch
 
@@ -1877,9 +2613,11 @@ unmatched arguments, and all prior receiver / ownership exclusions remain
 on the ordinary path.
 
 An admitted pair uses the already-existing typed `GuardedMethodCall`
-operation with **empty guards**; it does not enable currently disabled
-runtime-guarded receiver-method plans or add a new public IR variant. JIT
-emission mechanically imports the existing pinned-CPython
+operation with **empty guards**; this CPython-authoritative lookup path does
+not require receiver-owner/type-version guards and does not add a new public
+IR variant. It remains distinct from the existing profile-selected guarded
+receiver-method plans described above. JIT emission mechanically imports the
+existing pinned-CPython
 `_PyObject_GetMethod` symbol and follows its actual method/non-method/null
 result ABI. CPython remains responsible for inherited lookup, live class /
 MRO mutation, instance shadows, properties, data/non-data descriptors,
@@ -2296,9 +3034,13 @@ speedups or runtime semantic proofs.
 
 The existing shared vectorcall emitter now uses its current thread state,
 the real Cranelift native frame pointer, and private pinned
-`#[repr(C)]` layout facts: `PyThreadState.base_frame` offset **80**,
-embedded interpreter-frame size **88**, and frame-relative native soft
-limit offset **104**. For 64-bit `aarch64` / `x86_64`, exactly **two
+`#[repr(C)]` layout facts for `PyThreadState.base_frame`, the embedded native
+interpreter frame, and the native soft stack limit. These are physical
+stack-safety inputs, not reconstructed SOAC frames or locals-plus projections.
+The 2026-08-25 (PDT) observer removal deletes the reservation fields from both
+CPython and the private tail mirror. The structured recursion test compares
+the resulting offsets with the actual selected interpreter's C probe before checking
+the emitted loads. For 64-bit `aarch64` / `x86_64`, exactly **two
 trusted pinned loads** and **one hot unsigned conditional branch** check
 the conservative maximum-margin band
 **`[soft - 65536, soft + 32768)`** with wrapping unsigned
@@ -2450,13 +3192,15 @@ landed. No baseline CPython-visible bug is claimed; full-suite stock
   also keep the callee out of the typed inliner. Generator-instance
   planning recognizes both strict module-global generator names and locally
   proven generator function values such as nested generator helpers carried
-  through local slots. Source-backed named generators retain CPython's original
-  generator vectorcall in ordinary and apply modes when their original code
-  objects are available. Production compilation and source-backed CLIF/
+  through local slots. In unselected ordinary modules, source-backed named
+  synchronous generators retain CPython's original vectorcall when their
+  original code is available and the mode records no specialization counters.
+  Authenticated strict modules use source-owned SOAC entries instead.
+  Production compilation and source-backed CLIF/
   InstrTyped inspection use the same original-code matcher, so native perf
   annotations reflect this actual generator decision instead of reconstructing
-  an unrelated transformed generator body. Source-backed named generators also
-  receive their source code's CPython `MAKE_FUNCTION` version so native calls
+  an unrelated transformed generator body. The retained native generator path
+  receives its source code's CPython `MAKE_FUNCTION` version so native calls
   specialize and later defaults or closure mutations retain normal CPython
   invalidation.
   Both ordinary typed direct calls and inlined Python function bodies retain a
@@ -2501,12 +3245,26 @@ landed. No baseline CPython-visible bug is claimed; full-suite stock
   lets the native generator specialize global and builtin loads while preserving
   `function.__globals__ is module.__dict__`, global rebinding and deletion,
   and the generic fallback of indexed JIT accesses. Profile and verify modes
-  retain their original indexed dictionaries. After trusted
-  generator-resume inlining, typed
-  planning
-  can replace a nonescaping generator wrapper with explicit caller locals for
-  preserved activation slots, initializing those locals from the original
-  public-call arguments and runtime slot defaults. When a generator requires
+  retain their original indexed dictionaries. Generator resume calls currently
+  retain their native activation boundary, including bodies with no lexical
+  handlers: `PyErr_SetHandledException` can change the capsule-owned exception
+  item through an ordinary callback. Typed inlining records this rejection at
+  the source call, before allocating inline storage. An ordinary callee instead
+  shares its caller's current item; its cloned blocks compose the caller's
+  ordered handler prefix with its own regions. Guards, fallback, cleanup, and
+  continuation blocks preserve the original caller context. A
+  callee result is first stored in a fresh temporary when the callee has
+  handlers, then assigned to the caller's destination in the continuation.
+  Replacing the old destination can run a finalizer and must happen after the
+  callee's handlers have been left. A dynamic
+  `Preserve` or `Terminal` caller may inline a no-handler ordinary callee using
+  `Preserve`, but retains a callee with lexical handlers until a distinct
+  activation can be represented. This is not a generator-function exclusion:
+  ordinary calls inside suspended bodies and generator factory calls remain
+  eligible. Future resume inlining must explicitly represent the capsule's
+  actual exception-item owner and stable handled-region layout across resume,
+  yield, error, terminal cleanup, native calls, and deoptimization; caller-local
+  preserved slots alone are insufficient. When a generator requires
   the transformed factory, it uses the SOAC generator-factory vectorcall path
   consistently so its preserved activation storage model remains explicit. The
   transformed factory resolves `make_generator_instance` through the existing
@@ -2515,10 +3273,9 @@ landed. No baseline CPython-visible bug is claimed; full-suite stock
   asynchronous-generator wrappers reuse the source function's actual immutable
   code object when its name, qualified name, and generator-kind flags agree;
   otherwise the existing synthetic code-template fallback preserves behavior.
-  The first slice only lowers generators whose preserved state has no preserved cell
-  slots and whose wrapper has no remaining observable uses after the resume body
-  is inlined; synthetic alias/setup temps introduced while inlining trusted
-  `next`/`send` paths are consumed with the wrapper.
+  Generator-state lowering requires a complete executable resume-inline plan
+  and no remaining observable wrapper uses; the retained activation boundary
+  currently prevents that wrapper-erasure path from being selected.
   Exact generator-instance evidence also propagates through
   `iter(generator_function(...))`: the identity-iterator transfer retains the
   proven generator owner, instance origin, and resume function without
@@ -2528,16 +3285,14 @@ landed. No baseline CPython-visible bug is claimed; full-suite stock
   protocol call stays generic instead of exposing wrapper-only fields before
   generator-state lowering can prove the wrapper is erasable.
   Immediate consumption by `list`, `set`, or `tuple` is not by itself proof that
-  a source-backed named-generator activation may be erased. Its native
-  `PyGenObject` and suspended frame are observable through `frame.f_generator`,
-  tracing and monitoring, `sys._current_frames()`, traceback construction, and
-  exceptional cleanup. Source-backed generator function objects and escaping,
-  aliased, or immediately materialized calls therefore retain CPython's public
-  vectorcall in the generalized path. Admitting one safely will require a
-  pre-activation guard over the exact function binding, code, defaults, and
-  closure dependencies, with guard failure resuming the untouched original
-  expression. It must also reject the activation before rewriting when
-  argument/state binding or the whole ownership graph cannot be lowered.
+  a source-backed named-generator activation may be erased. Actual callable,
+  code, defaults and closure dependencies, argument/state binding, ownership,
+  and handled-exception state remain independent requirements; frame inspection
+  and observer coverage do not authorize or prevent SOAC execution. Unselected
+  ordinary named generators retain native vectorcall under the conditions above;
+  strict generator bodies use source-owned SOAC entries. A rewrite must preserve
+  the original call on guard failure and decline unsupported binding or ownership
+  shapes rather than discarding the activation.
   Calls to builtin `list` or `tuple` with a proven nonescaping generator
   instance can also carry an explicit typed builtin-implementation plan. That
   plan keeps the observed callable as the original builtin, but selects the
@@ -2558,10 +3313,10 @@ landed. No baseline CPython-visible bug is claimed; full-suite stock
   target stays within the bounded generator-inline budget, so large resume state
   machines keep the ordinary builtin path instead of flattening a
   disproportionate amount of control flow into the caller.
-  Cloned generator-resume state remains owned by its particular inline
-  instance: cloned activation slots and alias evidence cannot be merged across
-  sibling generators, and an ordinary caller must not retain unresolved
-  generator-preserved storage after rewriting.
+  Any future cloned generator-resume state must remain owned by its particular
+  inline instance: activation slots, exception items, and alias evidence cannot
+  be merged across sibling generators, and an ordinary caller must not retain
+  unresolved generator-preserved storage after rewriting.
   Calls to the resolved compiler-owned `resume_generator` runtime primitive
   can use its explicit five-borrowed-argument C ABI instead of Python
   vectorcall. The primitive returns an owned object, propagates the current
@@ -2571,14 +3326,34 @@ landed. No baseline CPython-visible bug is claimed; full-suite stock
   argument shapes retain the original Python-facing validation and exception
   behavior.
   Direct-call and constructor-init inlining use deterministic projected
-  cumulative block and instruction budgets. Generator-resume candidates are
-  prioritized, and continuation cloning consumes the same remaining CFG
+  cumulative block and instruction budgets. Representable candidates and
+  continuation cloning consume the same remaining CFG
   budget instead of applying an independent limit to each call site. Late
+  executable call candidates drain before optional hot/cleanup continuation
+  cloning. A successful idle split invalidates cached owner facts and resumes
+  selection; it is not discarded as a failed inline. The same cumulative
+  budget still bounds both kinds of growth.
+  Dead-materialization liveness counts operation-owned reads as well as `Load`:
+  `TakeOperand`, `IteratorStep`, comprehension insertion, class binding slots,
+  and argument assembly all retain their physical owners. Copy-chain analysis
+  ignores only the exact pure-copy `Load` node, not a call's callee, another
+  argument, or an implicit read of the same binding. A remaining generator
+  construction is an effect: its target plan alone does not prove infallible
+  argument binding or unobservable source-frame ownership. Generic cleanup
+  removes only unused compiler-generated factories and pure aliases; successful
+  generator-state lowering separately replaces its exact call origin.
+  Structured regressions preserve original
+  generator call IDs, targets and argument plans, their suspended layouts, and
+  each native-iterator or optimized-resume boundary independently.
+  Late
   builtin consumers are admitted one at a time so the trusted iterator
   protocol and generator-resume decisions can be refreshed before processing
   another consumer. Optional late builtin and protocol inlining stops at the
-  measured remaining budget while mandatory generator-resume cleanup
-  continues. Virtual-field join trampolines consume the remaining block
+  measured remaining budget. Each late iteration first prunes unreachable CFG
+  and refreshes facts only when that changes the graph, so dead blocks do not
+  consume the remaining admission budget. Reachable growth remains charged;
+  an unrepresented suspended activation retains its
+  call regardless of the available budget. Virtual-field join trampolines consume the remaining block
   budget in deterministic edge order.
   Constructor-entry targets currently require all user arguments to be explicit
   because their type-stored metadata does not yet refresh `__init__` defaults.
@@ -2629,6 +3404,15 @@ landed. No baseline CPython-visible bug is claimed; full-suite stock
     transformed function body
 
 ## Closed Iterator-Pipeline Fusion
+
+This section records the earlier generator-wrapper strategy and its growth
+limits. It does not authorize generator-resume inlining under the current
+strict activation contract. Current resume plans describe retained native
+out-of-line activations: they remain attached for codegen and are refreshed
+after late exception normalization, but consume no inline priority, size
+reservation, or rewrite-progress ticket. Common candidate admission checks
+the same activation predicate as application before selecting a target.
+The native iterator/materializer path described below is separate.
 
 Closed iterator-pipeline fusion removes proven generator, `map`, and `filter`
 intermediates when a single-use chain is consumed immediately by an exact
@@ -2683,8 +3467,11 @@ source-backed producers requires a guarded whole-graph fallback; closed
 ownership alone cannot protect against decorators, global or `__code__`
 rebinding, and positional or keyword-default mutation.
 
-Individual resume targets are currently limited to 64 blocks and 512
-recursively counted typed instructions. Optional inline admission stops near a
+Copyable resume targets are limited to 64 blocks and 512 recursively counted
+typed instructions. The shared `inline_callee_preserves_handled_activation`
+precondition excludes a retained, non-inlineable activation from copied-body
+cost; it does not grant an inline target or eliminate that activation. Actual
+consumer and protocol bodies still count. Optional inline admission stops near a
 cumulative caller cap of 384 blocks and 4096 typed body instructions; consumer
 admission reserves its immediate resume/protocol follow-up and admits at most
 one builtin-implementation source per fixpoint pass. These are typed CFG growth
@@ -2695,6 +3482,15 @@ graphs can therefore be only partially fused and grow substantial exception,
 ownership, and protocol control flow. Source-backed N-Queens generators remain
 on their ordinary native path; no benchmark-specific replacement bypasses
 those generator or fusion boundaries.
+
+Every candidate-family merge and late refresh applies the same retired-source
+filter before budget admission. The qualified function/instruction identity
+follows transitive inline copies of already-retired sites; a fresh hot-path
+replacement remains eligible. Executable cold fallback calls can therefore
+remain discoverable without being reselected and charged again. Structured
+tests distinguish retained and copyable body costs, foreign instruction-ID
+collisions, cold fallback retirement, and actual hot helper inlining. These
+decisions do not supply missing strict source or runtime authority.
 
 Fully fused intermediates intentionally relax CPython compatibility for
 back-door generator and frame introspection. Their generator-expression and
@@ -2711,6 +3507,43 @@ iterator escapes or erase their effects. Callback calls preserve ordinary
 result and exception semantics and may be independently specialized under the
 direct-call policy above.
 
+### Inline native-iterator map/filter materialization
+
+A separate versioned `TypedNativeIteratorPipelinePlan` selects one closed
+`map` or `filter` stage consumed by `list` or `tuple`. The current producer/
+consumer edge, unique origins, supported arity, and expansion budget must
+validate. Profiling and source-global names establish candidate membership,
+not authority. Both already-evaluated callee objects are compared with the
+canonical native builtin identities before iterator acquisition; failure runs
+the original calls with those same operands.
+
+Selection precedes typed expression linearization and commits as a complete
+bundle. Late validation checks the current typed function. The emitted loop
+owns one acquired native iterator and a separate callback-field reference,
+preserving source evaluation and explicit callback order. It does not inline an ordinary
+callback or admit an ordinary runtime helper. Source genexprs keep their actual
+native generator owner and source activation.
+
+Construction errors remain distinct from exhaustion and noncallable callbacks
+are not prechecked. Under the 2026-08-24 (PDT) execution-compatibility policy,
+map/filter stage owners use the same safe cleanup sequence; transient counts
+and implicit field-finalizer order need not match native wrapper internals.
+Filter caches the input next slot across rejected items and reloads it for the
+next requested output. List allocation, default length hint of eight, and
+shrink capacity follow the pinned native implementation. Tuple uses its
+eight-item stack buffer, promotes after item eight, and consumes the completion
+array with the native helper. Partial results retire before wrapper fields.
+
+`typed_native_iterator_pipeline_committed` on the
+`soac_native_iterator_pipeline` target records a completely emitted CFG, not
+an attempted inline or a runtime execution count. It reports the stage/sink,
+two guards, one native input, one eliminated internal wrapper, no residual
+template helper calls, and zero eliminated source activations. Escaped or
+observed wrappers, alias reconstruction, multiple input iterables,
+keyword/strict variants and unsupported callee shapes are excluded. Actual
+runtime checks, code sizes and benchmark evidence remain separately required;
+see the [strategy record](optimization-attempts/2026-08-22-native-iterator-pipeline-contracts.md).
+
 ## Opaque Fused Iteration
 
 Production does not admit benchmark-specific opaque iteration. The previous
@@ -2720,12 +3553,13 @@ specific indexed module-dictionary exception have been removed. Historical
 performance-log entries describing that experiment are not current runtime
 behavior or valid full-suite performance evidence.
 
-Source-backed named generators, including the actual N-Queens workload, retain
-their original CPython generator vectorcall and ordinary apply-mode module
-globals. Their source generator bodies run, real solution tuples are produced
-in encounter order, and active Python tracing continues to observe producer
-call and line callbacks. Production does not silently erase those source-backed
-generator activations, bypass observers, or replace the program with a
+Source-backed named synchronous generators in unselected ordinary modules retain
+their original CPython vectorcall when original code is available and the mode
+records no specialization counters. CPython supplies ordinary observer behavior
+on that native path. Authenticated strict modules instead use source-owned SOAC
+entries, without a frame-inspection or observer-coverage promise. Their source
+generator bodies still run and produce real values in encounter order, including
+solution tuples for N-Queens. Production does not replace the program with a
 benchmark-selected algorithm.
 
 The source-independent closed iterator-pipeline fusion described above remains
@@ -2788,14 +3622,14 @@ in the synthetic target; registration checks the realized `PyTypeObject` once
 and does not attach constructor metadata for custom `__new__`, metaclasses,
 abstract classes, or non-generic allocation.
 
-For source-defined classes, constructor identity must become available at
-class creation, not only after the entire transformed module finishes
-initializing. The existing `soac.runtime.create_class` callback already sees
-the realized class and its trusted transformed namespace function; that
-function can supply the owning module's SOAC context to the existing
-owner-type registration path. Registering the safe synthetic constructor
-identity before returning the class lets profile-mode module-level calls
-record that identity in `call_hot_targets`.
+The active enforcement-only path keeps constructor fast-path identity separate
+from actual class/function admission. Source-owned entries do not publish
+the legacy unchecked function ID, and import-time constructor calls retain
+pending-class, source and binder protections, not parameter/result predicates.
+The retained ordinary `soac.runtime.create_class` callback sees the
+realized class and transformed namespace function and can supply the module's
+SOAC context to the optional owner-type registration path; this callback is not
+strict construction authority.
 `_soac_ext.profile_watch_type_key_layout(cls, namespace_fn)` first retains the
 existing split-key watcher and then calls
 the public `soac_jit::register_created_owner_type_from_namespace` API, which
@@ -2803,6 +3637,14 @@ reads trusted SOAC namespace-function metadata and reuses ordinary owner-type
 registration. Untransformed namespace functions remain a no-op. The final
 module-wide registration sweep and owner-mutation invalidation remain
 necessary and are preserved.
+
+Strict source construction instead uses the compiler-owned native construction
+operation. After successful class completion it invokes the same split-key
+observer on the actual result, including dynamic declines. This restores
+observation of ordinary dictionary insertions without selecting indexed storage,
+minting a constructor ID, or deriving a layout from a namespace. The focused
+class-construction regression checks actual owner/key rows after real offline
+admission in both compiled and entry-interpreter modes.
 
 The early path must reject custom metaclasses and unsupported allocation
 shapes using raw CPython type slots before inspecting `__module__` or calling
@@ -2861,10 +3703,13 @@ the same virtual object can be proven redundant. The generic fallback path keeps
 the original materialized object behavior. Ordinary profiled constructor
 virtualization still requires indexed-field access plans before field loads and
 stores are rewritten, but fully trusted static runtime constructors can consume
-their bound constant fields directly in the fully-virtual path. That lets
-  compiler-generated runtime wrappers such as `ClosureGenerator` lower their hot
-  state to locals before indexed-field replay would otherwise make those fields
-  visible.
+their bound constant fields directly in the fully-virtual path when the
+continuation's operand ownership is represented. The ordinary source
+`ClosureGenerator`-shaped fixture is not current native-wrapper evidence: its
+`_is_closed` store consumes an operand, so that path now declines scalarization
+and retains the concrete allocation and field stores. The two replayable
+parameter bindings do not supply ownership of that consumed value. Recovering
+this selection requires deferred replay/ownership work.
 
 Field-state planning retains bindings only for constructor instructions that
 actually occur in the typed function. A real constructor can still expose
@@ -3006,19 +3851,31 @@ paths; unplanned item access goes through the CPython item APIs.
 ### Codegen
 
 - `SetItem` lowering routes through the operation-specialization module.
+- Captured assignment operands move into the operation without extra temporary
+  roots. Generic success and failure release key, container, then replacement,
+  matching native `STORE_SUBSCR`. Existing exact-list arms use the same order
+  for the inputs they still own; a replacement transferred into the list is
+  not released again. This is ownership correctness, not a new selected arm.
 - Without counters or v3 exact-list item emissions, `SetItem` stays on the generic
   `PyObject_SetItem` helper path.
 - With `setitem_hot_shapes` counters, profile/verify mode records the dispatch
   shape after evaluating operands. The validated exact-list item emission in
   the v3 plan selects the specialized arm directly.
+- A scalar-index store may keep its unboxed index only when the replacement is
+  a plain physical load or an already-bound module constant. Its two generated
+  guard arms must not consume the same compiler owner state or run a replacement
+  callback after checking list bounds. Consuming/effectful replacements use the
+  existing boxed-index exact-list path: all inputs are evaluated once, then the
+  current receiver and index are guarded. The same plan and hit/fallback counter
+  identity remain selected; this does not introduce another specialization.
 - The specialized arm guards:
   - the object is exactly `PyList_Type`
   - the index object is exactly `PyLong_Type`
   - the index is compact and normalizes in bounds
   - the replacement value is non-null
-- On hit, codegen INCREFs the replacement, stores it directly to
-  `PyListObject.ob_item[index]`, DECREFs the old slot value, and returns owned
-  `None`.
+- On hit, codegen clones a borrowed replacement or transfers its owned input,
+  stores it directly to `PyListObject.ob_item[index]`, DECREFs the old slot value,
+  and returns owned `None`.
 - On miss, codegen falls back to `PyObject_SetItem` through the generic helper
   path, which performs no exact-list rediscovery, and records
   `setitem_specialized_fallback` in verify mode.
@@ -3077,6 +3934,19 @@ paths; unplanned item access goes through the CPython item APIs.
   directly from the guarded module-dict slot; local fallbacks reload the global
   with the normal owned global-load path before running generic Python
   operation lowering.
+- Cell operands carry `CellValue` inputs with the resolved `CellLocation` and
+  the originating load instruction, rather than a same-spelled local name.
+  They also retain that load's original logical binding name and owned/free
+  binding kind. An inline free-variable read still raises `NameError` when
+  empty even if its physical location becomes a caller-owned cell; owned local
+  reads raise `UnboundLocalError`. Neither exception selection nor its name is
+  rediscovered from the final storage location.
+  Inlining remaps that instruction and preparation refreshes the binding from
+  the actual copied load. The hot region keeps an owning snapshot behind its
+  borrowed conversion input and releases it on success, input error, or guard
+  miss. The generic region owns and consumes its cell loads normally. Owned,
+  preserved, closure, and captured-source cells use the same representation;
+  neither generator functions nor closures are excluded from specialization.
 - On type/compactness/overflow miss, codegen runs the local generic fallback
   region emitted from the original Python operation shape. When the fallback is
   replay-safe, guard-miss lowering can instead target a cold
@@ -3088,6 +3958,10 @@ paths; unplanned item access goes through the CPython item APIs.
   - only exact `int`/`int`
   - no mixed-type shapes
   - unsupported operator kinds always use generic lowering
+  - an indexed-field operand whose receiver itself lives in a cell is not yet
+    modeled by the legacy indexed-field region input. That region alone uses
+    generic lowering; arithmetic on cell contents and the independent sealed
+    field capability path remain eligible.
 - Soundness boundary:
   - compact-long machine-code specialization guards exact runtime `PyLong`
     layout and compact representation before direct memory access
@@ -3317,6 +4191,136 @@ paths; unplanned item access goes through the CPython item APIs.
   while the full `just test-all` correctness gate passes.
 
 
+## Assignment Operand Lifetimes
+
+Assignment lowering marks its materialized value, unpack result, object, and
+index stores with `StoreLifetime::Operand` and a producer-selected
+`unwind_order`. Source-local spelling is not a lifetime proof. The metadata survives
+name binding and assignment from `yield`/`yield from`.
+
+General evaluated expression operands use the same lifetime, with explicit
+`OperandLocation::Local` or `Preserved` storage. `TakeOperand` transfers the
+existing owner and publishes NULL, rather than cloning a last-use `Load`.
+The capsule receives the ordered preserved-role indices from the public
+generator layout; only deferred boxed compiler operands start NULL. They are
+not lexical cells. Suspended destruction follows the producer-selected
+cleanup order, independently of
+whether a resume CFG executes.
+
+`BuildCollection` selects exact native list/set/dict construction.
+`CallArgumentOp` records source-selected star expansion, keyword-group merge,
+list-to-tuple conversion and singleton-star normalization. These phases have
+different failure effects: list conversion consumes its primary before the
+helper, while failed singleton normalization retains the raw primary. Normal
+and exceptional local facts account for that distinction. `PreparedCall`
+consumes its already-built tuple/dict without reconstructing arguments. These
+operations use no profile-derived callable authority or unchecked boundary.
+
+Source `for` loops use `IteratorStep`, an explicit borrowed read of their
+iterator Operand. The native primitive reloads the current type's next slot
+and leaves exhaustion pending for the selected continuation; the ordinary
+Python `next` builtin is unchanged. Loop-region cleanup owns exit lifetime,
+including inner handlers and finally callbacks. Exceptions retain their types,
+identity, chaining and propagation, but SOAC adds no native traceback-frame or
+source-position event. Ordinary function/lambda comprehensions use the normal
+scope lowering; native inlined-local correspondence is not an admission gate.
+Expanded calls, suspension and delegation retain their explicit operand
+ownership and source evaluation order. Earlier frame-attribution evidence in
+the chronological ledger is historical, not a current acceptance requirement.
+
+Augmented assignment materializes the operator result separately, releases
+the old-value operand before writing the target, then releases target operands
+in native stack order: receiver before result for attributes, key then
+receiver then result for subscripts. Its result reserves an unwind position
+below the target operands even though its value is computed later. This
+distinguishes stack position from chronological store execution and preserves
+the same release order when a setter raises. Name targets keep their ordinary
+source binding while the temporary old-value and result references are
+released at their corresponding operation boundaries.
+
+Callable-field fact transfer captures the receiver origin and replacement
+function identity before consuming setter operands, then invalidates the moved
+locations and updates the field fact. It does not resurrect a consumed
+receiver's per-slot facts. This preserves existing direct-call decisions for
+known callable fields without treating an unknown replacement as the old target.
+
+After exception arguments and physical storage have been resolved,
+`bb_prepared` computes conservative operand liveness and acquired prefixes.
+An exceptional edge releases operands that cannot be used by its continuation,
+in descending producer-selected unwind order. Explicit quiet `Del` operations run in a
+`HandledExceptionContext::Preserve` block before jumping to the original
+handler with its original exception parameters. The raised-scope marker is
+retained, but the new exception does not become the handled exception while
+operand finalizers run. These are ordinary resolved IR operations, consumed
+identically by the entry interpreter and JIT; no profile evidence, speculative
+guard, Python `finally`, or special runtime cleanup hook is involved.
+
+Class-comprehension non-exhaustion dispatch uses that exception-edge path
+before native cell restoration. Partial result and iterator operands retire
+before Restore; older call-prefix operands remain owned through Restore and
+retire afterward. A normal CFG jump to Restore would bypass the required
+partial-result cleanup even if the prefix's own ownership plan were correct.
+
+Preserved generator operands use their actual preserved locations. Liveness
+includes exception arguments and continuation reads, so a value needed after
+an internal delegation handler is not dropped. Quiet deletion covers a failed
+store's uninitialized target as well as values acquired by earlier steps.
+Source frame roots keep their existing lifetime, and uncaught frame cleanup
+continues through the frame's ordinary exit path. Typed-expression
+linearization still records its instruction-local operand temporaries in the
+physical storage layout for its local failure-cleanup plan. Shared MAY-bound
+and MUST-bound entry analyses restrict those operands to live successor uses
+or explicit block parameters, including inputs represented in typed-plan
+sidecars. An acquired operand whose normal cleanup `Del` was bypassed must
+unwind at the failing operation, not be forwarded into a handler merely
+because it was once bound. Ordinary source locals are not subject to this
+last-use rule. The same entry facts drive ownership, materialization, and
+unchecked-load decisions.
+
+Behavioral coverage compares the same ordinary and admitted strict bodies for
+unpack failure, partial target assignment, subscript failure, finalizer-visible
+handled state, suspension, and a live operand across delegated completion.
+Structured tests inspect explicit cleanup edges, unwind order, source
+frame roots, pending exception transport, preserved storage, and the actual
+production typed pipeline's handler transport. The first runtime checkpoint
+passes eleven of twelve cases; the remaining compiled replacement-operand
+defect has a passing structured repair but awaits a new fixed-runtime replay.
+Six additional ordinary/strict comparisons reproduce late augmented-assignment
+operand release on both execution paths. The explicit producer cleanup repair
+passes its normal/error-order structural tests, the full 427-test lowerer,
+and all 227 optimizer tests. The original iterator-backedge specialization
+regression passes again without changing the optimizer or bypassing cleanup.
+Actual runtime replay is awaiting the next coherent native/extension gate.
+See the strict-contract attempt ledger for exact checkpoint identities and
+current validation rather than treating this intermediate checkpoint as the
+complete runtime result.
+
+Pending finally payloads carry explicit primary and enclosing extent roles;
+their last expression use is not their lifetime boundary. Resolved cleanup
+evaluates overriding operands before retiring them and interleaves trim-only
+`HandledExceptionContext::Unwind` transitions with owner release. Physical
+local and preserved owners are tracked separately. Ephemeral
+`BlockContext::suspension_resume` identifies the actual yield/resume edge,
+including a distinct wrapper with zero parameters, and is consumed before
+optimization. Preserved state, not an incidental local copy, crosses that edge.
+
+A caught handler and its associated finally have distinct exception-region
+identities. Normal handler return/break/continue leaves the caught region
+before executing that finally; only an escaping exception initializes the
+finally's error payload. Physical jump-argument completion matches exact
+binding identities, never the first parameter with the same role. Producers
+must explicitly encode renamed transfers. Structured coverage follows this
+decision through name binding, and the fixed-runtime 149-case protocol cohort
+checks the resulting exception state and ownership behavior.
+
+`TermRaise::disposition` separates source raise normalization and context
+chaining from `PropagateNormalized` forwarding. Normalized forwarding does not
+load or call the Python normalization helper. It emits the restore operation
+mechanically in both native and deoptimized execution. Ordinary propagation
+does not detach a suspended activation, so it remains eligible for inlining;
+real suspended Terminal cleanup still prevents unsafe inlining. Typed CFG
+validation also rejects a stale plan with a changed raise disposition.
+
 ## Compiler-Owned Iterator Exhaustion Exceptions
 
 Compiler-generated synchronous and asynchronous iteration handlers bind their
@@ -3337,14 +4341,58 @@ optimizer direct-call selection, or bypass mutable runtime-helper globals.
 
 ## Guarded Canonical StopIteration Matching
 
-Profiled direct-call planning declines only a source-proven compiler-owned
+Eliminating an inlined `raise StopIteration` is a separate CFG decision from
+accelerating the exception matcher. Its `StopIterationObservationPlan` must
+start from a source raise, not normalized propagation, and must
+prove that the handled region cannot expose the exception implicitly. The walk
+includes enclosing exception roles in nested handlers, not only a caught-value
+name load. Calls, descriptors, arbitrary operators, chained errors, suspension,
+possibly unbound reads, and callback-capable rebind/delete or same-region
+cleanup retain the real raise. Constants and proven-bound local forwarding can
+remain eligible. Departing handled scopes are restored before edge/frame
+cleanup; codegen consumes the selected ordinary raise or jump rather than
+rediscovering observability. No new profile assumption authorizes elision.
+
+The proposed direct edge supplies None for the exact caught-exception slot.
+The observation proof permits retirement of that slot only while all writes
+keep it None and all incoming transfers preserve that absent value. Rebinding
+it to an arbitrary object, reading the exception, or releasing any other
+callback-capable owner keeps the real raise. Compiler-generated retirement
+must not disable this proof merely because the original, pre-elision ownership
+plan calls that slot owned.
+
+### Current native forwarding and planner exclusion
+
+Profiled direct-call planning still declines a source-proven compiler-owned
 `RuntimeName::ExceptionMatches` invocation whose exception type is the
 compiler-owned runtime `StopIteration`, including resolved constant-pool
-runtime aliases. Ordinary local handlers, callbacks, `ValueError`, and
-other direct-call targets remain unchanged. The declined matcher reaches the
-existing generic vectorcall hook mechanically; no new IR operation,
-runtime helper, owner catalog, public API, or process-global cache is added.
-The previous unsound process-global static matcher cache is removed.
+runtime aliases. This specific exclusion does not apply to ordinary local
+handlers, callbacks, `ValueError`, or other targets; their usual direct-call
+eligibility proofs still apply.
+
+The current generic path loads the actual `soac.runtime` attribute through
+`load_runtime_name_owned_by_id` and forwards calls through
+`PySoac_VectorcallWithContext`. That native entry handles its explicit
+frame-context builtins and otherwise calls `PyObject_Vectorcall`. For the
+ordinary exception helper and validator, Python code performs the live
+dependency lookups and CPython supplies normal tracing, profiling and
+monitoring behavior. No matcher-template cache or process-global matcher
+cache participates in this path.
+
+The shipped `runtime.py` is unmarked ordinary source; selecting an authenticated
+user module does not enroll that runtime module or install a custom-indexed
+dictionary on it. The historical raw kind-3 slot/version-bypass observers below
+therefore lack their former installed capability. Ordinary helper/dependency
+replacement and observer coverage remains relevant, but an ordinary-dictionary
+scope check is not equivalent to testing those raw indexed-store guards.
+
+### Historical matcher cache and measurements
+
+The following implementation, gate results and measurements describe the
+former guarded matcher revision. They are retained as historical evidence,
+not current cache/layout claims or new performance results. In particular,
+the historical **retained** verdict below does not assert that this matcher
+cache is installed by the current authenticated execution path.
 
 An existing private helper-instantiation template owns a zero-allocation
 pointer/index/session metadata cache. It records **seven custom-indexed
@@ -3359,9 +4407,9 @@ not change. Canonical original registered helper and validator functions,
 their code objects, compile session, globals mappings, and expected current
 dependency values must all still match.
 
-Both helper and validator are checked for tracing, profiling, global
-monitoring, and code-local monitoring; any active observer takes the full
-original Python path. The native match accepts **only an exact
+The 2026-08-25 (PDT) observer amendment removes observer-only fallback gates;
+the metadata and dependency checks above remain necessary for actual helper
+semantics. The native match accepts **only an exact
 `StopIteration` instance**. All subclasses, spoofed or raising `__class__`,
 exception class objects, nonmatching exceptions, code/module/helper/builtin
 replacement, and descriptor or callback changes fall back, preserving the
@@ -3484,7 +4532,7 @@ Some notable hot paths still use only generic lowering:
 
 - keyword calls
 - starred-argument calls
-- omitted-default profiled direct calls
+- omitted-default profiled calls outside the exact signed unbound fixed-positional path
 - constructor calls with keywords, starred arguments, unresolved owner metadata,
   or argument plans that need default refresh
 - most non-`int` operator shapes

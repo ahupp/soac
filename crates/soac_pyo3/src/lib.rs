@@ -17,6 +17,9 @@ pub(crate) fn lowering_error_to_pyerr(err: soac_lowering::LoweringError) -> PyEr
         soac_lowering::LoweringError::Parse(parse_error) => {
             pyo3::exceptions::PySyntaxError::new_err(parse_error.to_string())
         }
+        soac_lowering::LoweringError::StrictAuthentication(message) => {
+            Python::attach(|py| soac_jit::strict_runtime_unavailable(py, message))
+        }
         soac_lowering::LoweringError::Other(err) => {
             pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
         }
@@ -113,6 +116,28 @@ fn flush_counter_dump_outputs() -> PyResult<()> {
 fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     soac_config::init_logging().map_err(PyRuntimeError::new_err)?;
     soac_jit::install_sigill_diagnostics().map_err(PyRuntimeError::new_err)?;
+    soac_jit::initialize_strict_runtime(py)?;
+    unsafe extern "C" {
+        fn PySoac_GetStrictMutationError() -> *mut pyo3::ffi::PyObject;
+        fn PySoac_GetStrictRuntimeUnavailableError() -> *mut pyo3::ffi::PyObject;
+    }
+    for (name, exception) in [
+        ("StrictMutationError", unsafe {
+            PySoac_GetStrictMutationError()
+        }),
+        ("StrictRuntimeUnavailableError", unsafe {
+            PySoac_GetStrictRuntimeUnavailableError()
+        }),
+    ] {
+        if exception.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        // Export the native per-interpreter classes themselves. A Python-side
+        // substitute must not split the exception identity used by barriers.
+        module.add(name, unsafe {
+            Bound::<PyAny>::from_borrowed_ptr(py, exception)
+        })?;
+    }
     PyModule::import(py, "soac.bootstrap")?;
     module.add(
         "IndexedModuleType",

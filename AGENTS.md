@@ -1,5 +1,180 @@
 # AGENTS
 
+## EXECUTION ENVIRONMENT: UBUNTU VM
+
+Run all testing and other project command execution inside the Lima
+`ubuntu24` VM, using the guest checkout at `/home/adamh.guest/soac`.
+This includes environment setup and dependency installation, CPython and Rust
+builds, `cargo check`/`cargo test`, Python execution and repros, formatting and
+linting, code generation, test suites, benchmarks, profiling, debugging, and
+development servers. Do not run host-native equivalents or use host results as
+project validation.
+
+VCS operations (`jj` and necessary Git operations) may run on either the host
+or in the VM, as desired. The existing Jujutsu workflow still applies.
+
+From the host, launch guest commands through the repository helper:
+
+```bash
+python3 scripts/run_lima_with_host_environment.py \
+  --instance ubuntu24 \
+  --workdir /home/adamh.guest/soac \
+  -- just test-all
+```
+
+Replace the command after `--` with the required project command. When using a
+different worktree, use its corresponding guest path and verify that it is the
+intended checkout before building or testing. All project commands documented
+below are guest commands unless explicitly identified as host launchers or VCS
+operations. If the VM is unavailable, report the problem; do not silently fall
+back to host execution.
+
+The launcher uses stdin to transport allowlisted environment settings; guest
+commands receive EOF on that stream. Do not feed `python -` a host heredoc
+through it: that can exit successfully without running the intended script.
+Put multiline drivers under ignored `work/` and pass their guest path, or use
+an explicitly quoted guest-side command with `python -c`.
+The launcher's `--workdir` must be a SOAC checkout root containing the receiver
+script. For a command inside a vendored repository or another subdirectory,
+keep that root and use guest-side `env --chdir=/absolute/guest/subdirectory`.
+
+Keep `vendor/cpython` on the same shared source mount as the host checkout.
+Never hide it with a guest-local source bind mount. On case-insensitive
+virtiofs, set `CPYTHON_BUILD_DIR` to a case-sensitive guest-local directory
+(for example, `$HOME/.local/share/soac/cpython-build`) for `just build-python`.
+Successful builds save the selection in ignored `work/cpython-selected-build.json`;
+ordinary later `just` commands reuse it without changing login configuration.
+Use `just select-cpython-build /absolute/build/path` to select another verified
+build. Explicit environment variables override this selection.
+Selected external build directories must persist across VM restarts. The
+selection writer rejects resolved paths beneath `/tmp`, `/var/tmp`, or the
+configured system temporary directory, including symlink aliases. Checkout-owned
+build/fixture directories remain allowed because they share the checkout's
+lifetime. Use a persistent guest path such as `$HOME/.local/share/soac/builds`.
+The VM disk is backed by host storage: free space reported inside the guest or
+under `/tmp` is not independent host physical capacity. Before moving caches,
+check both host and guest space and budget for the peak while both copies exist;
+never copy caches when the host cannot hold that peak.
+Use `just build-python optimized --no-select` in a fresh `CPYTHON_BUILD_DIR`
+to verify a candidate without switching the saved selection. This leaves
+source/build checks intact: changing shared sources still invalidates the old
+build. Stop native consumers before source promotion; do not validate against
+new headers and an old library while waiting to select the candidate.
+`CPYTHON_BIN` and `CPYTHON_LIB_DIR` default to
+that build's `python` executable and build directory; explicit overrides must
+refer to the same built interpreter. `CPYTHON_SOURCE_DIR` can explicitly select
+another shared checkout at the tracked submodule pin, and defaults to
+`vendor/cpython`; selecting a different source does not repair an existing
+vendor overlay. Native changes are logical commits in the CPython repository,
+pinned by SOAC's exact `vendor/cpython` gitlink. Keep generated cases in a
+separate top commit with regeneration commands. `just prepare-cpython` and its
+`--check` spelling are both verify-only: no fetching, applying, resetting or
+source rewriting. The common committed-source verifier compares raw checkout
+bytes/modes and index entries to immutable Git objects, independently of local
+filters, index flags and uncommitted ignore rules. Do not edit selected sources
+or change their pin during a build; develop changes in a separate shared
+checkout, commit them, and coordinate promotion after stopping consumers.
+When removing native files, audit references to every deleted header/source
+basename in remaining headers, sources and Makefile prerequisites; a symbol-only
+search misses orphan includes and build dependencies. For large region deletions,
+also review removed function definitions and their remaining callers: ordinary
+cleanup can sit between extension-specific sections. Complete native linking
+before source promotion. Compile one native C
+fixture and the relevant public C++ header smoke test before broad native test
+selections, so a shared fixture error is reported once instead of as many setup
+failures.
+When staging a frozen native test cohort, make its fixture root the test
+process working directory as well as its import root. Nested `python -c`
+children do not inherit the parent's in-memory `sys.path` additions. Run a
+subprocess-based fixture before the full cohort; keep source/build provenance
+bound to the explicit candidate checkout, not the test process cwd.
+For a JJ workspace, source verification reads the recorded `@` gitlink; the
+colocated Git index can still name the parent pin. This JJ version does not
+snapshot submodule changes, so integrate the gitlink into the JJ revision and
+verify its actual Git tree before building. A failed JJ query must not fall
+back to the index. Plain Git checkouts use the resolved index pin.
+Private-index/commit-tree pin imports use an isolated Git environment that
+ignores global Git configuration. Preflight the author/committer identity
+before mutation and pass the verified identity for that command only; do not
+enable global configuration or weaken source verification to obtain it.
+`just build-python` verifies and locks the
+source while building, records schema-2 source/build provenance, and
+`just cpython-info` reports the pin, mount, paths, and verification status.
+Runtime preflights reject stale source/build identities and old patch-based
+receipts before launching the interpreter; rebuild rather than restamping them.
+The existing source-lock path under `work/cpython-patches/` is retained only for
+interoperation with old in-flight commands, not as manifest authority. Preserve both
+original checkouts when migrating an existing source overlay; the staged
+`scripts/migrate_cpython_shared_source.py` workflow never deletes them.
+Use the default `just build-python optimized` for final validation and
+measurements. `just build-python development` provides a faster nondebug,
+shared, no-PGO/LTO build for native iteration in a separate guest-local build
+directory. Build mode is recorded and benchmark entrypoints reject a
+development build. Use this nondebug mode for iterative Rust/JIT checks:
+`soac_jit`'s CLIF refcount support explicitly rejects `Py_REF_DEBUG`, including
+in `cargo check --tests`. Do not bypass that guard to use a StackRef-debug
+interpreter for Rust checks. For native reference-handle diagnostics, use a fresh
+guest-local build directory with `just build-python stackref-debug --no-select`.
+It explicitly sets `--with-pydebug` and `CPPFLAGS=-DPy_STACKREF_DEBUG=1`, replacing
+ambient `CPPFLAGS` only in this mode, and uses `-O0 -g` without PGO/LTO.
+Its mode-specific runtime proof checks debug-only native exports and actual
+executable/library identity; neither `Py_DEBUG` nor `-X dev` is sufficient.
+Existing nondebug provenance records are unchanged. Benchmark entrypoints
+reject stackref-debug as well. Regenerate bytecode cases with
+`just regenerate-cpython-cases`, never by editing the live selected checkout.
+`--check` verifies the generated-only pinned top commit from its logical parent.
+`--source <shared-staging-checkout> --revision <logical-commit> --output
+work/cpython-generated/<review-name>` emits review files for a separate
+generated commit without promoting or changing sources.
+Keep CPython prepare/build commands serial for a shared source directory, even
+with separate build directories or modes. The source lock covers the entire
+build and also rejects concurrent runtime/source preflights; do not bypass it.
+Check shared-host free space as well as guest free space before large builds
+or artifact copies. Lima's sparse guest disk is backed by the same host volume;
+guest free space is not additional physical capacity. A cross-filesystem cache
+copy needs room for the whole duplicate plus reserve before its source can be
+retired. VirtioFS may retain host-deleted files through open handles; do not
+assume deletion reclaimed space without checking. On disk-full/EIO, stop project
+execution, recover space, and reverify retained artifact/source hashes before
+resuming. Never delete source or validation evidence to make room.
+
+Ruff/`ty` changes likewise belong in logical commits in the `vendor/ruff`
+submodule, whose origin is `https://github.com/adamh-oai/ruff.git`. The root
+compiler and offline checker must use that same vendored crate family, not
+separate Git revisions or an applied checker patch cache. `just ty-prepare`
+only verifies the tracked commit, raw source identity and absence of untracked
+checker files; it never fetches or repairs a checkout. Use complete local
+object stores, not partial/promisor clones. Checker verification/build/use
+holds a source lock distinct from the strict-fixture build lock. Stop consumers
+before source/pin promotion and commit regenerated dependency locks separately.
+`SOAC_TY_RUFF_REVISION` is a build-only identity supplied by the verified
+checker runner, not a user override for selecting a source revision.
+Keep tracked edits, including documentation, between validation cohorts.
+Desktop/JJ observers can snapshot a changed workspace without an explicit
+agent VCS command, so documentation edits can also change the recorded `@`
+while a strict fixture is reading its submodule pins. A later successful
+query does not diagnose an earlier checkout-state read failure.
+For a failed Jujutsu pin query, retain its reported command, return code and
+bounded output before retrying; a later successful query does not explain the
+original failure. Strict fixtures retain unique combined checker logs under
+`work/logs/strict-integration-checker-build-*.log`, with the verification phase
+reported by the checker runner. Never fall back to the Git index or weaken the
+source check to clear a transient failure.
+For isolated Ruff mdtests before pin promotion, verify the resolved Cargo package
+paths with `cargo metadata --locked`: a root `soac_source` path override can mix
+the selected and staged Ruff crate families. Any temporary source bridge must
+preserve the compiler source bytes and bind its entire Ruff dependency family
+to the staged checkout; it is test setup, not authenticated checker publication.
+Before scoped Ruff hooks, ensure its pinned Rust toolchain includes `rustfmt`;
+having that toolchain's `rustc` and `cargo` is not sufficient.
+Keep hook environments and `RUFF_CACHE_DIR` outside the staged checker source:
+Ruff source verification rejects even ignored, untracked cache outputs. Preserve
+any accidentally created caches outside the checkout before verifying it.
+The 2026-08-23 PDT user instruction keeps both CPython and Ruff commits local:
+do not push now. Independent local reproduction does not prove remote/CI
+availability. Delete maintained patch files/appliers only after their complete
+committed-history/tooling migration is verified; preserve historical evidence.
+
 ## WHY AND HOW?
 
 `soac` is a just-in-time compiler for Python. The context here matters
@@ -13,9 +188,10 @@ because it should affect engineering decisions:
 * Optimization priorities should favor long-running or batch workloads
   over changes that only improve cold-start behavior.
 
-* Read `OPT_GOAL.md` before optimizer, specialization, or benchmarking work.
-  It defines the pyperformance acceptance target, measurement and JIT-coverage
-  requirements, optimization architecture, and compatibility guardrails.
+* Read `OPT_GOAL.md` before contract, optimizer, specialization, or benchmarking
+  work. Its dated scope currently requires interpreter enforcement and
+  compatibility first. Optimization and benchmarks remain deferred until
+  separately requested; the older measurement sections are future reference.
 
 * Prefer an explicit end-to-end pipeline from parsing through lowering
   and code generation, rather than hiding behavior in ad hoc runtime
@@ -29,11 +205,38 @@ because it should affect engineering decisions:
 ## DESIGN GOALS
 
 
-1. SOAC should *always* either have the same user-visible behavior as
-   CPython, or (in uncommon cases) fail explicitly rather than
-   producing incorrect results.  This includes behavior around
-   evaluation order, when refcounting / when objects are freed, and
-   interaction with C extensions.
+1. SOAC should *always* either preserve CPython user-visible behavior,
+   follow an explicitly approved compatibility contract documented in
+   `OPT_GOAL.md`, or (in uncommon cases) fail explicitly rather than
+   producing incorrect results. This includes evaluation order,
+   refcounting/object lifetime, and interaction with C extensions.
+   The 2026-08-24 (PDT) execution-compatibility clarification permits SOAC's
+   compiled and entry-interpreter paths to differ in transient reference
+   counts, fused-opcode schedules and implicit finalizer/weakref timing or
+   order. Do not maintain bytecode recipes, lifecycle proofs or parallel
+   execution solely to reproduce those observations. Preserve source semantics,
+   comprehension scoping, explicit callback order, safe ownership, required
+   cleanup and installed contracts. The CPython backend retains ordinary
+   CPython execution; specialized bytecodes and supported C APIs still enforce
+   contracts. Neither this clarification nor the strict-instance field-release-
+   order exception permits leaks or suppressed finalizers/resource release.
+
+   The 2026-08-25 (PDT) amendments exclude SOAC traceback reconstruction,
+   frame inspection and CPython-compatible tracing/profiling/monitoring,
+   including mandatory observer refusal. Do not add synthetic frames,
+   locals-plus correspondence, observer reservations or enablement barriers
+   solely for these excluded features. Keep native layout access only for
+   an independently required invariant such as recursion safety or actual
+   construction authentication. Ordinary CPython frames and observers are
+   unchanged; SOAC's internal compiler counters and logs remain supported.
+   Split mixed tests to preserve exception/scoping/callback/suspension and
+   ownership-safety assertions without SOAC-only frame/event/refusal oracles.
+
+   Runtime value enforcement is field-only: remove parameter, return and
+   dataclass-factory call checks from all backends. Preserve static `ty`
+   signatures and actual source/function ownership, but never treat them as
+   runtime call-type guarantees. Check selected storage writes regardless of
+   the writer, including escaped dictionaries and supported native APIs.
 
 2. Keep the codebase conceptually small.  The ideal is that every
    concept is represented by one type, and in one part of the
@@ -128,7 +331,32 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 3. Keep debugging and repros repo-native.
    Prefer `Justfile` entrypoints over raw interpreter commands.
    Use `just py ...`, `just pytest ...`, and `just test-all` for transformed-runtime work unless you are intentionally debugging raw vendored CPython behavior.
-   For isolated transformed-runtime repros, prefer `tests._integration.transformed_module(...)`.
+   For isolated transformed-runtime repros, use
+   `tests._strict_integration.create_strict_project(...)` with explicit module
+   selection, then `StrictProject.run(...)` or `run_case(...)`. These run the
+   actual offline checker and native startup-configured subprocess; import-hook
+   and mode flags alone are not strict authority. Use
+   `tests._integration.stock_module(...)` for ordinary controls. Delimiter
+   validation tails run outside the sealed module and must either declare one
+   synchronous `validate_module(module)`/`validate(module)` or use top-level
+   checks, not both. Never convert unexpected test failures to xfails based on
+   exception text.
+   Every delimiter case needs an explicit strict-admission, strict-rejection,
+   or ordinary-interoperability decision in `tests/test_integration_cases.py`;
+   an unreviewed case fails before attempting a transformed run. Preserve the
+   original stock body and validator when enrolling it. A strict-only rejection
+   validator must name the documented contract difference.
+   Publish and replay retained strict fixtures through the same recipe
+   environment. `_pytest-run` prefixes `LD_LIBRARY_PATH` with the selected
+   CPython library directory; direct `just --command` does not add that prefix.
+   A signed environment mismatch is an admission failure, not a reason to edit
+   a deployment digest or bypass authentication.
+   For bounded pytest runs, use `just pytest-fast --require-batch-runner`
+   followed only by file/node selectors. This fails before collection if an
+   option such as `-q` or `-v`, or disabled `PYTEST_NUMPROCS`, would select
+   passthrough and skip the runner's worker, timeout and progress controls.
+   The guard also works with one worker and refuses an empty collection without
+   replaying pytest. Omit it only when serial pytest passthrough is intended.
 
 4. Keep generated artifacts out of logical changes unless explicitly requested.
    The generated `snapshot/` directory is ignored and should not be committed.
@@ -266,11 +494,29 @@ For fast feedback on Rust changes that may affect crate test targets,
 run `cargo check -p soac_jit --tests` before the full gate; it
 type-checks the `soac_jit` crate including tests without running the
 entire transformed-runtime suite.
+For a cross-crate IR or ABI change, include every changed crate's test targets
+in that check, for example `cargo check -p soac_core -p soac_lowering
+-p soac_driver -p soac_opt -p soac_jit -p soac_pyo3 --tests`.
+Checking only a downstream crate compiles dependency libraries but does not
+type-check their unit-test code; otherwise a coherent production change can
+hide a stale fixture or edition-specific test error until the full gate.
+When changing a native extension export and its Python runtime import together,
+build and stage the matching extension before running Cargo tests that import
+`soac.runtime`. `cargo check` and a JIT test-binary rebuild do not refresh the
+installed `_soac_ext`; a stale export can poison the shared Python test lock
+and turn one setup failure into many unrelated-looking failures.
+Use the same `CARGO_TARGET_DIR` for extension builds and their Rust tests.
+Extension recipes resolve Cargo's configured target directory; embedded tests
+stage from their own compile-time Cargo profile directory and reject a missing
+matching library rather than reusing a stale staged extension. The standalone
+`soac_cpython` test target also links the selected out-of-tree CPython build.
 For Rust formatting, use `just fmt-rust <package> ...` and
 `just fmt-rust-check <package> ...`, which call package-scoped
 `cargo fmt`. Do not run bare `rustfmt <path>` for repo files: it can
 miss the crate edition/config context and fail on valid Rust 2024
-syntax. Avoid full-workspace `cargo fmt` unless broad formatting churn
+syntax. Crate editions are mixed: `soac_lowering` is Rust 2021, so its
+source cannot use Rust 2024 let-chains even when adjacent JIT code can.
+Avoid full-workspace `cargo fmt` unless broad formatting churn
 is intentional, because it can touch unrelated preexisting formatting.
 Put test output in `work/logs/`. Summarize the failures, separate expected
 failures from unexpected failures, investigate the root cause, report
@@ -385,16 +631,75 @@ so a later turn can resume without rediscovering context.
 
 ### Testing and runtime entrypoints
 
+- `just test-source-tooling [pytest-options...]`
+  Runs the source/pin/build-wrapper tests with guest system Python and the
+  repository's pytest 8.4.2 version in an isolated uv environment. This
+  requires Git and Jujutsu for real repository fixtures. The
+  bootstrap gate can validate tooling while old native build receipts are
+  intentionally stale; it does not build or validate the native runtime or
+  replace `just test-all`. Logs are retained under `work/logs/source-tooling.*`.
+- `just ty --debug-build --test-upstream [ty_project|ty_module_resolver] -- [filter/options]`
+  Tests the vendored checker libraries using their pinned lockfile and
+  full source verification before and after the run. Run serially with other
+  checker builds: all share `work/target-ty`. Never run unlocked Cargo commands
+  in selected `vendor/ruff` sources. Regenerate upstream lock changes in a
+  mutable review checkout, preserving compatible external pins, and keep the
+  generated lock in a separate top commit in the Ruff repository.
+- `just build-python [optimized|development|stackref-debug] [--no-select]`
+  Verifies the tracked native commit and builds the selected shared
+  source into `CPYTHON_BUILD_DIR`. The default optimized mode uses PGO/LTO;
+  development mode is nondebug/shared without PGO/LTO and is rejected by
+  benchmark entrypoints. Stackref-debug enables pydebug and explicitly owns
+  `CPPFLAGS=-DPy_STACKREF_DEBUG=1`, uses `-O0 -g` without PGO/LTO, and is also
+  rejected by benchmark entrypoints. Its versioned mode-specific proof checks
+  the actual candidate's debug exports, configuration and loaded library before
+  recording/selecting it. All modes verify critical native extension imports.
+  Reuses a saved source/build selection or defaults to in-source; use
+  guest-local ext4 for a macOS shared checkout. Records the exact source,
+  gitlink/tree/checkout and runtime identity, then saves the build selection.
+  `--no-select` preserves the existing selection after successful verification;
+  use `just select-cpython-build` for the explicit later switch.
+- `just prepare-cpython [--check]`
+  Both spellings verify the exact `vendor/cpython` gitlink and source bytes.
+  Refuses source changes and concurrent prepare/build commands; never fetches,
+  applies patches, resets or discards edits. Rebuild after changing the pin.
+- `just regenerate-cpython-cases [--check]`
+  Recreates or checks the generated-only native top commit from its logical
+  parent in a disposable guest checkout. `--source <shared-staging-checkout>
+  --revision <logical-commit> --output work/cpython-generated/<review-name>`
+  emits review files without editing selected sources. Commit generated files
+  separately in CPython, with the command in that commit's description.
+- `just select-cpython-build /absolute/build/path`
+  Verifies an existing build and saves its source/build selection under
+  ignored `work/` for later ordinary `just` commands.
+- `just cpython-info`
+  Reports source pin and mount, configured build/executable/library paths,
+  interpreter `abs_srcdir`/`abs_builddir`, and whether provenance matches.
 - `just test-all`
-  Full gate for non-doc changes.
+  Full gate for non-doc changes. After a successful build, attempts workspace
+  Rust tests, standalone raw runtime tests, and pytest serially even if an
+  earlier test stage fails. Records each outcome and returns the first nonzero
+  status; a failed build prevents tests from starting. The workspace Rust stage
+  uses `--no-fail-fast` so an early test-target failure does not hide later
+  targets, with one compiler job and a serial test harness: parallel debug-test
+  linkers can exhaust the 12 GiB Lima VM even when tests run serially.
 - `just fmt-rust <cargo-package> ...`
   Formats Rust through package-scoped `cargo fmt`. Prefer this over bare
   `rustfmt <path>` so rustfmt receives Cargo's edition/config context, and over
   full-workspace `cargo fmt` unless unrelated formatting churn is intentional.
+  Both format recipes also accept the standalone `soac_jit_runtime` package,
+  which is deliberately excluded from the main Cargo workspace.
 - `just fmt-rust-check <cargo-package> ...`
   Package-scoped Rust formatting check. Use this for validation after scoped
   Rust edits.
+- `just test-jit-runtime [cargo-test-args...]`
+  Tests the standalone raw CLIF input crate in `work/target-jit-runtime`.
+  This suite is also a serial stage in `just test-all`; ordinary workspace
+  `cargo test` does not include it.
 - `cargo test -p <package> <test-filter>`
+  Cargo commands require the selected CPython build environment. In a fresh
+  guest launcher, use `just --command cargo ...` to load it; a bare Cargo
+  invocation can otherwise look for build artifacts in the shared source tree.
   Cargo accepts only one test-name filter before `--`. To run multiple named
   focused Rust tests, run separate `cargo test` commands serially, use one shared
   substring/module-path filter that matches all intended tests, or run the
@@ -405,7 +710,7 @@ so a later turn can resume without rediscovering context.
   Authoritative transformed-runtime pytest entrypoint.
 - `just pytest-fast ...`
   Fast transformed-runtime pytest entrypoint for repeated focused checks. It
-  reuses the existing venv and debug extension when `vendor/cpython/python`,
+  reuses the existing venv and debug extension when the selected `CPYTHON_BIN`,
   `soac_py/pyproject.toml`, the actual `soac_py/uv.lock`, and workspace
   Rust/build/toolchain inputs are unchanged; a root `uv.lock` is also checked
   when present. It falls back to the full build path when inputs or ready
@@ -418,6 +723,8 @@ so a later turn can resume without rediscovering context.
   `cargo-test`/`pytest`, or the PID of a stuck `just`, `pytest`, or
   `cargo test` process. The recipe walks the process tree and writes native
   gdb stacks plus Python `py-bt` stacks, when available, to `work/logs/` by default.
+  It explicitly loads `Tools/gdb/libpython.py` from the selected CPython source
+  tree, including for out-of-tree builds; do not weaken GDB's auto-load safe path.
   It may need ptrace permission/CAP_SYS_PTRACE depending on host
   `/proc/sys/kernel/yama/ptrace_scope`.
 - `just py ...`
@@ -486,7 +793,7 @@ another revision's cache.
   and defaults to `none`.
 
   The shared venv fast path checks `.venv/.soac-ready`, executable Python and
-  pyperformance entrypoints, `vendor/cpython/python`,
+  pyperformance entrypoints, the selected `CPYTHON_BIN`,
   `soac_py/pyproject.toml`, and `soac_py/uv.lock`, plus a root `uv.lock` when
   present. The release runtime fast path additionally checks
   `target/release-ext/lib_soac_ext.so` against relevant Rust/Cargo/build,
@@ -502,7 +809,12 @@ another revision's cache.
   preparation, skipping repeated pip install/freeze work during unchanged
   profile/apply passes and comparison rounds. Missing environments or changed
   benchmark dependencies, interpreter, environment, or lock inputs fall back
-  to normal upstream setup. Stock and SOAC modes both forward configured
+  to normal upstream setup. `scripts/pyperformance_local_packages.json` declares
+  pinned original local dependencies that must be prepared equally for stock
+  and strict runs, before offline analysis. Preserve the original source archive,
+  accepted installed-payload receipt and comparison fingerprint; do not substitute
+  a source edit or an import-time installer for this preparation.
+  Stock and SOAC modes both forward configured
   package-index, proxy, and TLS-certificate settings into benchmark venvs;
   first-time benchmark dependency installation may still require network
   access. Lima guest commands do not inherit these settings from the host: use
@@ -520,13 +832,27 @@ another revision's cache.
   evidence. Pass `--rigorous` or `--debug-single-value` to replace the default
   sample mode, or pass
   `--min-time=<seconds>` to override the default calibration window for both
-  passes. SOAC modes default
-  `SOAC_MODULE_ENABLED` to the pyperformance benchmark source tree so
-  pyperformance's harness and venv setup stay on stock CPython unless a caller
-  explicitly overrides the allow-list. Compiler-owned `soac.*` modules remain
-  transform-eligible regardless of that allow-list. Pyperformance workers also append the
-  installed `tomli` package path so `tomli_loads` transforms the parser
-  implementation rather than only the benchmark wrapper. They also default
+  passes. Before workers start, the actual offline checker prepares strict
+  source overlays against their selected benchmark venv. Fixed source policy
+  `driver-local-static-imports-v1` opts in the driver and statically imported
+  local modules; Python input data, dynamically imported dependencies,
+  third-party packages (including `tomli`), and stdlib stay ordinary. The fixed
+  `terminal-main-measurement-suffix-v1` projection keeps setup in module
+  initialization and executes unchanged measurement statements in an ordinary
+  copied namespace after actual module sealing. Reject unsafe suffix global
+  rebinding or unsupported reflection; never run timing during initialization
+  or silently drop a failed driver. Parameter/return checks use supported
+  annotations, class eligibility is automatic, frameworks fall back, and optional
+  checked fields are disabled for this benchmark policy. Exact opted-in paths
+  become the allow-list; workers reexec with native authenticated startup
+  authority and validate real seal/source diagnostics before measured values.
+  `soac.*` names and source manifests are not optimization authority.
+  Recipe-owned `SOAC_PYPERFORMANCE_CHECKER` selects the offline CLI;
+  `SOAC_PYPERFORMANCE_STRICT_BUNDLE` selects its immutable execution manifest;
+  `SOAC_PYPERFORMANCE_WORK_ROOT` stays stable across per-worker `SOAC_WORK_DIR`
+  changes. `SOAC_PYPERFORMANCE_ENABLE`, `SOAC_PYPERFORMANCE_DRIVER`, and
+  `SOAC_PYPERFORMANCE_EXEC_WRAPPED` coordinate ordinary-manager/strict-worker
+  startup only; environment flags never grant native authority. Workers default
   `SOAC_BACKGROUND_JIT=0`
   because pyperformance uses short worker subprocesses where background
   compiler threads can outlive interpreter shutdown, and default
@@ -549,7 +875,9 @@ another revision's cache.
   body. SOAC pyperformance runs write worker replay metadata to
   `<result>.soac-work/worker_manifest.jsonl`; the recipe rejects pyperf
   calibration workers and requires `worker=<worker-dir>` when the benchmark has
-  multiple measured workers. During replay it sets
+  multiple measured workers. Replay verifies the original strict source bundle,
+  venv selection, harness, and descriptor, then uses the same native startup and
+  post-seal harness; it rejects old ordinary-SOAC worker records. During replay it sets
   `SOAC_PYPERFORMANCE_MEASURE_READY_FILE`, which makes the generic pyperf worker
   hook pause immediately before measured values so `perf` can attach after
   benchmark import and any pyperf warmups. It reuses a fresh release runtime,
@@ -573,6 +901,14 @@ another revision's cache.
   recipes use `UV_OFFLINE=1` for uv-backed venv refreshes; use
   `just update-venv` or rerun `just setup-dev-env` when dependency changes
   intentionally require network access.
+  The development group includes real framework dependencies for strict
+  fallback tests. Native Python sdists under `.uv-cache` must stay excluded
+  from the root Cargo workspace. When their build runs alongside project
+  Cargo, explicitly use a separate target directory (for example,
+  `CARGO_TARGET_DIR="$REPO_ROOT/work/target-python-frameworks"`); keep the
+  no-shared-parallel-Cargo rule. Regenerate the Python lock with
+  `just --command uv lock --project soac_py --python .venv/bin/python`, and
+  keep the generated lock change in its own commit.
 - `SOAC_PARENT_REPO`
   Optional override for `just setup-dev-env` in a jj worktree. The setup recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
@@ -634,6 +970,22 @@ explicit ordinary
   `BENCHMARK_CONSTANT_CLOCKS=1` only when you explicitly want the wrapper
   to request steadier clocks. If you add or change benchmark-stability
   knobs, document them in `README.md` and in this appendix note.
+- `PYPERFORMANCE_RESULTS_DIR`
+  Selects the result and benchmark-venv root for pyperformance; nested recipes
+  retain it. The default is `work/pyperformance`. Select a new task-owned
+  result root only after verifying its physical backing capacity; do not move
+  existing artifacts or change the shared source mount to hide a shortage.
+  Report the chosen location and keep essential results in the tracked strategy
+  file.
+  A guest-local filesystem is not necessarily independent physical capacity:
+  Lima's sparse disk can grow on the same host volume as the shared checkout.
+  Before large copies/builds, budget the additional bytes against both guest
+  and host backing space (the shared mount's free-space report exposes the
+  latter here), and monitor both while running. Stop the owned command with
+  reserve remaining; do not continue copying after an I/O/ENOSPC failure.
+  Guest free space alone cannot justify duplicating a large cache. Preserve
+  source and evidence, and obtain approval before deleting obsolete caches or
+  restarting the VM for recovery.
 - `PYPERFORMANCE_AFFINITY` / `PYPERFORMANCE_TIMEOUT` /
   `PYPERFORMANCE_INHERIT_ENV_EXTRA`
   `just pyperformance` maps `PYPERFORMANCE_AFFINITY` to pyperformance's
@@ -680,27 +1032,30 @@ explicit ordinary
   and `just test-all` reports currently running batches every
   `SOAC_PYTEST_PROGRESS_INTERVAL` seconds, default `10`, and kills any one
   batch that exceeds `SOAC_PYTEST_BATCH_TIMEOUT` seconds, default `300`. Set
-  either value to `0` to disable that behavior. Use these live batch labels
+  either value to `0` to disable that behavior. Batches stay file-local with
+  at most four collected tests, independently of total suite size. Integration
+  cohorts run only the worker's actual collected case/mode pairs, retaining their
+  complete reviewed analysis inputs. Use these live batch labels
   before falling back to host-process inspection when sandbox process namespaces
-  hide the stuck pytest child.
+  hide the stuck pytest child. SIGINT/SIGTERM cancels queued batches and cleans
+  every active worker process group, including surviving descendants, with one
+  shared five-second termination grace period. Captured output is retained.
 - `SOAC_RUN_SLOW_TESTS`
   `just pytest ...` and `just test-all` deselect pytest tests marked `slow` by
   default. Set `SOAC_RUN_SLOW_TESTS=1` to include intentionally expensive tests
   such as broad import-hook coverage. Direct pytest invocations can also pass
   `--run-slow`.
 - `SOAC_PRECOMPILED_LIBRARY`
-  Optional path to an offline-precompiled SOAC shared library. When set, runtime
-  direct-function compilation first tries to load matching code by module name,
-  source hash, and function id, patches module-constant slots, and falls back to
-  lazy JIT when a function symbol is absent.
+  Retired: configuration rejects any present value, including an empty value.
+  Unset it. The old executable/native-constant cache lacked authenticated strict
+  template, policy, and native ABI identity; it is not a runtime fallback.
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
   shared library. The precompile JIT path uses the same raw `profile.bin`
   evidence and matching module-cache entries in `$SOAC_WORK_DIR/modules`; run a
-  profile/benchmark pass first when the cache is empty. Use
-  `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the resulting shared
-  library.
+  profile/benchmark pass first when the cache is empty. The resulting objects
+  and shared library are inspection artifacts, not runtime execution authority.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark
@@ -748,8 +1103,10 @@ explicit ordinary
   Optional comma-separated import-hook allow-list. Entries currently
   use `path:<file-or-directory>` and are resolved before matching. When
   set, `SoacLoader` only wraps source imports whose resolved source
-  path is inside one of the listed roots, except compiler-owned `soac`
-  and `soac.*` modules, which always remain transform-eligible. Test
+  path is inside one of the listed roots. Native startup authority then selects
+  strict execution; ordinary imports retain their original loader and CPython
+  execution. Neither `soac.*` names nor mutable runtime-ready flags authorize
+  transformation. Compiler-owned intrinsic operations need explicit provenance. Test
   recipes intentionally do not set or change this variable; they inherit
   the caller environment unchanged.
 
@@ -757,7 +1114,12 @@ explicit ordinary
 
 - Vendored CPython lives at `vendor/cpython`.
 
-- Only use `vendor/cpython/python` directly when there is no suitable
+- Run guest native-linked Cargo commands through `just --command cargo ...`
+  when using an out-of-tree CPython build. This forwards the selected
+  `CPYTHON_BIN`, `CPYTHON_LIB_DIR`, and PyO3 configuration consistently; do not
+  infer a missing library from a bare Cargo command using the source directory.
+
+- Only use the selected `CPYTHON_BIN` directly when there is no suitable
   `Justfile` recipe, or when debugging raw CPython rather than the
   built `_soac_ext` path.
 
@@ -774,6 +1136,10 @@ explicit ordinary
 
 ### Jujutsu conventions
 
+- If host-side `jj` cannot access the Watchman state directory in the sandbox,
+  use `jj --config fsmonitor.backend=none ...` for that invocation. Jujutsu's
+  setting is `fsmonitor.backend`; `core.fsmonitor` does not disable its monitor.
+  Do not change daemon permissions merely to obtain a repository snapshot.
 - Use `jj describe` with real newlines for multi-paragraph messages.
 - Keep one logical change per `jj` change.
 - After finishing a logical change and moving to the next, create a fresh child with `jj new`.

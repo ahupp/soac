@@ -134,22 +134,37 @@ def test_transformed_native_loop_hands_gil_to_waiting_thread_by_default(tmp_path
     assert result.stdout.strip() == "True"
 
 
-def test_import_hook_transforms_resolvable_frozen_module_source():
+def test_import_hook_keeps_resolvable_frozen_source_ordinary_without_strict_opt_in():
     env = os.environ.copy()
     ntpath_source = (
-        Path(__file__).resolve().parent.parent / "vendor" / "cpython" / "Lib" / "ntpath.py"
+        Path(__file__).resolve().parent.parent
+        / env.get("CPYTHON_SOURCE_DIR", "vendor/cpython")
+        / "Lib"
+        / "ntpath.py"
     )
+    # Path selection is not strict source opt-in or authenticated authority.
+    # A resolvable source path must not change an ordinary frozen import.
     env["SOAC_MODULE_ENABLED"] = f"path:{ntpath_source}"
     code = "\n".join(
         [
-            "from soac import import_hook",
+            "import importlib.machinery, sys, types",
+            "import ntpath",
+            "native_loader = ntpath.__spec__.loader",
+            "native_origin = ntpath.__spec__.origin",
+            "native_file = ntpath.__file__",
+            "assert native_loader is importlib.machinery.FrozenImporter",
+            "from soac import _soac_ext, import_hook",
             "import_hook.install()",
-            "import sys",
             "sys.modules.pop('ntpath', None)",
             "import ntpath",
-            "print(type(ntpath.__spec__.loader).__name__)",
-            'print(ntpath.__spec__.origin.endswith("/Lib/ntpath.py"))',
-            'print(ntpath.__file__.endswith("/Lib/ntpath.py"))',
+            "assert type(ntpath) is types.ModuleType",
+            "assert ntpath.__spec__.loader is native_loader",
+            "assert ntpath.__spec__.origin == native_origin == 'frozen'",
+            "assert ntpath.__file__ == native_file",
+            'assert ntpath.__file__.endswith("/Lib/ntpath.py")',
+            "assert _soac_ext.strict_module_diagnostics(ntpath) is None",
+            "assert ntpath.join('drive', 'file') == r'drive\\file'",
+            "print('ordinary-frozen-source')",
         ]
     )
     result = subprocess.run(
@@ -159,7 +174,7 @@ def test_import_hook_transforms_resolvable_frozen_module_source():
         capture_output=True,
         env=env,
     )
-    assert result.stdout.splitlines() == ["SoacLoader", "True", "True"]
+    assert result.stdout.splitlines() == ["ordinary-frozen-source"]
 
 
 def test_import_hook_preserves_cpython_frozen_fixture_loader():

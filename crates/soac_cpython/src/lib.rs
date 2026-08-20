@@ -18,13 +18,29 @@ pub struct EmbeddedPythonConfig {
 impl EmbeddedPythonConfig {
     pub fn vendored(repo_root: impl AsRef<Path>, program_name: impl Into<String>) -> Self {
         let repo_root = repo_root.as_ref();
-        let python_home = vendored_python_home(repo_root);
+        // Preserve the build selected when compiling standalone binaries, while
+        // allowing an explicit runtime environment to select another build.
+        let build_dir = std::env::var_os("CPYTHON_LIB_DIR")
+            .or_else(|| std::env::var_os("CPYTHON_BUILD_DIR"))
+            .or_else(|| option_env!("CPYTHON_LIB_DIR").map(Into::into))
+            .or_else(|| option_env!("CPYTHON_BUILD_DIR").map(Into::into))
+            .map(|path| repo_root.join(path))
+            .unwrap_or_else(|| vendored_python_home(repo_root));
+        Self::vendored_with_build_dir(
+            &vendored_python_home(repo_root),
+            program_name.into(),
+            &build_dir,
+        )
+    }
+
+    fn vendored_with_build_dir(source_dir: &Path, program_name: String, build_dir: &Path) -> Self {
+        let python_home = source_dir.to_path_buf();
         let mut search_paths = vec![python_home.join("Lib")];
-        if let Some(build_lib_dir) = vendored_python_build_lib_dir(&python_home) {
+        if let Some(build_lib_dir) = vendored_python_build_lib_dir(build_dir) {
             search_paths.push(build_lib_dir);
         }
         Self {
-            program_name: program_name.into(),
+            program_name,
             python_home,
             search_paths,
         }
@@ -58,19 +74,22 @@ pub fn repo_root() -> PathBuf {
 }
 
 pub fn vendored_python_home(repo_root: &Path) -> PathBuf {
-    repo_root.join("vendor").join("cpython")
+    std::env::var_os("CPYTHON_SOURCE_DIR")
+        .or_else(|| option_env!("CPYTHON_SOURCE_DIR").map(Into::into))
+        .map(|path| repo_root.join(path))
+        .unwrap_or_else(|| repo_root.join("vendor").join("cpython"))
 }
 
-pub fn vendored_python_build_lib_dir(python_home: &Path) -> Option<PathBuf> {
-    let pybuilddir = python_home.join("pybuilddir.txt");
+pub fn vendored_python_build_lib_dir(python_build: &Path) -> Option<PathBuf> {
+    let pybuilddir = python_build.join("pybuilddir.txt");
     if let Ok(raw) = std::fs::read_to_string(pybuilddir) {
         let relative = raw.trim();
         if !relative.is_empty() {
-            return Some(python_home.join(relative));
+            return Some(python_build.join(relative));
         }
     }
 
-    let build_dir = python_home.join("build");
+    let build_dir = python_build.join("build");
     let entries = std::fs::read_dir(build_dir).ok()?;
     for entry in entries {
         let path = entry.ok()?.path();
@@ -86,22 +105,23 @@ pub fn vendored_python_build_lib_dir(python_home: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn test_extension_staging_dir(repo_root: &Path) -> Result<PathBuf, String> {
-    let staging_dir = repo_root.join("target").join("debug").join("test-ext");
-    let source_ext = repo_root
-        .join("target")
-        .join("debug")
-        .join("lib_soac_ext.so");
+fn test_extension_staging_dir(artifact_dir: &Path) -> Result<PathBuf, String> {
+    let staging_dir = artifact_dir.join("test-ext");
+    let source_ext = artifact_dir.join("lib_soac_ext.so");
     let staged_ext = staging_dir.join("_soac_ext.so");
+    if !source_ext.is_file() {
+        return Err(format!(
+            "matching test extension not found at {}; build soac_pyo3 in this Cargo target/profile before embedded runtime tests",
+            source_ext.display()
+        ));
+    }
     std::fs::create_dir_all(&staging_dir).map_err(|err| {
         format!(
             "failed to create test extension staging dir {}: {err}",
             staging_dir.display()
         )
     })?;
-    if source_ext.exists() {
-        stage_extension_file(&source_ext, &staged_ext)?;
-    }
+    stage_extension_file(&source_ext, &staged_ext)?;
     Ok(staging_dir)
 }
 
@@ -145,7 +165,19 @@ fn stage_extension_file(source_ext: &Path, staged_ext: &Path) -> Result<(), Stri
 
 pub fn test_python_config(program_name: impl Into<String>) -> Result<EmbeddedPythonConfig, String> {
     let repo_root = repo_root();
-    let staging_dir = test_extension_staging_dir(&repo_root)?;
+    test_python_config_with_artifacts(
+        &repo_root,
+        program_name.into(),
+        Path::new(env!("SOAC_TEST_ARTIFACT_DIR")),
+    )
+}
+
+fn test_python_config_with_artifacts(
+    repo_root: &Path,
+    program_name: String,
+    artifact_dir: &Path,
+) -> Result<EmbeddedPythonConfig, String> {
+    let staging_dir = test_extension_staging_dir(artifact_dir)?;
     Ok(EmbeddedPythonConfig::vendored(&repo_root, program_name)
         .with_search_path(repo_root.join("soac_py").join("src"))
         .with_search_path(staging_dir))
@@ -329,6 +361,105 @@ fn os_str_to_cstring(value: &std::ffi::OsStr) -> Result<CString, std::ffi::NulEr
 mod tests {
     use super::*;
 
+    struct ArtifactFixture(PathBuf);
+
+    impl ArtifactFixture {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "soac-test-extension-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for ArtifactFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_extension_stages_from_the_actual_cargo_artifact_directory() {
+        let fixture = ArtifactFixture::new();
+        let artifacts = fixture.0.join("external-target/debug");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("lib_soac_ext.so"), b"matched extension").unwrap();
+
+        let staging = test_extension_staging_dir(&artifacts).unwrap();
+
+        assert_eq!(staging, artifacts.join("test-ext"));
+        assert_eq!(
+            std::fs::read(staging.join("_soac_ext.so")).unwrap(),
+            b"matched extension"
+        );
+    }
+
+    #[test]
+    fn test_extension_missing_source_does_not_accept_a_stale_staged_library() {
+        let fixture = ArtifactFixture::new();
+        let staging = fixture.0.join("test-ext");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("_soac_ext.so"), b"stale extension").unwrap();
+
+        assert!(test_extension_staging_dir(&fixture.0).is_err());
+        assert_eq!(
+            std::fs::read(staging.join("_soac_ext.so")).unwrap(),
+            b"stale extension",
+            "a rejected setup must not destroy an earlier artifact"
+        );
+    }
+
+    #[test]
+    fn test_extension_replaces_a_stale_link_with_the_matched_artifact() {
+        let fixture = ArtifactFixture::new();
+        let old = fixture.0.join("old.so");
+        let staging = fixture.0.join("test-ext");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(&old, b"old extension").unwrap();
+        stage_extension_file(&old, &staging.join("_soac_ext.so")).unwrap();
+        std::fs::write(fixture.0.join("lib_soac_ext.so"), b"current extension").unwrap();
+
+        let actual = test_extension_staging_dir(&fixture.0).unwrap();
+
+        assert_eq!(actual, staging);
+        assert_eq!(
+            std::fs::read(actual.join("_soac_ext.so")).unwrap(),
+            b"current extension"
+        );
+    }
+
+    #[test]
+    fn out_of_tree_config_keeps_shared_stdlib_and_guest_extension_paths_separate() {
+        let temp = std::env::temp_dir().join(format!(
+            "soac-cpython-separated-build-{}",
+            std::process::id()
+        ));
+        let root = temp.join("shared");
+        let build = temp.join("guest-build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("pybuilddir.txt"), "build/lib.test-python\n").unwrap();
+
+        let config = EmbeddedPythonConfig::vendored_with_build_dir(
+            &root.join("vendor/cpython"),
+            "soac-test".into(),
+            &build,
+        );
+
+        assert_eq!(config.python_home(), root.join("vendor/cpython"));
+        assert_eq!(
+            config.search_paths(),
+            [
+                root.join("vendor/cpython/Lib"),
+                build.join("build/lib.test-python")
+            ]
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
     #[test]
     fn vendored_config_contains_stdlib_path() {
         let root = repo_root();
@@ -344,14 +475,25 @@ mod tests {
 
     #[test]
     fn test_config_contains_soac_sources_and_staging_dir() {
-        let root = repo_root();
-        let config = test_python_config("soac-test").unwrap();
+        let fixture = ArtifactFixture::new();
+        let root = fixture.0.join("source");
+        let artifacts = fixture.0.join("artifacts/debug");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("lib_soac_ext.so"), b"extension fixture").unwrap();
+        let config =
+            test_python_config_with_artifacts(&root, "soac-test".into(), &artifacts).unwrap();
 
         assert!(config.search_paths().contains(&root.join("soac_py/src")));
-        assert!(
-            config
-                .search_paths()
-                .contains(&root.join("target/debug/test-ext"))
+        assert!(config.search_paths().contains(&artifacts.join("test-ext")));
+    }
+
+    #[test]
+    fn compiled_artifact_directory_matches_this_test_binary() {
+        let executable = std::env::current_exe().unwrap();
+        let artifacts = executable.parent().unwrap().parent().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(env!("SOAC_TEST_ARTIFACT_DIR")).unwrap(),
+            std::fs::canonicalize(artifacts).unwrap(),
         );
     }
 }

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import subprocess
-import sys
 import textwrap
+
+from scripts.strict_pyperformance_sources import strict_opt_in
+from tests._strict_integration import (
+    StrictValidationCase,
+    _VALIDATION_PRELUDE,
+    create_strict_project,
+)
+
+_PROFILE_FUNCTIONS = ('consume', 'under_call', 'under_power', 'inverse_distance', 'returned_tree', 'addition_tree', 'guarded_unbound', 'record', 'ordered', 'ordered_failure')
 
 
 def test_profiled_exact_float_expression_trees_preserve_python_semantics(
@@ -98,14 +104,21 @@ def test_profiled_exact_float_expression_trees_preserve_python_semantics(
         encoding="utf-8",
     )
 
+    # Keep the original ordinary file for the stock control. Only the
+    # separately analyzed copy carries the strict future and startup authority.
+    relative = f"{module_name}.py"
+    original_source = (tmp_path / relative).read_bytes()
+    project = create_strict_project(
+        tmp_path / "strict-project",
+        {relative: strict_opt_in(original_source, relative)[0].decode()},
+        modules={module_name: relative},
+    )
+
     script = textwrap.dedent(
         f"""
         import math
         import sys
 
-        sys.path.insert(0, {str(tmp_path)!r})
-        from soac.import_hook import install
-        install()
         import {module_name} as module
 
         for index in range(12):
@@ -179,21 +192,42 @@ def test_profiled_exact_float_expression_trees_preserve_python_semantics(
     )
 
     work_dir = tmp_path / "soac-work"
-    base_env = {
-        **os.environ,
-        "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
-        "SOAC_WORK_DIR": str(work_dir),
-        "SOAC_COMPILE_MODE": "eager",
-        "SOAC_BACKGROUND_JIT": "0",
-    }
+    witnesses = f"""
+import ctypes
+from tests._strict_integration import _plain_function_witness
+function_id = ctypes.pythonapi.PyFunction_GetSoacFunctionId
+function_id.argtypes = [ctypes.py_object]
+function_id.restype = ctypes.c_uint64
+sealed_id = ctypes.pythonapi.PyFunction_GetSoacStrictId
+sealed_id.argtypes = [ctypes.py_object]
+sealed_id.restype = ctypes.c_uint64
+native_owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+native_owner.argtypes = [ctypes.py_object]
+native_owner.restype = ctypes.c_void_p
+def assert_profile_functions():
+    for path in {_PROFILE_FUNCTIONS!r}:
+        function = _plain_function_witness(module, path)
+        # The old ID grants unchecked dispatch, not source admission.
+        assert function_id(function) == 0, path
+        assert sealed_id(function) > 0, path
+        assert native_owner(function), path
+assert_profile_functions()
+"""
+    validation = "def validate_module(module):\n" + textwrap.indent(
+        witnesses + script + "\nassert_profile_functions()\n", "    "
+    )
+    program = _VALIDATION_PRELUDE + project._validation_program(
+        module_name,
+        StrictValidationCase(
+            validation, Path(__file__), required_functions=_PROFILE_FUNCTIONS,
+            
+        ),
+        entry_interpreter=False,
+    )
 
-    profile = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env={**base_env, "SOAC_OPT_MODE": "profile"},
-        timeout=60,
+    profile = project.run(
+        program, opt_mode="profile", extra_env={"SOAC_WORK_DIR": str(work_dir)},
+        timeout=60, check=False,
     )
     assert profile.returncode == 0, profile.stdout + profile.stderr
 
@@ -241,12 +275,8 @@ def test_profiled_exact_float_expression_trees_preserve_python_semantics(
         for function in tree_functions
     ), exact_float_rows
 
-    apply = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env={**base_env, "SOAC_OPT_MODE": "apply"},
-        timeout=60,
+    apply = project.run(
+        program, opt_mode="apply", extra_env={"SOAC_WORK_DIR": str(work_dir)},
+        timeout=60, check=False,
     )
     assert apply.returncode == 0, apply.stdout + apply.stderr

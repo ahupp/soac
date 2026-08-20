@@ -9,5 +9,4 @@ def run():
 # diet-python: validate
 
 def validate_module(module):
-    expected = "\ufffdX\ufffdY" if __dp_integration_soac__ else "\ud83dX\udc0dY"
-    assert module.run() == expected
+    assert module.run() == "\ud83dX\udc0dY"

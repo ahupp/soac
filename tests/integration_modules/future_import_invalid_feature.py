@@ -7,15 +7,17 @@ def validate_module(module):
     import os
     import tempfile
     import pytest
-    import _soac_ext
+    from soac.import_hook import SoacLoader
 
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as handle:
         handle.write(module.SOURCE)
         path = handle.name
     try:
         spec = importlib.util.spec_from_file_location("invalid_future_fixture", path)
+        spec.loader = SoacLoader(spec.name, path, spec.loader)
+        loaded = importlib.util.module_from_spec(spec)
         with pytest.raises(SyntaxError) as excinfo:
-            _soac_ext.create_module(path, spec)
+            spec.loader.exec_module(loaded)
         assert "not_a_feature" in str(excinfo.value)
     finally:
         os.remove(path)

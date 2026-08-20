@@ -667,12 +667,15 @@ fn typed_virtual_reachable_blocks_after_materialization(
 ) -> Option<HashSet<BlockLabel>> {
     match term {
         BlockTerm::Jump(edge) => typed_hot_reachable_block_labels(function, labels, edge.target),
-        BlockTerm::Return(_) | BlockTerm::Raise(_) if !require_hot_continuation => {
+        BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) | BlockTerm::Raise(_)
+            if !require_hot_continuation =>
+        {
             Some(HashSet::new())
         }
         BlockTerm::IfTerm(_)
         | BlockTerm::BranchTable(_)
         | BlockTerm::Return(_)
+        | BlockTerm::GeneratorReturn(_)
         | BlockTerm::Raise(_) => None,
     }
 }
@@ -711,7 +714,7 @@ pub fn lower_typed_fully_virtual_objects_to_locals_with_plan(
         );
     }
     plan.objects
-        .retain(|object| !typed_virtual_constructor_has_external_identity_uses(function, object));
+        .retain(|object| typed_virtual_constructor_can_erase(function, module_constants, object));
     let virtualization =
         virtualize_typed_hot_constructor_plans(function, module_constants, &plan.objects);
     TypedFullyVirtualObjectLoweringStats {
@@ -734,7 +737,10 @@ fn typed_virtual_constructor_has_external_identity_uses(
             if self.found {
                 return;
             }
-            if typed_expr_is_virtual_constructor_load(expr, self.plan) {
+            if typed_expr_is_virtual_constructor_load(expr, self.plan)
+                || matches!(expr, InstrTyped::TakeOperand(op)
+                    if typed_resolved_name_is_virtual_constructor(&op.name, self.plan))
+            {
                 self.found = true;
                 return;
             }
@@ -746,7 +752,7 @@ fn typed_virtual_constructor_has_external_identity_uses(
     let Some(reachable) =
         typed_reachable_block_labels(function, &labels, plan.materialization_block)
     else {
-        return false;
+        return true;
     };
 
     for block in &function.blocks {
@@ -775,6 +781,7 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
     module_constants: &[ConstantExpr],
     plan: &mut TypedVirtualizationPlan,
 ) -> TypedFieldScalarizationStats {
+    retain_typed_virtual_field_candidates_with_represented_ownership(function, plan);
     if !plan.has_field_lowering_candidates() {
         return TypedFieldScalarizationStats::default();
     }
@@ -878,6 +885,115 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
     stats
 }
 
+fn typed_virtual_field_ownership_is_unrepresented(instr: &InstrTyped) -> bool {
+    // Keep the same refusal boundary as the field-state analysis/rewrite
+    // resets below. Identity facts for a consumed slot are not replay storage.
+    matches!(
+        instr,
+        InstrTyped::TakeOperand(_)
+            | InstrTyped::ComprehensionInsert(_)
+            | InstrTyped::BuildCollection(_)
+            | InstrTyped::CallArgumentOp(_)
+            | InstrTyped::PreparedCall(_)
+            | InstrTyped::IteratorStep(_)
+    )
+}
+
+fn typed_virtual_continuation_any(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    allocation_block: BlockLabel,
+    allocation_index: usize,
+    reachable: &HashSet<BlockLabel>,
+    predicate: impl Fn(&InstrTyped) -> bool,
+) -> bool {
+    struct Finder<F> {
+        predicate: F,
+        found: bool,
+    }
+    impl<F: Fn(&InstrTyped) -> bool> Visit<InstrTyped> for Finder<F> {
+        fn visit_instr(&mut self, instr: &InstrTyped) {
+            if !self.found {
+                self.found = (self.predicate)(instr);
+                if !self.found {
+                    instr.visit_children(self);
+                }
+            }
+        }
+    }
+    let mut finder = Finder {
+        predicate,
+        found: false,
+    };
+    for block in &function.blocks {
+        let start = if block.label == allocation_block {
+            allocation_index
+        } else if reachable.contains(&block.label) {
+            0
+        } else {
+            continue;
+        };
+        for instr in block.body.iter().skip(start) {
+            finder.visit_instr(instr);
+        }
+        finder.visit_term(&block.term);
+    }
+    finder.found
+}
+
+fn retain_typed_virtual_field_candidates_with_represented_ownership(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    plan: &mut TypedVirtualizationPlan,
+) {
+    if !plan.has_field_lowering_candidates() {
+        return;
+    }
+    let labels = typed_block_indices_by_label(function);
+    let mut seen = HashSet::new();
+    let mut declined = HashSet::new();
+    for block in &function.blocks {
+        for (index, instr) in block.body.iter().enumerate() {
+            let Some((source, _)) = typed_virtual_constructor_materialization(instr) else {
+                continue;
+            };
+            if !plan.field_lowering_bindings.contains_key(&source) {
+                continue;
+            }
+            seen.insert(source);
+            let represented = typed_virtual_reachable_blocks_after_materialization(
+                function,
+                &labels,
+                &block.term,
+                false,
+            )
+            .is_some_and(|reachable| {
+                !reachable.contains(&block.label)
+                    && !typed_virtual_continuation_any(
+                        function,
+                        block.label,
+                        index,
+                        &reachable,
+                        typed_virtual_field_ownership_is_unrepresented,
+                    )
+            });
+            if !represented {
+                declined.insert(source);
+            }
+        }
+    }
+    // All actual copies of a source must be supported. Do this before scalar
+    // slots, stores or block arguments can add owners to the concrete program.
+    let keep = |source: &InstrId| seen.contains(source) && !declined.contains(source);
+    plan.field_lowering_bindings
+        .retain(|source, _| keep(source));
+    plan.field_lowering_generic_sources.retain(&keep);
+    plan.objects.retain(|object| keep(&object.source));
+    plan.materializing_objects
+        .retain(|object| keep(&object.source));
+    plan.materialization_boundaries
+        .retain(|boundary| keep(&boundary.source));
+    plan.field_states = None;
+}
+
 pub fn lower_typed_virtual_objects_to_locals_with_plan(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
@@ -911,20 +1027,6 @@ pub fn materialize_typed_virtual_return_boundaries_with_plan(
         return TypedVirtualReturnMaterializationStats::default();
     };
     let labels = typed_block_indices_by_label(function);
-    let boundaries = plan
-        .materialization_boundaries
-        .iter()
-        .filter_map(|boundary| match boundary.location {
-            TypedVirtualBoundaryLocation::Term { block }
-                if boundary.kind == TypedVirtualBoundaryKind::ReturnUse =>
-            {
-                Some((boundary.source, block))
-            }
-            TypedVirtualBoundaryLocation::BodyInstr { .. }
-            | TypedVirtualBoundaryLocation::Term { .. }
-            | TypedVirtualBoundaryLocation::ExceptionEdge { .. } => None,
-        })
-        .collect::<HashMap<_, _>>();
     let mut insertions = Vec::<(
         TypedVirtualObjectPlan,
         BlockLabel,
@@ -932,9 +1034,19 @@ pub fn materialize_typed_virtual_return_boundaries_with_plan(
         Vec<ResolvedName>,
     )>::new();
     for object in &plan.materializing_objects {
-        let Some(block_label) = boundaries.get(&object.source).copied() else {
+        if !typed_virtual_constructor_can_erase(function, module_constants, object) {
+            continue;
+        }
+        let Some(boundary) = typed_virtual_unique_materialization_boundary(plan, object.source)
+        else {
             continue;
         };
+        let TypedVirtualBoundaryLocation::Term { block: block_label } = boundary.location else {
+            continue;
+        };
+        if boundary.kind != TypedVirtualBoundaryKind::ReturnUse {
+            continue;
+        }
         let Some(recipe) = object.materialization_recipe.clone() else {
             continue;
         };
@@ -974,19 +1086,28 @@ pub fn materialize_typed_virtual_return_boundaries_with_plan(
         .iter()
         .map(|(object, _, _, _)| object.clone())
         .collect::<Vec<_>>();
+    let Some((mut candidate, virtualization)) =
+        prepare_typed_virtual_materialization(function, module_constants, &eligible_plans)
+    else {
+        return TypedVirtualReturnMaterializationStats::default();
+    };
     let mut stats = TypedVirtualReturnMaterializationStats {
-        virtualization: virtualize_typed_hot_constructor_plans(
-            function,
-            module_constants,
-            &eligible_plans,
-        ),
+        virtualization,
         ..TypedVirtualReturnMaterializationStats::default()
     };
     for (object, block_label, recipe, field_values) in insertions {
-        let Some(block_index) = labels.get(&block_label).copied() else {
-            continue;
+        let Some(block) = candidate
+            .blocks
+            .iter_mut()
+            .find(|block| block.label == block_label)
+        else {
+            return TypedVirtualReturnMaterializationStats::default();
         };
-        let block = &mut function.blocks[block_index];
+        if !matches!(&block.term, BlockTerm::Return(value)
+            if typed_expr_loads_resolved_name(value, &object.root))
+        {
+            return TypedVirtualReturnMaterializationStats::default();
+        }
         block.body.push(recipe.allocation);
         stats.inserted_allocations += 1;
         for (mut field_store, field_value) in recipe.field_stores.into_iter().zip(field_values) {
@@ -997,6 +1118,7 @@ pub fn materialize_typed_virtual_return_boundaries_with_plan(
         }
         stats.materialized_objects += 1;
     }
+    *function = candidate;
     stats
 }
 
@@ -1008,47 +1130,48 @@ pub fn materialize_typed_virtual_store_boundaries_with_plan(
     let Some(field_states) = plan.field_states.as_ref() else {
         return TypedVirtualStoreMaterializationStats::default();
     };
-    let labels = typed_block_indices_by_label(function);
-    let boundaries = plan
-        .materialization_boundaries
-        .iter()
-        .filter_map(|boundary| match boundary.location {
-            TypedVirtualBoundaryLocation::BodyInstr { block, instr_index }
-                if boundary.kind == TypedVirtualBoundaryKind::EscapingStore =>
-            {
-                Some((boundary.source, (block, instr_index)))
-            }
-            TypedVirtualBoundaryLocation::BodyInstr { .. }
-            | TypedVirtualBoundaryLocation::Term { .. }
-            | TypedVirtualBoundaryLocation::ExceptionEdge { .. } => None,
-        })
-        .collect::<HashMap<_, _>>();
     let mut insertions = Vec::<(
         TypedVirtualObjectPlan,
         BlockLabel,
+        InstrId,
         TypedVirtualMaterializationRecipe,
         Vec<ResolvedName>,
     )>::new();
     for object in &plan.materializing_objects {
-        let Some((block_label, planned_boundary_index)) = boundaries.get(&object.source).copied()
+        if !typed_virtual_constructor_can_erase(function, module_constants, object) {
+            continue;
+        }
+        let Some(boundary) = typed_virtual_unique_materialization_boundary(plan, object.source)
         else {
             continue;
         };
+        let TypedVirtualBoundaryLocation::BodyInstr {
+            block: block_label,
+            instr_index: planned_boundary_index,
+        } = boundary.location
+        else {
+            continue;
+        };
+        if boundary.kind != TypedVirtualBoundaryKind::EscapingStore {
+            continue;
+        }
         let Some(recipe) = object.materialization_recipe.clone() else {
             continue;
         };
-        let Some(block_index) = labels.get(&block_label).copied() else {
-            continue;
-        };
-        let boundary_index = function.blocks[block_index].body.iter().position(|instr| {
-            matches!(
-                instr,
-                InstrTyped::Store(store)
-                    if typed_expr_loads_resolved_name(store.value.as_ref(), &object.root)
-                        && !typed_resolved_name_is_virtual_constructor(&store.name, object)
-            )
-        });
-        let Some(_boundary_index) = boundary_index else {
+        let boundary = typed_virtual_boundary_identity(
+            function,
+            block_label,
+            planned_boundary_index,
+            |instr| {
+                matches!(
+                    instr,
+                    InstrTyped::Store(store)
+                        if typed_expr_loads_resolved_name(store.value.as_ref(), &object.root)
+                            && !typed_resolved_name_is_virtual_constructor(&store.name, object)
+                )
+            },
+        );
+        let Some(boundary) = boundary else {
             continue;
         };
         let Some(state) = field_states.body_before_instr.get(&TypedVirtualBodyInstr {
@@ -1074,36 +1197,46 @@ pub fn materialize_typed_virtual_store_boundaries_with_plan(
         let Some(field_values) = field_values else {
             continue;
         };
-        insertions.push((object.clone(), block_label, recipe, field_values));
+        insertions.push((object.clone(), block_label, boundary, recipe, field_values));
     }
 
     let eligible_plans = insertions
         .iter()
-        .map(|(object, _, _, _)| object.clone())
+        .map(|(object, _, _, _, _)| object.clone())
         .collect::<Vec<_>>();
+    let boundary_ids = insertions
+        .iter()
+        .map(|(_, block, source, _, _)| (*block, *source))
+        .collect::<Vec<_>>();
+    if !typed_virtual_boundaries_survive(function, &boundary_ids) {
+        return TypedVirtualStoreMaterializationStats::default();
+    }
+    let Some((mut candidate, virtualization)) =
+        prepare_typed_virtual_materialization(function, module_constants, &eligible_plans)
+    else {
+        return TypedVirtualStoreMaterializationStats::default();
+    };
+    if !typed_virtual_boundaries_survive(&candidate, &boundary_ids) {
+        return TypedVirtualStoreMaterializationStats::default();
+    }
     let mut stats = TypedVirtualStoreMaterializationStats {
-        virtualization: virtualize_typed_hot_constructor_plans(
-            function,
-            module_constants,
-            &eligible_plans,
-        ),
+        virtualization,
         ..TypedVirtualStoreMaterializationStats::default()
     };
-    for (object, block_label, recipe, field_values) in insertions {
-        let Some(block_index) = labels.get(&block_label).copied() else {
-            continue;
+    for (object, block_label, boundary, recipe, field_values) in insertions {
+        let Some((block_index, boundary_index)) =
+            typed_virtual_unique_body_instr(&candidate, block_label, boundary)
+        else {
+            return TypedVirtualStoreMaterializationStats::default();
         };
-        let boundary_index = function.blocks[block_index].body.iter().position(|instr| {
-            matches!(
-                instr,
-                InstrTyped::Store(store)
-                    if typed_expr_loads_resolved_name(store.value.as_ref(), &object.root)
-                        && !typed_resolved_name_is_virtual_constructor(&store.name, &object)
-            )
-        });
-        let Some(boundary_index) = boundary_index else {
-            continue;
-        };
+        if !matches!(
+            &candidate.blocks[block_index].body[boundary_index],
+            InstrTyped::Store(store)
+                if typed_expr_loads_resolved_name(store.value.as_ref(), &object.root)
+                    && !typed_resolved_name_is_virtual_constructor(&store.name, &object)
+        ) {
+            return TypedVirtualStoreMaterializationStats::default();
+        }
         let mut materialization = Vec::with_capacity(recipe.field_stores.len() + 1);
         materialization.push(recipe.allocation);
         stats.inserted_allocations += 1;
@@ -1113,11 +1246,15 @@ pub fn materialize_typed_virtual_store_boundaries_with_plan(
             materialization.push(InstrTyped::SetAttrTyped(field_store));
             stats.inserted_field_stores += 1;
         }
-        function.blocks[block_index]
+        candidate.blocks[block_index]
             .body
             .splice(boundary_index..boundary_index, materialization);
         stats.materialized_objects += 1;
     }
+    if !typed_virtual_boundaries_survive(&candidate, &boundary_ids) {
+        return TypedVirtualStoreMaterializationStats::default();
+    }
+    *function = candidate;
     stats
 }
 
@@ -1129,53 +1266,52 @@ pub fn materialize_typed_virtual_body_boundaries_with_plan(
     let Some(field_states) = plan.field_states.as_ref() else {
         return TypedVirtualBodyMaterializationStats::default();
     };
-    let labels = typed_block_indices_by_label(function);
-    let boundaries = plan
-        .materialization_boundaries
-        .iter()
-        .filter_map(|boundary| match boundary.location {
-            TypedVirtualBoundaryLocation::BodyInstr { block, instr_index }
-                if matches!(
-                    boundary.kind,
-                    TypedVirtualBoundaryKind::UnsupportedBodyUse
-                        | TypedVirtualBoundaryKind::DeoptResumeUse
-                ) =>
-            {
-                Some((boundary.source, (block, instr_index, boundary.kind)))
-            }
-            TypedVirtualBoundaryLocation::BodyInstr { .. }
-            | TypedVirtualBoundaryLocation::Term { .. }
-            | TypedVirtualBoundaryLocation::ExceptionEdge { .. } => None,
-        })
-        .collect::<HashMap<_, _>>();
     let mut insertions = Vec::<(
         TypedVirtualObjectPlan,
         BlockLabel,
-        usize,
+        InstrId,
         TypedVirtualMaterializationRecipe,
         Vec<ResolvedName>,
     )>::new();
     for object in &plan.materializing_objects {
-        let Some((block_label, planned_boundary_index, boundary_kind)) =
-            boundaries.get(&object.source).copied()
+        if !typed_virtual_constructor_can_erase(function, module_constants, object) {
+            continue;
+        }
+        let Some(boundary) = typed_virtual_unique_materialization_boundary(plan, object.source)
         else {
             continue;
         };
+        let TypedVirtualBoundaryLocation::BodyInstr {
+            block: block_label,
+            instr_index: planned_boundary_index,
+        } = boundary.location
+        else {
+            continue;
+        };
+        if !matches!(
+            boundary.kind,
+            TypedVirtualBoundaryKind::UnsupportedBodyUse | TypedVirtualBoundaryKind::DeoptResumeUse
+        ) {
+            continue;
+        }
+        let boundary_kind = boundary.kind;
         let Some(recipe) = object.materialization_recipe.clone() else {
             continue;
         };
-        let Some(block_index) = labels.get(&block_label).copied() else {
-            continue;
-        };
-        let boundary_index = function.blocks[block_index].body.iter().position(|instr| {
-            typed_virtual_body_instr_matches_materialization_boundary(
-                instr,
-                module_constants,
-                object,
-                boundary_kind,
-            )
-        });
-        let Some(boundary_index) = boundary_index else {
+        let boundary = typed_virtual_boundary_identity(
+            function,
+            block_label,
+            planned_boundary_index,
+            |instr| {
+                typed_virtual_body_instr_matches_materialization_boundary(
+                    instr,
+                    module_constants,
+                    object,
+                    boundary_kind,
+                )
+            },
+        );
+        let Some(boundary) = boundary else {
             continue;
         };
         let Some(state) = field_states.body_before_instr.get(&TypedVirtualBodyInstr {
@@ -1201,31 +1337,51 @@ pub fn materialize_typed_virtual_body_boundaries_with_plan(
         let Some(field_values) = field_values else {
             continue;
         };
-        insertions.push((
-            object.clone(),
-            block_label,
-            boundary_index,
-            recipe,
-            field_values,
-        ));
+        insertions.push((object.clone(), block_label, boundary, recipe, field_values));
     }
 
     let eligible_plans = insertions
         .iter()
         .map(|(object, _, _, _, _)| object.clone())
         .collect::<Vec<_>>();
+    let boundary_ids = insertions
+        .iter()
+        .map(|(_, block, source, _, _)| (*block, *source))
+        .collect::<Vec<_>>();
+    if !typed_virtual_boundaries_survive(function, &boundary_ids) {
+        return TypedVirtualBodyMaterializationStats::default();
+    }
+    let Some((mut candidate, virtualization)) =
+        prepare_typed_virtual_materialization(function, module_constants, &eligible_plans)
+    else {
+        return TypedVirtualBodyMaterializationStats::default();
+    };
+    if !typed_virtual_boundaries_survive(&candidate, &boundary_ids) {
+        return TypedVirtualBodyMaterializationStats::default();
+    }
     let mut stats = TypedVirtualBodyMaterializationStats {
-        virtualization: virtualize_typed_hot_constructor_plans(
-            function,
-            module_constants,
-            &eligible_plans,
-        ),
+        virtualization,
         ..TypedVirtualBodyMaterializationStats::default()
     };
-    for (object, block_label, boundary_index, recipe, field_values) in insertions {
-        let Some(block_index) = labels.get(&block_label).copied() else {
-            continue;
+    for (object, block_label, boundary, recipe, field_values) in insertions {
+        let Some((block_index, boundary_index)) =
+            typed_virtual_unique_body_instr(&candidate, block_label, boundary)
+        else {
+            return TypedVirtualBodyMaterializationStats::default();
         };
+        let Some(original_boundary) =
+            typed_virtual_unique_materialization_boundary(plan, object.source)
+        else {
+            return TypedVirtualBodyMaterializationStats::default();
+        };
+        if !typed_virtual_body_instr_matches_materialization_boundary(
+            &candidate.blocks[block_index].body[boundary_index],
+            module_constants,
+            &object,
+            original_boundary.kind,
+        ) {
+            return TypedVirtualBodyMaterializationStats::default();
+        }
         let mut materialization = Vec::with_capacity(recipe.field_stores.len() + 1);
         materialization.push(recipe.allocation);
         stats.inserted_allocations += 1;
@@ -1235,12 +1391,102 @@ pub fn materialize_typed_virtual_body_boundaries_with_plan(
             materialization.push(InstrTyped::SetAttrTyped(field_store));
             stats.inserted_field_stores += 1;
         }
-        function.blocks[block_index]
+        candidate.blocks[block_index]
             .body
             .splice(boundary_index..boundary_index, materialization);
         stats.materialized_objects += 1;
     }
+    if !typed_virtual_boundaries_survive(&candidate, &boundary_ids) {
+        return TypedVirtualBodyMaterializationStats::default();
+    }
+    *function = candidate;
     stats
+}
+
+fn typed_virtual_unique_materialization_boundary(
+    plan: &TypedVirtualizationPlan,
+    source: InstrId,
+) -> Option<TypedVirtualMaterializationBoundary> {
+    let mut matching = plan
+        .materialization_boundaries
+        .iter()
+        .filter(|boundary| boundary.source == source);
+    let boundary = *matching.next()?;
+    matching.next().is_none().then_some(boundary)
+}
+
+fn typed_virtual_unique_body_instr(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block: BlockLabel,
+    source: InstrId,
+) -> Option<(usize, usize)> {
+    let mut found = None;
+    for (block_index, candidate) in function.blocks.iter().enumerate() {
+        for (index, instr) in candidate.body.iter().enumerate() {
+            if instr.try_semantic_instr_id() == Some(source) {
+                if found.is_some() || candidate.label != block {
+                    return None;
+                }
+                found = Some((block_index, index));
+            }
+        }
+    }
+    found
+}
+
+fn typed_virtual_boundary_identity(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block_label: BlockLabel,
+    planned_index: usize,
+    matches: impl Fn(&InstrTyped) -> bool,
+) -> Option<InstrId> {
+    let block = function
+        .blocks
+        .iter()
+        .find(|block| block.label == block_label)?;
+    // Field lowering can insert instructions before the old snapshot point.
+    // Do not use a state recorded for a different operation or repair its index.
+    if block.body.iter().position(matches) != Some(planned_index) {
+        return None;
+    }
+    let source = block.body.get(planned_index)?.try_semantic_instr_id()?;
+    (typed_virtual_unique_body_instr(function, block_label, source)?.1 == planned_index)
+        .then_some(source)
+}
+
+fn typed_virtual_boundaries_survive(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    boundaries: &[(BlockLabel, InstrId)],
+) -> bool {
+    let mut seen = HashSet::new();
+    boundaries.iter().all(|(block, source)| {
+        seen.insert(*source) && typed_virtual_unique_body_instr(function, *block, *source).is_some()
+    })
+}
+
+fn prepare_typed_virtual_materialization(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    plans: &[TypedVirtualObjectPlan],
+) -> Option<(
+    BlockPyFunction<TypedBlockPyModuleShape>,
+    TypedVirtualConstructorStats,
+)> {
+    if plans.is_empty() || !typed_virtual_allocation_sites_are_unique(plans) {
+        return None;
+    }
+    // Only Rust IR is copied. Commit after every deletion and original
+    // boundary has been checked; refusal must leave the concrete program intact.
+    let mut candidate = function.clone();
+    let stats = virtualize_typed_hot_constructor_plans(&mut candidate, module_constants, plans);
+    (stats.removed_materializations == plans.len()).then_some((candidate, stats))
+}
+
+fn typed_virtual_allocation_sites_are_unique(plans: &[TypedVirtualObjectPlan]) -> bool {
+    let mut sites = HashSet::new();
+    plans
+        .iter()
+        .all(|plan| sites.insert((plan.materialization_block, plan.materialization_index)))
 }
 
 fn typed_virtual_body_instr_matches_materialization_boundary(
@@ -1311,10 +1557,21 @@ pub(super) fn virtualize_typed_hot_constructor_plans(
         planned_objects: plans.len(),
         ..TypedVirtualConstructorStats::default()
     };
+    if !typed_virtual_allocation_sites_are_unique(plans) {
+        return stats;
+    }
+    let can_erase = |plan: &&TypedVirtualObjectPlan| {
+        typed_virtual_constructor_can_erase(function, module_constants, plan)
+    };
+    let plans = if plans.iter().all(|plan| can_erase(&plan)) {
+        Cow::Borrowed(plans)
+    } else {
+        Cow::Owned(plans.iter().filter(can_erase).cloned().collect::<Vec<_>>())
+    };
     if plans.is_empty() {
         return stats;
     }
-    let param_removals = typed_virtual_constructor_param_removals(function, plans);
+    let param_removals = typed_virtual_constructor_param_removals(function, &plans);
     for block in &mut function.blocks {
         if let Some(remove) = param_removals.get(&block.label) {
             let before = block.params.len();
@@ -1331,9 +1588,68 @@ pub(super) fn virtualize_typed_hot_constructor_plans(
         rewrite_typed_virtual_constructor_edges(block, &param_removals, &mut stats);
     }
     for block in &mut function.blocks {
-        rewrite_typed_virtual_constructor_block(block, module_constants, plans, &mut stats);
+        rewrite_typed_virtual_constructor_block(block, module_constants, &plans, &mut stats);
     }
     stats
+}
+
+fn typed_virtual_constructor_can_erase(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    plan: &TypedVirtualObjectPlan,
+) -> bool {
+    let labels = typed_block_indices_by_label(function);
+    let Some(block) = block_by_label(function, &labels, plan.materialization_block) else {
+        return false;
+    };
+    let Some(reachable) =
+        typed_virtual_reachable_blocks_after_materialization(function, &labels, &block.term, false)
+    else {
+        return false;
+    };
+    if block
+        .body
+        .get(plan.materialization_index)
+        .and_then(typed_virtual_constructor_materialization)
+        != Some((plan.source, &plan.root))
+        || reachable.contains(&plan.materialization_block)
+        || reachable != plan.reachable_blocks
+        || typed_virtual_constructor_has_external_identity_uses(function, plan)
+    {
+        return false;
+    }
+    // A structural candidate is not evidence that field lowering succeeded.
+    // Check the actual remaining tree before removing any concrete owner.
+    // Materialization callers use this same check before scheduling a new
+    // allocation, so a refused erasure cannot duplicate the original object.
+    !typed_virtual_continuation_any(
+        function,
+        plan.materialization_block,
+        plan.materialization_index,
+        &plan.reachable_blocks,
+        |instr| {
+            typed_virtual_field_ownership_is_unrepresented(instr)
+                || match instr {
+                    InstrTyped::GetAttrTyped(op) => {
+                        typed_expr_is_virtual_constructor_load(op.value.as_ref(), plan)
+                    }
+                    InstrTyped::SetAttrTyped(op)
+                        if typed_expr_is_virtual_constructor_load(op.value.as_ref(), plan) =>
+                    {
+                        !typed_virtual_constructor_field_store(
+                            op,
+                            module_constants,
+                            &plan.field_bindings,
+                            plan,
+                        ) || typed_scalar_field_replacement_name(op.replacement.as_ref())
+                            .is_none_or(|name| {
+                                typed_resolved_name_is_virtual_constructor(name, plan)
+                            })
+                    }
+                    _ => false,
+                }
+        },
+    )
 }
 
 fn typed_virtual_constructor_materialization(
@@ -1722,7 +2038,7 @@ fn scan_typed_virtual_constructor_term(
             }
             Ok(())
         }
-        BlockTerm::Return(value) => {
+        BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
             if typed_expr_uses_virtual_constructor_identity(value, module_constants, bindings, plan)
             {
                 return Err(TypedVirtualBoundaryKind::ReturnUse);
@@ -1880,6 +2196,21 @@ fn typed_expr_uses_virtual_constructor_identity(
                 self.visit_instr(op.attr.as_ref());
                 return;
             }
+            if let InstrTyped::TakeOperand(op) = expr {
+                self.found |= typed_resolved_name_is_virtual_constructor(&op.name, self.plan);
+            }
+            if let InstrTyped::ComprehensionInsert(op) = expr {
+                self.found |= typed_resolved_name_is_virtual_constructor(&op.container, self.plan);
+            }
+            if let InstrTyped::IteratorStep(op) = expr {
+                self.found |= typed_resolved_name_is_virtual_constructor(&op.name, self.plan);
+            }
+            if let InstrTyped::CallArgumentOp(op) = expr {
+                self.found |= op
+                    .read_names()
+                    .chain(op.written_names())
+                    .any(|name| typed_resolved_name_is_virtual_constructor(name, self.plan));
+            }
             if typed_expr_is_virtual_constructor_load(expr, self.plan) {
                 self.found = true;
                 return;
@@ -1956,6 +2287,7 @@ fn rewrite_typed_virtual_constructor_edges(
         BlockTerm::IfTerm(_)
         | BlockTerm::BranchTable(_)
         | BlockTerm::Raise(_)
+        | BlockTerm::GeneratorReturn(_)
         | BlockTerm::Return(_) => {}
     }
     if let Some(edge) = &mut block.exc_edge {
@@ -2764,7 +3096,7 @@ fn typed_scalar_block_predecessor_edges(
                         });
                 }
             }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
         }
     }
     predecessors
@@ -3229,7 +3561,7 @@ fn transfer_typed_field_scalar_term(
                 state.invalidate_objects(typed_virtual_objects_in_expr(exc, state));
             }
         }
-        BlockTerm::Return(value) => {
+        BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
             rewrite_typed_field_scalar_expr(value, state, module_constants, stats, rewrite);
             state.invalidate_objects(typed_virtual_objects_in_expr(value, state));
         }
@@ -3259,7 +3591,7 @@ fn analyze_typed_field_scalar_term(
                 state.invalidate_objects(typed_virtual_objects_in_expr(exc, state));
             }
         }
-        BlockTerm::Return(value) => {
+        BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
             analyze_typed_field_scalar_expr(value, state, module_constants);
             state.invalidate_objects(typed_virtual_objects_in_expr(value, state));
         }
@@ -3631,6 +3963,122 @@ mod tests {
     }
 
     #[test]
+    fn materializers_refuse_duplicate_boundary_rows() {
+        // A data-only receipt fixture: reuse an actual resolved call/root and
+        // isolate its Return boundary. This does not publish runtime class or
+        // layout authority, and no field-state rewrite is needed.
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def caller(factory, value):\n    obj = factory(value)\n    return value\n",
+        )
+        .expect("source should lower");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let function = typed
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        let (allocation, source, root) = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .find_map(|instr| {
+                let (source, root) = typed_virtual_constructor_materialization(instr)?;
+                Some((instr.clone(), source, root.clone()))
+            })
+            .expect("actual resolved call should exist");
+        let allocation_block = function.name_gen.next_block_name();
+        let return_block = function.name_gen.next_block_name();
+        function.blocks = vec![
+            Block::new_with_extra(
+                allocation_block,
+                vec![allocation.clone()],
+                BlockTerm::Jump(BlockEdge::new(return_block)),
+                Vec::new(),
+                None,
+                TypedBlockExtra::default(),
+            ),
+            Block::new_with_extra(
+                return_block,
+                Vec::new(),
+                BlockTerm::Return(typed_load_temp(&root)),
+                Vec::new(),
+                None,
+                TypedBlockExtra::default(),
+            ),
+        ];
+        let boundary = TypedVirtualMaterializationBoundary {
+            source,
+            location: TypedVirtualBoundaryLocation::Term {
+                block: return_block,
+            },
+            kind: TypedVirtualBoundaryKind::ReturnUse,
+        };
+        let mut plan = TypedVirtualizationPlan {
+            materializing_objects: vec![TypedVirtualObjectPlan {
+                object_id: TypedVirtualObjectId(source.index()),
+                source,
+                root: root.clone(),
+                field_bindings: TypedConstructorFieldBindings { fields: Vec::new() },
+                materialization_recipe: Some(TypedVirtualMaterializationRecipe {
+                    allocation,
+                    field_stores: Vec::new(),
+                }),
+                materialization_block: allocation_block,
+                materialization_index: 0,
+                reachable_blocks: HashSet::from([return_block]),
+                virtual_locations: HashSet::from([root.local_location().unwrap()]),
+                virtual_names: HashSet::from([root.id_str().to_string()]),
+                assumed_owner_type: None,
+                guard_blocks: HashSet::new(),
+                allow_generic_field_accesses: false,
+            }],
+            materialization_boundaries: vec![boundary],
+            field_states: Some(TypedVirtualFieldStateAnalysis {
+                block_before_term: HashMap::from([(return_block, TypedVirtualState::default())]),
+                ..TypedVirtualFieldStateAnalysis::default()
+            }),
+            ..TypedVirtualizationPlan::default()
+        };
+        let mut valid = function.clone();
+        let accepted = materialize_typed_virtual_return_boundaries_with_plan(
+            &mut valid,
+            &typed.module_constants,
+            &plan,
+        );
+        assert_eq!(accepted.inserted_allocations, 1);
+        assert_eq!(accepted.virtualization.removed_materializations, 1);
+
+        // Duplicate the private row itself, not an allocation plan or physical
+        // instruction ID. A last-wins source map must not hide this ambiguity.
+        plan.materialization_boundaries.push(boundary);
+        let storage = function.storage_layout.clone();
+        let refused = materialize_typed_virtual_return_boundaries_with_plan(
+            function,
+            &typed.module_constants,
+            &plan,
+        );
+        assert!(!refused.changed());
+        assert_eq!(function.storage_layout, storage);
+        assert_eq!(function.blocks.len(), 2);
+        assert_eq!(function.blocks[0].label, allocation_block);
+        assert_eq!(function.blocks[0].body.len(), 1);
+        assert_eq!(
+            typed_virtual_constructor_materialization(&function.blocks[0].body[0]),
+            Some((source, &root)),
+        );
+        assert!(matches!(
+            &function.blocks[0].term,
+            BlockTerm::Jump(edge) if edge.target == return_block && edge.args.is_empty()
+        ));
+        assert_eq!(function.blocks[1].label, return_block);
+        assert!(function.blocks[1].body.is_empty());
+        assert!(matches!(
+            &function.blocks[1].term,
+            BlockTerm::Return(value) if typed_expr_loads_resolved_name(value, &root)
+        ));
+    }
+
+    #[test]
     fn split_virtual_field_param_edges_adds_branch_table_trampolines() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "def caller(kind, value):\n    return value\n",
@@ -3676,7 +4124,6 @@ mod tests {
                 TypedBlockExtra::default(),
             ),
         ];
-
         let object = TypedVirtualObjectId(7);
         let field = TypedVirtualFieldRef {
             object,
@@ -3776,6 +4223,97 @@ fn rewrite_typed_field_scalar_children(
     rewrite: bool,
 ) {
     match expr {
+        InstrTyped::ApplyFunctionDescriptor(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::CompleteFunctionDefinition(op) => {
+            rewrite_typed_field_scalar_expr(
+                &mut op.function,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::ConstructClass(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::PrepareClassDecorator(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::ApplyClassDecorator(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::DiscardClassDecorator(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::DiscardClassConstructionCaptures(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::RecordAnnotation(op) => rewrite_typed_field_scalar_expr(
+            &mut op.indices,
+            state,
+            module_constants,
+            stats,
+            rewrite,
+        ),
+        InstrTyped::CheckAnnotationFormat(op) => {
+            rewrite_typed_field_scalar_expr(&mut op.format, state, module_constants, stats, rewrite)
+        }
+        InstrTyped::SetupAnnotations(op) => {
+            if let Some(namespace) = &mut op.namespace {
+                rewrite_typed_field_scalar_expr(namespace, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::CreateTypeAlias(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::ConstructTypeParameterScope(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::SubscriptGeneric(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::SetFunctionTypeParameters(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::CreateTypeParameter(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::SetTypeParameterDefault(op) => {
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::NewAnnotationSet(_) => {}
+        InstrTyped::TakeOperand(_)
+        | InstrTyped::ComprehensionInsert(_)
+        | InstrTyped::BuildCollection(_)
+        | InstrTyped::CallArgumentOp(_)
+        | InstrTyped::PreparedCall(_)
+        | InstrTyped::IteratorStep(_) => *state = TypedVirtualLoweringState::default(),
         InstrTyped::Truthy(op) => rewrite_typed_field_scalar_expr(
             op.value.as_mut(),
             state,
@@ -3834,6 +4372,9 @@ fn rewrite_typed_field_scalar_children(
                 stats,
                 rewrite,
             );
+            if let Some(FrameNamespace::Mapping(namespace)) = &mut op.frame_namespace {
+                rewrite_typed_field_scalar_expr(namespace, state, module_constants, stats, rewrite);
+            }
         }
         InstrTyped::GuardedCallableCallTyped(op) => {
             rewrite_typed_field_scalar_expr(
@@ -3981,27 +4522,9 @@ fn rewrite_typed_field_scalar_children(
             rewrite,
         ),
         InstrTyped::MakeFunctionWithClosure(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.captures.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.param_defaults.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.annotate_fn.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
+            for operand in op.operands_mut() {
+                rewrite_typed_field_scalar_expr(operand, state, module_constants, stats, rewrite);
+            }
         }
         InstrTyped::Load(_)
         | InstrTyped::GetAttrTyped(_)
@@ -4020,6 +4543,87 @@ fn analyze_typed_field_scalar_children(
     module_constants: &[ConstantExpr],
 ) {
     match expr {
+        InstrTyped::ApplyFunctionDescriptor(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::CompleteFunctionDefinition(op) => {
+            analyze_typed_field_scalar_expr(&op.function, state, module_constants);
+        }
+        InstrTyped::ConstructClass(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::PrepareClassDecorator(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::ApplyClassDecorator(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::DiscardClassDecorator(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::DiscardClassConstructionCaptures(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::RecordAnnotation(op) => {
+            analyze_typed_field_scalar_expr(&op.indices, state, module_constants)
+        }
+        InstrTyped::CheckAnnotationFormat(op) => {
+            analyze_typed_field_scalar_expr(&op.format, state, module_constants)
+        }
+        InstrTyped::SetupAnnotations(op) => {
+            if let Some(namespace) = &op.namespace {
+                analyze_typed_field_scalar_expr(namespace, state, module_constants);
+            }
+        }
+        InstrTyped::CreateTypeAlias(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::ConstructTypeParameterScope(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::SubscriptGeneric(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::SetFunctionTypeParameters(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::CreateTypeParameter(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::SetTypeParameterDefault(op) => {
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
+        }
+        InstrTyped::NewAnnotationSet(_) => {}
+        InstrTyped::TakeOperand(_)
+        | InstrTyped::ComprehensionInsert(_)
+        | InstrTyped::BuildCollection(_)
+        | InstrTyped::CallArgumentOp(_)
+        | InstrTyped::PreparedCall(_)
+        | InstrTyped::IteratorStep(_) => *state = TypedVirtualLoweringState::default(),
         InstrTyped::Truthy(op) => {
             analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants)
         }
@@ -4041,6 +4645,9 @@ fn analyze_typed_field_scalar_children(
         InstrTyped::CallTyped(op) => {
             analyze_typed_field_scalar_expr(op.func.as_ref(), state, module_constants);
             analyze_typed_field_scalar_call_args(&op.args, &op.keywords, state, module_constants);
+            if let Some(FrameNamespace::Mapping(namespace)) = &op.frame_namespace {
+                analyze_typed_field_scalar_expr(namespace, state, module_constants);
+            }
         }
         InstrTyped::GuardedCallableCallTyped(op) => {
             analyze_typed_field_scalar_expr(op.func.as_ref(), state, module_constants);
@@ -4079,9 +4686,9 @@ fn analyze_typed_field_scalar_children(
             analyze_typed_field_scalar_expr(op.value.as_ref(), state, module_constants)
         }
         InstrTyped::MakeFunctionWithClosure(op) => {
-            analyze_typed_field_scalar_expr(op.captures.as_ref(), state, module_constants);
-            analyze_typed_field_scalar_expr(op.param_defaults.as_ref(), state, module_constants);
-            analyze_typed_field_scalar_expr(op.annotate_fn.as_ref(), state, module_constants);
+            for operand in op.operands() {
+                analyze_typed_field_scalar_expr(operand, state, module_constants);
+            }
         }
         InstrTyped::Load(_)
         | InstrTyped::GetAttrTyped(_)

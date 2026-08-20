@@ -1,40 +1,44 @@
 import inspect
+from pathlib import Path
 
 import pytest
-
 from soac import _soac_ext
-from soac.runtime import ClosureGenerator, NO_DEFAULT, make_generator_instance
-from tests._integration import soac_module
+from soac.runtime import NO_DEFAULT
+
+from tests._strict_integration import create_strict_project
 
 
-def _make_closure_generator(resume_function):
-    generator = make_generator_instance(
-        resume_function,
-        0,
-        "resume",
-        "resume",
-        (),
-        (),
-        0,
-        0,
-        0,
+def _resume_arguments(generator, handle, send_value=None):
+    import ctypes
+    import gc
+    import types
+
+    # Deliberately discover the real retained owner through supported GC/C APIs.
+    # Association is not permission to resume it outside its native operation.
+    assert type(generator) is types.GeneratorType
+    valid = ctypes.pythonapi.PyCapsule_IsValid
+    valid.argtypes = (ctypes.py_object, ctypes.c_char_p)
+    valid.restype = ctypes.c_int
+    (preserved_state,) = (
+        value for value in gc.get_referents(generator)
+        if valid(value, b"soac.PreservedState")
     )
-    assert isinstance(generator, ClosureGenerator)
-    return generator
-
-
-def _resume_arguments(generator, send_value=None):
+    matches = ctypes.pythonapi.PyGen_MatchesSoacOwner
+    matches.argtypes = (ctypes.py_object, ctypes.py_object)
+    matches.restype = ctypes.c_int
+    assert matches(generator, preserved_state) == 1
+    assert any(value is handle for value in gc.get_referents(preserved_state))
     return {
-        "handle": generator._resume_function,
+        "handle": handle,
         "owner": generator,
-        "preserved_state": generator._preserved_values,
+        "preserved_state": preserved_state,
         "send_value": send_value,
         "resume_exc": NO_DEFAULT,
     }
 
 
-def _call_resume(function, generator, send_value, calling_convention):
-    arguments = _resume_arguments(generator, send_value)
+def _call_resume(function, arguments, send_value, calling_convention):
+    arguments = dict(arguments, send_value=send_value)
     if calling_convention == "positional":
         return function(*arguments.values())
     if calling_convention == "keywords":
@@ -62,43 +66,98 @@ def test_generator_resume_fastcall_preserves_callable_metadata():
     assert inspect.signature(fastcall) == inspect.signature(fallback)
 
 
-@pytest.mark.parametrize("calling_convention", ["positional", "keywords", "mixed"])
-def test_generator_resume_fastcall_preserves_resume_behavior(
-    tmp_path, calling_convention
-):
+@pytest.fixture(scope="module")
+def strict_resume_project(tmp_path_factory):
     source = """
-def resume(owner, preserved_state, send_value, resume_exc):
-    if send_value is None:
-        return 3
-    return send_value
+from __future__ import strict
+
+def values():
+    sent = yield 3
+    yield sent
+
+def resume():
+    return values()
 """
+    return create_strict_project(
+        tmp_path_factory.mktemp("strict-resume-fastcall"),
+        {
+            "resume_model.py": source,
+            "ordinary_resume_model.py": source.replace(
+                "from __future__ import strict\n", "", 1
+            ),
+        },
+        modules={"resume_model": "resume_model.py"},
+    )
 
-    with soac_module(tmp_path, "generator_resume_fastcall", source) as module:
-        fast_generator = _make_closure_generator(module.resume)
-        fallback_generator = _make_closure_generator(module.resume)
 
-        assert _call_resume(
-            _soac_ext.resume_generator,
-            fast_generator,
-            None,
-            calling_convention,
-        ) == _call_resume(
-            _soac_ext._resume_generator_pyo3_fallback,
-            fallback_generator,
-            None,
-            calling_convention,
-        )
-        assert _call_resume(
-            _soac_ext.resume_generator,
-            fast_generator,
-            "sent",
-            calling_convention,
-        ) == _call_resume(
-            _soac_ext._resume_generator_pyo3_fallback,
-            fallback_generator,
-            "sent",
-            calling_convention,
-        )
+@pytest.mark.parametrize("entry_interpreter", [False, True])
+@pytest.mark.parametrize("calling_convention", ["positional", "keywords", "mixed"])
+def test_generator_resume_helpers_cannot_bypass_native_operation_ownership(
+    strict_resume_project, calling_convention, entry_interpreter
+):
+    strict_resume_project.run_case(
+        "resume_model",
+        f"""
+import ctypes
+import pytest
+from soac import _soac_ext
+import types
+from tests.test_regression_generator_resume_fastcall import _call_resume, _resume_arguments
+import ordinary_resume_model
+
+def validate_module(module):
+    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+    owner.argtypes = [ctypes.py_object]
+    owner.restype = ctypes.c_void_p
+    assert not owner(ordinary_resume_model.resume)
+    assert _soac_ext.strict_module_diagnostics(ordinary_resume_model) is None
+    assert owner(module.values)
+    assert _soac_ext.strict_function_entry_kind(module.values) == 'generator_factory'
+    calling_convention = {calling_convention!r}
+    # Authenticated source generators are exact native objects. Their public
+    # operations own entry; discovering the old resume operands cannot grant
+    # a private body execution outside that operation, for either ABI wrapper.
+    fast_generator = module.resume()
+    fallback_generator = module.resume()
+    ordinary_generator = ordinary_resume_model.resume()
+    assert type(fast_generator) is type(fallback_generator) is types.GeneratorType
+    fast_arguments = _resume_arguments(fast_generator, module.values)
+    fallback_arguments = _resume_arguments(fallback_generator, module.values)
+
+    def reject_private_resume(send_value):
+        for function, arguments in (
+            (_soac_ext.resume_generator, fast_arguments),
+            (_soac_ext._resume_generator_pyo3_fallback, fallback_arguments),
+        ):
+            with pytest.raises(RuntimeError) as rejected:
+                _call_resume(function, arguments, send_value, calling_convention)
+            assert type(rejected.value) is RuntimeError
+            assert str(rejected.value) == 'managed generator resume requires its active native step'
+
+    for send_value in (None, "sent"):
+        reject_private_resume(send_value)
+        assert fast_generator.send(send_value) == fallback_generator.send(send_value) == ordinary_generator.send(send_value)
+    reject_private_resume(None)
+    for generator in (fast_generator, fallback_generator, ordinary_generator):
+        with pytest.raises(StopIteration):
+            generator.send(None)
+    # Completion removes both the live association and the strict snapshot.
+    # Retaining its former operands cannot revive either execution authority.
+    from soac.strict import StrictRuntimeUnavailableError
+
+    for function, arguments in (
+        (_soac_ext.resume_generator, fast_arguments),
+        (_soac_ext._resume_generator_pyo3_fallback, fallback_arguments),
+    ):
+        with pytest.raises(StrictRuntimeUnavailableError) as rejected:
+            _call_resume(function, arguments, None, calling_convention)
+        assert type(rejected.value) is StrictRuntimeUnavailableError
+        assert str(rejected.value) == 'strict suspended state is absent or terminal'
+""",
+        Path(__file__),
+        required_functions=("resume",),
+        entry_interpreter=entry_interpreter,
+    )
 
 
 @pytest.mark.parametrize(

@@ -54,6 +54,12 @@ pub(super) trait OperationEmitState<'fb, E> {
     fn can_emit_guarded_i64_index_arg(&self, _arg: &E) -> bool {
         false
     }
+    /// The scalar SetItem emitter evaluates this expression in two mutually
+    /// exclusive arms after guarding the receiver. It must neither change
+    /// branch-local ownership state nor invalidate the receiver guard.
+    fn can_replay_setitem_replacement_after_guard(&self, _arg: &E) -> bool {
+        false
+    }
     fn emit_guarded_i64_index_arg(
         &mut self,
         _arg: &E,
@@ -933,7 +939,17 @@ fn emit_binop_with_arg_values<'fb, E>(
             emit_richcompare_from_values(ffi::Py_GE, state, arg_values)
         }
         blockpy_intrinsics::BinOpKind::Contains => {
-            emit_positional_bool_call_from_values(&PYSEQUENCE_CONTAINS_IMPORT, state, arg_values)
+            let [needle, container] = arg_values else {
+                panic!("membership requires two source-order operands");
+            };
+            // Evaluate in source order, but the C API takes container first.
+            // This helper also releases its supplied owners in order, matching
+            // CPython's container-before-needle operand cleanup.
+            emit_positional_bool_call_from_values(
+                &PYSEQUENCE_CONTAINS_IMPORT,
+                state,
+                &[*container, *needle],
+            )
         }
         blockpy_intrinsics::BinOpKind::Is => emit_identity_compare_from_values(state, arg_values),
     }
@@ -1577,8 +1593,31 @@ pub(super) fn emit_operation<'fb>(
         .then(|| emit_load(op, state)),
         InstrBlockPy::MakeCell(op) => Some(emit_make_cell(state, op.initial_value.as_deref())),
         InstrBlockPy::IncrementCounter(_) => None,
+        InstrBlockPy::TakeOperand(_)
+        | InstrBlockPy::IteratorStep(_)
+        | InstrBlockPy::BuildCollection(_)
+        | InstrBlockPy::CallArgumentOp(_)
+        | InstrBlockPy::PreparedCall(_)
+        | InstrBlockPy::ComprehensionInsert(_) => None,
         InstrBlockPy::CellRef(_) => None,
         InstrBlockPy::MakeFunctionWithClosure(_) => None,
+        InstrBlockPy::ConstructClass(_) => None,
+        InstrBlockPy::PrepareClassDecorator(_) => None,
+        InstrBlockPy::ApplyClassDecorator(_) => None,
+        InstrBlockPy::DiscardClassDecorator(_) => None,
+        InstrBlockPy::DiscardClassConstructionCaptures(_) => None,
+        InstrBlockPy::CompleteFunctionDefinition(_) => None,
+        InstrBlockPy::ApplyFunctionDescriptor(_) => None,
+        InstrBlockPy::NewAnnotationSet(_)
+        | InstrBlockPy::SetupAnnotations(_)
+        | InstrBlockPy::ConstructTypeParameterScope(_)
+        | InstrBlockPy::SubscriptGeneric(_)
+        | InstrBlockPy::SetFunctionTypeParameters(_)
+        | InstrBlockPy::CreateTypeAlias(_)
+        | InstrBlockPy::CreateTypeParameter(_)
+        | InstrBlockPy::SetTypeParameterDefault(_)
+        | InstrBlockPy::CheckAnnotationFormat(_)
+        | InstrBlockPy::RecordAnnotation(_) => None,
         InstrBlockPy::Store(op) => op.name.location.is_global().then(|| emit_store(op, state)),
         InstrBlockPy::Del(op) => op.name.location.is_global().then(|| emit_del(op, state)),
     }

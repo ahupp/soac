@@ -10,5 +10,8 @@ def run():
 def validate_module(module):
     import pytest
 
-    with pytest.raises(NotImplementedError):
-        module.run()
+    if __dp_integration_soac__:
+        with pytest.raises(NotImplementedError):
+            module.run()
+    else:
+        assert module.run() is True

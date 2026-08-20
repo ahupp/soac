@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-import os
+import ast
+import builtins
 import importlib
+import json
+import os
 import sys
+import time
+import traceback
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from uuid import uuid4
 from pathlib import Path
 from types import ModuleType
-from typing import Iterator
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 PYTHON_SRC = ROOT / "soac_py" / "src"
@@ -15,8 +20,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(PYTHON_SRC) not in sys.path:
     sys.path.insert(0, str(PYTHON_SRC))
-
-from soac import _soac_ext, import_hook
 
 _VALIDATE_DELIMITER = "# diet-python: validate"
 
@@ -57,16 +60,9 @@ def split_integration_case(module_path: Path) -> tuple[str, str]:
     return raw_source.rstrip() + "\n", padded_validate
 
 
-@contextmanager
-def _force_entry_interpreter_for_tests(enabled: bool) -> Iterator[None]:
-    previous = _soac_ext.force_entry_interpreter_for_tests(enabled)
-    try:
-        yield
-    finally:
-        _soac_ext.force_entry_interpreter_for_tests(previous)
-
-
-def _print_integration_failure_context(module_path: Path, mode: str | None = None) -> None:
+def _print_integration_failure_context(
+    module_path: Path, mode: str | None = None
+) -> None:
     if module_path in _PRINTED_MODULES:
         return
     try:
@@ -86,6 +82,10 @@ def _print_integration_failure_context(module_path: Path, mode: str | None = Non
 
 @contextmanager
 def _disable_import_hook() -> Iterator[None]:
+    import_hook = sys.modules.get("soac.import_hook")
+    if import_hook is None:
+        yield
+        return
     removed_indexes: list[int] = []
     for index in range(len(sys.meta_path) - 1, -1, -1):
         if sys.meta_path[index] is import_hook.SoacFinder:
@@ -102,6 +102,13 @@ def _disable_import_hook() -> Iterator[None]:
 def _load_module(
     tmp_path: Path, module_name: str, source: str, *, mode: str
 ) -> Iterator[ModuleType]:
+    if mode in {"soac", "entry", "cpython"}:
+        raise AssertionError(
+            f"{module_name}: in-process {mode} integration cannot establish native startup "
+            "authority; use an explicitly analyzed StrictProject.run_case subprocess"
+        )
+    if mode != "stock":
+        raise ValueError(f"unknown integration mode: {mode!r}")
     package_name = f"_dp_integration_{uuid4().hex}"
     package_dir = tmp_path / package_name
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -120,25 +127,12 @@ def _load_module(
     full_name = f"{package_name}.{module_name}"
 
     try:
-        if mode in {"soac", "entry"}:
-            os.environ["DIET_PYTHON_MODE"] = "transform"
-            if prior_enabled_modules is None:
-                os.environ["SOAC_MODULE_ENABLED"] = f"path:{package_dir}"
-            import_hook.install()
+        os.environ.pop("DIET_PYTHON_MODE", None)
+        with _disable_import_hook():
             sys.modules.pop(full_name, None)
             sys.modules.pop(package_name, None)
-            with _force_entry_interpreter_for_tests(mode == "entry"):
-                module = importlib.import_module(full_name)
-                yield module
-        elif mode == "stock":
-            os.environ.pop("DIET_PYTHON_MODE", None)
-            with _disable_import_hook():
-                sys.modules.pop(full_name, None)
-                sys.modules.pop(package_name, None)
-                module = importlib.import_module(full_name)
-                yield module
-        else:
-            raise ValueError(f"unsupported integration mode: {mode!r}")
+            module = importlib.import_module(full_name)
+            yield module
     except Exception:
         _print_integration_failure_context(module_path, mode=mode)
         raise
@@ -163,17 +157,13 @@ def _load_module(
 
 
 @contextmanager
-def soac_module(
-    tmp_path: Path, module_name: str, source: str
-) -> Iterator[ModuleType]:
+def soac_module(tmp_path: Path, module_name: str, source: str) -> Iterator[ModuleType]:
     with _load_module(tmp_path, module_name, source, mode="soac") as module:
         yield module
 
 
 @contextmanager
-def stock_module(
-    tmp_path: Path, module_name: str, source: str
-) -> Iterator[ModuleType]:
+def stock_module(tmp_path: Path, module_name: str, source: str) -> Iterator[ModuleType]:
     with _load_module(tmp_path, module_name, source, mode="stock") as module:
         yield module
 
@@ -181,11 +171,150 @@ def stock_module(
 def exec_integration_validation(
     validate_source: str, module: ModuleType, module_path: Path, *, mode: str
 ) -> None:
-    module.__dict__["__dp_integration_soac__"] = mode in {"soac", "entry"}
-    module.__dict__["__dp_integration_entry__"] = mode == "entry"
-    module.__dict__["__dp_integration_mode__"] = mode
+    """Run one declared validator, or an ordinary top-level validation tail.
+
+    Validation runs outside the analyzed module. Do not insert flags/functions
+    into its real namespace, which may already be permanently sealed.
+    """
+    if mode not in {"stock", "soac", "entry", "cpython"}:
+        raise ValueError(f"unknown integration validation mode: {mode!r}")
+    tree = ast.parse(validate_source, filename=str(module_path))
+    validators = [
+        statement
+        for statement in tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and statement.name in {"validate_module", "validate"}
+    ]
+    if len(validators) > 1 or any(
+        isinstance(node, ast.AsyncFunctionDef) for node in validators
+    ):
+        raise ValueError(
+            "an integration case must declare exactly one synchronous validator"
+        )
+    if validators and any(
+        not isinstance(statement, (ast.FunctionDef, ast.Import, ast.ImportFrom))
+        and not (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+        )
+        for statement in tree.body
+    ):
+        raise ValueError("choose a declared validator or top-level checks, not both")
     globals_dict = dict(module.__dict__)
-    exec(compile(validate_source, str(module_path), "exec"), globals_dict)
+    globals_dict.update(
+        # Validation is ordinary test code in its own namespace. A source
+        # function keeps its original captured builtins, including a minimal
+        # mapping without __import__; that mapping must not govern this tail.
+        __builtins__=builtins.__dict__,
+        __dp_integration_strict__=mode in {"soac", "entry", "cpython"},
+        __dp_integration_soac__=mode in {"soac", "entry"},
+        __dp_integration_entry__=mode == "entry",
+        __dp_integration_mode__=mode,
+    )
+    # The input is trusted ordinary test code, never the analyzed source body.
+    exec(compile(tree, str(module_path), "exec", dont_inherit=True), globals_dict)  # noqa: S102
+    if validators:
+        validator = globals_dict[validators[0].name]
+        if not callable(validator):
+            raise ValueError("the declared integration validator is not callable")
+        validator(module)
+
+
+def _validation_exception_summary(error: BaseException) -> str:
+    # Do not inspect frames, offsets, or exception-specific attributes here.
+    name = type.__getattribute__(type(error), "__name__")
+    try:
+        message = str(error)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as message_error:  # noqa: BLE001 - reporting must survive a broken __str__
+        message_type = type.__getattribute__(type(message_error), "__name__")
+        message = f"<message unavailable: {message_type}>"
+    return f"{name}: {message}"
+
+
+def _format_validation_failure(error: BaseException) -> str:
+    # Ordinary error reporting remains useful without a SOAC frame guarantee.
+    # Capture the primary first; a secondary renderer failure is not its cause.
+    primary = _validation_exception_summary(error)
+    try:
+        return "".join(traceback.format_exception(error))
+    except KeyboardInterrupt:
+        raise
+    except BaseException as rendering_error:  # noqa: BLE001 - preserve the failed case, not a renderer failure
+        secondary = _validation_exception_summary(rendering_error)
+        return f"{primary}\n[traceback rendering failed: {secondary}]\n"
+
+
+class ValidationBatch:
+    """Collect independent ordinary validation callbacks, not runtime authority.
+
+    Callers perform native admission and source/entry checks inside each
+    callback. This collector only reports failures and detects shared-state
+    interference; it must not be used for cases requiring process isolation.
+    """
+
+    def __init__(self, selected_modules: tuple[str, ...], journal: Path):
+        self.selected_modules = selected_modules
+        self.journal = journal
+        self.results: dict[str, str | None] = {}
+        self.contaminated = False
+
+    def run(self, name: str, callback: Callable[[], None]) -> None:
+        if name in self.results:
+            raise ValueError(f"validation case {name!r} was already reported")
+        error = None
+        started = time.monotonic()
+        if self.contaminated:
+            error = "not executed: an earlier case changed shared process state"
+        else:
+            search_path = tuple(sys.path)
+            hooks = tuple(sys.meta_path)
+            directory = os.getcwd()
+            builtin_bindings = dict(vars(builtins))
+            prior_modules = {
+                name: sys.modules[name]
+                for name in self.selected_modules
+                if name in sys.modules
+            }
+            try:
+                callback()
+            except KeyboardInterrupt:
+                raise
+            except BaseException as failure:  # noqa: BLE001 - pytest outcomes/SystemExit are failures, never skips
+                error = _format_validation_failure(failure)
+            try:
+                assert tuple(sys.path) == search_path, "case changed sys.path"
+                assert tuple(sys.meta_path) == hooks, "case changed sys.meta_path"
+                assert os.getcwd() == directory, "case changed cwd"
+                assert set(vars(builtins)) == set(builtin_bindings), (
+                    "case changed builtin names"
+                )
+                assert all(
+                    vars(builtins)[key] is value
+                    for key, value in builtin_bindings.items()
+                ), "case replaced a builtin"
+                assert all(
+                    sys.modules.get(key) is value
+                    for key, value in prior_modules.items()
+                ), "case replaced an earlier module"
+            except KeyboardInterrupt:
+                raise
+            except BaseException as failure:  # noqa: BLE001 - failed state observations contaminate the batch
+                self.contaminated = True
+                error = (error or "") + _format_validation_failure(failure)
+        self.results[name] = error
+        with self.journal.open("a") as output:
+            output.write(
+                json.dumps(
+                    {
+                        "case": name,
+                        "error": error,
+                        "seconds": time.monotonic() - started,
+                    }
+                )
+                + "\n"
+            )
 
 
 @contextmanager

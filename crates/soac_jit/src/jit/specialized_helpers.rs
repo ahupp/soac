@@ -1,6 +1,9 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
 use super::RuntimeJitDeoptInvocation;
+use crate::handled_exception::{
+    HandledExceptionRecord, HandledExceptionRegion, HandledExceptionState,
+};
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::module_constants::{load_runtime_name_owned, load_runtime_name_owned_by_id};
 use crate::preserved_state;
@@ -9,7 +12,6 @@ use libc;
 use pyo3::ffi;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
-use std::sync::OnceLock;
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
@@ -28,6 +30,7 @@ unsafe extern "C" {
         dict: *mut ffi::PyObject,
         key: *mut ffi::PyObject,
     ) -> ffi::Py_ssize_t;
+    fn _PyDict_HasNoLookupAliases(dict: *mut ffi::PyObject) -> libc::c_int;
     fn PyDict_GetItemRef(
         dict: *mut ffi::PyObject,
         key: *mut ffi::PyObject,
@@ -49,15 +52,29 @@ unsafe extern "C" {
         stack_refs: *const usize,
         count: ffi::Py_ssize_t,
     ) -> *mut ffi::PyObject;
+    fn PySoac_VectorcallWithContext(
+        callable: *mut ffi::PyObject,
+        args: *const *mut ffi::PyObject,
+        nargsf: usize,
+        kwnames: *mut ffi::PyObject,
+        globals: *mut ffi::PyObject,
+        namespace: *mut ffi::PyObject,
+        builtins: *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject;
+    fn PySoac_ObjectCallWithContext(
+        callable: *mut ffi::PyObject,
+        args: *mut ffi::PyObject,
+        kwargs: *mut ffi::PyObject,
+        globals: *mut ffi::PyObject,
+        namespace: *mut ffi::PyObject,
+        builtins: *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject;
 }
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_Get(cell: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_Set(cell: *mut ffi::PyObject, value: *mut ffi::PyObject) -> libc::c_int;
-    fn PyErr_GetHandledException() -> *mut ffi::PyObject;
-    fn PyErr_SetHandledException(exc: *mut ffi::PyObject);
-    fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
 }
 
 pub type ObjPtr = *mut c_void;
@@ -131,14 +148,6 @@ unsafe fn owned_none_hook() -> ObjPtr {
     none.cast()
 }
 
-#[repr(C)]
-struct RawPyRangeIterObject {
-    ob_base: ffi::PyObject,
-    start: libc::c_long,
-    step: libc::c_long,
-    len: libc::c_long,
-}
-
 unsafe fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
     !obj.is_null() && ffi::Py_TYPE(obj) == std::ptr::addr_of_mut!(PyCell_Type)
 }
@@ -175,21 +184,14 @@ unsafe fn raise_expected_cell(where_name: &str, obj: *mut ffi::PyObject) {
     }
 }
 unsafe extern "C" fn py_call_positional_three_hook(
-    tstate: ObjPtr,
     callable: ObjPtr,
     arg1: ObjPtr,
     arg2: ObjPtr,
     arg3: ObjPtr,
+    globals: ObjPtr,
+    namespace: ObjPtr,
+    builtins: ObjPtr,
 ) -> ObjPtr {
-    if tstate.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid null tstate in dp_jit_py_call_positional_three\0"
-                .as_ptr()
-                .cast(),
-        );
-        return ptr::null_mut();
-    }
     let args = [
         arg1 as *mut ffi::PyObject,
         arg2 as *mut ffi::PyObject,
@@ -199,8 +201,7 @@ unsafe extern "C" fn py_call_positional_three_hook(
         .iter()
         .position(|arg| arg.is_null())
         .unwrap_or(args.len());
-    ffi::_PyObject_VectorcallTstate(
-        tstate as *mut ffi::PyThreadState,
+    PySoac_VectorcallWithContext(
         callable as *mut ffi::PyObject,
         if nargs == 0 {
             ptr::null()
@@ -209,1675 +210,265 @@ unsafe extern "C" fn py_call_positional_three_hook(
         },
         nargs,
         ptr::null_mut(),
+        globals.cast(),
+        namespace.cast(),
+        builtins.cast(),
     ) as ObjPtr
 }
-unsafe extern "C" fn py_call_object_hook(callable: ObjPtr, args: ObjPtr) -> ObjPtr {
-    ffi::PyObject_CallObject(callable as *mut ffi::PyObject, args as *mut ffi::PyObject) as ObjPtr
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GuardedGeneratorBuiltin {
-    Any,
-    All,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VectorcallCallableKind {
-    GenericOnly,
-    ExactBuiltinNext,
-    ExactBuiltinGeneratorConsumer,
-    ExactPythonTwoArgs,
-}
-
-unsafe fn vectorcall_callable_kind(
+unsafe extern "C" fn py_call_object_hook(
     callable: ObjPtr,
     args: ObjPtr,
-    nargsf: ObjPtr,
-    kwnames: ObjPtr,
-) -> VectorcallCallableKind {
-    if !kwnames.is_null() || args.is_null() || callable.is_null() {
-        return VectorcallCallableKind::GenericOnly;
-    }
-    let nargs = ffi::PyVectorcall_NARGS(nargsf as usize);
-    if nargs != 1 && nargs != 2 {
-        return VectorcallCallableKind::GenericOnly;
-    }
-    let callable_type = (*callable.cast::<ffi::PyObject>()).ob_type;
-    if callable_type == ptr::addr_of_mut!(PyFunction_Type) {
-        if nargs == 2 {
-            VectorcallCallableKind::ExactPythonTwoArgs
-        } else {
-            VectorcallCallableKind::GenericOnly
-        }
-    } else if callable_type != ptr::addr_of_mut!(ffi::PyCFunction_Type) {
-        VectorcallCallableKind::GenericOnly
-    } else {
-        let method = (*callable.cast::<ffi::PyCFunctionObject>()).m_ml;
-        if method.is_null() || (*method).ml_name.is_null() {
-            return VectorcallCallableKind::GenericOnly;
-        }
-        let name = (*method).ml_name;
-        if (*method).ml_flags == ffi::METH_FASTCALL
-            && *name == b'n'
-            && CStr::from_ptr(name) == c"next"
-        {
-            VectorcallCallableKind::ExactBuiltinNext
-        } else if (*method).ml_flags == ffi::METH_O && nargs == 1 && *name == b'a' {
-            VectorcallCallableKind::ExactBuiltinGeneratorConsumer
-        } else {
-            VectorcallCallableKind::GenericOnly
-        }
-    }
-}
-
-unsafe fn guarded_generator_builtin_kind(
-    callable: ObjPtr,
-    args: ObjPtr,
-    nargsf: ObjPtr,
-    kwnames: ObjPtr,
-) -> Option<GuardedGeneratorBuiltin> {
-    if !kwnames.is_null()
-        || args.is_null()
-        || callable.is_null()
-        || ffi::PyVectorcall_NARGS(nargsf as usize) != 1
-    {
-        return None;
-    }
-
-    let callable = callable.cast::<ffi::PyObject>();
-    if (*callable).ob_type != ptr::addr_of_mut!(ffi::PyCFunction_Type) {
-        return None;
-    }
-    let function = &*callable.cast::<ffi::PyCFunctionObject>();
-    if function.m_ml.is_null()
-        || (*function.m_ml).ml_name.is_null()
-        || *(*function.m_ml).ml_name != b'a'
-        || (*function.m_ml).ml_flags != ffi::METH_O
-    {
-        return None;
-    }
-    match CStr::from_ptr((*function.m_ml).ml_name).to_bytes() {
-        b"any" => Some(GuardedGeneratorBuiltin::Any),
-        b"all" => Some(GuardedGeneratorBuiltin::All),
-        _ => None,
-    }
-}
-
-unsafe extern "C" fn py_vectorcall_hook(
-    tstate: ObjPtr,
-    callable: ObjPtr,
-    args: ObjPtr,
-    nargsf: ObjPtr,
-    kwnames: ObjPtr,
+    globals: ObjPtr,
+    namespace: ObjPtr,
+    builtins: ObjPtr,
 ) -> ObjPtr {
-    if tstate.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid null tstate in dp_jit_py_vectorcall\0"
-                .as_ptr()
-                .cast(),
-        );
-        return ptr::null_mut();
-    }
-    match vectorcall_callable_kind(callable, args, nargsf, kwnames) {
-        VectorcallCallableKind::ExactBuiltinNext => {
-            if let Some(result) = fast_builtin_next_range_iter(callable, args, nargsf, kwnames) {
-                return result;
-            }
-        }
-        VectorcallCallableKind::ExactBuiltinGeneratorConsumer => {
-            if let Some(kind) = guarded_generator_builtin_kind(callable, args, nargsf, kwnames)
-                && let Some(result) =
-                    fast_guarded_generator_builtin_consumption(callable, args, kind)
-            {
-                return result;
-            }
-        }
-        VectorcallCallableKind::ExactPythonTwoArgs => {
-            if let Some(result) = fast_runtime_stop_iteration_match(callable, args, nargsf, kwnames)
-            {
-                return result;
-            }
-        }
-        VectorcallCallableKind::GenericOnly => {}
-    }
-    ffi::_PyObject_VectorcallTstate(
-        tstate as *mut ffi::PyThreadState,
-        callable as *mut ffi::PyObject,
-        args as *const *mut ffi::PyObject,
-        nargsf as usize,
-        kwnames as *mut ffi::PyObject,
+    PySoac_ObjectCallWithContext(
+        callable.cast(),
+        args.cast(),
+        ptr::null_mut(),
+        globals.cast(),
+        namespace.cast(),
+        builtins.cast(),
     ) as ObjPtr
 }
 
 #[cfg(test)]
 #[test]
-fn canonical_generator_consumers_use_the_actual_vectorcall_dispatch() {
+fn runtime_call_helpers_preserve_explicit_context_and_public_binding() {
+    use pyo3::exceptions::{PyNotImplementedError, PyTypeError};
     use pyo3::prelude::*;
-
-    let guard = crate::python_runtime_test_lock().lock().unwrap();
-    crate::initialize_test_python();
-    let selections = Python::attach(|py| unsafe {
-        let builtins = py.import("builtins").expect("builtins should import");
-        let any = builtins.getattr("any").expect("builtin any should exist");
-        let all = builtins.getattr("all").expect("builtin all should exist");
-        let len = builtins.getattr("len").expect("builtin len should exist");
-        let any_values = py
-            .eval(c"(value for value in (0, 1))", None, None)
-            .expect("an actual Python generator should be created");
-        let all_values = py
-            .eval(c"(value for value in (1, 0))", None, None)
-            .expect("another actual Python generator should be created");
-        let tstate = ffi::PyThreadState_Get().cast::<c_void>();
-        assert!(
-            !tstate.is_null(),
-            "an attached test thread should have state"
-        );
-
-        let any_args = [any_values.as_ptr()];
-        let any_result = dp_jit_py_vectorcall(
-            tstate,
-            any.as_ptr().cast(),
-            any_args.as_ptr().cast::<c_void>().cast_mut(),
-            1usize as ObjPtr,
-            ptr::null_mut(),
-        );
-        assert_eq!(any_result, ffi::Py_True().cast());
-        ffi::Py_DECREF(any_result.cast());
-
-        let all_args = [all_values.as_ptr()];
-        let all_result = dp_jit_py_vectorcall(
-            tstate,
-            all.as_ptr().cast(),
-            all_args.as_ptr().cast::<c_void>().cast_mut(),
-            1usize as ObjPtr,
-            ptr::null_mut(),
-        );
-        assert_eq!(all_result, ffi::Py_False().cast());
-        ffi::Py_DECREF(all_result.cast());
-
-        let any_selected = guarded_generator_builtin_kind(
-            any.as_ptr().cast(),
-            any_args.as_ptr().cast::<c_void>().cast_mut(),
-            1usize as ObjPtr,
-            ptr::null_mut(),
-        );
-        let all_selected = guarded_generator_builtin_kind(
-            all.as_ptr().cast(),
-            all_args.as_ptr().cast::<c_void>().cast_mut(),
-            1usize as ObjPtr,
-            ptr::null_mut(),
-        );
-        assert_eq!(
-            guarded_generator_builtin_kind(
-                len.as_ptr().cast(),
-                any_args.as_ptr().cast::<c_void>().cast_mut(),
-                1usize as ObjPtr,
-                ptr::null_mut(),
-            ),
-            None,
-            "unrelated builtin calls must never enter generator consumption"
-        );
-        assert_eq!(
-            guarded_generator_builtin_kind(
-                any.as_ptr().cast(),
-                any_args.as_ptr().cast::<c_void>().cast_mut(),
-                2usize as ObjPtr,
-                ptr::null_mut(),
-            ),
-            None,
-            "wrong-arity builtin calls must retain ordinary vectorcall errors"
-        );
-        (any_selected, all_selected)
-    });
-    drop(guard);
-
-    assert_eq!(
-        selections,
-        (
-            Some(GuardedGeneratorBuiltin::Any),
-            Some(GuardedGeneratorBuiltin::All),
-        ),
-        "the production vectorcall hook must recognize canonical any/all without changing real generator results"
-    );
-}
-
-#[cfg(test)]
-#[test]
-fn vectorcall_callable_kind_partitions_exact_cpython_callables() {
-    use pyo3::prelude::*;
-
-    unsafe extern "C" fn eager_like_identity(
-        _owner: *mut ffi::PyObject,
-        argument: *mut ffi::PyObject,
-    ) -> *mut ffi::PyObject {
-        unsafe { ffi::Py_INCREF(argument) };
-        argument
-    }
+    use pyo3::types::{PyDict, PyTuple};
 
     let _guard = crate::python_runtime_test_lock().lock().unwrap();
     crate::initialize_test_python();
-    Python::attach(|py| unsafe {
-        let builtins = py.import("builtins").expect("builtins should import");
-        let next = builtins.getattr("next").expect("builtin next should exist");
-        let any = builtins.getattr("any").expect("builtin any should exist");
-        let all = builtins.getattr("all").expect("builtin all should exist");
-        let len = builtins.getattr("len").expect("builtin len should exist");
-        let iter = builtins.getattr("iter").expect("builtin iter should exist");
-        let mut eager_definition = ffi::PyMethodDef {
-            ml_name: c"<eager comprehension>".as_ptr(),
-            ml_meth: ffi::PyMethodDefPointer {
-                PyCFunction: eager_like_identity,
-            },
-            ml_flags: ffi::METH_O,
-            ml_doc: ptr::null(),
-        };
-        let eager = ffi::PyCFunction_NewEx(
-            ptr::addr_of_mut!(eager_definition),
-            ffi::Py_None(),
-            ptr::null_mut(),
-        );
-        assert!(
-            !eager.is_null(),
-            "an actual eager-shaped C callable should exist"
-        );
-        let eager = Bound::<PyAny>::from_owned_ptr(py, eager);
-        let one_arg = py
-            .eval(c"lambda value: value", None, None)
-            .expect("one-argument Python function should exist");
-        let two_args = py
-            .eval(c"lambda first, second: first", None, None)
-            .expect("two-argument Python function should exist");
-        let bound_method = py
-            .eval(
-                c"type('Owner', (), {'method': lambda self, value: value})().method",
-                None,
-                None,
-            )
-            .expect("bound Python method should exist");
-        let arguments = [ffi::Py_None(), ffi::Py_None()];
-        let argument_ptr = arguments.as_ptr().cast::<c_void>().cast_mut();
-        let no_keywords = ptr::null_mut();
+    Python::attach(|py| {
+        let actual_globals = PyDict::new(py);
+        let actual_namespace = PyDict::new(py);
+        let builtins = py.import("builtins").unwrap();
+        let captured_builtins = PyDict::new(py);
+        let marker = py.eval(c"object()", None, None).unwrap();
+        captured_builtins
+            .set_item("captured_marker", &marker)
+            .unwrap();
+        actual_globals
+            .set_item("__builtins__", builtins.dict())
+            .unwrap();
+        let ordinary = PyDict::new(py);
+        py.run(
+            cr#"def globals(*values):
+    return values
+class View:
+    @property
+    def __dict__(self):
+        return 'ordinary descriptor'
+view = View()
+"#,
+            Some(&ordinary),
+            None,
+        )
+        .unwrap();
 
-        assert_eq!(
-            vectorcall_callable_kind(
-                one_arg.as_ptr().cast(),
-                argument_ptr,
-                1usize as ObjPtr,
-                no_keywords,
-            ),
-            VectorcallCallableKind::GenericOnly,
-            "ordinary exact Python one-argument calls cannot select a C-builtin fast path"
-        );
-        assert_eq!(
-            vectorcall_callable_kind(
-                bound_method.as_ptr().cast(),
-                argument_ptr,
-                1usize as ObjPtr,
-                no_keywords,
-            ),
-            VectorcallCallableKind::GenericOnly,
-            "bound Python methods cannot select any builtin or exception matcher"
-        );
-        assert_eq!(
-            vectorcall_callable_kind(
-                two_args.as_ptr().cast(),
-                argument_ptr,
-                2usize as ObjPtr,
-                no_keywords,
-            ),
-            VectorcallCallableKind::ExactPythonTwoArgs,
-            "exact two-argument Python functions retain the StopIteration matcher"
-        );
-        for callable in [&any, &all] {
-            assert_eq!(
-                vectorcall_callable_kind(
-                    callable.as_ptr().cast(),
-                    argument_ptr,
-                    1usize as ObjPtr,
-                    no_keywords,
-                ),
-                VectorcallCallableKind::ExactBuiltinGeneratorConsumer,
-                "exact any/all C builtins retain guarded generator consumption"
+        for positional in [true, false] {
+            let invoke = |callable: &Bound<'_, PyAny>,
+                          arguments: &[&Bound<'_, PyAny>],
+                          namespace: Option<&Bound<'_, PyDict>>|
+             -> PyResult<Bound<'_, PyAny>> {
+                let namespace = namespace.map_or(ptr::null_mut(), Bound::as_ptr);
+                let result = if positional {
+                    let mut slots = [ptr::null_mut(); 3];
+                    for (slot, value) in slots.iter_mut().zip(arguments) {
+                        *slot = value.as_ptr().cast();
+                    }
+                    unsafe {
+                        py_call_positional_three_hook(
+                            callable.as_ptr().cast(),
+                            slots[0],
+                            slots[1],
+                            slots[2],
+                            actual_globals.as_ptr().cast(),
+                            namespace.cast(),
+                            captured_builtins.as_ptr().cast(),
+                        )
+                    }
+                } else {
+                    let tuple = PyTuple::new(py, arguments.iter().copied())?;
+                    unsafe {
+                        py_call_object_hook(
+                            callable.as_ptr().cast(),
+                            tuple.as_ptr().cast(),
+                            actual_globals.as_ptr().cast(),
+                            namespace.cast(),
+                            captured_builtins.as_ptr().cast(),
+                        )
+                    }
+                };
+                unsafe { Bound::from_owned_ptr_or_err(py, result.cast()) }
+            };
+
+            let globals = builtins.getattr("globals").unwrap();
+            let result = invoke(&globals, &[], Some(&actual_namespace)).unwrap();
+            assert_eq!(result.as_ptr(), actual_globals.as_ptr());
+            let none = py.None().into_bound(py);
+            assert!(
+                invoke(&globals, &[&none], Some(&actual_namespace))
+                    .unwrap_err()
+                    .is_instance_of::<PyTypeError>(py)
             );
-        }
-        assert_eq!(
-            vectorcall_callable_kind(
-                next.as_ptr().cast(),
-                argument_ptr,
-                1usize as ObjPtr,
-                no_keywords,
-            ),
-            VectorcallCallableKind::ExactBuiltinNext,
-            "one-argument builtin next retains its range-iterator specialization"
-        );
-        for callable in [&eager, &len, &iter] {
-            assert_eq!(
-                vectorcall_callable_kind(
-                    callable.as_ptr().cast(),
-                    argument_ptr,
-                    1usize as ObjPtr,
-                    no_keywords,
-                ),
-                VectorcallCallableKind::GenericOnly,
-                "eager, len, and iter C callables cannot select next or any/all"
-            );
-        }
-        assert_eq!(
-            vectorcall_callable_kind(
-                next.as_ptr().cast(),
-                argument_ptr,
-                2usize as ObjPtr,
-                no_keywords,
-            ),
-            VectorcallCallableKind::ExactBuiltinNext,
-            "two-argument builtin next retains its default-value specialization"
-        );
-        assert_eq!(
-            vectorcall_callable_kind(
-                next.as_ptr().cast(),
-                argument_ptr,
-                (1usize | ffi::PY_VECTORCALL_ARGUMENTS_OFFSET) as ObjPtr,
-                no_keywords,
-            ),
-            VectorcallCallableKind::ExactBuiltinNext,
-            "CPython's arguments-offset flag must not change positional arity"
-        );
-        assert_eq!(
-            vectorcall_callable_kind(
-                next.as_ptr().cast(),
-                argument_ptr,
-                1usize as ObjPtr,
-                ffi::Py_None().cast(),
-            ),
-            VectorcallCallableKind::GenericOnly,
-            "keyword calls retain ordinary CPython dispatch"
-        );
-    });
-}
 
-#[cfg(test)]
-#[test]
-fn vectorcall_callable_kind_rejects_rebound_next_without_poisoning_cache() {
-    use pyo3::prelude::*;
-
-    let _guard = crate::python_runtime_test_lock().lock().unwrap();
-    crate::initialize_test_python();
-    Python::attach(|py| unsafe {
-        let builtins = py.import("builtins").expect("builtins should import");
-        let original = builtins.getattr("next").expect("builtin next should exist");
-        let replacement = builtins.getattr("len").expect("builtin len should exist");
-        let dictionary = ffi::PyModule_GetDict(builtins.as_ptr());
-        assert!(
-            !dictionary.is_null(),
-            "builtins must have a live dictionary"
-        );
-        let cache = OnceLock::new();
-
-        assert_eq!(
-            ffi::PyDict_SetItemString(dictionary, c"next".as_ptr(), replacement.as_ptr()),
-            0,
-            "temporarily replacing builtin next should succeed"
-        );
-        let observed = cached_builtin_next_with(&cache);
-        let cached_replacement = cache.get().copied();
-        assert_eq!(
-            ffi::PyDict_SetItemString(dictionary, c"next".as_ptr(), original.as_ptr()),
-            0,
-            "the canonical builtin next must be restored before any assertion"
-        );
-        if cached_replacement == Some(replacement.as_ptr() as usize) {
-            ffi::Py_DECREF(replacement.as_ptr());
-        }
-
-        assert!(
-            observed.is_null(),
-            "a rebound builtin next must not turn another C callable into next"
-        );
-        assert!(
-            cache.get().is_none(),
-            "invalid builtin bindings must not permanently initialize the next cache"
-        );
-
-        let restored = cached_builtin_next_with(&cache);
-        assert_eq!(restored, original.as_ptr());
-        assert_eq!(cache.get().copied(), Some(original.as_ptr() as usize));
-        ffi::Py_DECREF(restored);
-    });
-}
-
-unsafe fn cached_builtin_next_with(cache: &OnceLock<usize>) -> *mut ffi::PyObject {
-    if let Some(&cached) = cache.get() {
-        return cached as *mut ffi::PyObject;
-    }
-    let builtins = ffi::PyEval_GetBuiltins();
-    if builtins.is_null() {
-        return ptr::null_mut();
-    }
-    let next = ffi::PyDict_GetItemString(builtins, c"next".as_ptr());
-    if next.is_null() {
-        if !ffi::PyErr_Occurred().is_null() {
-            ffi::PyErr_Clear();
-        }
-        return ptr::null_mut();
-    }
-    if !stop_iteration_exact_builtin(next, c"next", builtins)
-        || (*(*next.cast::<ffi::PyCFunctionObject>()).m_ml).ml_flags != ffi::METH_FASTCALL
-    {
-        return ptr::null_mut();
-    }
-    *cache.get_or_init(|| {
-        ffi::Py_INCREF(next);
-        next as usize
-    }) as *mut ffi::PyObject
-}
-
-unsafe fn cached_builtin_next() -> *mut ffi::PyObject {
-    static BUILTIN_NEXT: OnceLock<usize> = OnceLock::new();
-    cached_builtin_next_with(&BUILTIN_NEXT)
-}
-
-unsafe fn fast_builtin_next_range_iter(
-    callable: ObjPtr,
-    args: ObjPtr,
-    nargsf: ObjPtr,
-    kwnames: ObjPtr,
-) -> Option<ObjPtr> {
-    if !kwnames.is_null() || args.is_null() {
-        return None;
-    }
-    let nargs = ffi::PyVectorcall_NARGS(nargsf as usize);
-    if !(nargs == 1 || nargs == 2) {
-        return None;
-    }
-    let next = cached_builtin_next();
-    if next.is_null() || callable as *mut ffi::PyObject != next {
-        return None;
-    }
-    let args = args as *const *mut ffi::PyObject;
-    let iter = *args;
-    if iter.is_null() || ffi::Py_TYPE(iter) != std::ptr::addr_of_mut!(ffi::PyRangeIter_Type) {
-        return None;
-    }
-
-    let range_iter = iter as *mut RawPyRangeIterObject;
-    if (*range_iter).len <= 0 {
-        if nargs == 2 {
-            let default = *args.add(1);
-            ffi::Py_INCREF(default);
-            return Some(default as ObjPtr);
-        }
-        ffi::PyErr_SetNone(ffi::PyExc_StopIteration);
-        return Some(ptr::null_mut());
-    }
-    let result = (*range_iter).start;
-    (*range_iter).start = result + (*range_iter).step;
-    (*range_iter).len -= 1;
-    Some(ffi::PyLong_FromLong(result) as ObjPtr)
-}
-
-#[repr(C)]
-struct RawPyDictIndexedValues {
-    capacity: ffi::Py_ssize_t,
-    order_size: ffi::Py_ssize_t,
-    values: [*mut ffi::PyObject; 1],
-}
-
-unsafe fn stop_iteration_unicode_entries(
-    keys: *mut super::RawPyDictKeysObjectForJit,
-) -> *mut super::RawPyDictUnicodeEntryForJit {
-    keys.cast::<u8>()
-        .add(
-            std::mem::size_of::<super::RawPyDictKeysObjectForJit>()
-                + (1usize << (*keys).dk_log2_index_bytes),
-        )
-        .cast()
-}
-
-unsafe fn stop_iteration_indexed_value(
-    values: *mut RawPyDictIndexedValues,
-    index: usize,
-) -> *mut ffi::PyObject {
-    *(&raw const (*values).values)
-        .cast::<*mut ffi::PyObject>()
-        .add(index)
-}
-
-unsafe fn prepare_stop_iteration_runtime_entry(
-    data: &crate::PyFunctionJitExtra,
-    keys: *mut super::RawPyDictKeysObjectForJit,
-    values: *mut RawPyDictIndexedValues,
-    name: &'static CStr,
-) -> Option<crate::PreparedStopIterationDictionaryEntry> {
-    let name_str = name.to_str().ok()?;
-    let index = data
-        .module_state
-        .lowered_module
-        .global_names
-        .iter()
-        .position(|global| global == name_str)?;
-    if index >= (*keys).dk_nentries as usize || index >= (*values).capacity as usize {
-        return None;
-    }
-    let entry = &*stop_iteration_unicode_entries(keys).add(index);
-    if entry.me_key.is_null()
-        || ffi::PyUnicode_CheckExact(entry.me_key) == 0
-        || ffi::PyUnicode_CompareWithASCIIString(entry.me_key, name.as_ptr()) != 0
-    {
-        return None;
-    }
-    let value = stop_iteration_indexed_value(values, index);
-    let value = if value.is_null()
-        || value.cast::<i8>() == ptr::addr_of_mut!(super::_PyDict_IndexedValueTombstone)
-    {
-        0
-    } else {
-        value as usize
-    };
-    Some(crate::PreparedStopIterationDictionaryEntry {
-        index,
-        key: entry.me_key as usize,
-        value,
-    })
-}
-
-unsafe fn prepare_stop_iteration_builtin_entry(
-    keys: *mut super::RawPyDictKeysObjectForJit,
-    name: &'static CStr,
-) -> Option<crate::PreparedStopIterationDictionaryEntry> {
-    for index in 0..(*keys).dk_nentries as usize {
-        let entry = &*stop_iteration_unicode_entries(keys).add(index);
-        if entry.me_key.is_null()
-            || ffi::PyUnicode_CheckExact(entry.me_key) == 0
-            || ffi::PyUnicode_CompareWithASCIIString(entry.me_key, name.as_ptr()) != 0
-        {
-            continue;
-        }
-        if entry.me_value.is_null() {
-            return None;
-        }
-        return Some(crate::PreparedStopIterationDictionaryEntry {
-            index,
-            key: entry.me_key as usize,
-            value: entry.me_value as usize,
-        });
-    }
-    None
-}
-
-unsafe fn stop_iteration_exact_builtin(
-    function: *mut ffi::PyObject,
-    name: &'static CStr,
-    builtins: *mut ffi::PyObject,
-) -> bool {
-    if function.is_null() || ffi::PyCFunction_CheckExact(function) == 0 {
-        return false;
-    }
-    let function = &*function.cast::<ffi::PyCFunctionObject>();
-    if function.m_ml.is_null()
-        || (*function.m_ml).ml_name.is_null()
-        || CStr::from_ptr((*function.m_ml).ml_name) != name
-        || function.m_self.is_null()
-        || ffi::PyModule_CheckExact(function.m_self) == 0
-    {
-        return false;
-    }
-    ffi::PyModule_GetDict(function.m_self) == builtins
-}
-
-unsafe fn prepare_stop_iteration_matcher(
-    helper: *mut ffi::PyObject,
-    data: &crate::PyFunctionJitExtra,
-) -> Option<crate::PreparedStopIterationMatcher> {
-    if data.module_state.module_name != "soac.runtime"
-        || data.function_template.function().names.qualname != "exception_matches"
-        || crate::PyFunction_GetSoacFunctionId(helper) != data.function_id.to_packed_runtime_u64()
-    {
-        return None;
-    }
-    let helper_function = &*helper.cast::<ffi::PyFunctionObject>();
-    let helper_code = helper_function.func_code;
-    if helper_code != data.registered_code
-        || data
-            .module_state
-            .lookup_original_code(data.function_id)
-            .map(pyo3::Py::as_ptr)
-            != Some(helper_code)
-        || super::raw_py_function_activation_is_observed(helper_code)
-    {
-        return None;
-    }
-
-    let globals = helper_function.func_globals;
-    let builtins = helper_function.func_builtins;
-    if globals.is_null()
-        || builtins.is_null()
-        || globals != data.function_env.globals_obj()
-        || builtins != data.function_env.builtins_obj()
-        || ffi::PyDict_CheckExact(globals) == 0
-        || ffi::PyDict_CheckExact(builtins) == 0
-    {
-        return None;
-    }
-    let globals_dict = &*globals.cast::<ffi::PyDictObject>();
-    let runtime_keys = globals_dict
-        .ma_keys
-        .cast::<super::RawPyDictKeysObjectForJit>();
-    let runtime_values = globals_dict.ma_values.cast::<RawPyDictIndexedValues>();
-    if runtime_keys.is_null()
-        || runtime_values.is_null()
-        || (*runtime_keys).dk_kind != 3
-        || (*runtime_keys).dk_nentries < 0
-        || (*runtime_values).capacity < 0
-    {
-        return None;
-    }
-
-    let builtin_dict = &*builtins.cast::<ffi::PyDictObject>();
-    let builtin_keys = builtin_dict
-        .ma_keys
-        .cast::<super::RawPyDictKeysObjectForJit>();
-    if builtin_keys.is_null()
-        || !builtin_dict.ma_values.is_null()
-        || (*builtin_keys).dk_kind != 1
-        || (*builtin_keys).dk_nentries < 0
-    {
-        return None;
-    }
-
-    let runtime_entries = [
-        prepare_stop_iteration_runtime_entry(
-            data,
-            runtime_keys,
-            runtime_values,
-            c"_validate_exception_type",
-        )?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"isinstance")?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"tuple")?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"type")?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"issubclass")?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"BaseException")?,
-        prepare_stop_iteration_runtime_entry(
-            data,
-            runtime_keys,
-            runtime_values,
-            c"RecursionError",
-        )?,
-    ];
-    let builtin_entries = [
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"isinstance")?,
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"issubclass")?,
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"BaseException")?,
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"RecursionError")?,
-    ];
-    if runtime_entries[1].value != builtin_entries[0].value
-        || !stop_iteration_exact_builtin(
-            runtime_entries[1].value as *mut ffi::PyObject,
-            c"isinstance",
-            builtins,
-        )
-        || runtime_entries[2].value
-            != ptr::addr_of_mut!(ffi::PyTuple_Type).cast::<ffi::PyObject>() as usize
-        || runtime_entries[3].value
-            != ptr::addr_of_mut!(ffi::PyType_Type).cast::<ffi::PyObject>() as usize
-        || runtime_entries[4].value != 0
-        || runtime_entries[5].value != 0
-        || runtime_entries[6].value != 0
-        || !stop_iteration_exact_builtin(
-            builtin_entries[1].value as *mut ffi::PyObject,
-            c"issubclass",
-            builtins,
-        )
-        || builtin_entries[2].value != ffi::PyExc_BaseException as usize
-        || builtin_entries[3].value != ffi::PyExc_RecursionError as usize
-    {
-        return None;
-    }
-
-    let validator = runtime_entries[0].value as *mut ffi::PyObject;
-    if validator.is_null() || ffi::PyFunction_Check(validator) == 0 {
-        return None;
-    }
-    let validator_metadata = crate::PyFunction_GetSoacMetadata(validator);
-    if validator_metadata.is_null() {
-        return None;
-    }
-    let validator_data = &*validator_metadata.cast::<crate::PyFunctionJitExtra>();
-    let validator_function = &*validator.cast::<ffi::PyFunctionObject>();
-    if validator_data.compile_session.id() != data.compile_session.id()
-        || validator_data.module_state.module_name != "soac.runtime"
-        || validator_data.function_template.function().names.qualname != "_validate_exception_type"
-        || crate::PyFunction_GetSoacFunctionId(validator)
-            != validator_data.function_id.to_packed_runtime_u64()
-        || validator_function.func_globals != globals
-        || validator_function.func_builtins != builtins
-        || validator_function.func_code != validator_data.registered_code
-        || validator_data
-            .module_state
-            .lookup_original_code(validator_data.function_id)
-            .map(pyo3::Py::as_ptr)
-            != Some(validator_function.func_code)
-        || super::raw_py_function_activation_is_observed(validator_function.func_code)
-    {
-        return None;
-    }
-
-    Some(crate::PreparedStopIterationMatcher {
-        compile_session_id: data.compile_session.id(),
-        helper_function_id: data.function_id,
-        helper: helper as usize,
-        helper_code: helper_code as usize,
-        validator_function_id: validator_data.function_id,
-        validator: validator as usize,
-        validator_code: validator_function.func_code as usize,
-        runtime_globals: globals as usize,
-        runtime_keys: runtime_keys as usize,
-        runtime_values: runtime_values as usize,
-        builtins: builtins as usize,
-        builtin_keys: builtin_keys as usize,
-        runtime_entries,
-        builtin_entries,
-    })
-}
-
-unsafe fn stop_iteration_matcher_still_canonical(
-    prepared: &crate::PreparedStopIterationMatcher,
-    helper: *mut ffi::PyObject,
-    data: &crate::PyFunctionJitExtra,
-) -> bool {
-    if helper as usize != prepared.helper
-        || data.compile_session.id() != prepared.compile_session_id
-        || crate::PyFunction_GetSoacFunctionId(helper)
-            != prepared.helper_function_id.to_packed_runtime_u64()
-        || (*helper.cast::<ffi::PyFunctionObject>()).func_code as usize != prepared.helper_code
-        || (*helper.cast::<ffi::PyFunctionObject>()).func_globals as usize
-            != prepared.runtime_globals
-        || (*helper.cast::<ffi::PyFunctionObject>()).func_builtins as usize != prepared.builtins
-        || super::raw_py_function_activation_is_observed(prepared.helper_code as *mut ffi::PyObject)
-    {
-        return false;
-    }
-
-    let globals = &*(prepared.runtime_globals as *mut ffi::PyDictObject);
-    let runtime_keys = globals.ma_keys.cast::<super::RawPyDictKeysObjectForJit>();
-    let runtime_values = globals.ma_values.cast::<RawPyDictIndexedValues>();
-    if runtime_keys as usize != prepared.runtime_keys
-        || runtime_values as usize != prepared.runtime_values
-        || (*runtime_keys).dk_kind != 3
-        || (*runtime_keys).dk_nentries < 0
-        || (*runtime_values).capacity < 0
-    {
-        return false;
-    }
-    if !stop_iteration_runtime_entries_still_match(
-        runtime_keys,
-        runtime_values,
-        &prepared.runtime_entries,
-    ) {
-        return false;
-    }
-
-    let builtins = &*(prepared.builtins as *mut ffi::PyDictObject);
-    let builtin_keys = builtins.ma_keys.cast::<super::RawPyDictKeysObjectForJit>();
-    if builtin_keys as usize != prepared.builtin_keys
-        || !builtins.ma_values.is_null()
-        || (*builtin_keys).dk_kind != 1
-        || (*builtin_keys).dk_nentries < 0
-        || !stop_iteration_builtin_entries_still_match(builtin_keys, &prepared.builtin_entries)
-    {
-        return false;
-    }
-
-    let validator = prepared.validator as *mut ffi::PyObject;
-    ffi::PyFunction_Check(validator) != 0
-        && crate::PyFunction_GetSoacFunctionId(validator)
-            == prepared.validator_function_id.to_packed_runtime_u64()
-        && (*validator.cast::<ffi::PyFunctionObject>()).func_code as usize
-            == prepared.validator_code
-        && (*validator.cast::<ffi::PyFunctionObject>()).func_globals as usize
-            == prepared.runtime_globals
-        && (*validator.cast::<ffi::PyFunctionObject>()).func_builtins as usize == prepared.builtins
-        && !super::raw_py_function_activation_is_observed(
-            prepared.validator_code as *mut ffi::PyObject,
-        )
-}
-
-unsafe fn stop_iteration_runtime_entries_still_match(
-    runtime_keys: *mut super::RawPyDictKeysObjectForJit,
-    runtime_values: *mut RawPyDictIndexedValues,
-    entries: &[crate::PreparedStopIterationDictionaryEntry],
-) -> bool {
-    let runtime_key_entries = stop_iteration_unicode_entries(runtime_keys);
-    for expected in entries {
-        if expected.index >= (*runtime_keys).dk_nentries as usize
-            || expected.index >= (*runtime_values).capacity as usize
-            || (*runtime_key_entries.add(expected.index)).me_key as usize != expected.key
-        {
-            return false;
-        }
-        let value = stop_iteration_indexed_value(runtime_values, expected.index);
-        if expected.value == 0 {
-            if !value.is_null()
-                && value.cast::<i8>() != ptr::addr_of_mut!(super::_PyDict_IndexedValueTombstone)
-            {
-                return false;
+            for name in ["locals", "vars"] {
+                let callable = builtins.getattr(name).unwrap();
+                let result = invoke(&callable, &[], Some(&actual_namespace)).unwrap();
+                assert_eq!(result.as_ptr(), actual_namespace.as_ptr());
+                assert!(
+                    invoke(&callable, &[], None)
+                        .unwrap_err()
+                        .is_instance_of::<PyNotImplementedError>(py)
+                );
             }
-        } else if value as usize != expected.value {
-            return false;
+            let eval = builtins.getattr("eval").unwrap();
+            assert!(
+                invoke(&eval, &[], Some(&actual_namespace))
+                    .unwrap_err()
+                    .is_instance_of::<PyTypeError>(py)
+            );
+            let code = py
+                .eval(
+                    c"compile('captured_marker', '<context>', 'eval', dont_inherit=True)",
+                    None,
+                    None,
+                )
+                .unwrap();
+            let target_globals = PyDict::new(py);
+            let value = invoke(&eval, &[&code, target_globals.as_any()], None).unwrap();
+            assert!(value.is(&marker));
+            assert!(
+                target_globals
+                    .get_item("__builtins__")
+                    .unwrap()
+                    .unwrap()
+                    .is(&captured_builtins)
+            );
+            let replacement_builtins = PyDict::new(py);
+            replacement_builtins
+                .set_item("captured_marker", py.None())
+                .unwrap();
+            target_globals
+                .set_item("__builtins__", &replacement_builtins)
+                .unwrap();
+            assert!(
+                invoke(&eval, &[&code, target_globals.as_any()], None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                target_globals
+                    .get_item("__builtins__")
+                    .unwrap()
+                    .unwrap()
+                    .is(&replacement_builtins)
+            );
+
+            let ordinary_globals = ordinary.get_item("globals").unwrap().unwrap();
+            let result = invoke(&ordinary_globals, &[&none], None).unwrap();
+            assert_eq!(result.cast::<PyTuple>().unwrap().len(), 1);
+            assert!(result.get_item(0).unwrap().is_none());
+            let vars = builtins.getattr("vars").unwrap();
+            let view = ordinary.get_item("view").unwrap().unwrap();
+            assert_eq!(
+                invoke(&vars, &[&view], None)
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "ordinary descriptor"
+            );
         }
-    }
-    true
-}
-
-unsafe fn stop_iteration_builtin_entries_still_match(
-    builtin_keys: *mut super::RawPyDictKeysObjectForJit,
-    entries: &[crate::PreparedStopIterationDictionaryEntry],
-) -> bool {
-    let builtin_key_entries = stop_iteration_unicode_entries(builtin_keys);
-    for expected in entries {
-        if expected.index >= (*builtin_keys).dk_nentries as usize {
-            return false;
-        }
-        let entry = &*builtin_key_entries.add(expected.index);
-        if entry.me_key as usize != expected.key || entry.me_value as usize != expected.value {
-            return false;
-        }
-    }
-    true
-}
-
-unsafe fn fast_runtime_stop_iteration_match(
-    callable: ObjPtr,
-    args: ObjPtr,
-    nargsf: ObjPtr,
-    kwnames: ObjPtr,
-) -> Option<ObjPtr> {
-    if !kwnames.is_null() || args.is_null() {
-        return None;
-    }
-    let nargs = ffi::PyVectorcall_NARGS(nargsf as usize);
-    if nargs != 2 {
-        return None;
-    }
-    let args = args as *const *mut ffi::PyObject;
-    let exc = *args;
-    let exc_type = *args.add(1);
-    if exc.is_null()
-        || exc_type != ffi::PyExc_StopIteration
-        || ffi::Py_TYPE(exc) != ffi::PyExc_StopIteration.cast::<ffi::PyTypeObject>()
-    {
-        // Even a real StopIteration subclass can override __class__, observed by the
-        // helper's initial isinstance(exc, RecursionError) check.
-        return None;
-    }
-
-    let helper = callable.cast::<ffi::PyObject>();
-    if helper.is_null() || ffi::PyFunction_Check(helper) == 0 {
-        return None;
-    }
-    let metadata = crate::PyFunction_GetSoacMetadata(helper);
-    if metadata.is_null() {
-        return None;
-    }
-    let data = &*metadata.cast::<crate::PyFunctionJitExtra>();
-    let prepared = match data.function_template.prepared_stop_iteration_matcher.get() {
-        Some(prepared) => prepared,
-        None => {
-            let prepared = prepare_stop_iteration_matcher(helper, data)?;
-            let _ = data
-                .function_template
-                .prepared_stop_iteration_matcher
-                .set(prepared);
-            data.function_template
-                .prepared_stop_iteration_matcher
-                .get()?
-        }
-    };
-    if !stop_iteration_matcher_still_canonical(prepared, helper, data) {
-        return None;
-    }
-    Some(ffi::PyBool_FromLong(1) as ObjPtr)
-}
-
-const GENERATOR_RUNTIME_CLASS: usize = 0;
-const GENERATOR_RUNTIME_CLOSED: usize = 1;
-const GENERATOR_RUNTIME_RERAISE: usize = 2;
-const GENERATOR_RUNTIME_RESUME: usize = 3;
-const GENERATOR_RUNTIME_LOAD_STATE: usize = 4;
-const GENERATOR_RUNTIME_NO_DEFAULT: usize = 5;
-const GENERATOR_RUNTIME_BOOL: usize = 6;
-const GENERATOR_RUNTIME_BASE_EXCEPTION: usize = 7;
-const GENERATOR_RUNTIME_STOP_ITERATION: usize = 8;
-
-unsafe fn prepare_generator_consumer_method(
-    data: &crate::PyFunctionJitExtra,
-    function: *mut ffi::PyObject,
-    expected_qualname: &str,
-) -> Option<crate::PreparedGeneratorConsumerMethod> {
-    if function.is_null() || ffi::PyFunction_Check(function) == 0 {
-        return None;
-    }
-    let metadata = crate::PyFunction_GetSoacMetadata(function);
-    if metadata.is_null() {
-        return None;
-    }
-    let method_data = &*metadata.cast::<crate::PyFunctionJitExtra>();
-    let method = &*function.cast::<ffi::PyFunctionObject>();
-    if method_data.compile_session.id() != data.compile_session.id()
-        || method_data.module_state.module_name != "soac.runtime"
-        || !ptr::eq(
-            method_data.module_state.as_ref(),
-            data.module_state.as_ref(),
-        )
-        || method_data.function_template.function().names.qualname != expected_qualname
-        || crate::PyFunction_GetSoacFunctionId(function)
-            != method_data.function_id.to_packed_runtime_u64()
-        || method.func_code != method_data.registered_code
-        || method_data
-            .module_state
-            .lookup_original_code(method_data.function_id)
-            .map(pyo3::Py::as_ptr)
-            != Some(method.func_code)
-        || method.func_globals != data.function_env.globals_obj()
-        || method.func_builtins != data.function_env.builtins_obj()
-    {
-        return None;
-    }
-    Some(crate::PreparedGeneratorConsumerMethod {
-        function: function as usize,
-        code: method.func_code as usize,
-        function_id: method_data.function_id,
-    })
-}
-
-unsafe fn prepare_guarded_generator_builtin_consumer(
-    owner_type: *mut ffi::PyTypeObject,
-    data: &crate::PyFunctionJitExtra,
-) -> Option<crate::PreparedGeneratorBuiltinConsumer> {
-    if data.module_state.module_name != "soac.runtime"
-        || !data
-            .function_template
-            .function()
-            .names
-            .qualname
-            .starts_with("ClosureGenerator.__soac_constructor_entry__#")
-        || crate::PyType_GetSoacFunctionId(owner_type.cast())
-            != data.function_id.to_packed_runtime_u64()
-        || (*owner_type).tp_dict.is_null()
-        || (*owner_type).tp_version_tag == 0
-    {
-        return None;
-    }
-
-    let globals = data.function_env.globals_obj();
-    let builtins = data.function_env.builtins_obj();
-    if globals.is_null()
-        || builtins.is_null()
-        || ffi::PyDict_CheckExact(globals) == 0
-        || ffi::PyDict_CheckExact(builtins) == 0
-    {
-        return None;
-    }
-
-    let globals_dict = &*globals.cast::<ffi::PyDictObject>();
-    let runtime_keys = globals_dict
-        .ma_keys
-        .cast::<super::RawPyDictKeysObjectForJit>();
-    let runtime_values = globals_dict.ma_values.cast::<RawPyDictIndexedValues>();
-    if runtime_keys.is_null()
-        || runtime_values.is_null()
-        || (*runtime_keys).dk_kind != 3
-        || (*runtime_keys).dk_nentries < 0
-        || (*runtime_values).capacity < 0
-    {
-        return None;
-    }
-
-    let builtins_dict = &*builtins.cast::<ffi::PyDictObject>();
-    let builtin_keys = builtins_dict
-        .ma_keys
-        .cast::<super::RawPyDictKeysObjectForJit>();
-    if builtin_keys.is_null()
-        || !builtins_dict.ma_values.is_null()
-        || (*builtin_keys).dk_kind != 1
-        || (*builtin_keys).dk_nentries < 0
-    {
-        return None;
-    }
-
-    let runtime_entries = [
-        prepare_stop_iteration_runtime_entry(
-            data,
-            runtime_keys,
-            runtime_values,
-            c"ClosureGenerator",
-        )?,
-        prepare_stop_iteration_runtime_entry(
-            data,
-            runtime_keys,
-            runtime_values,
-            c"_is_generator_closed",
-        )?,
-        prepare_stop_iteration_runtime_entry(
-            data,
-            runtime_keys,
-            runtime_values,
-            c"_reraise_control_flow",
-        )?,
-        prepare_stop_iteration_runtime_entry(
-            data,
-            runtime_keys,
-            runtime_values,
-            c"resume_generator",
-        )?,
-        prepare_stop_iteration_runtime_entry(
-            data,
-            runtime_keys,
-            runtime_values,
-            c"load_preserved_state",
-        )?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"NO_DEFAULT")?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"bool")?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"BaseException")?,
-        prepare_stop_iteration_runtime_entry(data, runtime_keys, runtime_values, c"StopIteration")?,
-    ];
-    let builtin_entries = [
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"any")?,
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"all")?,
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"bool")?,
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"BaseException")?,
-        prepare_stop_iteration_builtin_entry(builtin_keys, c"StopIteration")?,
-    ];
-    if runtime_entries[GENERATOR_RUNTIME_CLASS].value != owner_type as usize
-        || runtime_entries[GENERATOR_RUNTIME_BOOL].value != 0
-        || runtime_entries[GENERATOR_RUNTIME_BASE_EXCEPTION].value != 0
-        || runtime_entries[GENERATOR_RUNTIME_STOP_ITERATION].value != 0
-        || runtime_entries[GENERATOR_RUNTIME_NO_DEFAULT].value == 0
-        || !stop_iteration_exact_builtin(
-            builtin_entries[0].value as *mut ffi::PyObject,
-            c"any",
-            builtins,
-        )
-        || !stop_iteration_exact_builtin(
-            builtin_entries[1].value as *mut ffi::PyObject,
-            c"all",
-            builtins,
-        )
-        || builtin_entries[2].value
-            != ptr::addr_of_mut!(ffi::PyBool_Type).cast::<ffi::PyObject>() as usize
-        || builtin_entries[3].value != ffi::PyExc_BaseException as usize
-        || builtin_entries[4].value != ffi::PyExc_StopIteration as usize
-    {
-        return None;
-    }
-
-    for (entry, expected_name) in [
-        (GENERATOR_RUNTIME_RESUME, c"resume_generator"),
-        (GENERATOR_RUNTIME_LOAD_STATE, c"load_preserved_state"),
-    ] {
-        let function = runtime_entries[entry].value as *mut ffi::PyObject;
-        if function.is_null() || ffi::PyCFunction_CheckExact(function) == 0 {
-            return None;
-        }
-        let function = &*function.cast::<ffi::PyCFunctionObject>();
-        if function.m_ml.is_null()
-            || (*function.m_ml).ml_name.is_null()
-            || CStr::from_ptr((*function.m_ml).ml_name) != expected_name
-        {
-            return None;
-        }
-    }
-
-    let dict = (*owner_type).tp_dict;
-    let init = ffi::PyDict_GetItemString(dict, c"__init__".as_ptr());
-    if init.is_null()
-        || ffi::PyFunction_Check(init) == 0
-        || (*init.cast::<ffi::PyFunctionObject>()).func_code != data.registered_code
-    {
-        return None;
-    }
-    let methods = [
-        prepare_generator_consumer_method(
-            data,
-            ffi::PyDict_GetItemString(dict, c"__iter__".as_ptr()),
-            "ClosureGenerator.__iter__",
-        )?,
-        prepare_generator_consumer_method(
-            data,
-            ffi::PyDict_GetItemString(dict, c"__next__".as_ptr()),
-            "ClosureGenerator.__next__",
-        )?,
-        prepare_generator_consumer_method(
-            data,
-            ffi::PyDict_GetItemString(dict, c"send".as_ptr()),
-            "ClosureGenerator.send",
-        )?,
-        prepare_generator_consumer_method(
-            data,
-            runtime_entries[GENERATOR_RUNTIME_CLOSED].value as *mut ffi::PyObject,
-            "_is_generator_closed",
-        )?,
-        prepare_generator_consumer_method(
-            data,
-            runtime_entries[GENERATOR_RUNTIME_RERAISE].value as *mut ffi::PyObject,
-            "_reraise_control_flow",
-        )?,
-    ];
-
-    let resume_name = std::ffi::CString::new("_resume_function").ok()?;
-    let preserved_name = std::ffi::CString::new("_preserved_values").ok()?;
-    let closed_name = std::ffi::CString::new("_closed_slot").ok()?;
-    let resume_function_offset = crate::late_bound_slot_offset_for_owner(
-        owner_type,
-        &resume_name,
-        crate::IndexedFieldAccessKind::Load,
-    )?;
-    let preserved_values_offset = crate::late_bound_slot_offset_for_owner(
-        owner_type,
-        &preserved_name,
-        crate::IndexedFieldAccessKind::Load,
-    )?;
-    let closed_slot_offset = crate::late_bound_slot_offset_for_owner(
-        owner_type,
-        &closed_name,
-        crate::IndexedFieldAccessKind::Load,
-    )?;
-
-    Some(crate::PreparedGeneratorBuiltinConsumer {
-        compile_session_id: data.compile_session.id(),
-        constructor_function_id: data.function_id,
-        owner_type: owner_type as usize,
-        owner_type_version: (*owner_type).tp_version_tag,
-        runtime_globals: globals as usize,
-        runtime_keys: runtime_keys as usize,
-        runtime_values: runtime_values as usize,
-        builtins: builtins as usize,
-        builtin_keys: builtin_keys as usize,
-        runtime_entries,
-        builtin_entries,
-        methods,
-        resume_function_offset,
-        preserved_values_offset,
-        closed_slot_offset,
-    })
-}
-
-unsafe fn guarded_generator_consumer_still_canonical(
-    prepared: &crate::PreparedGeneratorBuiltinConsumer,
-    data: &crate::PyFunctionJitExtra,
-    owner_type: *mut ffi::PyTypeObject,
-) -> bool {
-    if crate::entry_interpreter_vectorcall_for_tests_enabled()
-        || data.compile_session.id() != prepared.compile_session_id
-        || owner_type as usize != prepared.owner_type
-        || (*owner_type).tp_version_tag != prepared.owner_type_version
-        || crate::PyType_GetSoacMetadata(owner_type.cast()) != ptr::from_ref(data).cast_mut().cast()
-        || crate::PyType_GetSoacFunctionId(owner_type.cast())
-            != prepared.constructor_function_id.to_packed_runtime_u64()
-        || data.function_env.globals_obj() as usize != prepared.runtime_globals
-        || data.function_env.builtins_obj() as usize != prepared.builtins
-    {
-        return false;
-    }
-
-    let globals = &*(prepared.runtime_globals as *mut ffi::PyDictObject);
-    let keys = globals.ma_keys.cast::<super::RawPyDictKeysObjectForJit>();
-    let values = globals.ma_values.cast::<RawPyDictIndexedValues>();
-    if keys as usize != prepared.runtime_keys
-        || values as usize != prepared.runtime_values
-        || (*keys).dk_kind != 3
-        || (*keys).dk_nentries < 0
-        || (*values).capacity < 0
-        || !stop_iteration_runtime_entries_still_match(keys, values, &prepared.runtime_entries)
-    {
-        return false;
-    }
-
-    let builtins = &*(prepared.builtins as *mut ffi::PyDictObject);
-    let builtin_keys = builtins.ma_keys.cast::<super::RawPyDictKeysObjectForJit>();
-    if builtin_keys as usize != prepared.builtin_keys
-        || !builtins.ma_values.is_null()
-        || (*builtin_keys).dk_kind != 1
-        || (*builtin_keys).dk_nentries < 0
-        || !stop_iteration_builtin_entries_still_match(builtin_keys, &prepared.builtin_entries)
-    {
-        return false;
-    }
-
-    prepared.methods.iter().all(|method| {
-        let function = method.function as *mut ffi::PyObject;
-        ffi::PyFunction_Check(function) != 0
-            && crate::PyFunction_GetSoacFunctionId(function)
-                == method.function_id.to_packed_runtime_u64()
-            && (*function.cast::<ffi::PyFunctionObject>()).func_code as usize == method.code
-            && !super::raw_py_function_activation_is_observed(method.code as *mut ffi::PyObject)
-    })
-}
-
-unsafe fn generator_consumer_object_slot(
-    owner: *mut ffi::PyObject,
-    offset: usize,
-) -> *mut ffi::PyObject {
-    *owner.cast::<u8>().add(offset).cast::<*mut ffi::PyObject>()
-}
-
-unsafe fn guarded_generator_direct_next(
-    prepared: &crate::PreparedGeneratorBuiltinConsumer,
-    data: &crate::PyFunctionJitExtra,
-    iterator: *mut ffi::PyObject,
-) -> Option<*mut ffi::PyObject> {
-    if (*iterator).ob_type as usize != prepared.owner_type
-        || !guarded_generator_consumer_still_canonical(prepared, data, (*iterator).ob_type)
-    {
-        return None;
-    }
-
-    let resume = generator_consumer_object_slot(iterator, prepared.resume_function_offset);
-    let preserved = generator_consumer_object_slot(iterator, prepared.preserved_values_offset);
-    let closed = generator_consumer_object_slot(iterator, prepared.closed_slot_offset);
-    if resume.is_null()
-        || preserved.is_null()
-        || closed.is_null()
-        || ffi::PyFunction_Check(resume) == 0
-        || ffi::PyLong_CheckExact(closed) == 0
-        || ffi::PyCapsule_IsValid(preserved, c"soac.PreservedState".as_ptr()) == 0
-    {
-        return None;
-    }
-
-    let resume_metadata = crate::PyFunction_GetSoacMetadata(resume);
-    if resume_metadata.is_null() {
-        return None;
-    }
-    let resume_data = &*resume_metadata.cast::<crate::PyFunctionJitExtra>();
-    let resume_function = &*resume.cast::<ffi::PyFunctionObject>();
-    if resume_data.compile_session.id() != data.compile_session.id()
-        || *resume_data.function_template.function().lowered_kind()
-            != soac_core::block_py::FunctionKind::Generator
-        || resume_data.function_template.function().names.display_name != "<genexpr>"
-        || crate::PyFunction_GetSoacFunctionId(resume)
-            != resume_data.function_id.to_packed_runtime_u64()
-        || resume_function.func_code != resume_data.registered_code
-        || resume_data
-            .module_state
-            .lookup_original_code(resume_data.function_id)
-            .map(pyo3::Py::as_ptr)
-            != Some(resume_function.func_code)
-        || super::raw_py_function_activation_is_observed(resume_function.func_code)
-    {
-        return None;
-    }
-
-    let closed_slot = ffi::PyLong_AsSsize_t(closed);
-    if closed_slot < 0 {
-        if !ffi::PyErr_Occurred().is_null() {
-            ffi::PyErr_Clear();
-        }
-        return None;
-    }
-    let Some(layout) = resume_data
-        .function_template
-        .function()
-        .public_storage_layout()
-    else {
-        return None;
-    };
-    let Some(slot) = layout.preserved_slots.get(closed_slot as usize) else {
-        return None;
-    };
-    if slot.logical_name != "_dp_is_closed"
-        || slot.storage != soac_core::block_py::PreservedSlotStorage::I64
-    {
-        return None;
-    }
-    // The capsule is a mutable public instance attribute: another valid
-    // preserved state need not have this generator's expected slot count.
-    let closed_value = preserved_state::load_preserved_state_owned(preserved, closed_slot as i64);
-    if closed_value.is_null() {
-        if !ffi::PyErr_Occurred().is_null() {
-            ffi::PyErr_Clear();
-        }
-        return None;
-    }
-    if ffi::PyLong_CheckExact(closed_value) == 0 {
-        ffi::Py_DECREF(closed_value);
-        return None;
-    }
-    let closed_state = ffi::PyLong_AsLongLong(closed_value);
-    ffi::Py_DECREF(closed_value);
-    if !ffi::PyErr_Occurred().is_null() {
-        ffi::PyErr_Clear();
-        return None;
-    }
-    if closed_state != 0 {
-        ffi::PyErr_SetNone(ffi::PyExc_StopIteration);
-        return Some(ptr::null_mut());
-    }
-
-    let no_default =
-        prepared.runtime_entries[GENERATOR_RUNTIME_NO_DEFAULT].value as *mut ffi::PyObject;
-    // The Python send wrapper evaluates these attributes into owned call
-    // arguments. Keep the same owners alive if the generator body reenters and
-    // replaces an instance slot or the runtime sentinel while its native frame
-    // is active.
-    ffi::Py_INCREF(resume);
-    ffi::Py_INCREF(preserved);
-    ffi::Py_INCREF(no_default);
-    let result = crate::resume_generator(resume, iterator, preserved, ffi::Py_None(), no_default);
-    ffi::Py_DECREF(no_default);
-    ffi::Py_DECREF(preserved);
-    ffi::Py_DECREF(resume);
-    if !result.is_null() {
-        return Some(result);
-    }
-    let error = ffi::PyErr_GetRaisedException();
-    if error.is_null() {
-        return Some(ptr::null_mut());
-    }
-    if (*error).ob_type == ffi::PyExc_StopIteration.cast::<ffi::PyTypeObject>() {
-        // A native CPython generator does not run SOAC's cancellation helper when
-        // ordinary iteration ends. Preserve the pending exception until the owner
-        // is released, exactly as builtin any()/all() do.
-        ffi::PyErr_SetRaisedException(error);
-        return Some(ptr::null_mut());
-    }
-
-    // The body can replace the helper or resize/promote its runtime globals.
-    // Resolve the current global by its actual interned name instead of
-    // dereferencing cached dictionary storage after arbitrary Python code.
-    let helper_name = ffi::PyUnicode_InternFromString(c"_reraise_control_flow".as_ptr());
-    if helper_name.is_null() {
-        ffi::Py_DECREF(error);
-        return Some(ptr::null_mut());
-    }
-    let reraise = load_global_slow(
-        data.function_env.globals_obj(),
-        data.function_env.builtins_obj(),
-        helper_name,
-    );
-    ffi::Py_DECREF(helper_name);
-    if reraise.is_null() {
-        ffi::Py_DECREF(error);
-        return Some(ptr::null_mut());
-    }
-    let handled = ffi::PyObject_CallOneArg(reraise, error);
-    ffi::Py_DECREF(reraise);
-    ffi::Py_DECREF(error);
-    if handled.is_null() {
-        return Some(ptr::null_mut());
-    }
-    ffi::Py_DECREF(handled);
-    let none = ffi::Py_None();
-    ffi::Py_INCREF(none);
-    Some(none)
-}
-
-unsafe fn consume_guarded_generator_builtin(
-    prepared: &crate::PreparedGeneratorBuiltinConsumer,
-    data: &crate::PyFunctionJitExtra,
-    iterable: *mut ffi::PyObject,
-    kind: GuardedGeneratorBuiltin,
-) -> *mut ffi::PyObject {
-    let iterator = ffi::PyObject_GetIter(iterable);
-    if iterator.is_null() {
-        return ptr::null_mut();
-    }
-    let Some(iternext) = (*(*iterator).ob_type).tp_iternext else {
-        ffi::Py_DECREF(iterator);
-        ffi::PyErr_SetString(
-            ffi::PyExc_TypeError,
-            c"iter() returned a non-iterator".as_ptr(),
-        );
-        return ptr::null_mut();
-    };
-
-    loop {
-        let item = match guarded_generator_direct_next(prepared, data, iterator) {
-            Some(item) => item,
-            None => iternext(iterator),
-        };
-        if item.is_null() {
-            break;
-        }
-        let truth = ffi::PyObject_IsTrue(item);
-        ffi::Py_DECREF(item);
-        if truth < 0 {
-            ffi::Py_DECREF(iterator);
-            return ptr::null_mut();
-        }
-        if (kind == GuardedGeneratorBuiltin::Any && truth > 0)
-            || (kind == GuardedGeneratorBuiltin::All && truth == 0)
-        {
-            ffi::Py_DECREF(iterator);
-            return ffi::PyBool_FromLong((kind == GuardedGeneratorBuiltin::Any) as libc::c_long);
-        }
-    }
-
-    ffi::Py_DECREF(iterator);
-    if !ffi::PyErr_Occurred().is_null() {
-        if ffi::PyErr_ExceptionMatches(ffi::PyExc_StopIteration) == 0 {
-            return ptr::null_mut();
-        }
-        ffi::PyErr_Clear();
-    }
-    ffi::PyBool_FromLong((kind == GuardedGeneratorBuiltin::All) as libc::c_long)
-}
-
-#[inline(never)]
-unsafe fn fast_guarded_generator_builtin_consumption(
-    callable: ObjPtr,
-    args: ObjPtr,
-    kind: GuardedGeneratorBuiltin,
-) -> Option<ObjPtr> {
-    if crate::entry_interpreter_vectorcall_for_tests_enabled() {
-        return None;
-    }
-    let iterable = *args.cast::<*mut ffi::PyObject>();
-    if iterable.is_null() {
-        return None;
-    }
-    let owner_type = (*iterable).ob_type;
-    if owner_type.is_null() || (*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE == 0 {
-        return None;
-    }
-    let metadata = crate::PyType_GetSoacMetadata(owner_type.cast());
-    if metadata.is_null() {
-        return None;
-    }
-    let data = &*metadata.cast::<crate::PyFunctionJitExtra>();
-    if data.module_state.module_name != "soac.runtime" {
-        return None;
-    }
-    let prepared = match data
-        .function_template
-        .prepared_generator_builtin_consumer
-        .get()
-    {
-        Some(prepared) => prepared,
-        None => {
-            let prepared = prepare_guarded_generator_builtin_consumer(owner_type, data)?;
-            // Preparation may allocate Python names; never initialize a OnceLock
-            // while callbacks can reenter another generator consumer.
-            let _ = data
-                .function_template
-                .prepared_generator_builtin_consumer
-                .set(prepared);
-            data.function_template
-                .prepared_generator_builtin_consumer
-                .get()?
-        }
-    };
-    let callable_index = match kind {
-        GuardedGeneratorBuiltin::Any => 0,
-        GuardedGeneratorBuiltin::All => 1,
-    };
-    if callable as usize != prepared.builtin_entries[callable_index].value
-        || !guarded_generator_consumer_still_canonical(prepared, data, owner_type)
-    {
-        return None;
-    }
-
-    if ffi::Py_EnterRecursiveCall(c" while calling a Python object".as_ptr()) != 0 {
-        return Some(ptr::null_mut());
-    }
-    let result = consume_guarded_generator_builtin(prepared, data, iterable, kind);
-    ffi::Py_LeaveRecursiveCall();
-    Some(result.cast())
+    });
 }
 
 #[cfg(test)]
 #[test]
-fn stop_iteration_live_dictionary_guards_observe_unversioned_slot_mutations() {
-    unsafe extern "C" {
-        fn _PyDict_NewIndexedKeySet(keys: *mut ffi::PyObject) -> *mut c_void;
-        fn _PyDict_NewWithIndexedKeySet(keys: *mut c_void) -> *mut ffi::PyObject;
-        fn _PyDictKeys_DecRef(keys: *mut c_void);
-    }
+fn indexed_globals_preserve_alias_lookup_and_do_not_retry_policy_errors() {
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
 
     let _guard = crate::python_runtime_test_lock().lock().unwrap();
     crate::initialize_test_python();
-    pyo3::Python::attach(|_| unsafe {
-        let key_names = ffi::PyTuple_New(2);
-        assert!(!key_names.is_null(), "indexed key tuple must allocate");
-        for (index, name) in [c"present", c"missing"].iter().enumerate() {
-            let mut key = ffi::PyUnicode_FromString(name.as_ptr());
-            assert!(!key.is_null(), "indexed key must allocate");
-            ffi::PyUnicode_InternInPlace(&mut key);
-            assert_eq!(ffi::PyTuple_SetItem(key_names, index as isize, key), 0);
+    Python::attach(|py| {
+        let namespace = PyDict::new(py);
+        py.run(
+            cr#"import _testcapi, _testinternalcapi
+class Alias:
+    active = False
+    def __hash__(self): return hash('field')
+    def __eq__(self, other): return self.active and other == 'field'
+alias = Alias()
+globals_dict = _testinternalcapi.dict_new_indexed(('field',))
+globals_dict[alias] = ['alias']
+globals_dict['field'] = ['canonical']
+alias.active = True
+name = 'field'
+builtins_dict = {'field': ['builtin']}
+replacement = ['replacement']
+calls = []
+def reject(d, key, value, operation):
+    calls.append(key)
+    raise ValueError('owner refused write')
+protected = {'field': 1}
+owner = _testcapi.dict_set_soac_policy(protected, {'field': int}, (), reject)
+"#,
+            Some(&namespace),
+            None,
+        )
+        .unwrap();
+        let get = |name| namespace.get_item(name).unwrap().unwrap();
+        let globals = get("globals_dict");
+        let builtins = get("builtins_dict");
+        let name = get("name");
+        let replacement = get("replacement");
+        unsafe {
+            assert_eq!(
+                guarded_indexed_global_slot(globals.as_ptr().cast(), name.as_ptr(), 0),
+                -1
+            );
+            let value = soac_runtime_load_global_slow(
+                globals.as_ptr().cast(),
+                builtins.as_ptr().cast(),
+                name.as_ptr().cast(),
+                0,
+            );
+            assert!(!value.is_null());
+            let value = Bound::<pyo3::PyAny>::from_owned_ptr(py, value.cast());
+            assert_eq!(value.extract::<Vec<String>>().unwrap(), ["alias"]);
+            let stored = store_global_hook(
+                globals.as_ptr().cast(),
+                name.as_ptr().cast(),
+                0,
+                replacement.as_ptr().cast(),
+            );
+            assert_eq!(stored, replacement.as_ptr().cast());
+            ffi::Py_DECREF(stored.cast());
+            let mut physical = ptr::null_mut();
+            assert_eq!(
+                _PyDict_GetIndexedItem(globals.as_ptr(), 0, &mut physical),
+                1
+            );
+            let physical = Bound::<pyo3::PyAny>::from_owned_ptr(py, physical);
+            assert_eq!(physical.extract::<Vec<String>>().unwrap(), ["canonical"]);
+
+            let protected = get("protected");
+            let value = ffi::PyLong_FromLong(2);
+            let rejected = store_global_hook(
+                protected.as_ptr().cast(),
+                name.as_ptr().cast(),
+                0,
+                value.cast(),
+            );
+            assert!(rejected.is_null());
+            let error = PyErr::fetch(py);
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            ffi::Py_DECREF(value);
+            assert_eq!(get("calls").extract::<Vec<String>>().unwrap(), ["field"]);
         }
-
-        let indexed_keys = _PyDict_NewIndexedKeySet(key_names);
-        assert!(
-            !indexed_keys.is_null(),
-            "actual indexed key set must allocate"
-        );
-        let indexed_dict = _PyDict_NewWithIndexedKeySet(indexed_keys);
-        _PyDictKeys_DecRef(indexed_keys);
-        assert!(
-            !indexed_dict.is_null(),
-            "actual indexed dictionary must allocate"
-        );
-
-        let present_key = ffi::PyTuple_GetItem(key_names, 0);
-        let missing_key = ffi::PyTuple_GetItem(key_names, 1);
-        let present_index = _PyDict_IndexedKeyIndex(indexed_dict, present_key);
-        let missing_index = _PyDict_IndexedKeyIndex(indexed_dict, missing_key);
-        assert!(present_index >= 0 && missing_index >= 0);
-
-        let present = ffi::PyList_New(0);
-        let replacement = ffi::PyList_New(0);
-        assert!(!present.is_null() && !replacement.is_null());
-        assert_eq!(
-            _PyDict_SetIndexedItem(indexed_dict, present_index, present),
-            0
-        );
-        let present_refcount = ffi::Py_REFCNT(present);
-        let replacement_refcount = ffi::Py_REFCNT(replacement);
-        assert_eq!(
-            present_refcount, 2,
-            "the local and indexed slot each own one reference"
-        );
-        assert_eq!(
-            replacement_refcount, 1,
-            "the replacement begins locally owned"
-        );
-
-        let dict = &*indexed_dict.cast::<ffi::PyDictObject>();
-        let keys = dict.ma_keys.cast::<super::RawPyDictKeysObjectForJit>();
-        let values = dict.ma_values.cast::<RawPyDictIndexedValues>();
-        assert_eq!((*keys).dk_kind, 3);
-        let key_entries = stop_iteration_unicode_entries(keys);
-        let expected = [
-            crate::PreparedStopIterationDictionaryEntry {
-                index: present_index as usize,
-                key: (*key_entries.add(present_index as usize)).me_key as usize,
-                value: present as usize,
-            },
-            crate::PreparedStopIterationDictionaryEntry {
-                index: missing_index as usize,
-                key: (*key_entries.add(missing_index as usize)).me_key as usize,
-                value: 0,
-            },
-        ];
-        assert!(stop_iteration_runtime_entries_still_match(
-            keys, values, &expected,
-        ));
-
-        let slots = (&raw mut (*values).values).cast::<*mut ffi::PyObject>();
-        let version = (*keys).dk_version;
-        let used = dict.ma_used;
-
-        ffi::Py_INCREF(replacement);
-        *slots.add(present_index as usize) = replacement;
-        ffi::Py_DECREF(present);
-        assert_eq!(ffi::Py_REFCNT(present), present_refcount - 1);
-        assert_eq!(ffi::Py_REFCNT(replacement), replacement_refcount + 1);
-        assert_eq!((*keys).dk_version, version);
-        assert_eq!(dict.ma_used, used);
-        assert!(
-            !stop_iteration_runtime_entries_still_match(keys, values, &expected),
-            "replacing a present indexed value without watcher/version updates must invalidate"
-        );
-        ffi::Py_INCREF(present);
-        *slots.add(present_index as usize) = present;
-        ffi::Py_DECREF(replacement);
-        assert_eq!(ffi::Py_REFCNT(present), present_refcount);
-        assert_eq!(ffi::Py_REFCNT(replacement), replacement_refcount);
-        assert!(stop_iteration_runtime_entries_still_match(
-            keys, values, &expected,
-        ));
-
-        let missing_slot = slots.add(missing_index as usize);
-        let original_missing = *missing_slot;
-        ffi::Py_INCREF(replacement);
-        *missing_slot = replacement;
-        assert_eq!(ffi::Py_REFCNT(replacement), replacement_refcount + 1);
-        assert_eq!((*keys).dk_version, version);
-        assert_eq!(dict.ma_used, used);
-        assert!(
-            !stop_iteration_runtime_entries_still_match(keys, values, &expected),
-            "populating a formerly absent indexed shadow without metadata updates must invalidate"
-        );
-        *missing_slot = original_missing;
-        ffi::Py_DECREF(replacement);
-        assert_eq!(ffi::Py_REFCNT(replacement), replacement_refcount);
-        assert!(stop_iteration_runtime_entries_still_match(
-            keys, values, &expected,
-        ));
-
-        let builtin_dict = ffi::PyDict_New();
-        let builtin_key = ffi::PyUnicode_FromString(c"guarded".as_ptr());
-        assert!(!builtin_dict.is_null() && !builtin_key.is_null());
-        assert_eq!(ffi::PyDict_SetItem(builtin_dict, builtin_key, present), 0);
-        let builtin_keys = (*builtin_dict.cast::<ffi::PyDictObject>())
-            .ma_keys
-            .cast::<super::RawPyDictKeysObjectForJit>();
-        assert_eq!((*builtin_keys).dk_kind, 1);
-        let builtin_entry = prepare_stop_iteration_builtin_entry(builtin_keys, c"guarded").unwrap();
-        assert!(stop_iteration_builtin_entries_still_match(
-            builtin_keys,
-            &[builtin_entry],
-        ));
-        assert_eq!(
-            ffi::PyDict_SetItem(builtin_dict, builtin_key, replacement),
-            0
-        );
-        assert_eq!(
-            (*builtin_dict.cast::<ffi::PyDictObject>()).ma_keys as usize,
-            builtin_keys as usize,
-            "replacing an existing builtin value must retain its keys object"
-        );
-        assert!(
-            !stop_iteration_builtin_entries_still_match(builtin_keys, &[builtin_entry]),
-            "combined builtin value replacement must invalidate even when keys are unchanged"
-        );
-
-        ffi::Py_DECREF(builtin_key);
-        ffi::Py_DECREF(builtin_dict);
-        ffi::Py_DECREF(replacement);
-        ffi::Py_DECREF(present);
-        ffi::Py_DECREF(indexed_dict);
-        ffi::Py_DECREF(key_names);
     });
 }
 
@@ -1911,18 +502,6 @@ unsafe extern "C" fn guard_method_type_version_hook(
     ((*receiver_type).tp_version_tag == expected_version as u32) as i32
 }
 
-unsafe extern "C" fn py_call_with_kw_hook(
-    callable: ObjPtr,
-    args: ObjPtr,
-    kwargs: ObjPtr,
-) -> ObjPtr {
-    let result = ffi::PyObject_Call(
-        callable as *mut ffi::PyObject,
-        args as *mut ffi::PyObject,
-        kwargs as *mut ffi::PyObject,
-    ) as ObjPtr;
-    result
-}
 unsafe extern "C" fn record_top_value_sample_hook(counter: ObjPtr, value: i64) {
     if counter.is_null() || value < 0 {
         ffi::PyErr_SetString(
@@ -1955,7 +534,7 @@ unsafe extern "C" fn protocol_iter_function_id_hook(receiver: ObjPtr) -> i64 {
 }
 
 unsafe fn protocol_method_function_id_hook(receiver: ObjPtr, method_name: &std::ffi::CStr) -> i64 {
-    if receiver.is_null() {
+    if receiver.is_null() || !ffi::PyErr_Occurred().is_null() {
         return 0;
     }
     let receiver_type = ffi::Py_TYPE(receiver as *mut ffi::PyObject);
@@ -1966,17 +545,35 @@ unsafe fn protocol_method_function_id_hook(receiver: ObjPtr, method_name: &std::
     if dict.is_null() {
         return 0;
     }
-    let descriptor = ffi::PyDict_GetItemString(dict, method_name.as_ptr());
-    if descriptor.is_null() {
-        if !ffi::PyErr_Occurred().is_null() {
-            ffi::PyErr_Clear();
+    // An optional observation must not invoke equality/hash callbacks on
+    // arbitrary class-dictionary keys, or run a descriptor a second time.
+    let mut position = 0;
+    let mut key = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    while ffi::PyDict_Next(dict, &mut position, &mut key, &mut descriptor) != 0 {
+        if ffi::PyUnicode_CheckExact(key) != 0
+            && ffi::PyUnicode_CompareWithASCIIString(key, method_name.as_ptr()) == 0
+        {
+            return profile_callable_function_id_hook(descriptor.cast());
         }
+    }
+    0
+}
+
+unsafe fn profile_callable_function_id_hook(callable: ObjPtr) -> i64 {
+    // Preserve a pre-existing body error. Any error from optional owner
+    // authentication is consumed here; the eventual public call independently
+    // validates its authority and reports a required failure in ordinary order.
+    if !ffi::PyErr_Occurred().is_null() {
         return 0;
     }
-    if ffi::PyFunction_Check(descriptor) == 0 {
-        return 0;
+    match std::panic::catch_unwind(|| crate::observed_strict_function_id(callable.cast())) {
+        Ok(Some(function)) => function.to_packed_runtime_u64() as i64,
+        Ok(None) | Err(_) => {
+            ffi::PyErr_Clear();
+            0
+        }
     }
-    crate::PyFunction_GetSoacFunctionId(descriptor) as i64
 }
 unsafe extern "C" fn get_arg_item_hook(args: ObjPtr, index: i64) -> ObjPtr {
     if args.is_null() {
@@ -2013,9 +610,7 @@ unsafe fn load_global_obj_impl(
             return load_builtin_slow(builtins_obj.cast::<ffi::PyObject>(), name_obj).cast();
         }
         if rc < 0 {
-            // The module dict can be promoted after an unprofiled key insertion.
-            // Fall back to the mapping lookup so the JIT remains semantically CPython-like.
-            ffi::PyErr_Clear();
+            return ptr::null_mut();
         }
     }
     load_global_slow(
@@ -2035,7 +630,7 @@ unsafe fn guarded_indexed_global_slot(
     name_obj: *mut ffi::PyObject,
     expected_index: i64,
 ) -> i64 {
-    if expected_index < 0 {
+    if expected_index < 0 || _PyDict_HasNoLookupAliases(globals_obj as *mut ffi::PyObject) == 0 {
         return -1;
     }
     let actual_index = _PyDict_IndexedKeyIndex(globals_obj as *mut ffi::PyObject, name_obj) as i64;
@@ -2204,6 +799,8 @@ unsafe extern "C" fn store_global_hook(
         );
         return ptr::null_mut();
     }
+    let slot_index =
+        guarded_indexed_global_slot(globals_obj, name as *mut ffi::PyObject, slot_index);
     if slot_index >= 0 {
         let rc = _PyDict_SetIndexedItem(
             globals_obj as *mut ffi::PyObject,
@@ -2214,7 +811,9 @@ unsafe extern "C" fn store_global_hook(
             ffi::Py_INCREF(value as *mut ffi::PyObject);
             return value;
         }
-        ffi::PyErr_Clear();
+        // A policy/allocator/callback error is final, not a layout miss. A
+        // fallback retry could execute validation or user effects twice.
+        return ptr::null_mut();
     }
     let rc = ffi::PyObject_SetItem(
         globals_obj as *mut ffi::PyObject,
@@ -2366,25 +965,111 @@ unsafe extern "C" fn raise_super_arg_deleted_hook() {
 unsafe extern "C" fn make_cell_hook(value: ObjPtr) -> ObjPtr {
     PyCell_New(value as *mut ffi::PyObject) as ObjPtr
 }
-unsafe extern "C" fn load_cell_hook(cell: ObjPtr) -> ObjPtr {
+unsafe extern "C" fn load_cell_hook(cell: ObjPtr, name: ObjPtr, binding_kind: i64) -> ObjPtr {
+    if name.is_null()
+        || ffi::PyUnicode_CheckExact(name.cast()) == 0
+        || !matches!(binding_kind, 0 | 1)
+    {
+        if ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_SetString(
+                ffi::PyExc_SystemError,
+                c"dp_jit_load_cell requires an exact name and source binding kind".as_ptr(),
+            );
+        }
+        return ptr::null_mut();
+    }
     if !is_cell_object(cell as *mut ffi::PyObject) {
         raise_expected_cell("dp_jit_load_cell", cell as *mut ffi::PyObject);
         return ptr::null_mut();
     }
     let value = PyCell_Get(cell as *mut ffi::PyObject);
-    if value.is_null() {
-        if ffi::PyErr_ExceptionMatches(ffi::PyExc_ValueError) != 0 {
-            ffi::PyErr_Clear();
+    if value.is_null() && ffi::PyErr_Occurred().is_null() {
+        // The binding kind belongs to the original Load operation, not the
+        // current physical cell slot (which an inline clone may have remapped).
+        let (exception, message) = if binding_kind == 0 {
+            (
+                ffi::PyExc_UnboundLocalError,
+                c"cannot access local variable '%U' where it is not associated with a value",
+            )
+        } else {
+            (
+                ffi::PyExc_NameError,
+                c"cannot access free variable '%U' where it is not associated with a value in enclosing scope",
+            )
+        };
+        ffi::PyErr_Format(exception, message.as_ptr(), name.cast::<ffi::PyObject>());
+        if binding_kind == 1 {
+            // Match _PyEval_FormatExcCheckArg: only the free-variable
+            // NameError gets .name; local UnboundLocalError leaves it None.
+            let error = ffi::PyErr_GetRaisedException();
+            if !error.is_null() {
+                if ffi::PyErr_GivenExceptionMatches(error, ffi::PyExc_NameError) != 0 {
+                    let _ = ffi::PyObject_SetAttrString(error, c"name".as_ptr(), name.cast());
+                }
+                ffi::PyErr_SetRaisedException(error);
+            }
         }
-        ffi::PyErr_SetString(
-            ffi::PyExc_UnboundLocalError,
-            b"local variable referenced before assignment\0"
-                .as_ptr()
-                .cast(),
-        );
     }
     value as ObjPtr
 }
+
+#[cfg(test)]
+#[test]
+fn cell_load_errors_use_the_original_binding_and_preserve_pending_errors() -> pyo3::PyResult<()> {
+    use pyo3::prelude::*;
+    use pyo3::types::PyString;
+
+    let _guard = crate::python_runtime_test_lock().lock().unwrap();
+    crate::initialize_test_python();
+    Python::attach(|py| unsafe {
+        let cell = Bound::<PyAny>::from_owned_ptr_or_err(py, PyCell_New(ptr::null_mut()))?;
+        let name = PyString::new(py, "value");
+        for (kind, exception, message) in [
+            (
+                0,
+                ffi::PyExc_UnboundLocalError,
+                "cannot access local variable 'value' where it is not associated with a value",
+            ),
+            (
+                1,
+                ffi::PyExc_NameError,
+                "cannot access free variable 'value' where it is not associated with a value in enclosing scope",
+            ),
+        ] {
+            assert!(dp_jit_load_cell(cell.as_ptr().cast(), name.as_ptr().cast(), kind).is_null());
+            let error = PyErr::fetch(py);
+            assert_eq!(error.get_type(py).as_ptr(), exception);
+            assert_eq!(
+                error.value(py).getattr("args")?.extract::<(String,)>()?.0,
+                message
+            );
+            let actual_name = error.value(py).getattr("name")?;
+            if kind == 1 {
+                assert!(actual_name.is(&name));
+            } else {
+                assert!(actual_name.is_none());
+            }
+        }
+
+        let pending = pyo3::exceptions::PyValueError::new_err("existing lookup error");
+        let pending_value = pending.value(py).clone();
+        pending.restore(py);
+        assert!(dp_jit_load_cell(cell.as_ptr().cast(), name.as_ptr().cast(), 1).is_null());
+        assert!(PyErr::fetch(py).value(py).is(&pending_value));
+
+        assert!(dp_jit_load_cell(cell.as_ptr().cast(), name.as_ptr().cast(), 2).is_null());
+        assert!(PyErr::fetch(py).is_instance_of::<pyo3::exceptions::PySystemError>(py));
+
+        assert_eq!(PyCell_Set(cell.as_ptr(), ffi::Py_None()), 0);
+        let value = Bound::<PyAny>::from_owned_ptr_or_err(
+            py,
+            dp_jit_load_cell(cell.as_ptr().cast(), name.as_ptr().cast(), 1).cast(),
+        )?;
+        assert!(value.is_none());
+        Ok(())
+    })
+}
+
 unsafe extern "C" fn store_cell_hook(cell: ObjPtr, value: ObjPtr) -> ObjPtr {
     if !is_cell_object(cell as *mut ffi::PyObject) {
         raise_expected_cell("dp_jit_store_cell", cell as *mut ffi::PyObject);
@@ -2600,76 +1285,273 @@ unsafe extern "C" fn raise_from_exc_hook(exc: ObjPtr) -> i32 {
         return -1;
     }
     let exc_obj = exc as *mut ffi::PyObject;
-    ffi::Py_INCREF(exc_obj);
-    PyErr_SetRaisedException(exc_obj);
+    // The native raise path chains the actual handled exception, including
+    // supported C-API changes, before any handler transition is unwound.
+    ffi::PyErr_SetObject(ffi::Py_TYPE(exc_obj).cast(), exc_obj);
     0
 }
-unsafe fn attach_implicit_exception_context(exc: *mut ffi::PyObject, previous: *mut ffi::PyObject) {
-    if previous.is_null() || ptr::eq(exc, previous) {
-        return;
-    }
 
-    let suppress = ffi::PyObject_GetAttrString(exc, c"__suppress_context__".as_ptr());
-    if suppress.is_null() {
-        ffi::PyErr_Clear();
-    } else {
-        let is_suppressed = ffi::PyObject_IsTrue(suppress);
-        ffi::Py_DECREF(suppress);
-        if is_suppressed > 0 {
-            return;
-        }
-        if is_suppressed < 0 {
-            ffi::PyErr_Clear();
-            return;
-        }
-    }
-
-    let context = ffi::PyObject_GetAttrString(exc, c"__context__".as_ptr());
-    if context.is_null() {
-        ffi::PyErr_Clear();
-        return;
-    }
-    let has_context = !ptr::eq(context, ffi::Py_None());
-    ffi::Py_DECREF(context);
-    if has_context {
-        return;
-    }
-
-    if ffi::PyObject_SetAttrString(exc, c"__context__".as_ptr(), previous) != 0 {
-        ffi::PyErr_Clear();
-    }
-}
-unsafe extern "C" fn push_handled_exception_hook(exc: ObjPtr) -> ObjPtr {
-    if exc.is_null() {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_handled_state_init(
+    preserved: ObjPtr,
+    state: ObjPtr,
+    records: ObjPtr,
+    capacity: i64,
+    deopt_table: ObjPtr,
+) -> ObjPtr {
+    let Ok(capacity) = usize::try_from(capacity) else {
         ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"missing exception for dp_jit_push_handled_exception\0"
-                .as_ptr()
-                .cast(),
+            ffi::PyExc_SystemError,
+            c"invalid handled-state capacity".as_ptr(),
+        );
+        return ptr::null_mut();
+    };
+    if preserved.is_null() && (state.is_null() || records.is_null()) {
+        ffi::PyErr_SetString(
+            ffi::PyExc_SystemError,
+            c"invalid handled-state storage".as_ptr(),
         );
         return ptr::null_mut();
     }
-    let previous = PyErr_GetHandledException();
-    attach_implicit_exception_context(exc as *mut ffi::PyObject, previous);
-    PyErr_SetHandledException(exc as *mut ffi::PyObject);
-    previous as ObjPtr
-}
-unsafe extern "C" fn pop_handled_exception_hook(previous: ObjPtr) {
-    let previous = previous as *mut ffi::PyObject;
-    PyErr_SetHandledException(previous);
-    if !previous.is_null() {
-        ffi::Py_DECREF(previous);
+    if !preserved.is_null() {
+        let empty_plan = crate::handled_exception::HandledExceptionPlan::default();
+        // FunctionEnv owns the immutable original-first plan throughout this
+        // call. A standalone handler-free body needs no region identities.
+        let plan = if deopt_table.is_null() && capacity == 0 {
+            &empty_plan
+        } else if let Some(table) = unsafe {
+            deopt_table
+                .cast::<super::deopt::RuntimeJitDeoptTable>()
+                .as_ref()
+        } {
+            &table.handled_plan
+        } else {
+            ffi::PyErr_SetString(
+                ffi::PyExc_SystemError,
+                c"suspended body is missing its handled-region plan".as_ptr(),
+            );
+            return ptr::null_mut();
+        };
+        if plan.len() != capacity {
+            ffi::PyErr_SetString(
+                ffi::PyExc_SystemError,
+                c"suspended body has a different handled-region capacity".as_ptr(),
+            );
+            return ptr::null_mut();
+        }
+        return match unsafe {
+            preserved_state::enter_handled_exception_state(preserved.cast(), plan)
+        } {
+            Ok(state) => state.cast(),
+            Err(()) => ptr::null_mut(),
+        };
+    }
+    unsafe {
+        HandledExceptionState::initialize_normal(
+            state.cast(),
+            records.cast::<HandledExceptionRecord>(),
+            capacity,
+        )
+        .cast()
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_push_handled_exception(exc: ObjPtr) -> ObjPtr {
-    push_handled_exception_hook(exc)
+pub unsafe extern "C" fn dp_jit_handled_state_select(
+    state: ObjPtr,
+    regions: ObjPtr,
+    count: i64,
+    transition: i64,
+) -> i32 {
+    let Ok(count) = usize::try_from(count) else {
+        ffi::PyErr_SetString(
+            ffi::PyExc_SystemError,
+            c"invalid handled-region count".as_ptr(),
+        );
+        return -1;
+    };
+    let Some(transition) =
+        crate::handled_exception::HandledExceptionTransition::from_abi(transition)
+    else {
+        ffi::PyErr_SetString(
+            ffi::PyExc_SystemError,
+            c"invalid handled-region transition".as_ptr(),
+        );
+        return -1;
+    };
+    let regions = if count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(regions.cast::<HandledExceptionRegion>(), count) }
+    };
+    unsafe { HandledExceptionState::select(state.cast(), regions, transition) }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_pop_handled_exception(previous: ObjPtr) {
-    pop_handled_exception_hook(previous);
+pub unsafe extern "C" fn dp_jit_handled_state_raised(state: ObjPtr, scope: i64) {
+    unsafe { HandledExceptionState::mark_raised(state.cast(), scope as usize) };
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_handled_state_finish(
+    state: ObjPtr,
+    yielded: i64,
+    preserved: ObjPtr,
+) {
+    if yielded == 0 {
+        unsafe { crate::managed_generator::notify_terminal(preserved.cast()) };
+    }
+    unsafe { HandledExceptionState::retire_scopes_and_detach(state.cast(), yielded != 0) };
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_handled_state_release_residual(state: ObjPtr) {
+    unsafe { HandledExceptionState::release_residual(state.cast()) };
+}
+
+/// Release completed invocation and suspension ownership, without reconstructing
+/// native frames or specifying implicit finalizer timing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_retire_terminal_roots(environment: ObjPtr) -> i32 {
+    let Some(header) = (unsafe { environment.cast::<crate::FunctionEnvAbiHeader>().as_ref() })
+    else {
+        return 0;
+    };
+    let Some(activation) = (unsafe { header.active_strict_call.as_ref() }) else {
+        return 0;
+    };
+    let preserved = activation.preserved_state();
+    if unsafe { activation.retire_terminal_protocol_roots() }.is_err() {
+        return -1;
+    }
+    if !preserved.is_null()
+        && unsafe { crate::preserved_state::retire_terminal_protocol_roots(preserved) }.is_err()
+    {
+        return -1;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_reraise_current() {
+    unsafe { crate::handled_exception::reraise_current() };
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_restore_raised_exception(exception: ObjPtr) -> i32 {
+    unsafe { crate::handled_exception::restore_raised_exception(exception.cast()) }
+}
+
+/// Consume the owned completion value after the generator/coroutine activation
+/// and its frame roots have been released. CPython chains the caller's handled
+/// exception for None completion, but installs a non-None StopIteration value
+/// directly (preserving tuple and exception-object identity).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_generator_return(owned_value: ObjPtr) -> ObjPtr {
+    unsafe {
+        if owned_value.is_null() {
+            if ffi::PyErr_Occurred().is_null() {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_SystemError,
+                    c"generator completion is missing its return value".as_ptr(),
+                );
+            }
+            return ptr::null_mut();
+        }
+        if ffi::PyErr_Occurred().is_null() {
+            if owned_value.cast::<ffi::PyObject>() == ffi::Py_None() {
+                ffi::PyErr_SetNone(ffi::PyExc_StopIteration);
+            } else {
+                let exception =
+                    ffi::PyObject_CallOneArg(ffi::PyExc_StopIteration, owned_value.cast());
+                if !exception.is_null() {
+                    ffi::PyErr_SetRaisedException(exception);
+                }
+            }
+        }
+        // Allocation failure can make this the value's final reference. Keep
+        // the exact pending error while a finalizer runs during its release.
+        let error = ffi::PyErr_GetRaisedException();
+        ffi::Py_DECREF(owned_value.cast());
+        ffi::PyErr_SetRaisedException(error);
+        ptr::null_mut()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn generator_return_preserves_native_completion_context_value_and_owned_input() {
+    use pyo3::exceptions::{PyMemoryError, PyStopIteration, PyValueError};
+    use pyo3::prelude::*;
+
+    unsafe extern "C" {
+        fn PyErr_GetHandledException() -> *mut ffi::PyObject;
+        fn PyErr_SetHandledException(exception: *mut ffi::PyObject);
+    }
+    struct RestoreHandled(*mut ffi::PyObject);
+    impl Drop for RestoreHandled {
+        fn drop(&mut self) {
+            unsafe {
+                PyErr_SetHandledException(self.0);
+                ffi::Py_XDECREF(self.0);
+            }
+        }
+    }
+
+    let _guard = crate::python_runtime_test_lock().lock().unwrap();
+    crate::initialize_test_python();
+    Python::attach(|py| unsafe {
+        let _restore = RestoreHandled(PyErr_GetHandledException());
+        let outer = PyValueError::new_err("caller handled exception").into_value(py);
+        PyErr_SetHandledException(outer.as_ptr());
+        for expression in [
+            c"None",
+            c"True",
+            c"(object(), object())",
+            c"ValueError('return value')",
+        ] {
+            let value = py.eval(expression, None, None).unwrap();
+            let before = ffi::Py_REFCNT(value.as_ptr());
+            {
+                assert!(dp_jit_generator_return(value.clone().into_ptr().cast()).is_null());
+                let error = PyErr::fetch(py);
+                assert!(error.is_instance_of::<PyStopIteration>(py));
+                let exception = error.value(py);
+                assert!(exception.getattr("value").unwrap().is(&value));
+                let context = exception.getattr("__context__").unwrap();
+                if value.is_none() {
+                    assert!(context.is(outer.bind(py)));
+                    assert_eq!(exception.getattr("args").unwrap().len().unwrap(), 0);
+                } else {
+                    assert!(context.is_none());
+                    let args = exception.getattr("args").unwrap();
+                    assert_eq!(args.len().unwrap(), 1);
+                    assert!(args.get_item(0).unwrap().is(&value));
+                }
+                let current = PyErr_GetHandledException();
+                assert_eq!(current, outer.as_ptr());
+                ffi::Py_XDECREF(current);
+            }
+            assert_eq!(
+                ffi::Py_REFCNT(value.as_ptr()),
+                before,
+                "completion must consume exactly the input reference"
+            );
+        }
+
+        let value = py.eval(c"object()", None, None).unwrap();
+        let before = ffi::Py_REFCNT(value.as_ptr());
+        let memory_error = PyMemoryError::new_err("completion allocation").into_value(py);
+        ffi::PyErr_SetRaisedException(memory_error.clone_ref(py).into_ptr());
+        assert!(dp_jit_generator_return(value.clone().into_ptr().cast()).is_null());
+        let error = PyErr::fetch(py);
+        assert!(error.value(py).is(memory_error.bind(py)));
+        assert_eq!(
+            ffi::Py_REFCNT(value.as_ptr()),
+            before,
+            "pending-error cleanup must also consume the input reference"
+        );
+    });
 }
 
 #[cfg(test)]
@@ -2735,36 +1617,26 @@ mod test_only_export_stubs {
     panic_dual_i32_export!(dp_jit_raise_from_exc, dp_jit_raise_from_exc_with_frame(
         exc: ObjPtr
     ));
-    panic_obj_export!(dp_jit_push_handled_exception(exc: ObjPtr));
-    panic_unit_export!(dp_jit_pop_handled_exception(previous: ObjPtr));
     panic_dual_i32_export!(dp_jit_guard_method_type_version, dp_jit_guard_method_type_version_with_frame(
         receiver: ObjPtr,
         expected_type: ObjPtr,
         expected_version: i64
     ));
     panic_dual_obj_export!(dp_jit_py_call_positional_three, dp_jit_py_call_positional_three_with_frame(
-        tstate: ObjPtr,
         callable: ObjPtr,
         arg1: ObjPtr,
         arg2: ObjPtr,
         arg3: ObjPtr,
-        sentinel: ObjPtr,
+        globals: ObjPtr,
+        namespace: ObjPtr,
+        builtins: ObjPtr,
     ));
     panic_dual_obj_export!(dp_jit_py_call_object, dp_jit_py_call_object_with_frame(
         callable: ObjPtr,
-        args: ObjPtr
-    ));
-    panic_dual_obj_export!(dp_jit_py_vectorcall, dp_jit_py_vectorcall_with_frame(
-        tstate: ObjPtr,
-        callable: ObjPtr,
         args: ObjPtr,
-        nargsf: ObjPtr,
-        kwnames: ObjPtr
-    ));
-    panic_dual_obj_export!(dp_jit_py_call_with_kw, dp_jit_py_call_with_kw_with_frame(
-        callable: ObjPtr,
-        args: ObjPtr,
-        kw: ObjPtr
+        globals: ObjPtr,
+        namespace: ObjPtr,
+        builtins: ObjPtr,
     ));
     panic_unit_export!(dp_jit_record_top_value_sample(counter: ObjPtr, value: i64));
     panic_dual_obj_export!(dp_jit_get_arg_item, dp_jit_get_arg_item_with_frame(
@@ -2806,7 +1678,7 @@ mod test_only_export_stubs {
     panic_unit_export!(dp_jit_raise_unbound_local_error(name: ObjPtr));
     panic_unit_export!(dp_jit_raise_missing_required_argument());
     panic_unit_export!(dp_jit_raise_super_arg_deleted());
-    panic_obj_export!(dp_jit_load_cell(cell: ObjPtr));
+    panic_obj_export!(dp_jit_load_cell(cell: ObjPtr, name: ObjPtr, binding_kind: i64));
     panic_obj_export!(dp_jit_store_cell(cell: ObjPtr, value: ObjPtr));
     panic_obj_export!(dp_jit_del_deref(cell: ObjPtr));
     panic_obj_export!(dp_jit_del_deref_quietly(cell: ObjPtr));
@@ -2817,7 +1689,9 @@ mod test_only_export_stubs {
         function_data_obj: ObjPtr,
         record_ordinal: i64,
         live_values: ObjPtr,
-        live_value_count: i64
+        live_value_count: i64,
+        handled_state: ObjPtr,
+        strict_activation: ObjPtr
     ));
     panic_obj_export!(dp_jit_dict_new());
     panic_i32_export!(dp_jit_dict_set_item(dict_obj: ObjPtr, key: ObjPtr, value: ObjPtr));
@@ -2869,38 +1743,33 @@ define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_call_positional_three,
     dp_jit_py_call_positional_three_with_frame(
-        tstate: ObjPtr,
         callable: ObjPtr,
         arg1: ObjPtr,
         arg2: ObjPtr,
         arg3: ObjPtr,
-        _sentinel: ObjPtr
-    ) => py_call_positional_three_hook(tstate, callable, arg1, arg2, arg3)
+        globals: ObjPtr,
+        namespace: ObjPtr,
+        builtins: ObjPtr
+    ) => py_call_positional_three_hook(callable, arg1, arg2, arg3, globals, namespace, builtins)
 );
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_py_call_object,
-    dp_jit_py_call_object_with_frame(callable: ObjPtr, args: ObjPtr) => py_call_object_hook(callable, args)
-);
-define_perf_toggle_export!(
-    ObjPtr,
-    dp_jit_py_vectorcall,
-    dp_jit_py_vectorcall_with_frame(
-        tstate: ObjPtr,
+    dp_jit_py_call_object_with_frame(
         callable: ObjPtr,
         args: ObjPtr,
-        nargsf: ObjPtr,
-        kwnames: ObjPtr
-    ) => py_vectorcall_hook(tstate, callable, args, nargsf, kwnames)
-);
-define_perf_toggle_export!(
-    ObjPtr,
-    dp_jit_py_call_with_kw,
-    dp_jit_py_call_with_kw_with_frame(callable: ObjPtr, args: ObjPtr, kw: ObjPtr) => py_call_with_kw_hook(callable, args, kw)
+        globals: ObjPtr,
+        namespace: ObjPtr,
+        builtins: ObjPtr
+    ) => py_call_object_hook(callable, args, globals, namespace, builtins)
 );
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_record_top_value_sample(counter: ObjPtr, value: i64) {
     record_top_value_sample_hook(counter, value)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_profile_callable_function_id(callable: ObjPtr) -> i64 {
+    profile_callable_function_id_hook(callable)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_protocol_next_function_id(receiver: ObjPtr) -> i64 {
@@ -3086,8 +1955,8 @@ pub unsafe extern "C" fn dp_jit_raise_super_arg_deleted() {
     raise_super_arg_deleted_hook()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_load_cell(cell: ObjPtr) -> ObjPtr {
-    load_cell_hook(cell)
+pub unsafe extern "C" fn dp_jit_load_cell(cell: ObjPtr, name: ObjPtr, binding_kind: i64) -> ObjPtr {
+    load_cell_hook(cell, name, binding_kind)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_store_cell(cell: ObjPtr, value: ObjPtr) -> ObjPtr {
@@ -3113,6 +1982,8 @@ pub unsafe extern "C" fn dp_jit_deopt_resume(
     record_ordinal: i64,
     live_values: ObjPtr,
     live_value_count: i64,
+    handled_state: ObjPtr,
+    strict_activation: ObjPtr,
 ) -> ObjPtr {
     match unsafe {
         run_deopt_resume(
@@ -3123,6 +1994,8 @@ pub unsafe extern "C" fn dp_jit_deopt_resume(
             record_ordinal,
             live_values,
             live_value_count,
+            handled_state,
+            strict_activation,
         )
     } {
         Ok(value) => value,
@@ -3142,6 +2015,8 @@ unsafe fn run_deopt_resume(
     record_ordinal: i64,
     live_values: ObjPtr,
     live_value_count: i64,
+    handled_state: ObjPtr,
+    strict_activation: ObjPtr,
 ) -> Result<ObjPtr, String> {
     let invocation = unsafe {
         RuntimeJitDeoptInvocation::from_raw(
@@ -3152,13 +2027,25 @@ unsafe fn run_deopt_resume(
             record_ordinal,
             live_values,
             live_value_count,
+            handled_state.cast(),
+            strict_activation.cast(),
         )?
     };
+    // This is a diagnostic of the actual cold handoff, after validating its
+    // immutable table ordinal and incoming buffer shape. It is not a hot-path
+    // guard or evidence used to select an optimization in this process.
+    invocation.record_native_entry();
     super::deopt_interpreter::execute_deopt_invocation(&invocation)
 }
 
 #[cold]
 fn set_deopt_unsupported_continuation_error(detail: String) {
+    if unsafe { !ffi::PyErr_Occurred().is_null() } {
+        // In particular, a NULL boxed scalar can arrive with MemoryError.
+        // The diagnostic describes admission failure, not a replacement for
+        // the original Python error after the incoming owners are released.
+        return;
+    }
     let message = format!("JIT deopt helper is not implemented: {detail}");
     if let Ok(c_message) = std::ffi::CString::new(message) {
         unsafe {
@@ -3229,6 +2116,10 @@ fn chosen_helper_symbol(fast: *const u8, with_frame: *const u8) -> *const u8 {
 }
 
 pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
+    super::native_iterator_runtime::register_symbols(builder);
+    super::collection_runtime::register_symbols(builder);
+    super::iteration_runtime::register_symbols(builder);
+    super::call_arguments_runtime::register_symbols(builder);
     builder.symbol(
         "dp_jit_unpack_fixed_slow",
         dp_jit_unpack_fixed_slow as *const u8,
@@ -3260,11 +2151,12 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         ),
     );
     builder.symbol(
-        "dp_jit_py_vectorcall",
-        chosen_helper_symbol(
-            dp_jit_py_vectorcall as *const u8,
-            dp_jit_py_vectorcall_with_frame as *const u8,
-        ),
+        "dp_jit_match_sealed_field_capability",
+        crate::strict_class_state::dp_jit_match_sealed_field_capability as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_resolve_sealed_virtual_method_capability",
+        crate::strict_class_state::dp_jit_resolve_sealed_virtual_method_capability as *const u8,
     );
     builder.symbol(
         "dp_jit_make_generator_instance_from_vectorcall",
@@ -3273,13 +2165,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_enter_recursive_call",
         enter_recursive_call_hook as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_py_call_with_kw",
-        chosen_helper_symbol(
-            dp_jit_py_call_with_kw as *const u8,
-            dp_jit_py_call_with_kw_with_frame as *const u8,
-        ),
     );
     builder.symbol(
         "dp_jit_get_arg_item",
@@ -3297,12 +2182,32 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_load_runtime_obj_by_id as *const u8,
     );
     builder.symbol(
+        "dp_jit_checked_function_metadata",
+        crate::checked_function_metadata as *const u8,
+    );
+    builder.symbol(
         "dp_jit_vectorcall_bind_direct_args",
         crate::bind_direct_args_from_vectorcall as *const u8,
     );
     builder.symbol(
         "dp_jit_vectorcall_compile_function_env",
         crate::vectorcall_compile_function_env as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_strict_finish_call",
+        crate::strict_function::strict_finish_call as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_prepare_strict_direct_call",
+        crate::strict_call::dp_jit_prepare_strict_direct_call as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_finish_strict_direct_call",
+        crate::strict_call::dp_jit_finish_strict_direct_call as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_retire_strict_call_arguments",
+        crate::strict_call::dp_jit_retire_strict_call_arguments as *const u8,
     );
     builder.symbol(
         "dp_jit_vectorcall_previous_for_changed_code",
@@ -3380,6 +2285,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_record_top_value_sample as *const u8,
     );
     builder.symbol(
+        "dp_jit_profile_callable_function_id",
+        dp_jit_profile_callable_function_id as *const u8,
+    );
+    builder.symbol(
         "dp_jit_protocol_next_function_id",
         dp_jit_protocol_next_function_id as *const u8,
     );
@@ -3423,12 +2332,40 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         ),
     );
     builder.symbol(
-        "dp_jit_push_handled_exception",
-        push_handled_exception_hook as *const u8,
+        "dp_jit_handled_state_init",
+        dp_jit_handled_state_init as *const u8,
     );
     builder.symbol(
-        "dp_jit_pop_handled_exception",
-        pop_handled_exception_hook as *const u8,
+        "dp_jit_handled_state_select",
+        dp_jit_handled_state_select as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_handled_state_raised",
+        dp_jit_handled_state_raised as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_handled_state_finish",
+        dp_jit_handled_state_finish as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_handled_state_release_residual",
+        dp_jit_handled_state_release_residual as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_retire_terminal_roots",
+        dp_jit_retire_terminal_roots as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_reraise_current",
+        dp_jit_reraise_current as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_restore_raised_exception",
+        dp_jit_restore_raised_exception as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_generator_return",
+        dp_jit_generator_return as *const u8,
     );
     builder.symbol(
         "PyObject_RichCompare",

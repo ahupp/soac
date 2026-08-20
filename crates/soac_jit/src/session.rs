@@ -36,6 +36,50 @@ pub struct CompileSession {
         Mutex<HashMap<SharedTypedModulePlanCacheKey, Arc<SharedTypedModulePlanResult>>>,
     process_jit: OnceLock<Result<ProcessJitEngine, String>>,
     env_config: OnceLock<Result<SoacEnvConfig, String>>,
+    // Native startup authority is immutable per interpreter. This cache owns
+    // only Rust data/files, never Python objects or a process-wide Python key.
+    strict_interpreters: Mutex<HashMap<i64, StrictInterpreterConfiguration>>,
+    runtime_compilation_activity: RuntimeCompilationCounters,
+}
+
+/// An execution choice, never source or contract authority. A native
+/// interpreter chooses once before loading any selected source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrictExecutionBackend {
+    Soac,
+    CPython,
+}
+
+impl StrictExecutionBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Soac => "soac",
+            Self::CPython => "cpython",
+        }
+    }
+}
+
+#[derive(Default)]
+struct StrictInterpreterConfiguration {
+    backend: Option<StrictExecutionBackend>,
+    artifact_loader: Option<Option<Arc<crate::StrictArtifactLoader>>>,
+}
+
+/// Observations at the actual runtime compiler seams. These process-session
+/// counters are not admission permits; isolated interpreter tests use them to
+/// prove that native source execution did not enter lowering, its cache, or JIT.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeCompilationActivity {
+    pub lowering_entries: u64,
+    pub blockpy_cache_entries: u64,
+    pub jit_engine_entries: u64,
+}
+
+#[derive(Default)]
+struct RuntimeCompilationCounters {
+    lowering_entries: AtomicU64,
+    blockpy_cache_entries: AtomicU64,
+    jit_engine_entries: AtomicU64,
 }
 
 type PlannedOptimizationInputsResult = Result<PlannedOptimizationInputs, String>;
@@ -192,6 +236,8 @@ impl CompileSession {
             shared_typed_module_plans: Mutex::new(HashMap::new()),
             process_jit: OnceLock::new(),
             env_config: OnceLock::new(),
+            strict_interpreters: Mutex::new(HashMap::new()),
+            runtime_compilation_activity: RuntimeCompilationCounters::default(),
         }
     }
 
@@ -204,6 +250,100 @@ impl CompileSession {
 
     pub fn process() -> Arc<Self> {
         Arc::clone(PROCESS_COMPILE_SESSION.get_or_init(|| Arc::new(Self::new())))
+    }
+
+    pub fn strict_artifact_loader(
+        &self,
+        py: pyo3::Python<'_>,
+    ) -> pyo3::PyResult<Option<Arc<crate::StrictArtifactLoader>>> {
+        let interpreter =
+            unsafe { pyo3::ffi::PyInterpreterState_GetID(pyo3::ffi::PyInterpreterState_Get()) };
+        if interpreter < 0 {
+            return Err(pyo3::PyErr::fetch(py));
+        }
+        let mut interpreters = self.strict_interpreters.lock().map_err(|_| {
+            crate::strict_runtime_unavailable(py, "strict artifact loader cache is poisoned")
+        })?;
+        let configuration = interpreters.entry(interpreter).or_default();
+        if let Some(loader) = &configuration.artifact_loader {
+            return Ok(loader.clone());
+        }
+        let loader = crate::StrictArtifactLoader::capture(py)?.map(Arc::new);
+        configuration.artifact_loader = Some(loader.clone());
+        Ok(loader)
+    }
+
+    pub fn select_strict_backend(
+        &self,
+        py: pyo3::Python<'_>,
+        requested: Option<StrictExecutionBackend>,
+    ) -> pyo3::PyResult<StrictExecutionBackend> {
+        let interpreter =
+            unsafe { pyo3::ffi::PyInterpreterState_GetID(pyo3::ffi::PyInterpreterState_Get()) };
+        if interpreter < 0 {
+            return Err(pyo3::PyErr::fetch(py));
+        }
+        let mut interpreters = self.strict_interpreters.lock().map_err(|_| {
+            crate::strict_runtime_unavailable(py, "strict interpreter configuration is poisoned")
+        })?;
+        let configuration = interpreters.entry(interpreter).or_default();
+        if let Some(backend) = configuration.backend {
+            if requested.is_some_and(|requested| requested != backend) {
+                return Err(crate::strict_runtime_unavailable(
+                    py,
+                    "strict execution backend is immutable within an interpreter",
+                ));
+            }
+            return Ok(backend);
+        }
+        let backend = requested.unwrap_or(StrictExecutionBackend::Soac);
+        configuration.backend = Some(backend);
+        Ok(backend)
+    }
+
+    /// Must precede the runtime's actual BlockPy cache/lowering operation.
+    /// Selecting a backend never permits an unauthenticated module to enter it.
+    pub fn enter_runtime_lowering(&self, py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
+        self.require_soac_backend(py)?;
+        self.runtime_compilation_activity
+            .lowering_entries
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn enter_runtime_blockpy_cache(&self, py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
+        self.require_soac_backend(py)?;
+        self.runtime_compilation_activity
+            .blockpy_cache_entries
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn require_soac_backend(&self, py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
+        if self.select_strict_backend(py, None)? == StrictExecutionBackend::CPython {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "SOAC compilation is disabled for the CPython interpreter backend",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn runtime_compilation_activity(&self) -> RuntimeCompilationActivity {
+        RuntimeCompilationActivity {
+            lowering_entries: self
+                .runtime_compilation_activity
+                .lowering_entries
+                .load(Ordering::Relaxed),
+            blockpy_cache_entries: self
+                .runtime_compilation_activity
+                .blockpy_cache_entries
+                .load(Ordering::Relaxed),
+            jit_engine_entries: self
+                .runtime_compilation_activity
+                .jit_engine_entries
+                .load(Ordering::Relaxed),
+        }
     }
 
     pub fn flush_counter_dump_outputs(&self) -> Result<(), String> {
@@ -233,6 +373,9 @@ impl CompileSession {
     }
 
     pub(crate) fn process_jit(&self) -> Result<&ProcessJitEngine, String> {
+        self.runtime_compilation_activity
+            .jit_engine_entries
+            .fetch_add(1, Ordering::Relaxed);
         match self.process_jit.get_or_init(|| ProcessJitEngine::new(self)) {
             Ok(engine) => Ok(engine),
             Err(err) => Err(err.clone()),
@@ -568,5 +711,57 @@ mod test {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn strict_backend_selection_is_immutable_and_blocks_runtime_lowering() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        pyo3::Python::attach(|py| {
+            let native = CompileSession::new();
+            assert_eq!(
+                native
+                    .select_strict_backend(py, Some(super::StrictExecutionBackend::CPython))
+                    .unwrap(),
+                super::StrictExecutionBackend::CPython,
+            );
+            assert_eq!(
+                native.select_strict_backend(py, None).unwrap(),
+                super::StrictExecutionBackend::CPython,
+            );
+            assert!(
+                native
+                    .select_strict_backend(py, Some(super::StrictExecutionBackend::Soac))
+                    .is_err()
+            );
+            assert!(native.enter_runtime_blockpy_cache(py).is_err());
+            assert!(native.enter_runtime_lowering(py).is_err());
+            assert_eq!(
+                native.runtime_compilation_activity(),
+                super::RuntimeCompilationActivity::default()
+            );
+            assert!(native.process_jit.get().is_none());
+
+            let compiled = CompileSession::new();
+            assert_eq!(
+                compiled.select_strict_backend(py, None).unwrap(),
+                super::StrictExecutionBackend::Soac,
+            );
+            compiled.enter_runtime_blockpy_cache(py).unwrap();
+            compiled.enter_runtime_lowering(py).unwrap();
+            assert_eq!(
+                compiled.runtime_compilation_activity(),
+                super::RuntimeCompilationActivity {
+                    blockpy_cache_entries: 1,
+                    lowering_entries: 1,
+                    jit_engine_entries: 0,
+                }
+            );
+            assert!(
+                compiled
+                    .select_strict_backend(py, Some(super::StrictExecutionBackend::CPython))
+                    .is_err()
+            );
+        });
     }
 }

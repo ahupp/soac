@@ -7,7 +7,7 @@ use std::ffi::{CStr, CString, c_char, c_int};
 use std::mem::{self, offset_of};
 use std::ptr;
 
-use super::{ModuleConstantId, ModuleConstantValue};
+use super::ModuleConstantValue;
 
 unsafe extern "C" {
     fn _Py_SetImmortal(op: *mut ffi::PyObject);
@@ -170,22 +170,9 @@ pub(super) fn build_python_constants(
     values: &[ModuleConstantValue],
     py: Python<'_>,
     runtime_name_mode: RuntimeNameConstantMode,
-    mut static_resolver: impl FnMut(ModuleConstantId) -> PyResult<Option<*mut ffi::PyObject>>,
 ) -> PyResult<Vec<Py<PyAny>>> {
     let mut out = Vec::with_capacity(values.len());
-    for (index, value) in values.iter().enumerate() {
-        let constant_id = ModuleConstantId(index);
-        if static_pyobject_image(value).is_some()
-            && let Some(ptr) = static_resolver(constant_id)?
-        {
-            if matches!(value, ModuleConstantValue::Unicode(_)) {
-                out.push(unsafe { intern_borrowed_unicode_constant(py, ptr)? });
-            } else {
-                let bound: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, ptr) };
-                out.push(bound.unbind());
-            }
-            continue;
-        }
+    for value in values {
         out.push(match value {
             ModuleConstantValue::Unicode(bytes) => {
                 if let Some(template) = StaticPyObjectTemplate::for_unicode(bytes) {
@@ -531,18 +518,6 @@ fn build_static_unicode_constant(
 fn intern_owned_unicode_constant(py: Python<'_>, object: Py<PyAny>) -> PyResult<Py<PyAny>> {
     let mut ptr = object.into_ptr();
     unsafe {
-        ffi::PyUnicode_InternInPlace(&mut ptr);
-        Bound::from_owned_ptr_or_err(py, ptr).map(Py::from)
-    }
-}
-
-unsafe fn intern_borrowed_unicode_constant(
-    py: Python<'_>,
-    ptr: *mut ffi::PyObject,
-) -> PyResult<Py<PyAny>> {
-    let mut ptr = ptr;
-    unsafe {
-        ffi::Py_INCREF(ptr);
         ffi::PyUnicode_InternInPlace(&mut ptr);
         Bound::from_owned_ptr_or_err(py, ptr).map(Py::from)
     }
@@ -1063,110 +1038,6 @@ mod tests {
 
                 let mut utf8_len = 0;
                 let utf8 = ffi::PyUnicode_AsUTF8AndSize(image_obj, &mut utf8_len);
-                assert!(!utf8.is_null());
-                assert_eq!(utf8_len as usize, value.len());
-                assert_eq!(
-                    std::slice::from_raw_parts(utf8.cast::<u8>(), utf8_len as usize),
-                    value.as_bytes()
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn build_python_constants_uses_static_resolver_for_static_pylong() {
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let mut constants = ModuleCodegenConstants::default();
-            let constant_id = constants.intern_int(12345);
-            let resolved_ptr = unsafe { ffi::PyLong_FromLongLong(12345) };
-            assert!(
-                !resolved_ptr.is_null(),
-                "test PyLong allocation should succeed"
-            );
-
-            let objects = constants
-                .build_python_constants_with_static_resolver(py, false, |id| {
-                    assert_eq!(id, constant_id);
-                    Ok(Some(resolved_ptr))
-                })
-                .expect("building constants with static resolver should succeed");
-
-            assert_eq!(objects[constant_id.0].as_ptr(), resolved_ptr);
-        });
-    }
-
-    #[test]
-    fn build_python_constants_interns_static_resolver_unicode() {
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let mut constants = ModuleCodegenConstants::default();
-            let constant_id = constants.intern_unicode_bytes(b"soac-static-resolver-ascii");
-            let image = constants
-                .static_pyobject_image(constant_id)
-                .expect("test constant should have a static image");
-            let resolved_object = materialize_static_pyobject_image(py, &image)
-                .expect("materializing static Unicode image should succeed");
-            let resolved_ptr = resolved_object.as_ptr();
-
-            let objects = constants
-                .build_python_constants_with_static_resolver(py, false, |id| {
-                    assert_eq!(id, constant_id);
-                    Ok(Some(resolved_ptr))
-                })
-                .expect("building constants with static resolver should succeed");
-
-            let obj = objects[constant_id.0].as_ptr();
-            unsafe {
-                assert_ne!(ffi::PyUnicode_CheckExact(obj), 0);
-                assert_eq!(ffi::_PyUnicode_CheckConsistency(obj, 1), 1);
-                let raw = &*(obj.cast::<RawPyASCIIObject>());
-                assert_ne!(raw.state & RAW_PYUNICODE_INTERNED_MASK, 0);
-                assert_eq!(ffi::PyUnicode_GET_LENGTH(obj), 26);
-                let mut utf8_len = 0;
-                let utf8 = ffi::PyUnicode_AsUTF8AndSize(obj, &mut utf8_len);
-                assert!(!utf8.is_null());
-                assert_eq!(utf8_len, 26);
-                assert_eq!(
-                    std::slice::from_raw_parts(utf8.cast::<u8>(), utf8_len as usize),
-                    b"soac-static-resolver-ascii"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn build_python_constants_interns_static_resolver_non_ascii_unicode() {
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let mut constants = ModuleCodegenConstants::default();
-            let value = "caf\u{e9} \u{1f40d}";
-            let constant_id = constants.intern_unicode_bytes(value.as_bytes());
-            let image = constants
-                .static_pyobject_image(constant_id)
-                .expect("test non-ASCII constant should have a static image");
-            let resolved_object = materialize_static_pyobject_image(py, &image)
-                .expect("materializing static non-ASCII Unicode image should succeed");
-            let resolved_ptr = resolved_object.as_ptr();
-
-            let objects = constants
-                .build_python_constants_with_static_resolver(py, false, |id| {
-                    assert_eq!(id, constant_id);
-                    Ok(Some(resolved_ptr))
-                })
-                .expect("building constants with static resolver should succeed");
-
-            let obj = objects[constant_id.0].as_ptr();
-            unsafe {
-                assert_ne!(ffi::PyUnicode_CheckExact(obj), 0);
-                assert_eq!(ffi::_PyUnicode_CheckConsistency(obj, 1), 1);
-                let raw = &*(obj.cast::<RawPyCompactUnicodeObject>());
-                assert_ne!(raw.base.state & RAW_PYUNICODE_COMPACT_MASK, 0);
-                assert_eq!(raw.base.state & RAW_PYUNICODE_ASCII_MASK, 0);
-                assert_ne!(raw.base.state & RAW_PYUNICODE_INTERNED_MASK, 0);
-                assert_eq!(ffi::PyUnicode_GET_LENGTH(obj), 6);
-                let mut utf8_len = 0;
-                let utf8 = ffi::PyUnicode_AsUTF8AndSize(obj, &mut utf8_len);
                 assert!(!utf8.is_null());
                 assert_eq!(utf8_len as usize, value.len());
                 assert_eq!(

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import textwrap
+import pytest
+
+from tests._strict_integration import create_strict_project
 
 
+# Original ordinary source, retained unchanged. Strict enrollment is explicit
+# in the fixture; import-hook/mode settings alone are never admission evidence.
 _MODULE_SOURCE = """
 import gc
 
@@ -164,422 +163,539 @@ def collect_cycle():
 """
 
 
-def _run_eager_worker(
-    tmp_path: Path, module_name: str, work_dir: Path, mode: str
-) -> tuple[dict, Path]:
-    event_path = work_dir / f"{mode}-events.jsonl"
-    script = textwrap.dedent(
-        """
-        import builtins as _builtins
-        import ctypes
-        import gc
-        import importlib
-        import json
-        import sys
-        import types
+@pytest.fixture(scope="module", params=("soac", "cpython"))
+def eager_project(tmp_path_factory, request):
+    return create_strict_project(
+        tmp_path_factory.mktemp(f"eager-semantic-{request.param}"),
+        {
+            "eager_source.py": "from __future__ import strict\n" + _MODULE_SOURCE,
+            "eager_ordinary.py": _MODULE_SOURCE,
+        },
+        modules={"eager_source": "eager_source.py"},
+        backend=request.param,
+    )
 
-        module_name = __MODULE_NAME__
-        root = __MODULE_ROOT__
-        source = open(root + "/" + module_name + ".py", encoding="utf-8").read()
-        stock_globals = {"__name__": "stock_eager_control", "__builtins__": _builtins.__dict__}
-        exec(compile(source, "<stock-eager-control>", "exec"), stock_globals)
 
-        sys.path.insert(0, root)
-        from soac import _soac_ext
-        from soac.import_hook import install
-        install()
-        module = importlib.import_module(module_name)
-        import soac.bootstrap as bootstrap
-        import soac.runtime as runtime
-
-        names = {"<listcomp>", "<setcomp>", "<dictcomp>", "<genexpr>"}
-        watched = {"stock": [], "soac": []}
-        audits = {"stock": [], "soac": [], "controls": []}
-        errors = []
-        phase = "stock"
-
-        def audit(event, args):
-            if event == "code.__new__" and len(args) >= 3 and args[2] in names:
-                audits[phase].append(args[2])
-
-        sys.addaudithook(audit)
-        watcher_type = ctypes.CFUNCTYPE(
-            ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+def _run_modes(project, name, validation, required_functions):
+    path = project.root / f"{name}-validation.py"
+    path.write_text(validation)
+    for entry in ((False, True) if project.backend == "soac" else (False,)):
+        project.run_case(
+            name,
+            validation,
+            path,
+            entry_interpreter=entry,
+            required_functions=required_functions,
         )
 
-        @watcher_type
-        def watch(event, pointer, _new_value):
-            if event != 0:
-                return 0
-            try:
-                function = ctypes.cast(pointer, ctypes.py_object).value
-                code = function.__code__
-                if code.co_name in names:
-                    if function.__globals__ is stock_globals:
-                        watched["stock"].append((code.co_name, code.co_qualname))
-                    elif function.__globals__ is module.__dict__:
-                        watched["soac"].append((code.co_name, code.co_qualname))
-            except BaseException as error:
-                errors.append(type(error).__name__)
-            return 0
 
-        add = ctypes.pythonapi.PyFunction_AddWatcher
-        add.argtypes = [watcher_type]
-        add.restype = ctypes.c_int
-        clear = ctypes.pythonapi.PyFunction_ClearWatcher
-        clear.argtypes = [ctypes.c_int]
-        clear.restype = ctypes.c_int
-        watcher_id = add(watch)
-        assert watcher_id >= 0, watcher_id
+def test_set_comprehension_does_not_read_shadowable_constructor(eager_project):
+    validation = """
+import eager_ordinary
+import eager_source
 
-        def synthetic_count():
-            return sum(name != "<genexpr>" for name, _ in watched["soac"])
+events = []
 
-        try:
-            expected = stock_globals["canonical"](3, (1, 2))
-            stock_created = list(watched["stock"])
-            stock_audits = list(audits["stock"])
+def shadowed_set(*args, **kwargs):
+    events.append((args, kwargs))
+    raise AssertionError("set comprehension looked up the source name 'set'")
 
-            phase = "soac"
-            assert module.canonical(3, (1, 2)) == expected
-            canonical_created = list(watched["soac"])
-            canonical_audits = list(audits["soac"])
-            assert module.canonical(30, (1, 2)) == stock_globals["canonical"](
-                30, (1, 2)
-            )
-            phase = "controls"
-
-            for offset in range(32):
-                assert module.mixed(offset) == [offset, offset + 1]
-                assert module.unrelated(offset) == offset + 1
-
-            original_factory = runtime.code_with_freevars
-            assert original_factory is bootstrap.code_with_freevars
-            callbacks = []
-
-            def patched_factory(freevars, is_async, is_generator):
-                callbacks.append(tuple(freevars))
-                return original_factory(freevars, is_async, is_generator)
-
-            runtime.code_with_freevars = patched_factory
-            try:
-                assert module.prepatched(5) == [5, 6]
-                assert module.mixed(100) == [100, 101]
-            finally:
-                runtime.code_with_freevars = original_factory
-            assert len(callbacks) == 2, callbacks
-
-            assert module.postpatched(6) == [6, 7]
-            runtime.code_with_freevars = patched_factory
-            try:
-                assert module.postpatched(60) == [60, 61]
-            finally:
-                runtime.code_with_freevars = original_factory
-            assert len(callbacks) == 3, callbacks
-
-            original_code = original_factory.__code__
-            delegated_factory = types.FunctionType(
-                original_code,
-                original_factory.__globals__,
-                original_factory.__name__,
-                original_factory.__defaults__,
-                original_factory.__closure__,
-            )
-            _builtins._soac_eager_delegate = delegated_factory
-            _builtins._soac_eager_code_calls = []
-
-            def alternate_code(freevars, is_async, is_generator):
-                _builtins._soac_eager_code_calls.append(tuple(freevars))
-                return _builtins._soac_eager_delegate(
-                    freevars, is_async, is_generator
-                )
-
-            try:
-                original_factory.__code__ = alternate_code.__code__
-                assert module.modified_factory_code(7) == [7, 8]
-                code_calls = list(_builtins._soac_eager_code_calls)
-            finally:
-                original_factory.__code__ = original_code
-                del _builtins._soac_eager_delegate
-                del _builtins._soac_eager_code_calls
-            assert len(code_calls) == 1, code_calls
-
-            runtime.code_with_freevars = patched_factory
-            bootstrap.code_with_freevars = patched_factory
-            try:
-                assert module.both_factories_replaced(8) == [8, 9]
-            finally:
-                runtime.code_with_freevars = original_factory
-                bootstrap.code_with_freevars = original_factory
-            assert len(callbacks) == 4, callbacks
-
-            original_cache = bootstrap._DP_CODE_WITH_FREEVARS_CACHE
-            reentered = []
-
-            class ReentrantCache(dict):
-                active = False
-
-                def get(self, key, default=None):
-                    if not self.active:
-                        self.active = True
-                        try:
-                            reentered.append(module.reentrant(80))
-                        finally:
-                            self.active = False
-                    return super().get(key, default)
-
-            bootstrap._DP_CODE_WITH_FREEVARS_CACHE = ReentrantCache(original_cache)
-            try:
-                assert module.reentrant(9) == [9, 10]
-            finally:
-                bootstrap._DP_CODE_WITH_FREEVARS_CACHE = original_cache
-            assert reentered == [[80, 81]], reentered
-
-            original_runtime = sys.modules["soac.runtime"]
-            replacement = types.ModuleType("soac.runtime")
-            replacement.__dict__.update(original_runtime.__dict__)
-            replacement.code_with_freevars = patched_factory
-            sys.modules["soac.runtime"] = replacement
-            try:
-                assert module.replaced_module(10) == [10, 11]
-            finally:
-                sys.modules["soac.runtime"] = original_runtime
-            assert len(callbacks) == 5, callbacks
-
-            stock_lazy = stock_globals["lazy"](12)
-            soac_lazy = module.lazy(12)
-            assert next(stock_lazy) == next(soac_lazy) == 12
-            assert list(stock_lazy) == list(soac_lazy) == [13]
-            assert any(name == "<genexpr>" for name, _ in watched["stock"])
-            assert any(name == "<genexpr>" for name, _ in watched["soac"])
-
-            first = module.source_function(13)
-            second = module.source_function(130)
-            assert isinstance(first, types.FunctionType)
-            assert isinstance(second, types.FunctionType)
-            assert first is not second and first(1) == 14 and second(1) == 131
-            spoofed = module.spoofed_source_function(14)
-            assert isinstance(spoofed, types.FunctionType)
-            assert spoofed(1) == 15
-
-            for fail in (False, True):
-                expected_lifetime = stock_globals["lifetime"](fail)
-                actual_lifetime = module.lifetime(fail)
-                if fail:
-                    assert expected_lifetime == (
-                        None,
-                        ("iter", "read", "caught", "drop-item", "drop-iterator"),
-                    ), expected_lifetime
-                    assert actual_lifetime == (
-                        None,
-                        ("iter", "read", "drop-item", "caught", "drop-iterator"),
-                    ), actual_lifetime
-                else:
-                    assert actual_lifetime == expected_lifetime, (
-                        actual_lifetime,
-                        expected_lifetime,
-                    )
-                assert actual_lifetime[1].count("drop-item") == 1
-                assert actual_lifetime[1].count("drop-iterator") == 1
-            assert module.collect_cycle() == ([11, 11], 1)
-
-            observer_counts = {}
-            before = synthetic_count()
-
-            def trace(frame, event, argument):
-                return trace
-
-            sys.settrace(trace)
-            try:
-                assert module.observed(20) == [20, 21]
-            finally:
-                sys.settrace(None)
-            observer_counts["trace"] = synthetic_count() - before
-
-            before = synthetic_count()
-
-            def profile(frame, event, argument):
-                return None
-
-            sys.setprofile(profile)
-            try:
-                assert module.observed(21) == [21, 22]
-            finally:
-                sys.setprofile(None)
-            observer_counts["profile"] = synthetic_count() - before
-
-            monitoring = sys.monitoring
-            tool_id = next(
-                identifier
-                for identifier in range(6)
-                if monitoring.get_tool(identifier) is None
-            )
-            monitor_events = []
-
-            def monitor(code, offset):
-                if code is module.observed.__code__:
-                    monitor_events.append(offset)
-
-            monitoring.use_tool_id(tool_id, "soac.eager-comprehension-elision")
-            try:
-                monitoring.register_callback(
-                    tool_id, monitoring.events.PY_START, monitor
-                )
-                monitoring.set_local_events(
-                    tool_id, module.observed.__code__, monitoring.events.PY_START
-                )
-                before = synthetic_count()
-                assert module.observed(22) == [22, 23]
-                observer_counts["monitor-local"] = synthetic_count() - before
-                monitoring.set_local_events(tool_id, module.observed.__code__, 0)
-
-                monitoring.set_events(tool_id, monitoring.events.PY_START)
-                try:
-                    before = synthetic_count()
-                    assert module.observed(23) == [23, 24]
-                    observer_counts["monitor-global"] = synthetic_count() - before
-                finally:
-                    monitoring.set_events(tool_id, 0)
-            finally:
-                monitoring.set_events(tool_id, 0)
-                monitoring.set_local_events(tool_id, module.observed.__code__, 0)
-                monitoring.register_callback(tool_id, monitoring.events.PY_START, None)
-                monitoring.free_tool_id(tool_id)
-            assert all(count >= 1 for count in observer_counts.values()), (
-                observer_counts
-            )
-
-            before = synthetic_count()
-            previous = _soac_ext.force_entry_interpreter_for_tests(True)
-            try:
-                assert module.forced(24) == [24, 25]
-            finally:
-                _soac_ext.force_entry_interpreter_for_tests(previous)
-            assert synthetic_count() > before
-            assert errors == [], errors
-        finally:
-            assert clear(watcher_id) == 0
-
-        print(json.dumps({
-            "mode": __MODE__,
-            "stock_created": stock_created,
-            "stock_audits": stock_audits,
-            "soac_created": canonical_created,
-            "soac_audits": canonical_audits,
-            "observer_counts": observer_counts,
-            "factory_calls": len(callbacks),
-            "factory_code_calls": len(code_calls),
-        }))
-        """
+for module in (eager_ordinary, eager_source):
+    module.set = shadowed_set
+    assert module.canonical(4, (1, 2)) == (
+        [(4, 1), (4, 2)],
+        {(4, 1), (4, 2)},
+        {1: (4, 1), 2: (4, 2)},
+        {1: [(4, 1), (4, 1)], 2: [(4, 2), (4, 2)]},
     )
-    script = (
-        script.replace("__MODULE_ROOT__", repr(str(tmp_path)))
-        .replace("__MODULE_NAME__", repr(module_name))
-        .replace("__MODE__", repr(mode))
+assert events == []
+"""
+    _run_modes(
+        eager_project,
+        "eager_source",
+        validation,
+        required_functions=["canonical"],
     )
-    env = {
-        **os.environ,
-        "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
-        "SOAC_WORK_DIR": str(work_dir),
-        "SOAC_OPT_MODE": mode,
-        "SOAC_COMPILE_MODE": "eager",
-        "SOAC_BACKGROUND_JIT": "0",
-        "SOAC_LOG": f"soac_jit_direct_edges=info;json={event_path}",
-    }
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=90,
-    )
-    assert completed.returncode == 0, (
-        f"{mode} transformed subprocess failed:\n"
-        f"{completed.stdout}{completed.stderr}"
-    )
-    return json.loads(completed.stdout.splitlines()[-1]), event_path
 
 
-def test_eager_comprehensions_match_stock_function_and_code_creation(
-    tmp_path: Path,
-) -> None:
-    module_name = "eager_comprehension_function_elision_case"
-    (tmp_path / f"{module_name}.py").write_text(
-        textwrap.dedent(_MODULE_SOURCE), encoding="utf-8"
+_LAMBDA_DEFAULT_SOURCE = """
+body_only = -99
+
+
+def record(events, label, value):
+    events.append((label, value))
+    return value
+
+
+def direct(value, events):
+    # These containing-scope bindings exist only because defaults write them.
+    callback = (
+        lambda argument=(saved := record(events, "pos", value)), /,
+        *, keyword=(keyword_saved := record(events, "kw", saved + 10)):
+        (body_only := record(events, "body", argument + keyword), saved, keyword_saved)
     )
-    work_dir = tmp_path / "soac-work"
-    results = {}
-    event_paths = {}
+    def read():
+        return saved, keyword_saved, body_only
+    return callback, read
 
-    for mode in ("profile", "verify", "apply"):
-        results[mode], event_paths[mode] = _run_eager_worker(
-            tmp_path, module_name, work_dir, mode
-        )
 
-    from soac import _soac_ext
-
-    dump = json.loads(
-        _soac_ext.inspect_counter_dump_json(str(work_dir / "profile.bin"))
-    )
-    records = [
-        record for record in dump["records"] if record["module_name"] == module_name
+def eager(values, events):
+    saved = keyword_saved = -1
+    callbacks = [
+        (lambda argument=(saved := record(events, "pos", value)), /,
+         *, keyword=(keyword_saved := record(events, "kw", saved + 10)):
+         (body_only := record(events, "body", argument + keyword), saved, keyword_saved))
+        for value in values
     ]
-    assert records, dump
-    unrelated = [
-        row
-        for record in records
-        for row in record["rows"]
-        if row["kind"] == "call_hot_targets"
-        and row["function_qualname"] == "unrelated"
-        and row["value"] >= 32
-    ]
-    assert unrelated, records
+    def read():
+        return saved, keyword_saved, body_only
+    return callbacks, read
 
-    summary = [
-        json.loads(line)
-        for line in (work_dir / "jit-code-summary.jsonl").read_text(
-            encoding="utf-8"
-        ).splitlines()
-        if line.strip()
-    ]
-    assert any(
-        row.get("entry_kind") == "direct_function_body"
-        and row.get("function_qualname") == "canonical"
-        for row in summary
-    ), summary
-    assert any(
-        row.get("entry_kind") == "direct_function_body"
-        and row.get("function_qualname", "").startswith("canonical.<locals>.")
-        for row in summary
-    ), summary
-    assert any(
-        row.get("entry_kind") == "direct_function_body"
-        and row.get("function_qualname") == "unrelated"
-        for row in summary
-    ), summary
 
-    for mode, result in results.items():
-        assert result["stock_created"] == [], result
-        assert result["stock_audits"] == [], result
-        assert (result["soac_created"], result["soac_audits"]) == ([], []), (
-            "CPython inlines eager list, set, and dict comprehensions without "
-            "creating throwaway function objects or audited code objects",
-            mode,
-            result,
-        )
+def lazy(values, events):
+    saved = keyword_saved = -1
+    callbacks = (
+        (lambda argument=(saved := record(events, "pos", value)), /,
+         *, keyword=(keyword_saved := record(events, "kw", saved + 10)):
+         (body_only := record(events, "body", argument + keyword), saved, keyword_saved))
+        for value in values
+    )
+    def read():
+        return saved, keyword_saved, body_only
+    return callbacks, read
+"""
 
-    for mode in ("verify", "apply"):
-        events = [
-            event
-            for line in event_paths[mode].read_text(encoding="utf-8").splitlines()
-            if line.strip()
-            if (event := json.loads(line)).get("target") == "soac_jit_direct_edges"
-            and event.get("module") == module_name
+
+@pytest.mark.parametrize("backend", ("soac", "cpython"))
+def test_lambda_default_walrus_preserves_containing_scope_and_evaluation_order(
+    tmp_path, backend,
+):
+    project = create_strict_project(
+        tmp_path,
+        {
+            "lambda_defaults.py": "from __future__ import strict\n" + _LAMBDA_DEFAULT_SOURCE,
+            "ordinary_lambda_defaults.py": _LAMBDA_DEFAULT_SOURCE,
+        },
+        modules={"lambda_defaults": "lambda_defaults.py"},
+        backend=backend,
+    )
+    _run_modes(
+        project,
+        "lambda_defaults",
+        r'''
+import ctypes
+import ordinary_lambda_defaults as stock
+
+def validate_module(module):
+    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+    owner.argtypes = [ctypes.py_object]
+    owner.restype = ctypes.c_void_p
+    for name in ("record", "direct", "eager", "lazy"):
+        assert owner(getattr(stock, name)) is None
+
+    for target in (stock, module):
+        events = []
+        callback, read = target.direct(3, events)
+        assert events == [("pos", 3), ("kw", 13)]
+        assert read() == (3, 13, -99)
+        assert callback() == (16, 3, 13)
+        assert callback(20, keyword=2) == (22, 3, 13)
+        assert read() == (3, 13, -99)
+        assert events == [("pos", 3), ("kw", 13), ("body", 16), ("body", 22)]
+
+        events = []
+        callbacks, read = target.eager((2, 4), events)
+        assert events == [("pos", 2), ("kw", 12), ("pos", 4), ("kw", 14)]
+        assert read() == (4, 14, -99)
+        # Defaults keep each iteration's value; the body reads the shared cells.
+        assert [callback() for callback in callbacks] == [(14, 4, 14), (18, 4, 14)]
+        assert read() == (4, 14, -99)
+        assert events == [
+            ("pos", 2), ("kw", 12), ("pos", 4), ("kw", 14),
+            ("body", 14), ("body", 18),
         ]
-        assert any(
-            event.get("qualname") != "mixed"
-            and event.get("clif_direct_edges", 0) > 0
-            for event in events
-        ), events
-        assert not any(event.get("qualname") == "mixed" for event in events), events
+
+        events = []
+        callbacks, read = target.lazy((5, 7), events)
+        try:
+            assert events == [] and read() == (-1, -1, -99)
+            first = next(callbacks)
+            assert events == [("pos", 5), ("kw", 15)]
+            assert read() == (5, 15, -99)
+            assert first() == (20, 5, 15)
+            second = next(callbacks)
+            assert read() == (7, 17, -99)
+            assert events == [
+                ("pos", 5), ("kw", 15), ("body", 20), ("pos", 7), ("kw", 17),
+            ]
+            assert first() == (20, 7, 17)
+            assert second() == (24, 7, 17)
+            assert list(callbacks) == []
+            assert read() == (7, 17, -99)
+            assert events == [
+                ("pos", 5), ("kw", 15), ("body", 20), ("pos", 7), ("kw", 17),
+                ("body", 20), ("body", 24),
+            ]
+        finally:
+            callbacks.close()
+        # A lambda-body walrus is local to that lambda, not a containing write.
+        assert target.body_only == -99
+''',
+        ("record", "direct", "eager", "lazy"),
+    )
+
+
+
+_NESTED_DEFAULT_LAMBDA_SUPER_SOURCE = """
+class Base:
+    pass
+
+
+class Derived(Base):
+    def build(self):
+        def nested(callback=lambda receiver: (super(), [item for item in (1,)])):
+            return callback
+        return nested()
+"""
+
+
+@pytest.fixture(scope="module")
+def nested_default_lambda_super_project(tmp_path_factory):
+    return create_strict_project(
+        tmp_path_factory.mktemp("nested-default-lambda-super"),
+        {
+            "nested_default_lambda_super.py": (
+                "from __future__ import strict\n" + _NESTED_DEFAULT_LAMBDA_SUPER_SOURCE
+            ),
+            "ordinary_nested_default_lambda_super.py": _NESTED_DEFAULT_LAMBDA_SUPER_SOURCE,
+        },
+        modules={"nested_default_lambda_super": "nested_default_lambda_super.py"},
+    )
+
+
+@pytest.mark.parametrize("entry_interpreter", (False, True), ids=("compiled", "entry"))
+def test_nested_default_lambda_super_uses_its_own_receiver(
+    nested_default_lambda_super_project, entry_interpreter,
+):
+    expected_entry = "entry_interpreter" if entry_interpreter else "checked_native"
+    validation = f"""
+def validate_module(module):
+    import ctypes
+    import types
+    from soac import _soac_ext
+    from tests._strict_integration import _plain_function_witness
+    import ordinary_nested_default_lambda_super as stock
+
+    metadata = ctypes.pythonapi.PyFunction_GetSoacMetadata
+    metadata.argtypes = [ctypes.py_object]
+    metadata.restype = ctypes.c_void_p
+    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+    owner.argtypes = [ctypes.py_object]
+    owner.restype = ctypes.c_void_p
+    source = ctypes.pythonapi.PyCode_GetSoacStrictSourceId
+    source.argtypes = [ctypes.py_object]
+    source.restype = ctypes.c_uint64
+
+    ordinary_build = _plain_function_witness(stock, "Derived.build")
+    assert owner(ordinary_build) is None and metadata(ordinary_build) is None
+    for target in (stock, module):
+        builder = target.Derived()
+        receiver = target.Derived()
+        assert receiver is not builder
+        callback = builder.build()
+        assert type(callback) is types.FunctionType
+        # The default expression belongs to build, not the nested def's body.
+        assert callback.__qualname__ == "Derived.build.<locals>.<lambda>"
+        code = callback.__code__
+        if target is module:
+            assert metadata(callback) and owner(callback) and source(code)
+            assert _soac_ext.strict_function_entry_kind(callback) == {expected_entry!r}
+        else:
+            assert owner(callback) is None and metadata(callback) is None
+            assert source(code) == 0
+
+        proxy, items = callback(receiver)
+        assert type(proxy) is super
+        assert proxy.__self__ is receiver
+        assert proxy.__self__ is not builder
+        assert proxy.__thisclass__ is target.Derived
+        assert items == [1]
+        assert callback.__code__ is code
+        if target is module:
+            assert metadata(callback) and owner(callback) and source(code)
+            assert _soac_ext.strict_function_entry_kind(callback) == {expected_entry!r}
+"""
+    project = nested_default_lambda_super_project
+    validation_path = project.root / f"nested-default-lambda-super-{expected_entry}-validation.py"
+    validation_path.write_text(validation)
+    project.run_case(
+        "nested_default_lambda_super", validation, validation_path,
+        entry_interpreter=entry_interpreter,
+        required_functions=("Derived.build",),
+    )
+
+
+_CLASS_COMPREHENSION_SOURCE = """
+label = "module"
+events = []
+
+
+def record(kind, value):
+    events.append(kind)
+    return value
+
+
+def build(outside):
+    class Box:
+        label = "class"
+        inputs = (1, 2)
+        values = [record("value", item + outside)
+                  for item in record("iterable", inputs)]
+        labels = [label for _ in inputs]
+        pairs = [(left, right, outside) for left, right in ((3, 4), (5, 6))]
+        nested = [[left + right for right in (1, 2)] for left in (10, 20)]
+        callbacks = [lambda: outside for outside in (5, 6)]
+        owner_callbacks = [lambda: __class__ for _ in (0, 1)]
+
+        def read_outer(self):
+            return outside
+
+        def owner(self):
+            return __class__
+
+    return Box
+"""
+
+
+@pytest.mark.parametrize("backend", ("soac", "cpython"))
+def test_class_comprehensions_keep_lexical_cells_without_native_slot_correspondence(
+    tmp_path, backend,
+):
+    project = create_strict_project(
+        tmp_path,
+        {
+            "class_comprehensions.py": "from __future__ import strict\n" + _CLASS_COMPREHENSION_SOURCE,
+            "ordinary_class_comprehensions.py": _CLASS_COMPREHENSION_SOURCE,
+        },
+        modules={"class_comprehensions": "class_comprehensions.py"},
+        backend=backend,
+    )
+    _run_modes(
+        project,
+        "class_comprehensions",
+        r'''
+import ctypes
+import ordinary_class_comprehensions as stock
+
+def validate_module(module):
+    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+    owner.argtypes = [ctypes.py_object]
+    owner.restype = ctypes.c_void_p
+    assert owner(stock.build) is None and owner(stock.record) is None
+    for target in (stock, module):
+        target.events.clear()
+        box = target.build(10)
+        assert target.events == ["iterable", "value", "value"]
+        assert box.values == [11, 12]
+        # Only the first iterable is evaluated in the class namespace.
+        assert box.labels == ["module", "module"] and box.label == "class"
+        assert box.pairs == [(3, 4, 10), (5, 6, 10)]
+        assert box.nested == [[11, 12], [21, 22]]
+        assert [callback() for callback in box.callbacks] == [6, 6]
+        assert all(callback() is box for callback in box.owner_callbacks)
+        assert box().owner() is box
+        # The helper's loop cell cannot replace the genuine outer FREE cell.
+        assert box().read_outer() == 10
+        assert not {"item", "left", "right", "outside", "_"} & vars(box).keys()
+''',
+        ("record", "build"),
+    )
+
+
+def test_eager_comprehensions_preserve_semantics_and_eventual_cleanup(eager_project):
+    _run_modes(
+        eager_project,
+        "eager_source",
+        _SEMANTIC_VALIDATION,
+        (
+            "canonical", "mixed", "prepatched", "postpatched", "modified_factory_code",
+            "both_factories_replaced", "reentrant", "replaced_module", "observed", "forced",
+            "source_function", "spoofed_source_function", "increment", "unrelated",
+            "lifetime", "collect_cycle",
+        ),
+    )
+
+
+_SEMANTIC_VALIDATION = r'''
+import ctypes
+import gc
+import types
+import eager_ordinary as stock
+
+def validate_module(module):
+    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+    owner.argtypes = [ctypes.py_object]
+    owner.restype = ctypes.c_void_p
+    seal = ctypes.pythonapi.PyFunction_GetSoacStrictId
+    seal.argtypes = [ctypes.py_object]
+    seal.restype = ctypes.c_uint64
+    assert owner(stock.canonical) is None and seal(stock.canonical) == 0
+
+    for offset in (3, 30):
+        assert module.canonical(offset, (1, 2)) == stock.canonical(offset, (1, 2))
+    for offset in range(32):
+        assert module.mixed(offset) == stock.mixed(offset) == [offset, offset + 1]
+        assert module.unrelated(offset) == stock.unrelated(offset) == offset + 1
+    for name, offsets in (
+        ("prepatched", (5, 100)), ("postpatched", (6, 60)),
+        ("modified_factory_code", (7,)), ("both_factories_replaced", (8,)),
+        ("reentrant", (9, 80)), ("replaced_module", (10,)),
+        ("observed", (20, 21, 22, 23)), ("forced", (24,)),
+    ):
+        for offset in offsets:
+            assert getattr(module, name)(offset) == getattr(stock, name)(offset)
+
+    stock_lazy = stock.lazy(12)
+    actual_lazy = module.lazy(12)
+    assert next(actual_lazy) == next(stock_lazy) == 12
+    assert list(actual_lazy) == list(stock_lazy) == [13]
+
+    first, second = module.source_function(13), module.source_function(130)
+    assert type(first) is type(second) is types.FunctionType
+    assert first is not second and first(1) == 14 and second(1) == 131
+    assert first.__code__ is second.__code__
+    assert first.__closure__[0] is not second.__closure__[0]
+    assert owner(first) and owner(second) and seal(first) and seal(second)
+    spoofed = module.spoofed_source_function(14)
+    assert type(spoofed) is types.FunctionType and spoofed(1) == 15
+    assert spoofed.__code__.co_name == "_dp_listcomp_777"
+    assert owner(spoofed) and seal(spoofed)
+
+    for fail in (False, True):
+        previous_generation = module.generation
+        expected = stock.lifetime(fail)
+        actual = module.lifetime(fail)
+        # Preserve the original ordinary control, including its ordinary
+        # exception cleanup. Only SOAC's implicit-release schedule is relaxed.
+        if fail:
+            assert expected == (None, ("iter", "read", "caught", "drop-item", "drop-iterator"))
+        assert actual[0] == expected[0]
+        gc.collect()
+        explicit = tuple(event for event in module.events if not event.startswith("drop-"))
+        assert explicit == (("iter", "read", "caught") if fail else ("iter", "read"))
+        assert module.events.count("drop-item") == 1, module.events
+        assert module.events.count("drop-iterator") == 1, module.events
+        assert module.generation is not previous_generation
+    assert stock.collect_cycle() == ([11, 11], 1)
+    previous_generation = module.generation
+    values, _inside_body_release_count = module.collect_cycle()
+    assert values == [11, 11]
+    gc.collect()
+    assert module.events.count("drop-cycle") == 1, module.events
+    assert module.generation is not previous_generation
+'''
+
+
+def test_declared_global_rebinding_preserves_frozen_other_bindings(eager_project):
+    _run_modes(
+        eager_project,
+        "eager_source",
+        r'''
+import pytest
+import eager_ordinary as stock
+from soac.strict import StrictMutationError
+
+def validate_module(module):
+    # A lexical `global generation` explicitly declares this binding mutable.
+    # The original source is legal; it needs no holder or per-class opt-in.
+    events = module.events
+    module.events.append("unchanged")
+    with pytest.raises(StrictMutationError):
+        module.events = []
+    assert module.events is events and events == ["unchanged"]
+    for operation in (module.lifetime, module.collect_cycle):
+        generation = module.generation
+        operation()
+        assert module.generation is not generation
+        assert module.events is events
+    replacement = object()
+    module.generation = replacement
+    assert module.generation is replacement
+    assert module.events is events
+    old = stock.generation
+    assert stock.lifetime()[0] == [7]
+    assert stock.generation is not old
+    old = stock.generation
+    assert stock.collect_cycle() == ([11, 11], 1)
+    assert stock.generation is not old
+''',
+        ("lifetime", "collect_cycle"),
+    )
+
+
+def test_eager_untraced_callbacks_and_ordinary_observers(eager_project):
+    _run_modes(
+        eager_project,
+        "eager_source",
+        r'''
+import sys
+import eager_ordinary as stock
+
+def validate_module(module):
+    # Only ordinary and CPython-backend source execution promises these events.
+    # SOAC validates the same explicit arithmetic callbacks without observers.
+    def exercise(function, observer=None):
+        calls, observed = [], []
+        code = function.__code__
+        class Offset:
+            def __radd__(self, value):
+                calls.append(("add", value))
+                return 20 + value
+        def trace(frame, event, argument):
+            if frame.f_code is code and event == "call":
+                observed.append("call")
+            return trace
+        def monitor(actual_code, offset):
+            if actual_code is code:
+                observed.append("start")
+        tool = None
+        if observer is None:
+            install = remove = lambda: None
+        elif observer == "trace":
+            install = lambda: sys.settrace(trace)
+            remove = lambda: sys.settrace(None)
+        elif observer == "profile":
+            install = lambda: sys.setprofile(trace)
+            remove = lambda: sys.setprofile(None)
+        else:
+            tool = next(index for index in range(6) if sys.monitoring.get_tool(index) is None)
+            sys.monitoring.use_tool_id(tool, "eager-comprehension-policy")
+            sys.monitoring.register_callback(tool, sys.monitoring.events.PY_START, monitor)
+            if observer == "monitor-local":
+                install = lambda: sys.monitoring.set_local_events(tool, code, sys.monitoring.events.PY_START)
+                remove = lambda: sys.monitoring.set_local_events(tool, code, 0)
+            else:
+                install = lambda: sys.monitoring.set_events(tool, sys.monitoring.events.PY_START)
+                remove = lambda: sys.monitoring.set_events(tool, 0)
+        install()
+        try:
+            assert function(Offset()) == [20, 21]
+            assert calls == [("add", 0), ("add", 0)]
+            if observer is not None:
+                assert observed == (["call"] if observer in ("trace", "profile") else ["start"])
+        finally:
+            remove()
+            if tool is not None:
+                sys.monitoring.register_callback(tool, sys.monitoring.events.PY_START, None)
+                sys.monitoring.free_tool_id(tool)
+        assert sys.gettrace() is None and sys.getprofile() is None
+        assert function(20) == [20, 21]
+
+    for observer in ("trace", "profile", "monitor-local", "monitor-global"):
+        exercise(stock.observed, observer)
+        if not __dp_integration_soac__:
+            exercise(module.observed, observer)
+    exercise(module.observed)
+''',
+        ("observed",),
+    )

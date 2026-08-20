@@ -18,3 +18,6 @@ soac_instrument = { path = "../soac_instrument" }
 soac_lowering = { path = "../soac_lowering" }
 soac_opt = { path = "../soac_opt" }
 tracing = "0.1"
+
+[dev-dependencies]
+soac_contracts = { path = "../soac_contracts" }

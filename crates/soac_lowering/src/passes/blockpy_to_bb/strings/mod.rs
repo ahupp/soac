@@ -24,6 +24,7 @@ pub(crate) fn hoist_module_constants(
     module_constants.extend(normalizer.module_constants);
     BlockPyModule {
         module_name_gen: module.module_name_gen,
+        strict_source: module.strict_source,
         global_names: module.global_names,
         callable_defs,
         module_constants,

@@ -1,10 +1,7 @@
 use super::{
-    instr_any, map_function_blocks, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
-    ChildVisitable, Del, Instr, Load, MapInstr, MapTerm, Mappable, Meta, ModuleShape, Store,
-    UnresolvedName, WithMeta,
+    Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, FunctionKind,
+    HandledExceptionContext, HasBlockContext, Instr, ModuleShape,
 };
-use crate::namegen::fresh_name;
-use ruff_python_ast as ast;
 use std::collections::{HashMap, HashSet};
 
 fn blockpy_successors<E: Instr>(block: &Block<E>) -> Vec<BlockLabel> {
@@ -18,7 +15,7 @@ fn blockpy_successors<E: Instr>(block: &Block<E>) -> Vec<BlockLabel> {
             out.push(branch.default_label.clone());
             out
         }
-        BlockTerm::Raise(_) | BlockTerm::Return(_) => Vec::new(),
+        BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => Vec::new(),
     }
 }
 
@@ -124,187 +121,52 @@ pub(crate) fn prune_unreachable_blockpy_blocks<E: Instr>(
     blocks.retain(|block| reachable.contains(&block.label));
 }
 
-fn fresh_eval_name() -> ast::name::Name {
-    fresh_name("eval").into()
-}
-
-fn typed_store_expr<E>(target: ast::name::Name, meta: Meta, value: E) -> E
-where
-    E: Instr + From<Store<E>>,
-    <E as Instr>::Name: From<ast::name::Name>,
-{
-    Store::<E>::new(target, value).with_meta(meta).into()
-}
-
-fn typed_del_expr<E>(target: ast::name::Name, meta: Meta) -> E
-where
-    E: Instr<Name = UnresolvedName> + From<Del<E>>,
-{
-    Del::<E>::new(target, false).with_meta(meta).into()
-}
-
-fn append_stmt_cleanup<E>(out: &mut Vec<E>, cleanup: Vec<ast::name::Name>)
-where
-    E: Instr<Name = UnresolvedName> + From<Del<E>>,
-{
-    for temp in cleanup.into_iter().rev() {
-        out.push(typed_del_expr(temp, Meta::synthetic()));
-    }
-}
-
-fn expr_contains_matching_subexpression<E, F>(expr: &E, should_hoist: &mut F) -> bool
-where
-    E: Instr + ChildVisitable<E>,
-    F: FnMut(&E) -> bool,
-{
-    instr_any(expr, |value| should_hoist(value))
-}
-
-fn hoist_subexpression_if_matching<E, F>(
-    expr: E,
-    out: &mut Vec<E>,
-    cleanup: &mut Vec<ast::name::Name>,
-    should_hoist: &mut F,
-) -> E
-where
-    E: Instr<Name = UnresolvedName>
-        + ChildVisitable<E>
-        + Mappable<E, Mapped<E> = E>
-        + From<Load<E>>
-        + From<Store<E>>
-        + From<Del<E>>,
-    F: FnMut(&E) -> bool,
-{
-    let expr = expr.map_same_children(&mut |value| {
-        hoist_subexpression_if_matching(value, out, cleanup, should_hoist)
-    });
-    if should_hoist(&expr) {
-        let target = fresh_eval_name();
-        out.push(typed_store_expr(target.clone(), Meta::synthetic(), expr));
-        cleanup.push(target.clone());
-        Load::new(target).with_meta(Meta::synthetic()).into()
-    } else {
-        expr
-    }
-}
-
-fn rewrite_matching_children_in_expr<E, F>(
-    expr: E,
-    out: &mut Vec<E>,
-    cleanup: &mut Vec<ast::name::Name>,
-    should_hoist: &mut F,
-) -> E
-where
-    E: Instr<Name = UnresolvedName>
-        + ChildVisitable<E>
-        + Mappable<E, Mapped<E> = E>
-        + From<Load<E>>
-        + From<Store<E>>
-        + From<Del<E>>,
-    F: FnMut(&E) -> bool,
-{
-    expr.map_same_children(&mut |value| {
-        hoist_subexpression_if_matching(value, out, cleanup, should_hoist)
-    })
-}
-
-struct HoistMatchingSubexpressionsInTerm<'a, 'b, E, F> {
-    out: &'a mut Vec<E>,
-    cleanup: &'b mut Vec<ast::name::Name>,
-    should_hoist: &'b mut F,
-}
-
-impl<E, F> MapInstr<E, E> for HoistMatchingSubexpressionsInTerm<'_, '_, E, F>
-where
-    E: Instr<Name = UnresolvedName>
-        + ChildVisitable<E>
-        + Mappable<E, Mapped<E> = E>
-        + From<Load<E>>
-        + From<Store<E>>
-        + From<Del<E>>,
-    F: FnMut(&E) -> bool,
-{
-    fn map_instr(&mut self, expr: E) -> E {
-        hoist_subexpression_if_matching(expr, self.out, self.cleanup, self.should_hoist)
-    }
-
-    fn map_name(&mut self, name: UnresolvedName) -> UnresolvedName {
-        name
-    }
-}
-
-fn hoist_matching_subexpressions_in_term<E, F>(
-    term: BlockTerm<E>,
-    out: &mut Vec<E>,
-    should_hoist: &mut F,
-) -> BlockTerm<E>
-where
-    E: Instr<Name = UnresolvedName>
-        + ChildVisitable<E>
-        + Mappable<E, Mapped<E> = E>
-        + From<Load<E>>
-        + From<Store<E>>
-        + From<Del<E>>,
-    F: FnMut(&E) -> bool,
-{
-    let mut cleanup = Vec::new();
-    let mut map = HoistMatchingSubexpressionsInTerm {
-        out,
-        cleanup: &mut cleanup,
-        should_hoist,
-    };
-    map.map_term(term)
-}
-
-pub(crate) fn hoist_matching_subexpressions_in_callable_def<P, E, F>(
-    callable_def: BlockPyFunction<P>,
-    mut should_hoist: F,
-) -> BlockPyFunction<P>
-where
-    P: ModuleShape<Instr = E>,
-    E: Instr<Name = UnresolvedName>
-        + ChildVisitable<E>
-        + Mappable<E, Mapped<E> = E>
-        + From<Load<E>>
-        + From<Store<E>>
-        + From<Del<E>>,
-    F: FnMut(&E) -> bool,
-{
-    map_function_blocks(callable_def, |block| {
-        let Block {
-            label,
-            body: input_body,
-            term: input_term,
-            params,
-            exc_edge,
-            extra,
-        } = block;
-        let mut body = Vec::new();
-        for expr in input_body {
-            let mut setup = Vec::new();
-            let mut cleanup = Vec::new();
-            let expr = if expr_contains_matching_subexpression(&expr, &mut should_hoist) {
-                rewrite_matching_children_in_expr(expr, &mut setup, &mut cleanup, &mut should_hoist)
-            } else {
-                expr
-            };
-            body.extend(setup);
-            body.push(expr);
-            append_stmt_cleanup(&mut body, cleanup);
+/// Validate ephemeral suspension edges before resolved ownership consumes them.
+/// These edges describe a future activation, never an executable same-frame jump.
+pub(crate) fn validate_suspension_resumes<P: ModuleShape>(
+    function: &BlockPyFunction<P>,
+) -> Result<(), String> {
+    let blocks = function
+        .blocks
+        .iter()
+        .map(|block| (block.label, block))
+        .collect::<HashMap<_, _>>();
+    for block in &function.blocks {
+        let context = block.extra.block_context();
+        let Some(target_label) = context.suspension_resume else {
+            continue;
+        };
+        if function.kind == FunctionKind::Function
+            || !matches!(block.term, BlockTerm::Return(_))
+            || context.handled_exception == HandledExceptionContext::Terminal
+        {
+            return Err(format!(
+                "{}: suspension edge on non-yielding block {}",
+                function.names.qualname, block.label,
+            ));
         }
-        let term = hoist_matching_subexpressions_in_term(input_term, &mut body, &mut should_hoist);
-        Block {
-            label,
-            body,
-            term,
-            params,
-            exc_edge,
-            extra,
+        let Some(target) = blocks.get(&target_label) else {
+            return Err(format!(
+                "{}: suspension edge from {} has missing resume target {}",
+                function.names.qualname, block.label, target_label,
+            ));
+        };
+        if !target.params.is_empty()
+            || !matches!(target.term, BlockTerm::Jump(_))
+            || target.extra.block_context().handled_exception != HandledExceptionContext::Preserve
+        {
+            return Err(format!(
+                "{}: suspension edge from {} does not target a parameter-free resume wrapper at {}",
+                function.names.qualname, block.label, target_label,
+            ));
         }
-    })
+    }
+    Ok(())
 }
 
-pub(crate) fn relabel_blockpy_blocks_dense<I: Instr, E>(blocks: &mut [Block<I, E>]) {
+pub(crate) fn relabel_blockpy_blocks_dense<I: Instr, E: HasBlockContext>(
+    blocks: &mut [Block<I, E>],
+) {
     let relabel = blocks
         .iter()
         .enumerate()
@@ -317,6 +179,15 @@ pub(crate) fn relabel_blockpy_blocks_dense<I: Instr, E>(blocks: &mut [Block<I, E
             .expect("dense relabel should cover every block")
             .clone();
         block.term.relabel_targets(&relabel);
+        let mut context = block.extra.block_context();
+        if let Some(target) = context.suspension_resume {
+            context.suspension_resume = Some(
+                *relabel
+                    .get(&target)
+                    .expect("dense relabel should cover every suspension resume target"),
+            );
+            block.extra.set_block_context(context);
+        }
         if let Some(exc_edge) = &mut block.exc_edge {
             exc_edge.target = relabel
                 .get(&exc_edge.target)
@@ -366,7 +237,7 @@ impl<E: Instr> RelabelBlockTargets for BlockTerm<E> {
                     .expect("dense relabel should cover every br_table default target")
                     .clone();
             }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
         }
     }
 }

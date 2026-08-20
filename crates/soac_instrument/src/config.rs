@@ -28,7 +28,10 @@ impl InstrumentationConfig {
         let top_value_counters = config
             .specialization_mode()
             .is_some_and(SpecializationMode::records_counters);
-        let deopt_entry_counters = false;
+        let deopt_entry_counters = matches!(
+            config.specialization_mode(),
+            Some(SpecializationMode::Apply | SpecializationMode::Verify)
+        );
         let refcounts = if config.specialization_mode() == Some(SpecializationMode::Verify) {
             RefcountCounterMode::Scoped(CounterScope::Function)
         } else {
@@ -88,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_mode_records_refcount_counters_without_deopt_entry_counters() {
+    fn verify_mode_records_refcounts_and_post_plan_deopt_entries() {
         let config =
             SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Verify));
 
@@ -98,16 +101,16 @@ mod tests {
             instrumentation.counters.refcounts,
             RefcountCounterMode::Scoped(CounterScope::Function)
         );
-        assert!(!instrumentation.deopt_entry_counters_enabled());
+        assert!(instrumentation.deopt_entry_counters_enabled());
     }
 
     #[test]
-    fn apply_mode_disables_deopt_entry_counters() {
+    fn apply_mode_records_only_actual_cold_deopt_entries() {
         let config =
             SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Apply));
 
         let instrumentation = InstrumentationConfig::from_env_config(&config);
 
-        assert!(!instrumentation.deopt_entry_counters_enabled());
+        assert!(instrumentation.deopt_entry_counters_enabled());
     }
 }

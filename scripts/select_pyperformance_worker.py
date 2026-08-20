@@ -4,11 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import shlex
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def _source_tools():
+    path = Path(__file__).with_name("strict_pyperformance_sources.py")
+    spec = importlib.util.spec_from_file_location("_soac_replay_sources", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_records(path: Path) -> list[dict[str, Any]]:
@@ -80,6 +90,29 @@ def _validate_record(record: dict[str, Any]) -> None:
         isinstance(arg, str) for arg in stable_args
     ):
         raise ValueError("selected worker is missing string-list field 'stable_args'")
+    if record.get("language") != "strict" or not isinstance(
+        record.get("strict_bundle"), str
+    ):
+        raise ValueError("selected worker is not an offline-prepared strict worker")
+    execution = _source_tools().verify_strict_benchmark(
+        Path(record["strict_bundle"]), Path(record["python_executable"])
+    )
+    source = execution["source"]
+    expected = {
+        "benchmark_script": source["stock_script"],
+        "strict_deployment": execution["deployment"],
+        "strict_script": source["strict_script"],
+        "strict_harness": source["harness_script"],
+        "strict_project": source["project"],
+        "strict_modules": source["modules"],
+        "strict_source_fingerprint": source["source_fingerprint"],
+        "stock_source_fingerprint": source["stock_source_fingerprint"],
+        "selection_policy": source["selection_policy"],
+        "harness_policy": source["harness_projection"]["policy"],
+        "artifact_generation": execution["publication"]["generation"],
+    }
+    if any(record.get(key) != value for key, value in expected.items()):
+        raise ValueError("selected worker's source/authority provenance changed")
 
 
 def select_worker(
@@ -91,10 +124,13 @@ def select_worker(
     matching = _measurement_records(records, benchmark, worker)
     if not matching:
         worker_hint = f" and worker {worker!r}" if worker is not None else ""
-        raise ValueError(f"no measured worker found for benchmark {benchmark!r}{worker_hint}")
+        raise ValueError(
+            f"no measured worker found for benchmark {benchmark!r}{worker_hint}"
+        )
     if len(matching) > 1:
         candidates = ", ".join(
-            Path(str(record["work_dir"])).name for record in sorted(
+            Path(str(record["work_dir"])).name
+            for record in sorted(
                 matching,
                 key=lambda item: str(item["work_dir"]),
             )
@@ -117,6 +153,9 @@ def _print_bash(record: dict[str, Any]) -> None:
     print(f"WORKER_BENCHMARK_SCRIPT={shlex.quote(record['benchmark_script'])}")
     print(f"WORKER_PYTHON={shlex.quote(record['python_executable'])}")
     print(f"WORKER_WORK_DIR={shlex.quote(record['work_dir'])}")
+    print(f"WORKER_STRICT_BUNDLE={shlex.quote(record['strict_bundle'])}")
+    print(f"WORKER_STRICT_DEPLOYMENT={shlex.quote(record['strict_deployment'])}")
+    print(f"WORKER_STRICT_SCRIPT={shlex.quote(record['strict_script'])}")
     print("WORKER_STABLE_ARGS=(")
     for arg in stable_args:
         print(f"  {shlex.quote(arg)}")

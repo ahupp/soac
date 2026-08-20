@@ -525,6 +525,46 @@ fn split_param_defaults<'py>(
     function: &BlockPyFunction<BlockPyModuleShape>,
     param_defaults: &Bound<'py, PyAny>,
 ) -> PyResult<(Option<Bound<'py, PyTuple>>, Option<Bound<'py, PyDict>>)> {
+    if function.scope.creation_defaults
+        == soac_core::block_py::FunctionDefaultsProjection::NativeContainers
+    {
+        if !param_defaults.is_exact_instance_of::<PyTuple>() {
+            return Err(PyTypeError::new_err(
+                "native defaults projection requires an exact pair",
+            ));
+        }
+        let defaults = param_defaults.cast::<PyTuple>()?;
+        if defaults.len() != 2 {
+            return Err(PyTypeError::new_err(
+                "native defaults projection requires two containers",
+            ));
+        }
+        let positional = defaults.get_item(0)?;
+        let keywords = defaults.get_item(1)?;
+        let positional = if positional.is_none() {
+            None
+        } else {
+            if !positional.is_exact_instance_of::<PyTuple>() {
+                return Err(PyTypeError::new_err(
+                    "native positional defaults must be an exact tuple",
+                ));
+            }
+            Some(positional.cast_into::<PyTuple>()?)
+        };
+        let keywords = if keywords.is_none() {
+            None
+        } else {
+            if !keywords.is_exact_instance_of::<PyDict>() {
+                return Err(PyTypeError::new_err(
+                    "native keyword defaults must be an exact dictionary",
+                ));
+            }
+            Some(keywords.cast_into::<PyDict>()?)
+        };
+        // These are the already evaluated compiler operands. Do not rebuild
+        // the containers or inspect/hash their keys during function creation.
+        return Ok((positional, keywords));
+    }
     let defaults = param_defaults.cast::<PyTuple>().map_err(|_| {
         PyTypeError::new_err(format!(
             "bb param defaults must be a tuple, got {:?}",
@@ -605,6 +645,68 @@ fn make_lazy_clif_entry<'py>(
 struct InstantiatedEntry<'py> {
     entry: Bound<'py, PyAny>,
     has_prepared_code_metadata: bool,
+    expected_private_code: Option<Bound<'py, PyAny>>,
+}
+
+pub(crate) struct PreparedDeniedHelperCode {
+    original: Py<PyAny>,
+    code: Py<PyAny>,
+}
+
+fn denied_native_helper_code<'py>(
+    py: Python<'py>,
+    template: &FunctionInstantiationTemplate,
+    original: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(prepared) = template.prepared_denied_helper_code.get()
+        && prepared.original.as_ptr() == original.as_ptr()
+    {
+        return Ok(prepared.code.bind(py).clone());
+    }
+    if unsafe { ffi::Py_TYPE(original.as_ptr()) } != std::ptr::addr_of_mut!(ffi::PyCode_Type) {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "private helper factory returned non-code",
+        ));
+    }
+    // Denial only: the native frame guard rejects this code before the first
+    // instruction, including COPY_FREE_VARS with a not-yet-installed closure.
+    // No source ID is minted, and only the authenticated JIT entry may run the
+    // separate compiler body after actual owner installation.
+    const CO_FUTURE_STRICT: i32 = 0x1000_0000;
+    let flags: i32 = original.getattr("co_flags")?.extract()?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("co_flags", flags | CO_FUTURE_STRICT)?;
+    let code = original.call_method("replace", (), Some(&kwargs))?;
+    let prepared = PreparedDeniedHelperCode {
+        original: original.clone().unbind(),
+        code: code.clone().unbind(),
+    };
+    // Code replacement can invoke audit callbacks. Never initialize OnceLock
+    // under a callback; a reentrant exact original may have won publication.
+    if template.prepared_denied_helper_code.set(prepared).is_err()
+        && let Some(prepared) = template.prepared_denied_helper_code.get()
+        && prepared.original.as_ptr() == original.as_ptr()
+    {
+        return Ok(prepared.code.bind(py).clone());
+    }
+    Ok(code)
+}
+
+fn validate_private_helper_code(
+    function: &Bound<'_, PyAny>,
+    code: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    if unsafe { ffi::PyFunction_Check(function.as_ptr()) } == 0
+        || unsafe { (*function.as_ptr().cast::<ffi::PyFunctionObject>()).func_code }
+            != code.as_ptr()
+    {
+        return Err(crate::strict_runtime_unavailable(
+            function.py(),
+            "private helper code changed during creation",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) struct PreparedSyntheticCode {
@@ -635,7 +737,6 @@ pub(crate) struct PreparedEagerComprehension {
     runtime_owner: usize,
     runtime_owner_version: u32,
     factory: usize,
-    parent_code: usize,
     origin_code: usize,
     origin_cache: usize,
     cache_key: usize,
@@ -785,26 +886,6 @@ fn prepare_bootstrap_factory_origin(
     Ok(())
 }
 
-fn source_parent_code_for_eager_comprehension(
-    shared_state: &SharedModuleState,
-    function: &BlockPyFunction<BlockPyModuleShape>,
-) -> Option<*mut ffi::PyObject> {
-    let mut qualname = function.names.qualname.as_str();
-    while let Some((parent, _)) = qualname.rsplit_once(".<locals>.") {
-        if let Some(code) = shared_state
-            .lowered_module
-            .callable_defs
-            .iter()
-            .find(|candidate| candidate.names.qualname == parent)
-            .and_then(|candidate| shared_state.lookup_original_code(candidate.function_id))
-        {
-            return Some(code.as_ptr());
-        }
-        qualname = parent;
-    }
-    None
-}
-
 fn runtime_bootstrap_origin_template(
     compile_session: &CompileSession,
 ) -> PyResult<Option<Arc<FunctionInstantiationTemplate>>> {
@@ -910,6 +991,12 @@ unsafe extern "C" fn call_eager_comprehension_direct(
                 globals_obj: globals,
                 builtins_obj: builtins,
                 late_bound_owner_cells: state.late_bound_owner_cells,
+                namespace_execution: std::ptr::null(),
+                strict_field_slots: std::ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: std::ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: std::ptr::null(),
             },
             runtime_objects: [std::ptr::null_mut(); MAX_EAGER_COMPREHENSION_CAPTURES + 1],
         };
@@ -953,7 +1040,6 @@ fn prepare_eager_comprehension_callable<'template>(
     runtime_module: &Bound<'_, PyModule>,
     origin: &PreparedBootstrapFactoryOrigin,
     factory: *mut ffi::PyObject,
-    parent_code: *mut ffi::PyObject,
     owner: usize,
     owner_version: u32,
 ) -> PyResult<Option<&'template PreparedEagerComprehension>> {
@@ -1032,7 +1118,6 @@ fn prepare_eager_comprehension_callable<'template>(
         runtime_owner: owner,
         runtime_owner_version: owner_version,
         factory: factory as usize,
-        parent_code: parent_code as usize,
         origin_code: origin.code.as_ptr() as usize,
         origin_cache: origin.cache.as_ptr() as usize,
         cache_key: origin.cache_key.as_ptr() as usize,
@@ -1052,7 +1137,11 @@ fn make_eager_comprehension_callable(
     annotate_fn: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
 ) -> PyResult<Option<Py<PyAny>>> {
-    if !eager_comprehension_target_is_compiler_owned(module_runtime, function_template)
+    if module_runtime
+        .shared_module_state_owner
+        .verified_strict_module()
+        .is_some()
+        || !eager_comprehension_target_is_compiler_owned(module_runtime, function_template)
         || crate::entry_interpreter_vectorcall_requested(function_template.function())
         || !annotate_fn.is_none()
         || unsafe { ffi::PyTuple_CheckExact(param_defaults.as_ptr()) } == 0
@@ -1109,40 +1198,28 @@ fn make_eager_comprehension_callable(
     let origin = origin_template
         .as_ref()
         .and_then(|template| template.prepared_bootstrap_factory_origin.get());
-    let (origin_code, origin_cache, cache_key, builtins_key, parent_code) =
-        if let Some(prepared) = existing {
-            if prepared.compile_session_id != module_runtime.compile_session.id()
-                || prepared.runtime_module != runtime_module.as_ptr() as usize
-            {
-                return Ok(None);
-            }
-            (
-                prepared.origin_code as *mut ffi::PyObject,
-                prepared.origin_cache as *mut ffi::PyObject,
-                prepared.cache_key as *mut ffi::PyObject,
-                prepared.builtins_key as *mut ffi::PyObject,
-                prepared.parent_code as *mut ffi::PyObject,
-            )
-        } else if let Some(origin) = origin {
-            let Some(parent_code) = source_parent_code_for_eager_comprehension(
-                module_runtime.shared_module_state_owner.as_ref(),
-                function_template.function(),
-            ) else {
-                return Ok(None);
-            };
-            (
-                origin.code.as_ptr(),
-                origin.cache.as_ptr(),
-                origin.cache_key.as_ptr(),
-                origin.builtins_key.as_ptr(),
-                parent_code,
-            )
-        } else {
+    let (origin_code, origin_cache, cache_key, builtins_key) = if let Some(prepared) = existing {
+        if prepared.compile_session_id != module_runtime.compile_session.id()
+            || prepared.runtime_module != runtime_module.as_ptr() as usize
+        {
             return Ok(None);
-        };
-    if unsafe { crate::jit::raw_py_function_activation_is_observed(parent_code) } {
+        }
+        (
+            prepared.origin_code as *mut ffi::PyObject,
+            prepared.origin_cache as *mut ffi::PyObject,
+            prepared.cache_key as *mut ffi::PyObject,
+            prepared.builtins_key as *mut ffi::PyObject,
+        )
+    } else if let Some(origin) = origin {
+        (
+            origin.code.as_ptr(),
+            origin.cache.as_ptr(),
+            origin.cache_key.as_ptr(),
+            origin.builtins_key.as_ptr(),
+        )
+    } else {
         return Ok(None);
-    }
+    };
 
     let (owner, owner_version) = if let Some(prepared) = existing {
         let owner = unsafe { ffi::Py_TYPE(runtime_module.as_ptr()) };
@@ -1221,7 +1298,6 @@ fn make_eager_comprehension_callable(
             runtime_module,
             origin,
             factory,
-            parent_code,
             owner,
             owner_version,
         )?
@@ -1333,6 +1409,49 @@ fn prepared_original_code_for_template<'template>(
         None => None,
     };
 
+    if shared_state.verified_strict_module().is_some()
+        && function_template
+            .function()
+            .scope
+            .source_origin
+            .as_ref()
+            .is_some_and(|origin| {
+                matches!(
+                    origin.role,
+                    soac_core::block_py::CallableSourceRole::SourceFunction
+                        | soac_core::block_py::CallableSourceRole::AnnotationProvider
+                        | soac_core::block_py::CallableSourceRole::TypeParameterScope
+                )
+            })
+        && prepared
+            .as_ref()
+            .is_none_or(|prepared| !prepared.capture_layout_matches)
+    {
+        let native_captures = prepared
+            .as_ref()
+            .map(|prepared| {
+                prepared
+                    .code
+                    .bind(py)
+                    .getattr("co_freevars")?
+                    .extract::<Vec<String>>()
+            })
+            .transpose()?;
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            format!(
+                "strict source/provider requires its actual native code and exact capture layout [function={} role={:?} native={native_captures:?} lowered={:?}]",
+                function_template.function().names.qualname,
+                function_template
+                    .function()
+                    .scope
+                    .source_origin
+                    .as_ref()
+                    .map(|origin| origin.role),
+                function_template.capture_names(),
+            ),
+        ));
+    }
     // Preparing code metadata can invoke Python and must never run while a OnceLock
     // initialization lock is held: callbacks may re-enter this same function template.
     let _ = function_template.prepared_original_code.set(prepared);
@@ -1559,6 +1678,7 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
     captured_names: &[String],
     captured_values: &[Bound<'py, PyAny>],
     original_code: Option<&PreparedOriginalCode>,
+    deny_native_entry: bool,
 ) -> PyResult<InstantiatedEntry<'py>> {
     debug_assert!(!captured_names.is_empty());
     debug_assert_eq!(captured_names.len(), captured_values.len());
@@ -1573,6 +1693,17 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
         }
     } else {
         synthetic_code_for_template(py, dp, function, function_template, captured_names)?
+    };
+    let code = if deny_native_entry {
+        if original_code.is_some() || !has_prepared_code_metadata {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "private compiler helper needs its canonical synthetic code",
+            ));
+        }
+        denied_native_helper_code(py, function_template, &code)?
+    } else {
+        code
     };
     let mut closure_cells = Vec::with_capacity(captured_values.len());
     for value in captured_values {
@@ -1601,12 +1732,16 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
         }
         Bound::from_owned_ptr(py, ptr)
     };
+    if deny_native_entry {
+        validate_private_helper_code(&func, &code)?;
+    }
     if unsafe { ffi::PyFunction_SetClosure(func.as_ptr(), closure.as_ptr()) } != 0 {
         return Err(PyErr::fetch(py));
     }
     Ok(InstantiatedEntry {
         entry: func.into_any(),
         has_prepared_code_metadata,
+        expected_private_code: deny_native_entry.then_some(code),
     })
 }
 
@@ -1686,6 +1821,7 @@ fn build_closure_shaped_entry<'py>(
     Ok(InstantiatedEntry {
         entry: func.into_any(),
         has_prepared_code_metadata: false,
+        expected_private_code: None,
     })
 }
 
@@ -1755,6 +1891,7 @@ pub fn instantiate_bb_function(
         module_globals,
         annotate_fn,
         module_runtime,
+        None,
     )
 }
 
@@ -1768,6 +1905,7 @@ fn instantiate_bb_function_with_template(
     module_globals: &Bound<'_, PyAny>,
     annotate_fn: &Bound<'_, PyAny>,
     module_runtime: &ModuleRuntimeContext,
+    creation_execution: Option<&Arc<crate::strict_namespace::NamespaceExecution>>,
 ) -> PyResult<Py<PyAny>> {
     instantiate_bb_function_inner(
         py,
@@ -1780,6 +1918,7 @@ fn instantiate_bb_function_with_template(
         module_globals,
         annotate_fn,
         module_runtime,
+        creation_execution,
     )
 }
 
@@ -1794,6 +1933,7 @@ fn instantiate_bb_function_inner(
     module_globals: &Bound<'_, PyAny>,
     annotate_fn: &Bound<'_, PyAny>,
     module_runtime: &ModuleRuntimeContext,
+    creation_execution: Option<&Arc<crate::strict_namespace::NamespaceExecution>>,
 ) -> PyResult<Py<PyAny>> {
     let specialization_mode = module_runtime
         .compile_session
@@ -1816,13 +1956,19 @@ fn instantiate_bb_function_inner(
         function.blocks.len(),
         has_original_runtime_code,
         records_specialization_counters,
-    );
+    ) && module_runtime
+        .shared_module_state_owner
+        .verified_strict_module()
+        .is_none();
     let keep_source_generator = keep_source_generator_vectorcall(
         function.lowered_kind(),
         function.names.display_name.as_str(),
         has_original_runtime_code,
         records_specialization_counters,
-    );
+    ) && module_runtime
+        .shared_module_state_owner
+        .verified_strict_module()
+        .is_none();
     let instantiated_entry = instantiate_closure_backed_entry(
         py,
         dp,
@@ -1855,6 +2001,33 @@ fn instantiate_bb_function_inner(
         )?;
     if !module_already_matches {
         entry.setattr("__module__", module_name)?;
+    }
+    if let Some(code) = &instantiated_entry.expected_private_code {
+        validate_private_helper_code(&entry, code)?;
+    }
+    if module_runtime
+        .shared_module_state_owner
+        .verified_strict_module()
+        .is_some()
+    {
+        let template = match function_template {
+            Some(template) => Arc::clone(template),
+            None => module_runtime
+                .shared_module_state_owner
+                .lookup_function_template(function.function_id)
+                .map_err(PyRuntimeError::new_err)?
+                .ok_or_else(|| {
+                    crate::strict_runtime_unavailable(py, "strict function template is absent")
+                })?,
+        };
+        crate::strict_function::install_strict_function_owner(
+            py,
+            &entry,
+            &module_runtime.shared_module_state_owner,
+            &template,
+            annotate_fn,
+            creation_execution,
+        )?;
     }
     // soac.runtime's source helpers are the runtime ABI for other transformed
     // modules. Keep them on their source implementation outside countered
@@ -1915,6 +2088,42 @@ fn instantiate_bb_function_inner(
             function_template,
         )?;
     }
+    if let Some(verified) = module_runtime
+        .shared_module_state_owner
+        .verified_strict_module()
+        .filter(|_| {
+            !function.scope.source_origin.as_ref().is_some_and(|origin| {
+                use soac_core::block_py::CallableSourceRole;
+                origin.role == CallableSourceRole::TypeParameterScope
+                    || (origin.role == CallableSourceRole::AnnotationProvider
+                        && matches!(
+                            origin.definition.definition_kind,
+                            soac_contracts::DefinitionKind::TypeAlias
+                                | soac_contracts::DefinitionKind::Parameter
+                        ))
+            })
+        })
+    {
+        let execution = module_runtime
+            .shared_module_state_owner
+            .strict_execution
+            .as_ref()
+            .ok_or_else(|| {
+                crate::strict_runtime_unavailable(py, "strict function has no module execution")
+            })?;
+        execution.register_pending(
+            py,
+            module_globals.cast::<PyDict>()?,
+            verified,
+            crate::StrictPendingKind::Function {
+                function_id: function.function_id,
+            },
+            &entry,
+        )?;
+    }
+    if let Some(code) = &instantiated_entry.expected_private_code {
+        validate_private_helper_code(&entry, code)?;
+    }
     Ok(entry.unbind())
 }
 
@@ -1974,27 +2183,110 @@ fn instantiate_closure_backed_entry<'py>(
             .lookup_original_code(function.function_id)
             .map(|code| code.bind(py))
     };
+    let shared_state = module_runtime.shared_module_state_owner.as_ref();
+    let verified_strict = shared_state.verified_strict_module().is_some();
+    let private_generator_expression =
+        verified_strict && function.scope.generator_expression_code.is_some();
+    if private_generator_expression
+        && (function.scope.source_origin.is_some()
+            || !shared_state.admits_function(function)
+            || shared_state
+                .lookup_generator_expression_code(function.function_id)
+                .is_none())
+    {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "generator helper has no authenticated compiler-creation projection",
+        ));
+    }
+    // A code-exposure projection identifies a compiler-created helper, not a
+    // SourceFunction. Its public gi_code/ag_code stays in the separate catalogue.
+    // Deny the synthetic native entry before CREATE can observe a missing closure
+    // or owner; the rooted template still supplies all later execution authority.
+    let deny_native_entry = private_generator_expression
+        || (verified_strict
+            && function.scope.source_origin.as_ref().is_some_and(|origin| {
+                matches!(
+                    origin.role,
+                    soac_core::block_py::CallableSourceRole::ClassConstruction
+                        | soac_core::block_py::CallableSourceRole::ClassNamespace
+                )
+            }));
+    if deny_native_entry && original_code.is_some() {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "private compiler helper unexpectedly acquired original source code",
+        ));
+    }
     if let Some(function_template) = function_template {
         let captured_names = function_template.capture_names();
         if let Some(captured_values) = build_ordered_capture_values(py, captures, captured_names)? {
             if captured_names.is_empty() {
                 let prepared_original_code =
                     prepared_original_code.filter(|prepared| prepared.capture_layout_matches);
-                let original_code_without_freevars =
-                    prepared_original_code.map(|prepared| prepared.code.bind(py).as_any());
-                let has_prepared_code_metadata =
-                    prepared_original_code.is_some_and(|prepared| prepared.has_prepared_metadata);
+                let denied_code = if deny_native_entry {
+                    let (code, canonical) = synthetic_code_for_template(
+                        py,
+                        dp,
+                        function,
+                        function_template,
+                        captured_names,
+                    )?;
+                    if !canonical {
+                        return Err(crate::strict_runtime_unavailable(
+                            py,
+                            "private compiler helper needs the canonical bootstrap factory",
+                        ));
+                    }
+                    Some(denied_native_helper_code(py, function_template, &code)?)
+                } else {
+                    None
+                };
+                // A suspended helper without captures still needs its actual
+                // native family. The ordinary lazy-entry placeholder is a
+                // synchronous function, unlike the code produced by the
+                // closure-shaping path used for captured helpers.
+                let suspended_code = if denied_code.is_none()
+                    && prepared_original_code.is_none()
+                    && *function.lowered_kind() != FunctionKind::Function
+                {
+                    Some(synthetic_code_for_template(
+                        py,
+                        dp,
+                        function,
+                        function_template,
+                        captured_names,
+                    )?)
+                } else {
+                    None
+                };
+                let entry_code_without_freevars = denied_code
+                    .as_ref()
+                    .or_else(|| {
+                        prepared_original_code.map(|prepared| prepared.code.bind(py).as_any())
+                    })
+                    .or_else(|| suspended_code.as_ref().map(|(code, _)| code));
+                let has_prepared_code_metadata = denied_code.is_some()
+                    || prepared_original_code
+                        .is_some_and(|prepared| prepared.has_prepared_metadata)
+                    || suspended_code
+                        .as_ref()
+                        .is_some_and(|(_, has_prepared)| *has_prepared);
                 let entry = make_lazy_clif_entry(
                     py,
                     dp,
                     entry_name,
                     module_globals,
-                    original_code_without_freevars,
+                    entry_code_without_freevars,
                     has_prepared_code_metadata,
                 )?;
+                if let Some(code) = &denied_code {
+                    validate_private_helper_code(&entry, code)?;
+                }
                 return Ok(InstantiatedEntry {
                     entry,
                     has_prepared_code_metadata,
+                    expected_private_code: denied_code,
                 });
             } else {
                 return build_closure_shaped_entry_from_ordered_captures(
@@ -2007,9 +2299,16 @@ fn instantiate_closure_backed_entry<'py>(
                     captured_names,
                     captured_values.as_slice(),
                     prepared_original_code,
+                    deny_native_entry,
                 );
             }
         }
+    }
+    if deny_native_entry {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "private compiler helper has no exact template/capture layout",
+        ));
     }
 
     let (captured_names, closure_values) = build_capture_map(py, captures)?;
@@ -2030,6 +2329,7 @@ fn instantiate_closure_backed_entry<'py>(
         return Ok(InstantiatedEntry {
             entry,
             has_prepared_code_metadata: false,
+            expected_private_code: None,
         });
     } else {
         return build_closure_shaped_entry(
@@ -2122,6 +2422,10 @@ fn instantiate_shared_function(
     param_defaults: &Bound<'_, PyAny>,
     annotate_fn: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
+    creation_execution: Option<&Arc<crate::strict_namespace::NamespaceExecution>>,
+    active: Option<&crate::strict_function::StrictFunctionCall>,
+    class_namespace: Option<&Bound<'_, PyAny>>,
+    class_cells: &[Bound<'_, PyAny>],
 ) -> PyResult<Py<PyAny>> {
     let function = function_template.function();
     if *function.lowered_kind() != expected_kind {
@@ -2135,6 +2439,29 @@ fn instantiate_shared_function(
     module_globals.cast::<PyDict>().map_err(|_| {
         PyTypeError::new_err("JIT basic-block function instantiation requires module globals dict")
     })?;
+    let construction_captures = crate::strict_function::prepare_class_construction_captures(
+        py,
+        &shared_state,
+        &function_template,
+        active,
+        class_namespace,
+        if function.scope.class_construction.is_some() {
+            class_cells
+        } else {
+            &[]
+        },
+    )?;
+    let private_captures = crate::strict_function::prepare_private_lexical_captures(
+        py,
+        &shared_state,
+        &function_template,
+        active,
+        if function.scope.class_construction.is_none() {
+            class_cells
+        } else {
+            &[]
+        },
+    )?;
     trace!(
         target: "soac_function_create",
         event = "soac.function_create",
@@ -2171,14 +2498,23 @@ fn instantiate_shared_function(
         module_globals,
         annotate_fn,
         &module_runtime,
+        creation_execution,
     )?;
     if *function.lowered_kind() == FunctionKind::Coroutine {
         mark_coroutine_function(py, func.bind(py))?;
     }
+    if let Some(captures) = construction_captures {
+        let installed = captures.install(func.bind(py))?;
+        installed.commit();
+    }
+    if let Some(captures) = private_captures {
+        let installed = captures.install(func.bind(py))?;
+        installed.commit();
+    }
     Ok(func)
 }
 
-pub fn make_function(
+fn make_function(
     py: Python<'_>,
     function_id: RuntimeFunctionId,
     expected_kind: FunctionKind,
@@ -2186,6 +2522,10 @@ pub fn make_function(
     param_defaults: &Bound<'_, PyAny>,
     annotate_fn: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
+    creation_execution: Option<&Arc<crate::strict_namespace::NamespaceExecution>>,
+    active: Option<&crate::strict_function::StrictFunctionCall>,
+    class_namespace: Option<&Bound<'_, PyAny>>,
+    class_cells: &[Bound<'_, PyAny>],
 ) -> PyResult<Py<PyAny>> {
     let compile_session = CompileSession::process();
     let (shared_state, function_template) =
@@ -2200,6 +2540,10 @@ pub fn make_function(
         param_defaults,
         annotate_fn,
         module_globals,
+        creation_execution,
+        active,
+        class_namespace,
+        class_cells,
     )
 }
 
@@ -2213,6 +2557,10 @@ pub(crate) fn make_function_in_shared_state(
     param_defaults: &Bound<'_, PyAny>,
     annotate_fn: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
+    creation_execution: Option<&Arc<crate::strict_namespace::NamespaceExecution>>,
+    active: Option<&crate::strict_function::StrictFunctionCall>,
+    class_namespace: Option<&Bound<'_, PyAny>>,
+    class_cells: &[Bound<'_, PyAny>],
 ) -> PyResult<Py<PyAny>> {
     let function_template = shared_state
         .lookup_function_template(function_id)
@@ -2232,6 +2580,10 @@ pub(crate) fn make_function_in_shared_state(
         param_defaults,
         annotate_fn,
         module_globals,
+        creation_execution,
+        active,
+        class_namespace,
+        class_cells,
     )
 }
 
@@ -2249,16 +2601,32 @@ pub fn make_function_from_python_args(
             "JIT basic-block function instantiation got unknown kind {kind:?}"
         ))
     })?;
+    let function_id = RuntimeFunctionId::from_packed_runtime_u64(function_id);
+    let compile_session = CompileSession::process();
+    let (shared_state, function_template) =
+        lookup_shared_function_template(&compile_session, function_id)?;
+    if shared_state.verified_strict_module().is_some() {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "Python-supplied function IDs cannot authorize strict function construction",
+        ));
+    }
     let annotate_fn = annotate_fn.unwrap_or_else(|| py.None());
     let module_globals = module_globals.unwrap_or_else(|| py.None());
-    make_function(
+    instantiate_shared_function(
         py,
-        RuntimeFunctionId::from_packed_runtime_u64(function_id),
+        compile_session,
+        shared_state,
+        function_template,
         expected_kind,
         captures.bind(py).as_any(),
         param_defaults.bind(py).as_any(),
         annotate_fn.bind(py),
         module_globals.bind(py),
+        None,
+        None,
+        None,
+        &[],
     )
 }
 
@@ -2284,6 +2652,10 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
     param_defaults: *mut ffi::PyObject,
     annotate_fn: *mut ffi::PyObject,
     module_globals: *mut ffi::PyObject,
+    caller_environment: *const c_void,
+    class_namespace: *mut ffi::PyObject,
+    class_cells: *const *mut ffi::PyObject,
+    class_cell_count: usize,
 ) -> *mut ffi::PyObject {
     match panic::catch_unwind(AssertUnwindSafe(|| {
         let Some(expected_kind) = function_kind_from_abi_tag(kind_tag) else {
@@ -2305,6 +2677,41 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
         let param_defaults = unsafe { Bound::from_borrowed_ptr(py, param_defaults) };
         let annotate_fn = unsafe { Bound::from_borrowed_ptr(py, annotate_fn) };
         let module_globals = unsafe { Bound::from_borrowed_ptr(py, module_globals) };
+        if class_cell_count != 0 && class_cells.is_null() {
+            crate::strict_runtime_unavailable(py, "private capture array is null").restore(py);
+            return std::ptr::null_mut();
+        }
+        let class_cells = if class_cell_count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(class_cells, class_cell_count) }
+        };
+        if class_cells.iter().any(|cell| cell.is_null()) {
+            crate::strict_runtime_unavailable(py, "private capture cell is null").restore(py);
+            return std::ptr::null_mut();
+        }
+        let class_cells = class_cells
+            .iter()
+            .map(|cell| unsafe { Bound::from_borrowed_ptr(py, *cell) })
+            .collect::<Vec<_>>();
+        let class_namespace = (!class_namespace.is_null())
+            .then(|| unsafe { Bound::from_borrowed_ptr(py, class_namespace) });
+        let header = unsafe {
+            caller_environment
+                .cast::<crate::FunctionEnvAbiHeader>()
+                .as_ref()
+        };
+        let active = header.and_then(|header| unsafe { header.active_strict_call.as_ref() });
+        if let (Some(header), Some(active)) = (header, active)
+            && (!std::ptr::eq(active.environment().header(), header)
+                || header.globals_obj != module_globals.as_ptr())
+        {
+            crate::strict_runtime_unavailable(py, "function creation active frame changed")
+                .restore(py);
+            return std::ptr::null_mut();
+        }
+        let creation_execution =
+            unsafe { crate::FunctionEnv::namespace_execution_from_raw(caller_environment) };
         match make_function(
             py,
             RuntimeFunctionId::from_packed_runtime_u64(function_id),
@@ -2313,6 +2720,10 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
             &param_defaults,
             &annotate_fn,
             &module_globals,
+            creation_execution.as_ref(),
+            active,
+            class_namespace.as_ref(),
+            &class_cells,
         ) {
             Ok(func) => func.into_ptr(),
             Err(err) => {
@@ -2345,6 +2756,125 @@ mod tests {
     use std::ffi::c_void;
 
     #[test]
+    fn strict_private_helper_native_entry_is_denied_before_closure_installation() {
+        unsafe extern "C" {
+            fn PyCode_GetSoacStrictSourceId(code: *mut ffi::PyObject) -> u64;
+            fn PyFunction_GetSoacStrictOwner(function: *mut ffi::PyObject) -> *mut ffi::PyObject;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let source = r#"def outer(Target):
+    def inner():
+        return Target
+    return inner
+
+def plain():
+    return 7
+
+def generators(Target):
+    def captured_generator():
+        yield Target
+    async def captured_async_generator():
+        yield Target
+    return captured_generator, captured_async_generator
+
+def plain_generator():
+    yield 7
+
+async def plain_async_generator():
+    yield 7
+"#;
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .unwrap()
+                .blockpy_module;
+            let body = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "outer.<locals>.inner")
+                .unwrap();
+            let native = PyModule::from_code(
+                py,
+                &std::ffi::CString::new(source).unwrap(),
+                c"private_helper_denial.py",
+                c"private_helper_denial",
+            )
+            .unwrap();
+            let original_closure = native.getattr("outer").unwrap().call1((7,)).unwrap();
+            assert_eq!(
+                original_closure.call0().unwrap().extract::<i32>().unwrap(),
+                7
+            );
+            let generators = native
+                .getattr("generators")
+                .unwrap()
+                .call1((7,))
+                .unwrap()
+                .cast_into::<pyo3::types::PyTuple>()
+                .unwrap();
+            // Generator and async-generator code must reject before both
+            // COPY_FREE_VARS and RETURN_GENERATOR, even without any closure.
+            for original in [
+                original_closure,
+                native.getattr("plain").unwrap(),
+                generators.get_item(0).unwrap(),
+                generators.get_item(1).unwrap(),
+                native.getattr("plain_generator").unwrap(),
+                native.getattr("plain_async_generator").unwrap(),
+            ] {
+                let template = crate::FunctionInstantiationTemplate::from_function(body).unwrap();
+                let code = original.getattr("__code__").unwrap();
+                let original_flags: i32 = code.getattr("co_flags").unwrap().extract().unwrap();
+                let denied = super::denied_native_helper_code(py, &template, &code).unwrap();
+                let repeated = super::denied_native_helper_code(py, &template, &code).unwrap();
+                assert!(denied.is(&repeated));
+                assert_eq!(
+                    code.getattr("co_flags").unwrap().extract::<i32>().unwrap(),
+                    original_flags
+                );
+                assert_eq!(
+                    denied
+                        .getattr("co_flags")
+                        .unwrap()
+                        .extract::<i32>()
+                        .unwrap(),
+                    original_flags | 0x1000_0000
+                );
+                assert_eq!(
+                    unsafe { PyCode_GetSoacStrictSourceId(denied.as_ptr()) },
+                    0,
+                    "denial is not authenticated source provenance"
+                );
+                let function = unsafe {
+                    Bound::<PyAny>::from_owned_ptr_or_err(
+                        py,
+                        ffi::PyFunction_New(denied.as_ptr(), native.dict().as_ptr()),
+                    )
+                }
+                .unwrap();
+                let raw = function.as_ptr().cast::<ffi::PyFunctionObject>();
+                assert!(unsafe { (*raw).func_closure }.is_null());
+                assert!(unsafe { PyFunction_GetSoacStrictOwner(function.as_ptr()) }.is_null());
+                let error = function.call0().unwrap_err();
+                let expected = crate::strict_runtime_unavailable(py, "expected denial");
+                assert!(error.get_type(py).is(&expected.get_type(py)));
+                super::validate_private_helper_code(&function, &denied).unwrap();
+                function
+                    .setattr(
+                        "__code__",
+                        native
+                            .getattr("plain")
+                            .unwrap()
+                            .getattr("__code__")
+                            .unwrap(),
+                    )
+                    .unwrap();
+                assert!(super::validate_private_helper_code(&function, &denied).is_err());
+            }
+        });
+    }
+
+    #[test]
     fn synthetic_code_caches_the_exact_indexed_runtime_module_attribute_guard() {
         unsafe extern "C" {
             fn _PyDict_NewIndexedKeySet(keys: *mut ffi::PyObject) -> *mut c_void;
@@ -2356,6 +2886,7 @@ mod tests {
         struct RawPyDictIndexedValuesForTest {
             capacity: ffi::Py_ssize_t,
             order_size: ffi::Py_ssize_t,
+            prefix_keys: *mut c_void,
             values: [*mut ffi::PyObject; 1],
         }
 
@@ -3147,6 +3678,98 @@ def observe_unraisable(error):
                 vec!["RuntimeError"],
                 "the legacy lookup must preserve CPython's existing unraisable-hook behavior"
             );
+        });
+    }
+
+    #[test]
+    fn zero_capture_compiler_helpers_preserve_their_native_function_family() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let runtime = py.import("soac.runtime").unwrap();
+            let ordinary_template = runtime
+                .getattr("_entry_template")
+                .unwrap()
+                .getattr("__code__")
+                .unwrap();
+            for (source, kind, expected_flags) in [
+                (
+                    "def outer(values):\n    return [value for value in values]\n",
+                    FunctionKind::Function,
+                    0,
+                ),
+                (
+                    "async def outer(values):\n    return [value async for value in values]\n",
+                    FunctionKind::Coroutine,
+                    ffi::CO_COROUTINE,
+                ),
+                (
+                    "def outer(values):\n    return (value for value in values)\n",
+                    FunctionKind::Generator,
+                    ffi::CO_GENERATOR,
+                ),
+                (
+                    "def outer(values):\n    return (value async for value in values)\n",
+                    FunctionKind::AsyncGenerator,
+                    ffi::CO_ASYNC_GENERATOR,
+                ),
+            ] {
+                let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                    .unwrap()
+                    .blockpy_module;
+                let helper = lowered
+                    .callable_defs
+                    .iter()
+                    .find(|function| {
+                        function.names.qualname != "outer"
+                            && function.names.qualname.starts_with("outer.<locals>.")
+                            && *function.lowered_kind() == kind
+                    })
+                    .expect("the original expression must lower to its actual helper family");
+                let helper_id = helper.function_id;
+                assert!(helper.scope.source_origin.is_none());
+                let shared = crate::module_type::build_shared_state_for_testing(
+                    py,
+                    lowered,
+                    "zero_capture_compiler_helpers",
+                    "",
+                )
+                .unwrap();
+                let template = shared.lookup_function_template(helper_id).unwrap().unwrap();
+                assert!(template.capture_names().is_empty());
+                assert!(shared.lookup_original_code(helper_id).is_none());
+                let globals = PyDict::new(py);
+                let module_runtime = super::module_runtime_from_shared_state(
+                    std::sync::Arc::new(crate::session::CompileSession::new()),
+                    shared,
+                    globals.as_any(),
+                );
+                let function = template.function();
+                let captures = pyo3::types::PyTuple::empty(py);
+                let instantiated = super::instantiate_closure_backed_entry(
+                    py,
+                    &runtime,
+                    function,
+                    captures.as_any(),
+                    globals.as_any(),
+                    &module_runtime,
+                    Some(template.as_ref()),
+                    function.names.display_name.as_str(),
+                    function.names.qualname.as_str(),
+                )
+                .unwrap();
+                let code = instantiated.entry.getattr("__code__").unwrap();
+                let flags: i32 = code.getattr("co_flags").unwrap().extract().unwrap();
+                assert_eq!(
+                    flags & (ffi::CO_GENERATOR | ffi::CO_COROUTINE | ffi::CO_ASYNC_GENERATOR),
+                    expected_flags,
+                    "an empty closure must not change the compiler helper's native family",
+                );
+                if kind == FunctionKind::Function {
+                    assert!(code.is(&ordinary_template));
+                }
+            }
         });
     }
 

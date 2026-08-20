@@ -46,6 +46,7 @@ use soac_opt::access_emission_v3::{
 };
 use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
 use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_plans_from_v3};
+use soac_opt::inline_callee_preserves_activation;
 #[cfg(test)]
 use soac_opt::passes::TypedVirtualObjectId;
 #[cfg(test)]
@@ -71,8 +72,8 @@ use soac_opt::passes::{
     refresh_typed_function_value_facts,
     remap_typed_generator_preserved_instrs_with_existing_locals,
     rewrite_lowered_typed_generator_state_helper_calls_with_existing_constructor,
-    rewrite_typed_stop_iteration_raises_to_handler_jumps, simplify_typed_virtual_tuple_ops,
-    split_typed_alias_hot_continuations_with_budget,
+    rewrite_typed_stop_iteration_raises_to_handler_jumps, select_typed_native_iterator_pipelines,
+    simplify_typed_virtual_tuple_ops, split_typed_alias_hot_continuations_with_budget,
     split_typed_constructor_hot_continuations_with_budget,
     split_typed_generator_alias_hot_continuations_with_budget,
     split_typed_inline_cleanup_hot_continuations_for_labels_with_budget, summarize_module_escapes,
@@ -83,9 +84,11 @@ use soac_opt::passes::{
     trusted_owner_state_for_name, trusted_runtime_name_for_expr,
     typed_constructor_field_bindings_from_inline_stats_with_external_callees,
     typed_constructor_init_plans_from_inline_stats_with_external_callees,
+    typed_exact_int_region_matches_field_expression,
     typed_generator_alias_ignored_instr_ids_by_origin,
     typed_generator_constructor_capture_bindings_by_origin,
-    typed_generator_state_origin_can_lower_aliases_in_blocks, validate_typed_function_value_facts,
+    typed_generator_state_origin_can_lower_aliases_in_blocks,
+    typed_native_iterator_pipeline_reserved_budget, validate_typed_function_value_facts,
     visit_trusted_owner_term_instrs,
 };
 use soac_opt::region_emission_v3::{
@@ -102,7 +105,6 @@ const MAX_TYPED_INLINE_PASSES: usize = 64;
 const MAX_TYPED_INLINE_MAINTENANCE_PASSES: usize = 32;
 const MAX_TYPED_INLINE_FUNCTION_BLOCKS: usize = 384;
 const MAX_TYPED_INLINE_FUNCTION_BODY_INSTRS: usize = 4096;
-const MAX_LATE_TYPED_GENERATOR_RESUME_PASSES: usize = 8;
 const MAX_LATE_TYPED_RUNTIME_PROTOCOL_PASSES: usize = 8;
 const MAX_LATE_TYPED_BUILTIN_IMPLEMENTATION_PASSES: usize = 8;
 const MAX_TRANSITIVE_PROFILE_INLINE_BLOCKS: usize = 8;
@@ -223,6 +225,7 @@ fn immediate_method_call_sources(
         fn visit_instr(&mut self, expr: &InstrTyped) {
             if let InstrTyped::CallTyped(call) = expr
                 && matches!(call.access, soac_ir_typed::TypedCallAccessPlan::Generic)
+                && call.frame_namespace.is_none()
                 && call.extra.generator_instance_plan().is_none()
                 && let Some(call_source) = call.try_semantic_instr_id()
                 && let InstrTyped::GetAttrTyped(getter) = call.func.as_ref()
@@ -270,6 +273,7 @@ fn source_resolved_immediate_method_call_for_source(
     require_original_getter: bool,
 ) -> Option<InstrTyped> {
     if !matches!(call.access, soac_ir_typed::TypedCallAccessPlan::Generic)
+        || call.frame_namespace.is_some()
         || call.extra.generator_instance_plan().is_some()
     {
         return None;
@@ -665,6 +669,55 @@ struct StaticDirectCallTargets {
     module_global_generators: StaticModuleGlobalGeneratorTargets,
     strict_methods: StaticStrictMethodTargets,
     suppressed_source_generators: HashSet<RuntimeFunctionId>,
+    /// A source stamp can require a boundary; it cannot grant permission to
+    /// skip one. No unchecked ABI, inline, or constructor plan may target a
+    /// function in these modules until typed IR carries a dominating proof.
+    public_boundary_modules: HashSet<u32>,
+}
+
+impl StaticDirectCallTargets {
+    fn requires_public_boundary(&self, function: RuntimeFunctionId) -> bool {
+        self.public_boundary_modules
+            .contains(&function.runtime_module_id().as_u32())
+    }
+
+    fn retain_unchecked_candidates(&mut self) {
+        let modules = &self.public_boundary_modules;
+        let allowed =
+            |function: RuntimeFunctionId| !modules.contains(&function.runtime_module_id().as_u32());
+        self.runtime_names
+            .retain(|_, target| allowed(target.function.function_id));
+        self.runtime_builtin_implementations
+            .retain(|_, target| allowed(target.function_id));
+        self.module_globals
+            .values_mut()
+            .for_each(|targets| targets.retain(|_, target| allowed(target.function.function_id)));
+        self.module_global_generators
+            .values_mut()
+            .for_each(|targets| targets.retain(|_, target| allowed(target.function_id)));
+        self.strict_methods
+            .retain(|_, target| allowed(target.function_id));
+    }
+}
+
+fn retain_unchecked_call_emissions(
+    plans: &mut TypedCallEmissionPlans,
+    targets: &StaticDirectCallTargets,
+) {
+    plans.by_source.retain(|_, plan| match plan {
+        TypedCallEmissionPlan::Callable { function_guards } => {
+            function_guards.retain(|guard| !targets.requires_public_boundary(guard.function_id));
+            !function_guards.is_empty()
+        }
+        TypedCallEmissionPlan::DirectCallable { function_guard } => {
+            !targets.requires_public_boundary(function_guard.function_id)
+        }
+        TypedCallEmissionPlan::Method { method_guards, .. }
+        | TypedCallEmissionPlan::RuntimeProtocolMethod { method_guards, .. } => {
+            method_guards.retain(|guard| !targets.requires_public_boundary(guard.function_id));
+            !method_guards.is_empty()
+        }
+    });
 }
 
 fn typed_expr_is_runtime_name_load(
@@ -1024,6 +1077,7 @@ fn static_direct_call_target_for_expr<'a>(
     for runtime_name in RuntimeName::ALL.iter().copied() {
         if typed_expr_is_runtime_name_load(expr, runtime_name, module_constants)
             && let Some(target) = targets.runtime_names.get(&runtime_name)
+            && !targets.requires_public_boundary(target.function.function_id)
         {
             return Some((target, StaticDirectCallSource::RuntimeName(runtime_name)));
         }
@@ -1041,6 +1095,7 @@ fn static_direct_call_target_for_expr<'a>(
         .module_globals
         .get(&module_id)?
         .get(name)
+        .filter(|target| !targets.requires_public_boundary(target.function.function_id))
         .map(|target| {
             (
                 target,
@@ -1064,6 +1119,7 @@ fn static_direct_call_targets(
     let mut module_globals = HashMap::new();
     let mut module_global_generators = HashMap::new();
     let mut strict_methods = HashMap::new();
+    let mut public_boundary_modules = HashSet::new();
     let records_specialization_counters = env_config
         .specialization_mode()
         .is_some_and(SpecializationMode::records_counters);
@@ -1076,6 +1132,9 @@ fn static_direct_call_targets(
         .module_name_gen
         .runtime_module_id()
         .as_u32();
+    if shared_state.lowered_module.strict_source.is_some() {
+        public_boundary_modules.insert(current_module_id);
+    }
     module_globals.insert(
         current_module_id,
         strict_module_global_direct_call_targets_for_module(
@@ -1100,6 +1159,15 @@ fn static_direct_call_targets(
         .transpose()?
         .unwrap_or_default();
     for state in &shared_module_states {
+        if state.lowered_module.strict_source.is_some() {
+            public_boundary_modules.insert(
+                state
+                    .lowered_module
+                    .module_name_gen
+                    .runtime_module_id()
+                    .as_u32(),
+            );
+        }
         suppressed_source_generators.extend(suppressed_source_generators_for_shared_state(
             state,
             records_specialization_counters,
@@ -1175,14 +1243,17 @@ fn static_direct_call_targets(
             runtime_builtin_implementations.insert(source, target.function.clone());
         }
     }
-    Ok(StaticDirectCallTargets {
+    let mut targets = StaticDirectCallTargets {
         runtime_names,
         runtime_builtin_implementations,
         module_globals,
         module_global_generators,
         strict_methods,
         suppressed_source_generators,
-    })
+        public_boundary_modules,
+    };
+    targets.retain_unchecked_candidates();
+    Ok(targets)
 }
 
 fn static_direct_call_body() -> CallBodyPlan {
@@ -1429,6 +1500,9 @@ fn static_generator_instance_plan_for_expr(
             target
         }
     };
+    if targets.requires_public_boundary(target.function_id) {
+        return None;
+    }
     let arg_plan = super::direct_function::plan_public_call_args_for_target(
         target,
         explicit_positional_arg_count,
@@ -1615,7 +1689,10 @@ fn static_generator_instance_plans_for_module(
 ) -> HashMap<RuntimeFunctionId, HashMap<InstrId, TypedGeneratorInstancePlan>> {
     let local_generators = local_generator_targets_for_module(module)
         .into_iter()
-        .filter(|(function_id, _)| !targets.suppressed_source_generators.contains(function_id))
+        .filter(|(function_id, _)| {
+            !targets.suppressed_source_generators.contains(function_id)
+                && !targets.requires_public_boundary(*function_id)
+        })
         .collect();
     module
         .callable_defs
@@ -2261,7 +2338,7 @@ fn trusted_closed_iterator_stage_builtin_implementation_plans_from_analysis(
                 );
                 return;
             };
-            if !typed_generator_resume_inline_target_is_small_enough(
+            if !typed_generator_consumer_resume_target_is_within_budget(
                 self.module,
                 self.external_callees,
                 generator_plan.function_id,
@@ -2540,7 +2617,7 @@ fn trusted_generator_builtin_implementation_plans_from_analysis(
                 );
                 return;
             };
-            if !typed_generator_resume_inline_target_is_small_enough(
+            if !typed_generator_consumer_resume_target_is_within_budget(
                 self.module,
                 self.external_callees,
                 generator_plan.function_id,
@@ -3298,8 +3375,16 @@ fn typed_call_emission_plans_for_function_with_remapped(
 pub(super) fn apply_profile_call_emission_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
+    public_boundary_modules: &HashSet<u32>,
 ) -> Result<(), String> {
-    apply_call_emission_plans_to_typed_function(function, profile, None)
+    let mut plans = typed_call_emission_plans_for_function(profile, function.function_id, None)?;
+    let targets = StaticDirectCallTargets {
+        public_boundary_modules: public_boundary_modules.clone(),
+        ..Default::default()
+    };
+    retain_unchecked_call_emissions(&mut plans, &targets);
+    lower_typed_function_call_emission_plans(function, &plans)?;
+    Ok(())
 }
 
 fn apply_call_emission_plans_to_typed_function(
@@ -3410,6 +3495,7 @@ fn apply_call_emission_plans_to_typed_function_with_static_targets(
             }
         });
     }
+    retain_unchecked_call_emissions(&mut call_emissions, static_targets);
     lower_typed_function_call_emission_plans(function, &call_emissions)?;
     Ok(())
 }
@@ -4273,73 +4359,92 @@ pub(super) fn annotate_typed_exact_int_selections(
     Ok(annotator.count)
 }
 
-fn late_bound_exact_int_region_matches_expression(
-    expr: &InstrTyped,
-    region: &RegionPlan,
-    function_id: RuntimeFunctionId,
-) -> bool {
-    struct MatchingField<'a> {
-        source: InstrId,
-        owner_type: &'a soac_ir_typed::plan_v3::IndexedFieldOwnerType,
-        attr_name: &'a str,
-        expected_index: u32,
-        function_id: RuntimeFunctionId,
-        found: bool,
+pub(super) fn refresh_exact_int_cell_inputs(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+) -> Result<(), String> {
+    #[derive(Default)]
+    struct Loads {
+        names: HashMap<InstrId, (ResolvedName, Option<soac_core::block_py::CellLoadBinding>)>,
     }
-
-    impl Visit<InstrTyped> for MatchingField<'_> {
+    impl Visit<InstrTyped> for Loads {
         fn visit_instr(&mut self, expr: &InstrTyped) {
-            if self.found {
-                return;
-            }
-            if let InstrTyped::GetAttrTyped(op) = expr
-                && op.semantic_instr_id() == self.source
-                && let TypedAttrAccessPlan::LateBoundOwnerField(plan) = &op.access
-                && plan.counter_source.function_id.runtime_module_id()
-                    == self.function_id.runtime_module_id()
-                && &plan.owner_type == self.owner_type
-                && plan.attr_name == self.attr_name
-                && matches!(
-                    plan.storage,
-                    LateBoundOwnerFieldStorage::SplitDict { expected_index }
-                        if expected_index == self.expected_index
-                )
+            if let InstrTyped::Load(load) = expr
+                && let Some(source) = expr.try_semantic_instr_id()
             {
-                self.found = true;
-                return;
+                self.names
+                    .insert(source, (load.name.clone(), load.cell_binding.clone()));
             }
             expr.visit_children(self);
         }
     }
+    let mut loads = Loads::default();
+    loads.visit_fn(function);
 
-    region.inputs.iter().any(|input| {
-        if input.value.rep != soac_ir_typed::plan_v3::Rep::PyObjectBorrowed {
-            return false;
+    struct Refresh<'a> {
+        loads: &'a HashMap<InstrId, (ResolvedName, Option<soac_core::block_py::CellLoadBinding>)>,
+        error: Option<String>,
+    }
+    impl Refresh<'_> {
+        fn region(&mut self, region: &mut RegionPlan) {
+            for input in &mut region.inputs {
+                let RegionInputSource::CellValue {
+                    source,
+                    name,
+                    binding,
+                } = &mut input.source
+                else {
+                    continue;
+                };
+                let Some((actual, actual_binding)) = self.loads.get(source) else {
+                    self.error = Some(format!(
+                        "exact-int cell input references missing resolved load {source}",
+                    ));
+                    return;
+                };
+                if actual.cell_location().is_none() {
+                    self.error = Some(format!(
+                        "exact-int cell input {source} no longer names a cell binding",
+                    ));
+                    return;
+                }
+                let Some(actual_binding) = actual_binding else {
+                    self.error = Some(format!(
+                        "exact-int cell input {source} has no original source binding",
+                    ));
+                    return;
+                };
+                // Inlining maps the load's physical closure location as well as
+                // its instruction identity. The source coordinate selects that
+                // explicit binding; a matching display name is not sufficient.
+                *name = actual.clone();
+                *binding = actual_binding.clone();
+            }
         }
-        let RegionInputSource::IndexedField {
-            source,
-            owner_type,
-            attr_name,
-            expected_index,
-            ..
-        } = &input.source
-        else {
-            return false;
-        };
-        let mut matcher = MatchingField {
-            source: *source,
-            owner_type,
-            attr_name,
-            expected_index: *expected_index,
-            function_id,
-            found: false,
-        };
-        matcher.visit_instr(expr);
-        matcher.found
-    })
+    }
+    impl VisitMut<InstrTyped> for Refresh<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if let Some(extra) = expr.typed_extra_mut() {
+                if let Some(plan) = extra.exact_int_branch_plan_mut() {
+                    self.region(&mut plan.hot_plan);
+                    self.region(&mut plan.fallback_plan);
+                }
+                if let Some(plan) = extra.exact_int_return_plan_mut() {
+                    self.region(&mut plan.hot_plan);
+                    self.region(&mut plan.fallback_plan);
+                }
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+    let mut refresh = Refresh {
+        loads: &loads.names,
+        error: None,
+    };
+    refresh.visit_fn_mut(function);
+    refresh.error.map_or(Ok(()), Err)
 }
 
-fn annotate_typed_late_bound_remapped_exact_int_selections(
+fn annotate_typed_atomic_remapped_exact_int_selections(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     branch_plans: Option<&HashMap<InstrId, TypedExactIntBranchPlan>>,
     return_plans: Option<&HashMap<InstrId, TypedExactIntReturnPlan>>,
@@ -4368,18 +4473,30 @@ fn annotate_typed_late_bound_remapped_exact_int_selections(
             let Some(plan) = self.branch_plans.get(&instr_id) else {
                 return;
             };
-            if plan.instr_id != instr_id
-                || !late_bound_exact_int_region_matches_expression(
-                    expr,
-                    &plan.hot_plan,
-                    self.function_id,
+            // Scalar-only branch regions are complete before linearization.
+            // Attach their plan now so their comparison and operands stay one
+            // region instead of losing the semantic branch ID to a temporary.
+            // Indexed-field regions still need the matching resolved field
+            // operation: an unrelated field proposal cannot make them atomic.
+            let has_indexed_field = plan.hot_plan.inputs.iter().any(|input| {
+                matches!(
+                    input.source,
+                    soac_ir_typed::plan_v3::RegionInputSource::IndexedField { .. }
                 )
+            });
+            if plan.instr_id != instr_id
+                || (has_indexed_field
+                    && !typed_exact_int_region_matches_field_expression(
+                        expr,
+                        &plan.hot_plan,
+                        self.function_id,
+                    ))
             {
                 return;
             }
             let Some(extra) = expr.typed_extra_mut() else {
                 self.error = Some(format!(
-                    "remapped late-owner exact-int branch plan for {instr_id} reached a typed node without metadata"
+                    "remapped atomic exact-int branch plan for {instr_id} reached a typed node without metadata"
                 ));
                 return;
             };
@@ -4388,7 +4505,7 @@ fn annotate_typed_late_bound_remapped_exact_int_selections(
                 && existing.instr_id == instr_id
             {
                 self.error = Some(format!(
-                    "remapped late-owner exact-int branch plan for {instr_id} collides with an existing branch plan"
+                    "remapped atomic exact-int branch plan for {instr_id} collides with an existing branch plan"
                 ));
                 return;
             }
@@ -4403,7 +4520,7 @@ fn annotate_typed_late_bound_remapped_exact_int_selections(
                 return;
             };
             if plan.instr_id != instr_id
-                || !late_bound_exact_int_region_matches_expression(
+                || !typed_exact_int_region_matches_field_expression(
                     expr,
                     &plan.hot_plan,
                     self.function_id,
@@ -4413,7 +4530,7 @@ fn annotate_typed_late_bound_remapped_exact_int_selections(
             }
             let Some(extra) = expr.typed_extra_mut() else {
                 self.error = Some(format!(
-                    "remapped late-owner exact-int return plan for {instr_id} reached a typed node without metadata"
+                    "remapped field exact-int return plan for {instr_id} reached a typed node without metadata"
                 ));
                 return;
             };
@@ -4422,7 +4539,7 @@ fn annotate_typed_late_bound_remapped_exact_int_selections(
                 && existing.instr_id == instr_id
             {
                 self.error = Some(format!(
-                    "remapped late-owner exact-int return plan for {instr_id} collides with an existing return plan"
+                    "remapped field exact-int return plan for {instr_id} collides with an existing return plan"
                 ));
                 return;
             }
@@ -4590,28 +4707,78 @@ fn annotate_typed_remapped_exact_int_selections(
             return Err(error);
         }
     }
+    if annotator.used_branches.len() == branch_plans.len()
+        && annotator.used_returns.len() == return_plans.len()
+    {
+        return Ok(());
+    }
+
+    // A declined indexed-field proposal can leave its original comparison
+    // source live on a linearized producer, not the IfTerm test. Only this
+    // unguarded, unattached selection may be discarded here. Present plans
+    // still reach the existing later virtualization/final guard validation;
+    // eligible missing/colliding nodes must continue to fail.
+    let indexed_field_guards = super::typed_indexed_field_guards_by_instr(function);
+    let late_bound_owner_fields = super::typed_late_bound_owner_fields_by_instr(function);
+    let mut missing_field_sources = HashSet::new();
+    let mut has_live_guards = |hot: &RegionPlan, fallback: &RegionPlan| {
+        let hot_guarded = exact_int_region_has_live_indexed_field_guards(
+            function.function_id,
+            hot,
+            &indexed_field_guards,
+            &late_bound_owner_fields,
+            &mut missing_field_sources,
+        );
+        let fallback_guarded = exact_int_region_has_live_indexed_field_guards(
+            function.function_id,
+            fallback,
+            &indexed_field_guards,
+            &late_bound_owner_fields,
+            &mut missing_field_sources,
+        );
+        hot_guarded && fallback_guarded
+    };
     if annotator.used_branches.len() != branch_plans.len() {
         let missing = branch_plans
-            .keys()
-            .filter(|instr_id| !annotator.used_branches.contains(instr_id))
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "inlined optimizer v3 exact-int branch plans were not attached to typed nodes: {missing}"
-        ));
+            .iter()
+            .filter(|(instr_id, _)| !annotator.used_branches.contains(*instr_id))
+            .filter(|(_, plan)| has_live_guards(&plan.hot_plan, &plan.fallback_plan))
+            .map(|(instr_id, _)| instr_id.to_string())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "inlined optimizer v3 exact-int branch plans were not attached to typed nodes: {} [function={} id={}]",
+                missing.join(", "),
+                function.names.qualname,
+                function.function_id,
+            ));
+        }
     }
     if annotator.used_returns.len() != return_plans.len() {
         let missing = return_plans
-            .keys()
-            .filter(|instr_id| !annotator.used_returns.contains(instr_id))
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "inlined optimizer v3 exact-int return plans were not attached to typed nodes: {missing}"
-        ));
+            .iter()
+            .filter(|(instr_id, _)| !annotator.used_returns.contains(*instr_id))
+            .filter(|(_, plan)| has_live_guards(&plan.hot_plan, &plan.fallback_plan))
+            .map(|(instr_id, _)| instr_id.to_string())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "inlined optimizer v3 exact-int return plans were not attached to typed nodes: {} [function={} id={}]",
+                missing.join(", "),
+                function.names.qualname,
+                function.function_id,
+            ));
+        }
     }
+    tracing::info!(
+        target: "soac_jit_codegen",
+        function_id = ?function.function_id,
+        function_qualname = %function.names.qualname,
+        declined_branches = branch_plans.len() - annotator.used_branches.len(),
+        declined_returns = return_plans.len() - annotator.used_returns.len(),
+        missing_field_sources = ?missing_field_sources,
+        "typed_remapped_scalar_regions_declined_without_live_indexed_field_guards",
+    );
     Ok(())
 }
 
@@ -4646,6 +4813,7 @@ fn apply_profile_access_and_scalar_plans_to_typed_function(
         remapped_exact_int_branches,
         remapped_exact_int_returns,
     )?;
+    refresh_exact_int_cell_inputs(function)?;
     annotate_typed_constructor_init_plans(function, constructor_init_plans)?;
     Ok(())
 }
@@ -4858,6 +5026,9 @@ fn remap_exact_int_region_plan(
                     "inlined optimizer v3 exact-int region input has unnamed local source"
                         .to_string(),
                 );
+            }
+            RegionInputSource::CellValue { source, .. } => {
+                *source = remapped_typed_inline_instr_id(*source, context, "cell input")?;
             }
             RegionInputSource::IndexedGlobal { source, .. } => {
                 *source = remapped_typed_inline_instr_id(*source, context, "indexed-global input")?;
@@ -5280,29 +5451,9 @@ fn typed_inline_targets_for_function(
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum TypedInlineTargetPriority {
-    GeneratorResume,
     RuntimeProtocol,
     BuiltinImplementation,
     Other,
-}
-
-fn select_typed_inline_targets_within_cfg_budget(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    module: &BlockPyModule<TypedBlockPyModuleShape>,
-    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
-    generator_resume_plans: &HashMap<InstrId, TypedGeneratorResumePlan>,
-    targets: TypedInlineTargets,
-) -> TypedInlineTargets {
-    select_typed_inline_targets_within_cfg_budget_and_priorities(
-        function,
-        module,
-        external_callees,
-        generator_resume_plans,
-        &HashSet::new(),
-        &HashSet::new(),
-        targets,
-        None,
-    )
 }
 
 fn typed_builtin_generator_followup_cfg_budget(
@@ -5373,9 +5524,17 @@ fn typed_builtin_generator_followup_cfg_budget(
         return (0, 0);
     };
 
-    let mut reserved_blocks = resume_function.blocks.len().saturating_add(2);
-    let mut reserved_body_instrs =
-        typed_inline_function_body_instr_count(resume_function).saturating_add(8);
+    // A retained activation executes its body out of line. Reserve only code
+    // that can be copied into this caller; protocol bridges still cost space.
+    let (mut reserved_blocks, mut reserved_body_instrs) =
+        if inline_callee_preserves_activation(resume_function) {
+            (
+                resume_function.blocks.len().saturating_add(2),
+                typed_inline_function_body_instr_count(resume_function).saturating_add(8),
+            )
+        } else {
+            (0, 0)
+        };
     let protocol_bridge = module
         .callable_defs
         .iter()
@@ -5397,6 +5556,19 @@ fn typed_builtin_generator_followup_cfg_budget(
     (reserved_blocks, reserved_body_instrs)
 }
 
+/// Apply the same resolved retirement sidecar to every candidate family.
+fn remove_retired_typed_inline_targets(
+    function_id: RuntimeFunctionId,
+    targets: &mut TypedInlineTargets,
+    suppressed_inline_targets: &SuppressedTypedInlineTargets,
+) -> usize {
+    let before = targets.len();
+    if let Some(suppressed) = suppressed_inline_targets.get(&function_id) {
+        targets.retain(|source, _| !suppressed.contains(source));
+    }
+    before - targets.len()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_typed_inline_targets_within_cfg_budget_and_priorities(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
@@ -5405,14 +5577,47 @@ fn select_typed_inline_targets_within_cfg_budget_and_priorities(
     generator_resume_plans: &HashMap<InstrId, TypedGeneratorResumePlan>,
     trusted_runtime_protocol_sources: &HashSet<InstrId>,
     builtin_implementation_sources: &HashSet<InstrId>,
-    targets: TypedInlineTargets,
+    mut targets: TypedInlineTargets,
     max_builtin_sources: Option<usize>,
+    suppressed_inline_targets: &SuppressedTypedInlineTargets,
 ) -> TypedInlineTargets {
+    remove_retired_typed_inline_targets(
+        function.function_id,
+        &mut targets,
+        suppressed_inline_targets,
+    );
+    // A resume plan describes a native out-of-line activation, not permission
+    // to copy its body. Reject that operation before it can take priority or
+    // reserve space; application rejects the same call shape. Ordinary callees
+    // must satisfy the shared activation predicate as well.
+    targets.retain(|source, plans| {
+        !generator_resume_plans.contains_key(source)
+            && !plans.is_empty()
+            && plans.iter().all(|(target, _)| {
+                module
+                    .callable_defs
+                    .iter()
+                    .find(|callee| callee.function_id == *target)
+                    .or_else(|| external_callees.get(target).map(|callee| &callee.function))
+                    .is_some_and(inline_callee_preserves_activation)
+            })
+    });
+    struct OutOfLineResumeCalls<'a>(&'a mut TypedInlineTargets);
+    impl Visit<InstrTyped> for OutOfLineResumeCalls<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && call.extra.generator_resume_plan().is_some()
+                && let Some(source) = call.try_semantic_instr_id()
+            {
+                self.0.remove(&source);
+            }
+            expr.visit_children(self);
+        }
+    }
+    OutOfLineResumeCalls(&mut targets).visit_fn(function);
     let mut candidates = targets.into_iter().collect::<Vec<_>>();
     candidates.sort_by_key(|(source, _)| {
-        let priority = if generator_resume_plans.contains_key(source) {
-            TypedInlineTargetPriority::GeneratorResume
-        } else if trusted_runtime_protocol_sources.contains(source) {
+        let priority = if trusted_runtime_protocol_sources.contains(source) {
             TypedInlineTargetPriority::RuntimeProtocol
         } else if builtin_implementation_sources.contains(source) {
             TypedInlineTargetPriority::BuiltinImplementation
@@ -5424,8 +5629,10 @@ fn select_typed_inline_targets_within_cfg_budget_and_priorities(
 
     let mut selected = TypedInlineTargets::new();
     let mut selected_builtin_sources = 0usize;
-    let mut projected_blocks = function.blocks.len();
-    let mut projected_body_instrs = typed_inline_function_body_instr_count(function);
+    let (native_blocks, native_body) = typed_native_iterator_pipeline_reserved_budget(function);
+    let mut projected_blocks = function.blocks.len().saturating_add(native_blocks);
+    let mut projected_body_instrs =
+        typed_inline_function_body_instr_count(function).saturating_add(native_body);
     let single_source_fixpoint =
         max_builtin_sources.is_some() && !builtin_implementation_sources.is_empty();
 
@@ -5575,6 +5782,26 @@ fn typed_generator_resume_inline_target_is_small_enough(
         MAX_GENERATOR_RESUME_INLINE_BLOCKS,
         MAX_GENERATOR_RESUME_INLINE_BODY_INSTRS,
     )
+}
+
+fn typed_generator_consumer_resume_target_is_within_budget(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+    target: RuntimeFunctionId,
+) -> bool {
+    let Some(resume) = module
+        .callable_defs
+        .iter()
+        .find(|callee| callee.function_id == target)
+        .or_else(|| external_callees.get(&target).map(|callee| &callee.function))
+    else {
+        return false;
+    };
+    // The consumer and its protocol bridge remain bounded separately. A
+    // suspended body's private activation cannot be inlined and does not
+    // contribute to their caller's copied-code budget.
+    !inline_callee_preserves_activation(resume)
+        || typed_generator_resume_inline_target_is_small_enough(module, external_callees, target)
 }
 
 fn typed_generator_protocol_bridge_inline_target_is_small_enough(
@@ -6194,7 +6421,8 @@ fn remap_cloned_exact_int_region_plan(
     }
     for input in &mut remapped.inputs {
         match &mut input.source {
-            RegionInputSource::IndexedGlobal { source, .. }
+            RegionInputSource::CellValue { source, .. }
+            | RegionInputSource::IndexedGlobal { source, .. }
             | RegionInputSource::IndexedField { source, .. } => {
                 *source = remap_cloned_exact_int_instr_id(*source, context);
             }
@@ -6522,6 +6750,59 @@ fn remap_virtualized_exact_int_inputs_to_scalar_locals(
     remapper.count
 }
 
+fn exact_int_region_has_live_indexed_field_guards(
+    function_id: RuntimeFunctionId,
+    region: &RegionPlan,
+    indexed_field_guards: &HashMap<InstrId, Vec<soac_ir_typed::TypedIndexedFieldGuard>>,
+    late_bound_owner_fields: &HashMap<InstrId, TypedLateBoundOwnerFieldPlan>,
+    missing_field_sources: &mut HashSet<InstrId>,
+) -> bool {
+    let mut valid = true;
+    for input in &region.inputs {
+        if input.value.rep != soac_ir_typed::plan_v3::Rep::PyObjectBorrowed {
+            continue;
+        }
+        let RegionInputSource::IndexedField {
+            source,
+            owner_type,
+            attr_name,
+            expected_index,
+            ..
+        } = &input.source
+        else {
+            continue;
+        };
+        let has_matching_guard = indexed_field_guards.get(source).is_some_and(|guards| {
+            guards.iter().any(|guard| {
+                guard.expected_index == *expected_index
+                    && matches!(
+                        &guard.owner_type_ref,
+                        TypedAttrOwnerRef::TypeKey {
+                            module_name,
+                            qualname,
+                        } if module_name == &owner_type.module_name
+                            && qualname == &owner_type.qualname
+                    )
+            })
+        }) || late_bound_owner_fields.get(source).is_some_and(|plan| {
+            plan.counter_source.function_id.runtime_module_id() == function_id.runtime_module_id()
+                && &plan.owner_type == owner_type
+                && plan.attr_name == *attr_name
+                && matches!(
+                    plan.storage,
+                    LateBoundOwnerFieldStorage::SplitDict {
+                        expected_index: guarded_index,
+                    } if guarded_index == *expected_index
+                )
+        });
+        if !has_matching_guard {
+            missing_field_sources.insert(*source);
+            valid = false;
+        }
+    }
+    valid
+}
+
 fn invalidate_unguarded_exact_int_selections(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> usize {
@@ -6539,55 +6820,13 @@ fn invalidate_unguarded_exact_int_selections(
 
     impl Validator<'_> {
         fn region_has_live_indexed_field_guards(&mut self, region: &RegionPlan) -> bool {
-            let mut valid = true;
-            for input in &region.inputs {
-                if input.value.rep != soac_ir_typed::plan_v3::Rep::PyObjectBorrowed {
-                    continue;
-                }
-                let RegionInputSource::IndexedField {
-                    source,
-                    owner_type,
-                    attr_name,
-                    expected_index,
-                    ..
-                } = &input.source
-                else {
-                    continue;
-                };
-                let has_matching_guard =
-                    self.indexed_field_guards.get(source).is_some_and(|guards| {
-                        guards.iter().any(|guard| {
-                            guard.expected_index == *expected_index
-                                && matches!(
-                                    &guard.owner_type_ref,
-                                    TypedAttrOwnerRef::TypeKey {
-                                        module_name,
-                                        qualname,
-                                    } if module_name == &owner_type.module_name
-                                        && qualname == &owner_type.qualname
-                                )
-                        })
-                    }) || self
-                        .late_bound_owner_fields
-                        .get(source)
-                        .is_some_and(|plan| {
-                            plan.counter_source.function_id.runtime_module_id()
-                                == self.function_id.runtime_module_id()
-                                && &plan.owner_type == owner_type
-                                && plan.attr_name == *attr_name
-                                && matches!(
-                                    plan.storage,
-                                    LateBoundOwnerFieldStorage::SplitDict {
-                                        expected_index: guarded_index,
-                                    } if guarded_index == *expected_index
-                                )
-                        });
-                if !has_matching_guard {
-                    self.missing_field_sources.insert(*source);
-                    valid = false;
-                }
-            }
-            valid
+            exact_int_region_has_live_indexed_field_guards(
+                self.function_id,
+                region,
+                self.indexed_field_guards,
+                self.late_bound_owner_fields,
+                &mut self.missing_field_sources,
+            )
         }
 
         fn validate_expr(&mut self, expr: &mut InstrTyped) {
@@ -6812,13 +7051,49 @@ fn remap_cloned_profile_rewrites(
     }
 }
 
+/// Carry pre-existing retirement by qualified semantic source identity.
+///
+/// Run before retiring the newly replaced originals: a fresh hot clone of an
+/// active site remains active, while copying an already cold site cannot make
+/// it eligible again. A fixed point handles transitive mappings in any order.
+fn remap_suppressed_inline_targets(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    suppressed_inline_targets: &mut SuppressedTypedInlineTargets,
+) -> usize {
+    let mut total = 0;
+    loop {
+        let propagated = mappings
+            .iter()
+            .filter_map(|mapping| {
+                suppressed_inline_targets
+                    .get(&mapping.callee)
+                    .is_some_and(|sources| sources.contains(&mapping.callee_instr_id))
+                    .then_some(mapping.caller_instr_id)
+            })
+            .collect::<Vec<_>>();
+        let caller_sources = suppressed_inline_targets
+            .entry(caller_function_id)
+            .or_default();
+        let mut changed = 0;
+        for source in propagated {
+            changed += usize::from(caller_sources.insert(source));
+        }
+        total += changed;
+        if changed == 0 {
+            return total;
+        }
+    }
+}
+
 fn retire_cloned_inline_targets(
     caller_function_id: RuntimeFunctionId,
     mappings: &[TypedInlineInstrIdMapping],
     remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
     suppressed_inline_targets: &mut SuppressedTypedInlineTargets,
 ) -> usize {
-    let mut count = 0;
+    let mut count =
+        remap_suppressed_inline_targets(caller_function_id, mappings, suppressed_inline_targets);
     for mapping in mappings {
         if mapping.callee != caller_function_id {
             continue;
@@ -6833,6 +7108,12 @@ fn retire_cloned_inline_targets(
         if let Some(targets) = remapped_inline_targets.get_mut(&caller_function_id) {
             targets.remove(&mapping.callee_instr_id);
         }
+    }
+    if let (Some(targets), Some(suppressed)) = (
+        remapped_inline_targets.get_mut(&caller_function_id),
+        suppressed_inline_targets.get(&caller_function_id),
+    ) {
+        targets.retain(|source, _| !suppressed.contains(source));
     }
     count
 }
@@ -7255,15 +7536,12 @@ impl LateTypedRefreshSchedule {
 struct LateTypedFixpointIteration {
     builtin_implementation_rewrites: usize,
     runtime_protocol_rewrites: usize,
-    resume_rewrites: usize,
     stop_iteration_rewrites: usize,
 }
 
 impl LateTypedFixpointIteration {
     fn may_expose_stop_iteration_edges(&self) -> bool {
-        self.builtin_implementation_rewrites != 0
-            || self.runtime_protocol_rewrites != 0
-            || self.resume_rewrites != 0
+        self.builtin_implementation_rewrites != 0 || self.runtime_protocol_rewrites != 0
     }
 
     fn made_progress(&self) -> bool {
@@ -7709,42 +7987,6 @@ fn trusted_generator_resume_plans_and_report_from_analysis(
     (plans, report)
 }
 
-fn generator_resume_inline_targets(
-    plans: &HashMap<InstrId, TypedGeneratorResumePlan>,
-    module: &BlockPyModule<TypedBlockPyModuleShape>,
-    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
-) -> TypedInlineTargets {
-    plans
-        .iter()
-        .filter_map(|(source, plan)| {
-            if typed_generator_resume_plan_state_origin(plan).is_none()
-                || !typed_generator_resume_inline_target_is_small_enough(
-                    module,
-                    external_callees,
-                    plan.function_id,
-                )
-            {
-                return None;
-            }
-
-            Some((
-                *source,
-                vec![(
-                    plan.function_id,
-                    TypedDirectCallArgPlan {
-                        sources: vec![
-                            soac_ir_typed::TypedDirectCallArgSource::Provided(1),
-                            soac_ir_typed::TypedDirectCallArgSource::Provided(2),
-                            soac_ir_typed::TypedDirectCallArgSource::Provided(3),
-                            soac_ir_typed::TypedDirectCallArgSource::Provided(4),
-                        ],
-                    },
-                )],
-            ))
-        })
-        .collect()
-}
-
 #[derive(Default)]
 struct TrustedOwnerStateCache {
     states: Option<TrustedOwnerStateAnalysis>,
@@ -7785,33 +8027,17 @@ impl TrustedOwnerStateCache {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn inline_late_typed_generator_resume_plans_after_stop_iteration_normalization(
+fn refresh_late_typed_generator_resume_plans_after_stop_iteration_normalization(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
-    module_constants: &mut Vec<ConstantExpr>,
+    module_constants: &[ConstantExpr],
     late_refresh_schedule: &mut LateTypedRefreshSchedule,
     trusted_constructor_calls: &HashMap<InstrId, TypedAttrOwnerRef>,
     trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
-    callee_module: &BlockPyModule<TypedBlockPyModuleShape>,
-    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
-    generator_state_constructors_by_origin: &HashMap<InstrId, TypedGeneratorStateConstructor>,
-    constructor_capture_bindings_by_function: &HashMap<
-        RuntimeFunctionId,
-        HashMap<InstrId, HashMap<u32, CellLocation>>,
-    >,
-    constructor_capture_bindings_by_origin: &mut HashMap<InstrId, HashMap<u32, CellLocation>>,
-    generator_state_instr_ids_by_origin: &mut HashMap<
-        InstrId,
-        (RuntimeFunctionId, HashSet<InstrId>),
-    >,
     generator_state_pending_alias_use_instr_ids_by_origin: &mut HashMap<InstrId, HashSet<InstrId>>,
-    lowered_generator_preserved_locals: &mut LoweredGeneratorPreservedLocals,
-    static_targets: &StaticDirectCallTargets,
-    local_generators: &HashMap<RuntimeFunctionId, &BlockPyFunction<TypedBlockPyModuleShape>>,
-    remapped_generator_instance_plans: Option<&HashMap<InstrId, TypedGeneratorInstancePlan>>,
     late_trusted_owner_states: &mut TrustedOwnerStateCache,
-) -> Result<usize, String> {
+) -> Result<(), String> {
     if !late_refresh_schedule.requests(LateTypedRefreshFamily::TrustedGeneratorResume) {
-        return Ok(0);
+        return Ok(());
     }
     let pruned_unreachable_blocks = prune_unreachable_typed_blocks(function);
     if pruned_unreachable_blocks != 0 {
@@ -7823,14 +8049,6 @@ fn inline_late_typed_generator_resume_plans_after_stop_iteration_normalization(
             pruned_unreachable_blocks,
             "typed_generator_resume_pruned_unreachable_blocks_before_late_planning",
         );
-    }
-    let mut late_generator_state_constructors_by_origin =
-        generator_state_constructors_by_origin.clone();
-    for (origin, constructor) in &mut late_generator_state_constructors_by_origin {
-        if constructor.closure_cell_bindings.is_none() {
-            constructor.closure_cell_bindings =
-                constructor_capture_bindings_by_origin.get(origin).cloned();
-        }
     }
     let trusted_owner_states = late_trusted_owner_states.states(
         function,
@@ -7854,141 +8072,15 @@ fn inline_late_typed_generator_resume_plans_after_stop_iteration_normalization(
         generator_state_pending_alias_use_instr_ids_by_origin,
         &generator_resume_plans,
     );
-    let inline_targets =
-        generator_resume_inline_targets(&generator_resume_plans, callee_module, external_callees);
-    let inline_targets = select_typed_inline_targets_within_cfg_budget(
-        function,
-        callee_module,
-        external_callees,
-        &generator_resume_plans,
-        inline_targets,
-    );
-    if !generator_resume_plans.is_empty() {
-        tracing::info!(
-            target: "soac_generator_state_lowering",
-            function_id = ?function.function_id,
-            function_qualname = %function.names.qualname,
-            generator_resume_plan_count = generator_resume_plans.len(),
-            inline_target_count = inline_targets.len(),
-            "typed_late_generator_resume_targets_collected",
-        );
-    }
-    if inline_targets.is_empty() {
-        return Ok(0);
-    }
-
-    let pre_inline_block_labels = function
-        .blocks
-        .iter()
-        .map(|block| block.label)
-        .collect::<HashSet<_>>();
-    let stats = inline_typed_function_direct_call_stores_with_external_callees_and_trusted_calls(
-        function,
-        callee_module,
-        module_constants,
-        external_callees,
-        &inline_targets,
-        &HashMap::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &late_generator_state_constructors_by_origin,
-    );
-    let rewritten =
-        stats.rewritten_stores + stats.rewritten_effect_only_calls + stats.rewritten_returns;
-    tracing::info!(
-        target: "soac_generator_state_lowering",
+    // These decisions are consumed by native out-of-line resume emission.
+    // Refreshing them does not copy code or count as CFG rewrite progress.
+    tracing::debug!(
+        target: "soac_generator_resume_planning",
         function_id = ?function.function_id,
-        function_qualname = %function.names.qualname,
         generator_resume_plan_count = generator_resume_plans.len(),
-        rewritten_stores = stats.rewritten_stores,
-        rewritten_effect_only_calls = stats.rewritten_effect_only_calls,
-        rewritten_returns = stats.rewritten_returns,
-        skipped_candidates = stats.skipped_candidates,
-        skipped_exception_edges = stats.skipped_exception_edges,
-        inline_source_count = stats.inline_instance_sources.len(),
-        instr_id_mapping_count = stats.instr_id_mappings.len(),
-        "typed_late_generator_resume_inline_stats",
+        "typed_late_out_of_line_generator_resume_plans_refreshed",
     );
-    if rewritten == 0 {
-        return Ok(0);
-    }
-
-    import_typed_generator_constructor_capture_bindings_from_mappings(
-        function.function_id,
-        &stats.instr_id_mappings,
-        constructor_capture_bindings_by_function,
-        constructor_capture_bindings_by_origin,
-    );
-    collect_generator_state_lowering_instr_ids(
-        &generator_resume_plans,
-        &stats,
-        generator_state_instr_ids_by_origin,
-    );
-    propagate_generator_state_lowering_synthetic_instr_ids(
-        &stats,
-        generator_state_instr_ids_by_origin,
-    );
-    propagate_generator_pending_alias_use_synthetic_instr_ids(
-        &stats,
-        generator_state_pending_alias_use_instr_ids_by_origin,
-    );
-    let mut generator_resume_alias_cleanup_active_blocks =
-        trusted_generator_alias_cleanup_active_blocks(trusted_owner_states);
-    generator_resume_alias_cleanup_active_blocks.extend(
-        function
-            .blocks
-            .iter()
-            .filter(|block| !pre_inline_block_labels.contains(&block.label))
-            .map(|block| block.label),
-    );
-    retain_typed_generator_pending_alias_use_instr_ids_by_origin(
-        generator_state_pending_alias_use_instr_ids_by_origin,
-        typed_generator_pending_alias_use_source_instr_ids_by_origin(&generator_resume_plans),
-    );
-    let pending_alias_use_instr_ids_by_origin = typed_generator_alias_ignored_instr_ids_by_origin(
-        function,
-        module_constants,
-        generator_state_pending_alias_use_instr_ids_by_origin,
-    );
-    retain_typed_generator_pending_alias_use_instr_ids_by_origin(
-        generator_state_pending_alias_use_instr_ids_by_origin,
-        pending_alias_use_instr_ids_by_origin.clone(),
-    );
-    lower_or_remap_typed_generator_state_for_function(
-        function,
-        module_constants,
-        callee_module,
-        external_callees,
-        typed_generator_state_lowering_plans(
-            generator_state_instr_ids_by_origin.clone(),
-            &late_generator_state_constructors_by_origin,
-            &pending_alias_use_instr_ids_by_origin,
-            Some(&generator_resume_alias_cleanup_active_blocks),
-        ),
-        0,
-        None,
-        lowered_generator_preserved_locals,
-    );
-    remap_inlined_generator_constructor_capture_bindings_for_lowered_state(
-        function,
-        &generator_resume_plans,
-        &stats,
-        lowered_generator_preserved_locals,
-        constructor_capture_bindings_by_origin,
-    );
-    assign_missing_typed_function_instr_ids(function);
-    refresh_typed_function_value_facts(function);
-    let mut refreshed_generator_instance_plans =
-        static_generator_instance_plans_for_function(function, static_targets);
-    refreshed_generator_instance_plans.extend(static_local_generator_instance_plans_for_function(
-        function,
-        local_generators,
-    ));
-    if let Some(remapped) = remapped_generator_instance_plans {
-        refreshed_generator_instance_plans.extend(remapped.clone());
-    }
-    annotate_typed_generator_instance_plans(function, Some(&refreshed_generator_instance_plans))?;
-    Ok(rewritten)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8077,6 +8169,7 @@ fn inline_late_typed_runtime_protocol_and_static_method_plans(
     external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
     static_targets: &StaticDirectCallTargets,
     late_trusted_owner_states: &mut TrustedOwnerStateCache,
+    suppressed_inline_targets: &mut SuppressedTypedInlineTargets,
 ) -> Result<soac_opt::passes::TypedInlineRewriteStats, String> {
     let linearization = linearize_typed_function_expressions(function).map_err(|reason| {
         format!(
@@ -8150,6 +8243,7 @@ fn inline_late_typed_runtime_protocol_and_static_method_plans(
         &HashSet::new(),
         inline_targets,
         None,
+        suppressed_inline_targets,
     );
     if inline_targets.is_empty() {
         tracing::debug!(
@@ -8173,6 +8267,11 @@ fn inline_late_typed_runtime_protocol_and_static_method_plans(
         &trusted_runtime_protocol_receiver_origins,
         &trusted_runtime_protocol_resume_functions,
         &HashMap::new(),
+    );
+    remap_suppressed_inline_targets(
+        function.function_id,
+        &stats.instr_id_mappings,
+        suppressed_inline_targets,
     );
     let rewritten =
         stats.rewritten_stores + stats.rewritten_effect_only_calls + stats.rewritten_returns;
@@ -8328,6 +8427,7 @@ fn inline_late_typed_builtin_implementation_plans(
     >,
     constructor_capture_bindings_by_origin: &mut HashMap<InstrId, HashMap<u32, CellLocation>>,
     late_trusted_owner_states: &mut TrustedOwnerStateCache,
+    suppressed_inline_targets: &mut SuppressedTypedInlineTargets,
 ) -> Result<usize, String> {
     let linearization = linearize_typed_function_expressions(function).map_err(|reason| {
         format!(
@@ -8419,6 +8519,7 @@ fn inline_late_typed_builtin_implementation_plans(
         &builtin_implementation_sources,
         inline_targets,
         Some(1),
+        suppressed_inline_targets,
     );
     retain_selected_typed_builtin_implementation_plans(
         function,
@@ -8439,6 +8540,11 @@ fn inline_late_typed_builtin_implementation_plans(
         &HashMap::new(),
         &HashMap::new(),
         generator_state_constructors_by_origin,
+    );
+    remap_suppressed_inline_targets(
+        function.function_id,
+        &stats.instr_id_mappings,
+        suppressed_inline_targets,
     );
     let rewritten =
         stats.rewritten_stores + stats.rewritten_effect_only_calls + stats.rewritten_returns;
@@ -8831,7 +8937,7 @@ fn lower_or_remap_typed_generator_state_for_function(
             let mut next_remapped_existing_helper_calls = 0;
             let mut next_removed_reused_alias_setup = 0;
             if let Some(constructor) = plan.materialized_constructor.as_ref() {
-                let preserved_locals_by_name = callee_module
+                let preserved_control_locals = callee_module
                     .callable_defs
                     .iter()
                     .find(|callee| callee.function_id == plan.function_id)
@@ -8847,13 +8953,14 @@ fn lower_or_remap_typed_generator_state_for_function(
                             .iter()
                             .enumerate()
                             .filter_map(|(slot_index, slot)| {
+                                let role = slot.generator_control?;
                                 preserved_locals
                                     .get(&PreservedLocation(
                                         u32::try_from(slot_index)
                                             .expect("preserved slot index should fit in u32"),
                                     ))
                                     .cloned()
-                                    .map(|local| (slot.logical_name.clone(), local))
+                                    .map(|local| (role, local))
                             })
                             .collect::<HashMap<_, _>>()
                     })
@@ -8863,7 +8970,7 @@ fn lower_or_remap_typed_generator_state_for_function(
                         function,
                         module_constants,
                         constructor,
-                        &preserved_locals_by_name,
+                        &preserved_control_locals,
                         &plan.pending_alias_use_instr_ids,
                     );
                 if plan.pending_alias_use_instr_ids.is_empty() {
@@ -9067,10 +9174,10 @@ fn trusted_runtime_protocol_calls_from_analysis(
                     soac_ir_typed::TypedCallAccessPlan::GuardedRuntimeProtocolMethod { .. }
                 )
                 && let Some(instr_id) = call.try_semantic_instr_id()
-                && let Some(soac_core::block_py::CallArgPositional::Positional(InstrTyped::Load(
-                    load,
-                ))) = call.args.first()
-                && let Some(owner_type_ref) = trusted_owner_state_for_name(&load.name, self.state)
+                && let Some(soac_core::block_py::CallArgPositional::Positional(value)) =
+                    call.args.first()
+                && let Some(name) = typed_protocol_value_name(value)
+                && let Some(owner_type_ref) = trusted_owner_state_for_name(name, self.state)
             {
                 self.calls.insert(instr_id, owner_type_ref.clone());
             }
@@ -9132,6 +9239,14 @@ fn trusted_static_runtime_protocol_inlines_for_function(
         &states,
         static_targets,
     )
+}
+
+fn typed_protocol_value_name(value: &InstrTyped) -> Option<&ResolvedName> {
+    match value {
+        InstrTyped::Load(load) => Some(&load.name),
+        InstrTyped::TakeOperand(take) => Some(&take.name),
+        _ => None,
+    }
 }
 
 fn trusted_static_runtime_protocol_inlines_from_analysis(
@@ -9199,8 +9314,9 @@ fn trusted_static_runtime_protocol_inlines_from_analysis(
                     _ => None,
                 };
                 let owner_type_ref = call.args.first().and_then(|arg| match arg {
-                    soac_core::block_py::CallArgPositional::Positional(InstrTyped::Load(load)) => {
-                        trusted_owner_state_for_name(&load.name, self.state)
+                    soac_core::block_py::CallArgPositional::Positional(value) => {
+                        typed_protocol_value_name(value)
+                            .and_then(|name| trusted_owner_state_for_name(name, self.state))
                     }
                     _ => None,
                 });
@@ -9244,9 +9360,9 @@ fn trusted_static_runtime_protocol_inlines_from_analysis(
                 let Some(owner_type_ref) = owner_type_ref else {
                     if runtime_name == Some(RuntimeName::Next) {
                         let receiver_name = call.args.first().and_then(|arg| match arg {
-                            soac_core::block_py::CallArgPositional::Positional(
-                                InstrTyped::Load(load),
-                            ) => Some(&load.name),
+                            soac_core::block_py::CallArgPositional::Positional(value) => {
+                                typed_protocol_value_name(value)
+                            }
                             _ => None,
                         });
                         let receiver_origin = receiver_name
@@ -9310,9 +9426,10 @@ fn trusted_static_runtime_protocol_inlines_from_analysis(
                         } if module_name == "soac.runtime" && qualname == "ClosureGenerator"
                     )
                     && let Some(generator_origin) = call.args.first().and_then(|arg| match arg {
-                        soac_core::block_py::CallArgPositional::Positional(InstrTyped::Load(
-                            load,
-                        )) => trusted_object_origin_for_name(&load.name, self.state),
+                        soac_core::block_py::CallArgPositional::Positional(value) => {
+                            typed_protocol_value_name(value)
+                                .and_then(|name| trusted_object_origin_for_name(name, self.state))
+                        }
                         _ => None,
                     })
                 {
@@ -9331,12 +9448,15 @@ fn trusted_static_runtime_protocol_inlines_from_analysis(
                     )
                     .or_else(|| {
                         call.args.first().and_then(|arg| match arg {
-                            soac_core::block_py::CallArgPositional::Positional(
-                                InstrTyped::Load(load),
-                            ) => trusted_generator_resume_function_fact_for_name(
-                                &load.name, self.state,
-                            )
-                            .map(|fact| fact.function_id),
+                            soac_core::block_py::CallArgPositional::Positional(value) => {
+                                typed_protocol_value_name(value)
+                                    .and_then(|name| {
+                                        trusted_generator_resume_function_fact_for_name(
+                                            name, self.state,
+                                        )
+                                    })
+                                    .map(|fact| fact.function_id)
+                            }
                             _ => None,
                         })
                     });
@@ -10337,7 +10457,7 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
     let Some(profile) = profile else {
         return Ok(());
     };
-    apply_profile_call_emission_plans_to_typed_function(function, profile)?;
+    apply_profile_call_emission_plans_to_typed_function(function, profile, &HashSet::new())?;
     apply_profile_access_and_scalar_plans_to_typed_function(
         function, profile, None, None, None, None, None, None,
     )?;
@@ -10464,12 +10584,25 @@ pub(super) fn optimize_blockpy(
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
 ) -> Result<Arc<JitModulePlan>, String> {
+    optimize_blockpy_with_boundary_modules(module, profile, env_config, HashSet::new())
+}
+
+pub(super) fn optimize_blockpy_with_boundary_modules(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    profile: Option<&SpecializationProfile<'_>>,
+    env_config: &SoacEnvConfig,
+    public_boundary_modules: HashSet<u32>,
+) -> Result<Arc<JitModulePlan>, String> {
     optimize_blockpy_with_external_inline_callees(
         module,
         profile,
         env_config,
         HashMap::new(),
-        StaticDirectCallTargets::default(),
+        StaticDirectCallTargets {
+            public_boundary_modules,
+            ..Default::default()
+        },
+        None,
     )
 }
 
@@ -10530,11 +10663,13 @@ fn build_shared_state_jit_module_plan(
     // Keep profile mode on the original call graph so nested runtime protocol
     // sites still collect evidence before apply/verify rewrites inline them.
     let static_targets_start = Instant::now();
-    let static_targets = if env_config.specialization_mode() == Some(SpecializationMode::Profile) {
-        StaticDirectCallTargets::default()
-    } else {
-        static_direct_call_targets(shared_state, compile_session, env_config)?
-    };
+    let mut static_targets = static_direct_call_targets(shared_state, compile_session, env_config)?;
+    if env_config.specialization_mode() == Some(SpecializationMode::Profile) {
+        static_targets = StaticDirectCallTargets {
+            public_boundary_modules: static_targets.public_boundary_modules,
+            ..StaticDirectCallTargets::default()
+        };
+    }
     let static_targets_elapsed = static_targets_start.elapsed();
     let external_callees_start = Instant::now();
     let external_callees = external_typed_inline_callees(
@@ -10553,6 +10688,7 @@ fn build_shared_state_jit_module_plan(
         env_config,
         external_callees,
         static_targets,
+        shared_state.verified_strict_module(),
     )?;
     let optimize_elapsed = optimize_start.elapsed();
     tracing::info!(
@@ -10574,9 +10710,17 @@ fn optimize_blockpy_with_external_inline_callees(
     module: &BlockPyModule<BlockPyModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
-    external_callees: HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
-    static_targets: StaticDirectCallTargets,
+    mut external_callees: HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+    mut static_targets: StaticDirectCallTargets,
+    strict_module: Option<&crate::VerifiedStrictModule>,
 ) -> Result<Arc<JitModulePlan>, String> {
+    if module.strict_source.is_some() {
+        static_targets
+            .public_boundary_modules
+            .insert(module.module_name_gen.runtime_module_id().as_u32());
+    }
+    static_targets.retain_unchecked_candidates();
+    external_callees.retain(|function, _| !static_targets.requires_public_boundary(*function));
     let total_start = Instant::now();
     let inline_plan_start = Instant::now();
     let inline_plan = profile.map(|_| plan_module_inlining(&summarize_module_escapes(module)));
@@ -10589,10 +10733,20 @@ fn optimize_blockpy_with_external_inline_callees(
             for function in &mut typed_module.callable_defs {
                 assign_missing_typed_function_instr_ids(function);
             }
+            if matches!(
+                env_config.specialization_mode(),
+                Some(SpecializationMode::Apply | SpecializationMode::Verify)
+            ) && let Some(verified) = strict_module
+            {
+                crate::strict_optimization::annotate_typed_call_requests(typed_module, verified)?;
+            }
             let eligible_descriptor_targets = typed_module
                 .callable_defs
                 .iter()
-                .filter(|function| function.kind == FunctionKind::Function)
+                .filter(|function| {
+                    function.kind == FunctionKind::Function
+                        && !static_targets.requires_public_boundary(function.function_id)
+                })
                 .map(|function| function.function_id)
                 .collect::<HashSet<_>>();
             let immediate_method_sources = typed_module
@@ -10643,6 +10797,16 @@ fn optimize_blockpy_with_external_inline_callees(
                     (function.function_id, sources)
                 })
                 .collect::<HashMap<_, _>>();
+            // Resolve the complete lookup/call operation before linearization
+            // gives its receiver a temporary whose cleanup belongs to the
+            // lookup. Reassembling across that cleanup would delay finalizers.
+            // Profile call-emission plans can still replace this public-call
+            // region with their separately validated guarded operation.
+            for function in &mut typed_module.callable_defs {
+                if let Some(sources) = immediate_method_sources.get(&function.function_id) {
+                    recover_source_resolved_immediate_method_calls(function, sources);
+                }
+            }
             let static_generator_instances =
                 static_generator_instance_plans_for_module(typed_module, &static_targets);
             for function in &mut typed_module.callable_defs {
@@ -10679,6 +10843,19 @@ fn optimize_blockpy_with_external_inline_callees(
                 if let Some(sources) = immediate_method_sources.get(&function.function_id) {
                     recover_source_resolved_immediate_method_calls(function, sources);
                 }
+            }
+            // This rewrite must precede the shared value-fact synchronization:
+            // a storage capability does not prove the value returned by a
+            // generic fallback, and cannot preserve a stale profiled result.
+            if matches!(
+                env_config.specialization_mode(),
+                Some(SpecializationMode::Apply | SpecializationMode::Verify)
+            ) && let Some(verified) = strict_module
+            {
+                crate::strict_optimization::annotate_typed_capability_requests(
+                    typed_module,
+                    verified,
+                )?;
             }
             Ok(())
         },
@@ -10754,6 +10931,7 @@ fn external_typed_inline_callees(
         !static_targets
             .suppressed_source_generators
             .contains(function_id)
+            && !static_targets.requires_public_boundary(*function_id)
     });
     if targets.is_empty() {
         return Ok(HashMap::new());
@@ -10773,6 +10951,9 @@ fn external_typed_inline_callees(
 
     let mut external_callees = HashMap::new();
     for target_state in by_module.into_values() {
+        if target_state.lowered_module.strict_source.is_some() {
+            continue;
+        }
         let inline_plan =
             plan_module_inlining(&summarize_module_escapes(&target_state.lowered_module));
         let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module_with_rewrites(
@@ -11008,7 +11189,7 @@ fn prepare_trusted_typed_inline_work_for_function(
     let static_method = static_method_start.elapsed();
 
     let field_callable_start = Instant::now();
-    let (field_callable_emissions, static_field_callable_inline_targets) =
+    let (mut field_callable_emissions, static_field_callable_inline_targets) =
         trusted_field_callable_inlines_from_analysis(
             function,
             module_constants,
@@ -11016,6 +11197,7 @@ fn prepare_trusted_typed_inline_work_for_function(
             callee_module,
             external_callees,
         )?;
+    retain_unchecked_call_emissions(&mut field_callable_emissions, static_targets);
     let field_callable_mutated = !field_callable_emissions.is_empty();
     if field_callable_mutated {
         lower_typed_function_call_emission_plans(function, &field_callable_emissions)?;
@@ -11103,7 +11285,7 @@ fn apply_typed_v3_module_rewrites(
     external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
     static_targets: &StaticDirectCallTargets,
     static_direct_calls: &StaticTypedDirectCalls,
-) -> Result<(), String> {
+) -> Result<SuppressedTypedInlineTargets, String> {
     let total_start = Instant::now();
     let setup_start = Instant::now();
     let field_counter_function_ids = module
@@ -11136,15 +11318,32 @@ fn apply_typed_v3_module_rewrites(
     }
     for function in &mut module.callable_defs {
         assign_missing_typed_function_instr_ids(function);
+        let available_blocks =
+            MAX_TYPED_INLINE_FUNCTION_BLOCKS.saturating_sub(function.blocks.len() + 1);
+        let available_body = MAX_TYPED_INLINE_FUNCTION_BODY_INSTRS
+            .saturating_sub(typed_inline_function_body_instr_count(function) + 1);
+        select_typed_native_iterator_pipelines(
+            function,
+            &module.module_constants,
+            available_blocks,
+            available_body,
+        )?;
         if let Some(artifacts) = profile
             .opt_v3_exact_int_branch_artifacts
             .get(&function.function_id)
         {
             annotate_typed_late_bound_owner_fields(function, artifacts)?;
         }
+        // Resolve already-selected field guards before cloning callees or
+        // linearizing their dependent scalar expressions. Late attachment is
+        // still repeated after rewriting to validate the final live sources.
+        annotate_typed_indexed_field_accesses_from_profile(function, profile, None, None)?;
     }
 
-    let callee_module = module.clone();
+    let mut callee_module = module.clone();
+    callee_module
+        .callable_defs
+        .retain(|function| !static_targets.requires_public_boundary(function.function_id));
     let mut constructor_capture_bindings_by_function = callee_module
         .callable_defs
         .iter()
@@ -11169,6 +11368,7 @@ fn apply_typed_v3_module_rewrites(
             !static_targets
                 .suppressed_source_generators
                 .contains(function_id)
+                && !static_targets.requires_public_boundary(*function_id)
         })
         .collect();
     let synthetic_genexpr_function_ids = synthetic_genexpr_function_ids_for_module(&callee_module);
@@ -11300,17 +11500,15 @@ fn apply_typed_v3_module_rewrites(
         let mut inline_tuple_simplify_elapsed = Duration::ZERO;
         let mut inline_value_fact_refresh_elapsed = Duration::ZERO;
         let mut inline_call_emission_lower_elapsed = Duration::ZERO;
-        let mut inline_post_split_elapsed = Duration::ZERO;
         let mut inline_progress = Vec::new();
         let mut suppressed_alias_hot_split_instr_ids = HashSet::new();
         let mut suppressed_generator_alias_hot_split_instr_ids = HashSet::new();
-        let mut closed_iterator_pipeline_inlining_active = false;
         let mut retried_final_generator_plan_refresh = false;
         let mut retried_idle_hot_continuation_split = false;
         let mut inline_rewrite_pass_count = 0usize;
         let mut inline_maintenance_pass_count = 0usize;
         loop {
-            annotate_typed_late_bound_remapped_exact_int_selections(
+            annotate_typed_atomic_remapped_exact_int_selections(
                 function,
                 remapped_exact_int_branches.get(&function.function_id),
                 remapped_exact_int_returns.get(&function.function_id),
@@ -11436,29 +11634,26 @@ fn apply_typed_v3_module_rewrites(
             inline_targets.extend(static_protocol_inline_targets);
             inline_targets.extend(static_method_inline_targets);
             inline_targets.extend(static_field_callable_inline_targets);
-            let generator_resume_inline_targets = generator_resume_inline_targets(
-                &generator_resume_plans,
-                &callee_module,
-                external_callees,
-            );
-            let generator_resume_inline_target_count = generator_resume_inline_targets.len();
             if !generator_resume_plans.is_empty() {
                 tracing::info!(
                     target: "soac_generator_state_lowering",
                     caller = ?function.function_id,
                     pass,
                     generator_resume_plan_count = generator_resume_plans.len(),
-                    generator_resume_inline_target_count =
-                        generator_resume_inline_targets.len(),
-                    "typed_generator_resume_inline_targets_collected",
+                    "typed_out_of_line_generator_resume_plans_collected",
                 );
             }
-            inline_targets.extend(generator_resume_inline_targets);
             let builtin_implementation_inline_targets =
                 builtin_implementation_inline_targets(&builtin_implementation_plans);
             let builtin_implementation_inline_target_count =
                 builtin_implementation_inline_targets.len();
             inline_targets.extend(builtin_implementation_inline_targets);
+            // Apply after every profile/static/builtin extension, not merely
+            // to the initial profile candidates.
+            inline_targets.retain(|_, plans| {
+                plans.retain(|(target, _)| !static_targets.requires_public_boundary(*target));
+                !plans.is_empty()
+            });
             inline_target_collect_elapsed += inline_target_collect_start.elapsed();
             let inline_target_stage_start = Instant::now();
             let inline_target_count_before_stage = inline_targets.len();
@@ -11487,6 +11682,7 @@ fn apply_typed_v3_module_rewrites(
                 &builtin_implementation_sources,
                 inline_targets,
                 Some(1),
+                &suppressed_inline_targets,
             );
             retain_selected_typed_builtin_implementation_plans(
                 function,
@@ -11514,7 +11710,6 @@ fn apply_typed_v3_module_rewrites(
                 static_protocol_inline_target_count,
                 static_method_inline_target_count,
                 static_field_callable_inline_target_count,
-                generator_resume_inline_target_count,
                 builtin_implementation_inline_target_count,
                 inline_target_count_before_stage,
                 inline_target_count_after_stage = inline_targets.len(),
@@ -11810,14 +12005,6 @@ fn apply_typed_v3_module_rewrites(
                     skipped_exception_edges = stats.skipped_exception_edges,
                     "typed_builtin_generator_consumer_inline_rewrites",
                 );
-                closed_iterator_pipeline_inlining_active |=
-                    stats.inline_instance_sources.iter().any(|source| {
-                        builtin_implementation_plans
-                            .get(&source.source_instr_id)
-                            .is_some_and(|plan| {
-                                matches!(plan.source, RuntimeName::Map | RuntimeName::Filter)
-                            })
-                    });
             }
             trace_materialized_generator_state_constructor_anchors(
                 function,
@@ -11829,6 +12016,7 @@ fn apply_typed_v3_module_rewrites(
             let rewrote_inline = stats.rewritten_stores != 0
                 || stats.rewritten_effect_only_calls != 0
                 || stats.rewritten_returns != 0;
+
             tracing::debug!(
                 target: "soac_typed_inline_fixpoint",
                 function_id = ?function.function_id,
@@ -11847,7 +12035,7 @@ fn apply_typed_v3_module_rewrites(
             );
             if !rewrote_inline {
                 let idle_split_start = Instant::now();
-                let _ = split_typed_post_inline_hot_continuations(
+                let hot_split_stats = split_typed_post_inline_hot_continuations(
                     function,
                     &module.module_constants,
                     profile,
@@ -11871,7 +12059,7 @@ fn apply_typed_v3_module_rewrites(
                     &mut generator_state_instr_ids_by_origin,
                     &mut generator_state_pending_alias_use_instr_ids_by_origin,
                 )?;
-                split_typed_post_inline_cleanup_hot_continuations(
+                let cleanup_splits = split_typed_post_inline_cleanup_hot_continuations(
                     function,
                     profile,
                     static_direct_calls,
@@ -11893,6 +12081,23 @@ fn apply_typed_v3_module_rewrites(
                     &mut generator_state_pending_alias_use_instr_ids_by_origin,
                 )?;
                 inline_idle_split_elapsed += idle_split_start.elapsed();
+                if hot_split_stats.remapped_instr_ids != 0 || cleanup_splits != 0 {
+                    generator_state_lowering_attempt_epoch += 1;
+                    inline_trusted_owner_states.invalidate();
+                    retried_idle_hot_continuation_split = true;
+                    inline_progress.push(format!(
+                        "pass {pass}: failed_inline_hot_instrs={}, cleanup_splits={cleanup_splits}",
+                        hot_split_stats.remapped_instr_ids,
+                    ));
+                    inline_maintenance_pass_count += 1;
+                    if inline_maintenance_pass_count > MAX_TYPED_INLINE_MAINTENANCE_PASSES {
+                        return Err(format!(
+                            "typed-v3 direct-call inlining exhausted {MAX_TYPED_INLINE_MAINTENANCE_PASSES} maintenance passes in function {} without reaching a fixpoint: {inline_progress:?}",
+                            function.function_id,
+                        ));
+                    }
+                    continue;
+                }
                 retain_typed_generator_pending_alias_use_instr_ids_by_origin(
                     &mut generator_state_pending_alias_use_instr_ids_by_origin,
                     typed_generator_pending_alias_use_source_instr_ids_by_origin(
@@ -12132,6 +12337,9 @@ fn apply_typed_v3_module_rewrites(
             let mut projected_constructor_body_instrs =
                 typed_inline_function_body_instr_count(function);
             for (source, plan) in constructor_sources {
+                if static_targets.requires_public_boundary(plan.init_function_id) {
+                    bound_constructor_sources.insert(source);
+                }
                 if bound_constructor_sources.contains(&source) {
                     continue;
                 }
@@ -12218,6 +12426,11 @@ fn apply_typed_v3_module_rewrites(
                     static_direct_calls,
                     &mut remapped_call_emissions,
                 )?;
+                remap_suppressed_inline_targets(
+                    caller_function_id,
+                    &stats.instr_id_mappings,
+                    &mut suppressed_inline_targets,
+                );
                 remap_inlined_direct_call_targets(
                     caller_function_id,
                     &stats.instr_id_mappings,
@@ -12267,6 +12480,11 @@ fn apply_typed_v3_module_rewrites(
                     static_direct_calls,
                     &mut remapped_call_emissions,
                 )?;
+                remap_suppressed_inline_targets(
+                    caller_function_id,
+                    &init_body_stats.inline_stats.instr_id_mappings,
+                    &mut suppressed_inline_targets,
+                );
                 remap_inlined_direct_call_targets(
                     caller_function_id,
                     &init_body_stats.inline_stats.instr_id_mappings,
@@ -12301,7 +12519,15 @@ fn apply_typed_v3_module_rewrites(
                     &mut remapped_exact_int_returns,
                 )?;
             }
-            annotate_typed_late_bound_remapped_exact_int_selections(
+            // New inline instruction IDs need their resolved field guards
+            // before the remapped scalar expression can remain atomic.
+            annotate_typed_indexed_field_accesses_from_profile(
+                function,
+                profile,
+                remapped_indexed_fields.get(&caller_function_id),
+                remapped_indexed_field_counter_sources.get(&caller_function_id),
+            )?;
+            annotate_typed_atomic_remapped_exact_int_selections(
                 function,
                 remapped_exact_int_branches.get(&caller_function_id),
                 remapped_exact_int_returns.get(&caller_function_id),
@@ -12341,8 +12567,9 @@ fn apply_typed_v3_module_rewrites(
             refresh_typed_function_value_facts(function);
             inline_value_fact_refresh_elapsed += inline_value_fact_refresh_start.elapsed();
             if let Some(remapped_call_emissions) =
-                remapped_call_emissions.get(&function.function_id)
+                remapped_call_emissions.get_mut(&function.function_id)
             {
+                retain_unchecked_call_emissions(remapped_call_emissions, static_targets);
                 let inline_call_emission_lower_start = Instant::now();
                 lower_typed_function_call_emission_plans(function, remapped_call_emissions)?;
                 refresh_typed_function_value_facts(function);
@@ -12355,72 +12582,11 @@ fn apply_typed_v3_module_rewrites(
                 "after_call_emission_lowering",
                 &generator_state_constructors_by_origin,
             );
-            let inline_post_split_start = Instant::now();
-            if !closed_iterator_pipeline_inlining_active {
-                let _ = split_typed_post_inline_hot_continuations(
-                    function,
-                    &module.module_constants,
-                    profile,
-                    static_direct_calls,
-                    &mut trusted_static_constructor_calls,
-                    &mut hot_state_cleanup_labels,
-                    &mut remapped_call_emissions,
-                    &mut remapped_inline_targets,
-                    &mut remapped_generator_instance_plans,
-                    &mut suppressed_inline_targets,
-                    &mut remapped_indexed_fields,
-                    &mut remapped_indexed_field_counter_sources,
-                    &mut remapped_exact_list_items,
-                    &mut remapped_exact_int_branches,
-                    &mut remapped_exact_int_returns,
-                    &mut constructor_init_plans,
-                    &mut constructor_field_bindings,
-                    &mut constructor_capture_bindings_by_origin,
-                    &mut suppressed_alias_hot_split_instr_ids,
-                    &mut suppressed_generator_alias_hot_split_instr_ids,
-                    &mut generator_state_instr_ids_by_origin,
-                    &mut generator_state_pending_alias_use_instr_ids_by_origin,
-                )?;
-                trace_materialized_generator_state_constructor_anchors(
-                    function,
-                    pass,
-                    "after_hot_continuation_split",
-                    &generator_state_constructors_by_origin,
-                );
-                split_typed_post_inline_cleanup_hot_continuations(
-                    function,
-                    profile,
-                    static_direct_calls,
-                    &mut trusted_static_constructor_calls,
-                    &mut hot_state_cleanup_labels,
-                    &mut remapped_call_emissions,
-                    &mut remapped_inline_targets,
-                    &mut remapped_generator_instance_plans,
-                    &mut suppressed_inline_targets,
-                    &mut remapped_indexed_fields,
-                    &mut remapped_indexed_field_counter_sources,
-                    &mut remapped_exact_list_items,
-                    &mut remapped_exact_int_branches,
-                    &mut remapped_exact_int_returns,
-                    &mut constructor_init_plans,
-                    &mut constructor_field_bindings,
-                    &mut constructor_capture_bindings_by_origin,
-                    &mut generator_state_instr_ids_by_origin,
-                    &mut generator_state_pending_alias_use_instr_ids_by_origin,
-                )?;
-                annotate_typed_late_bound_remapped_exact_int_selections(
-                    function,
-                    remapped_exact_int_branches.get(&caller_function_id),
-                    remapped_exact_int_returns.get(&caller_function_id),
-                )?;
-            }
-            inline_post_split_elapsed += inline_post_split_start.elapsed();
-            trace_materialized_generator_state_constructor_anchors(
-                function,
-                pass,
-                "after_cleanup_hot_continuation_split",
-                &generator_state_constructors_by_origin,
-            );
+            // Refresh and drain executable inline work before optional continuation
+            // cloning. A split copies the rest of the CFG, including pending
+            // consumers; doing it after every rewrite spends their shared budget
+            // on duplicate work. The idle path above still performs all split
+            // families and retries admission when it changes the graph.
         }
         let inline_loop_elapsed = inline_loop_start.elapsed();
         let post_inline_cfg_start = Instant::now();
@@ -12476,7 +12642,10 @@ fn apply_typed_v3_module_rewrites(
         let final_hot_split_elapsed = Duration::ZERO;
         let final_cleanup_split_elapsed = Duration::ZERO;
         let final_call_emission_start = Instant::now();
-        if let Some(remapped_call_emissions) = remapped_call_emissions.get(&function.function_id) {
+        if let Some(remapped_call_emissions) =
+            remapped_call_emissions.get_mut(&function.function_id)
+        {
+            retain_unchecked_call_emissions(remapped_call_emissions, static_targets);
             lower_typed_function_call_emission_plans(function, remapped_call_emissions)?;
             refresh_typed_function_value_facts(function);
         }
@@ -12521,8 +12690,6 @@ fn apply_typed_v3_module_rewrites(
         let trusted_constructor_calls_for_function = trusted_static_constructor_calls
             .entry(function.function_id)
             .or_default();
-        let mut late_resume_rewrites = 0;
-        let mut late_resume_passes = 0;
         let mut late_runtime_protocol_rewrites = 0;
         let mut late_runtime_protocol_passes = 0;
         let mut late_builtin_implementation_rewrites = 0;
@@ -12530,7 +12697,29 @@ fn apply_typed_v3_module_rewrites(
         let mut late_stop_iteration_rewrites = 0;
         let mut late_trusted_owner_states = TrustedOwnerStateCache::default();
         loop {
-            annotate_typed_late_bound_remapped_exact_int_selections(
+            // Earlier rewrites can leave dead cleanup and fallback blocks.
+            // Reclaim them before admission: pruning only after this loop
+            // can leave a legal consumer permanently behind a stale budget.
+            let pruned_unreachable_blocks = prune_unreachable_typed_blocks(function);
+            if pruned_unreachable_blocks != 0 {
+                late_trusted_owner_states.invalidate();
+                refresh_typed_function_value_facts(function);
+                tracing::debug!(
+                    target: "soac_inline_budget",
+                    function_id = ?function.function_id,
+                    function_qualname = %function.names.qualname,
+                    pruned_unreachable_blocks,
+                    block_count = function.blocks.len(),
+                    "typed_late_inline_pruned_unreachable_blocks_before_admission",
+                );
+            }
+            annotate_typed_indexed_field_accesses_from_profile(
+                function,
+                profile,
+                remapped_indexed_fields.get(&function.function_id),
+                remapped_indexed_field_counter_sources.get(&function.function_id),
+            )?;
+            annotate_typed_atomic_remapped_exact_int_selections(
                 function,
                 remapped_exact_int_branches.get(&function.function_id),
                 remapped_exact_int_returns.get(&function.function_id),
@@ -12549,12 +12738,6 @@ fn apply_typed_v3_module_rewrites(
                     break;
                 }
             }
-            if late_resume_passes == MAX_LATE_TYPED_GENERATOR_RESUME_PASSES {
-                return Err(format!(
-                    "typed-v3 late generator-resume inlining exceeded {MAX_LATE_TYPED_GENERATOR_RESUME_PASSES} passes in function {}",
-                    function.names.qualname
-                ));
-            }
             let runtime_protocol_stats = if typed_inline_function_within_cfg_budget(function) {
                 if late_runtime_protocol_passes == MAX_LATE_TYPED_RUNTIME_PROTOCOL_PASSES {
                     return Err(format!(
@@ -12571,6 +12754,7 @@ fn apply_typed_v3_module_rewrites(
                     external_callees,
                     static_targets,
                     &mut late_trusted_owner_states,
+                    &mut suppressed_inline_targets,
                 )?
             } else {
                 soac_opt::passes::TypedInlineRewriteStats::default()
@@ -12616,6 +12800,7 @@ fn apply_typed_v3_module_rewrites(
                     &constructor_capture_bindings_by_function,
                     &mut constructor_capture_bindings_by_origin,
                     &mut late_trusted_owner_states,
+                    &mut suppressed_inline_targets,
                 )?
             } else {
                 0
@@ -12633,36 +12818,19 @@ fn apply_typed_v3_module_rewrites(
                 late_refresh_schedule.request(LateTypedRefreshFamily::TrustedGeneratorResume);
             }
 
-            let rewritten_resume =
-                inline_late_typed_generator_resume_plans_after_stop_iteration_normalization(
-                    function,
-                    &mut module.module_constants,
-                    &mut late_refresh_schedule,
-                    trusted_constructor_calls_for_function,
-                    &trusted_constructor_init_owners,
-                    &callee_module,
-                    external_callees,
-                    &generator_state_constructors_by_origin,
-                    &constructor_capture_bindings_by_function,
-                    &mut constructor_capture_bindings_by_origin,
-                    &mut generator_state_instr_ids_by_origin,
-                    &mut generator_state_pending_alias_use_instr_ids_by_origin,
-                    &mut lowered_generator_preserved_locals,
-                    static_targets,
-                    &local_generators,
-                    remapped_generator_instance_plans.get(&function.function_id),
-                    &mut late_trusted_owner_states,
-                )?;
-            late_resume_rewrites += rewritten_resume;
-            late_resume_passes += usize::from(rewritten_resume != 0);
-            if rewritten_resume != 0 {
-                late_trusted_owner_states.invalidate();
-            }
+            refresh_late_typed_generator_resume_plans_after_stop_iteration_normalization(
+                function,
+                &module.module_constants,
+                &mut late_refresh_schedule,
+                trusted_constructor_calls_for_function,
+                &trusted_constructor_init_owners,
+                &mut generator_state_pending_alias_use_instr_ids_by_origin,
+                &mut late_trusted_owner_states,
+            )?;
 
             let mut late_iteration = LateTypedFixpointIteration {
                 builtin_implementation_rewrites: rewritten_builtin_implementation,
                 runtime_protocol_rewrites: rewritten_runtime_protocol,
-                resume_rewrites: rewritten_resume,
                 stop_iteration_rewrites: 0,
             };
             late_iteration.stop_iteration_rewrites =
@@ -12685,19 +12853,6 @@ fn apply_typed_v3_module_rewrites(
             if !late_iteration.made_progress() {
                 break;
             }
-        }
-        if late_resume_rewrites != 0 {
-            tracing::info!(
-                target: "soac_generator_state_lowering",
-                function_id = ?function.function_id,
-                function_qualname = %function.names.qualname,
-                rewritten_stop_iteration = late_refresh_schedule.rewritten_stop_iteration,
-                pending_refresh_trusted_generator_resume = late_refresh_schedule
-                    .requests(LateTypedRefreshFamily::TrustedGeneratorResume),
-                late_resume_rewrites,
-                late_resume_passes,
-                "typed_generator_resume_inlined_during_late_post_inline_fixpoint",
-            );
         }
         if late_trusted_owner_states.builds != 0 || late_trusted_owner_states.reuses != 0 {
             tracing::debug!(
@@ -12805,16 +12960,18 @@ fn apply_typed_v3_module_rewrites(
                     bindings,
                     &trusted_sources,
                 );
-                let (field_callable_emissions, _) = trusted_field_callable_inlines_for_function(
-                    function,
-                    &module.module_constants,
-                    trusted_static_constructor_calls
-                        .get(&function.function_id)
-                        .unwrap_or(&HashMap::new()),
-                    &trusted_constructor_init_owners,
-                    &callee_module,
-                    external_callees,
-                )?;
+                let (mut field_callable_emissions, _) =
+                    trusted_field_callable_inlines_for_function(
+                        function,
+                        &module.module_constants,
+                        trusted_static_constructor_calls
+                            .get(&function.function_id)
+                            .unwrap_or(&HashMap::new()),
+                        &trusted_constructor_init_owners,
+                        &callee_module,
+                        external_callees,
+                    )?;
+                retain_unchecked_call_emissions(&mut field_callable_emissions, static_targets);
                 if !field_callable_emissions.is_empty() {
                     lower_typed_function_call_emission_plans(function, &field_callable_emissions)?;
                     refresh_typed_function_value_facts(function);
@@ -12972,6 +13129,19 @@ fn apply_typed_v3_module_rewrites(
         assign_missing_typed_function_instr_ids(function);
         invalidate_unguarded_exact_int_selections(function);
         refresh_typed_function_value_facts(function);
+        // Revalidate against the current tree after all inline/ID remapping.
+        // No helper admission or source activation erasure is implied by this
+        // fixed native template; codegen validates again before expansion.
+        let available_blocks =
+            MAX_TYPED_INLINE_FUNCTION_BLOCKS.saturating_sub(function.blocks.len() + 1);
+        let available_body = MAX_TYPED_INLINE_FUNCTION_BODY_INSTRS
+            .saturating_sub(typed_inline_function_body_instr_count(function) + 1);
+        select_typed_native_iterator_pipelines(
+            function,
+            &module.module_constants,
+            available_blocks,
+            available_body,
+        )?;
         trace_typed_preserved_name_count(
             function,
             MAX_TYPED_INLINE_PASSES,
@@ -12982,6 +13152,7 @@ fn apply_typed_v3_module_rewrites(
         tracing::info!(
             target: "soac_jit_codegen",
             event = "soac.typed_v3_function_rewrite",
+            process_id = std::process::id(),
             function_id = ?function.function_id,
             function_qualname = %function.names.qualname,
             inline_pass_count = u64::try_from(inline_pass_count).unwrap_or(u64::MAX),
@@ -13013,7 +13184,6 @@ fn apply_typed_v3_module_rewrites(
             typed_rewrite_inline_tuple_simplify_us = duration_micros(inline_tuple_simplify_elapsed),
             typed_rewrite_inline_value_fact_refresh_us = duration_micros(inline_value_fact_refresh_elapsed),
             typed_rewrite_inline_call_emission_lower_us = duration_micros(inline_call_emission_lower_elapsed),
-            typed_rewrite_inline_post_split_us = duration_micros(inline_post_split_elapsed),
             typed_rewrite_post_inline_cfg_us = duration_micros(post_inline_cfg_elapsed),
             typed_rewrite_final_state_lowering_us = duration_micros(final_state_lowering_elapsed),
             typed_rewrite_final_hot_split_us = duration_micros(final_hot_split_elapsed),
@@ -13043,7 +13213,7 @@ fn apply_typed_v3_module_rewrites(
         typed_rewrite_total_us = duration_micros(total_start.elapsed()),
         "typed_v3_module_rewrites",
     );
-    Ok(())
+    Ok(suppressed_inline_targets)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -13090,20 +13260,6 @@ fn typed_genexpr_function_materialization_location(
     .flatten()
 }
 
-fn typed_generator_instance_materialization_location(
-    instr: &InstrTyped,
-) -> Option<TypedBindingLocation> {
-    let InstrTyped::Store(store) = instr else {
-        return None;
-    };
-    store
-        .value
-        .generator_instance_plan()
-        .is_some()
-        .then(|| typed_binding_location(&store.name))
-        .flatten()
-}
-
 fn typed_none_placeholder_store_location(
     instr: &InstrTyped,
     module_constants: &[ConstantExpr],
@@ -13114,35 +13270,6 @@ fn typed_none_placeholder_store_location(
     typed_expr_is_runtime_name_load(store.value.as_ref(), RuntimeName::None, module_constants)
         .then(|| typed_binding_location(&store.name))
         .flatten()
-}
-
-fn typed_generator_instance_materialization_binding_locations(
-    instr: &InstrTyped,
-) -> Option<(TypedBindingLocation, TypedBindingLocation)> {
-    let InstrTyped::Store(store) = instr else {
-        return None;
-    };
-    let target = typed_binding_location(&store.name)?;
-    let func = match store.value.as_ref() {
-        InstrTyped::CallTyped(call) if call.extra.generator_instance_plan().is_some() => {
-            call.func.as_ref()
-        }
-        InstrTyped::GuardedCallableCallTyped(call)
-            if call.extra.generator_instance_plan().is_some() =>
-        {
-            call.func.as_ref()
-        }
-        InstrTyped::DirectCallableCallTyped(call)
-            if call.extra.generator_instance_plan().is_some() =>
-        {
-            call.func.as_ref()
-        }
-        _ => return None,
-    };
-    let InstrTyped::Load(load) = func else {
-        return None;
-    };
-    Some((target, typed_binding_location(&load.name)?))
 }
 
 fn typed_copy_store_binding_locations(
@@ -13169,16 +13296,44 @@ fn collect_typed_copy_alias_closure(
             if let Some((target, source)) = typed_copy_store_binding_locations(instr) {
                 changed |= aliases.contains(&source) && aliases.insert(target);
             }
-            if let Some((target, source)) =
-                typed_generator_instance_materialization_binding_locations(instr)
-            {
-                changed |= aliases.contains(&source) && aliases.insert(target);
-            }
         }
         if !changed {
             return aliases;
         }
     }
+}
+
+fn visit_typed_binding_reads(expr: &InstrTyped, mut visit: impl FnMut(TypedBindingLocation)) {
+    let mut read = |name: &ResolvedName| {
+        if let Some(location) = typed_binding_location(name) {
+            visit(location);
+        }
+    };
+    match expr {
+        InstrTyped::Load(op) => read(&op.name),
+        InstrTyped::TakeOperand(op) => read(&op.name),
+        InstrTyped::IteratorStep(op) => op.read_names().for_each(&mut read),
+        InstrTyped::ComprehensionInsert(op) => read(&op.container),
+        InstrTyped::CallArgumentOp(op) => op.read_names().for_each(&mut read),
+        _ => {}
+    }
+}
+
+fn ignored_typed_copy_load(
+    instr: &InstrTyped,
+    aliases: &HashSet<TypedBindingLocation>,
+) -> Option<*const InstrTyped> {
+    let InstrTyped::Store(store) = instr else {
+        return None;
+    };
+    let (_, source) = typed_copy_store_binding_locations(instr)?;
+    if !aliases.contains(&source) {
+        return None;
+    }
+    // This borrowed IR address lives only for the read-only traversal. A copy
+    // is internal to its alias closure; a call's callee and arguments are real
+    // reads, even when a generator-instance target is statically known.
+    Some(std::ptr::from_ref(store.value.as_ref()))
 }
 
 fn collect_typed_non_copy_loaded_binding_locations(
@@ -13187,15 +13342,13 @@ fn collect_typed_non_copy_loaded_binding_locations(
 ) -> HashSet<TypedBindingLocation> {
     struct Collector<'a> {
         copy_aliases: &'a HashSet<TypedBindingLocation>,
-        current_ignored_load: Option<TypedBindingLocation>,
+        current_ignored_load: Option<*const InstrTyped>,
         locations: HashSet<TypedBindingLocation>,
     }
 
     impl Collector<'_> {
         fn visit_top_level_instr(&mut self, expr: &InstrTyped) {
-            self.current_ignored_load = typed_copy_store_binding_locations(expr)
-                .and_then(|(_, source)| self.copy_aliases.contains(&source).then_some(source))
-                .or_else(|| removable_generator_instance_func_alias(expr, self.copy_aliases));
+            self.current_ignored_load = ignored_typed_copy_load(expr, self.copy_aliases);
             self.visit_instr(expr);
             self.current_ignored_load = None;
         }
@@ -13203,13 +13356,14 @@ fn collect_typed_non_copy_loaded_binding_locations(
 
     impl Visit<InstrTyped> for Collector<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped) {
-            if let InstrTyped::Load(load) = expr
-                && let Some(location) = typed_binding_location(&load.name)
-                && self.copy_aliases.contains(&location)
-                && self.current_ignored_load != Some(location)
-            {
-                self.locations.insert(location);
+            if self.current_ignored_load == Some(std::ptr::from_ref(expr)) {
+                return;
             }
+            visit_typed_binding_reads(expr, |location| {
+                if self.copy_aliases.contains(&location) {
+                    self.locations.insert(location);
+                }
+            });
             expr.visit_children(self);
         }
     }
@@ -13234,16 +13388,14 @@ fn collect_typed_non_copy_loaded_binding_contexts(
 ) -> Vec<String> {
     struct Collector<'a> {
         copy_aliases: &'a HashSet<TypedBindingLocation>,
-        current_ignored_load: Option<TypedBindingLocation>,
+        current_ignored_load: Option<*const InstrTyped>,
         current_top_level: Option<String>,
         contexts: Vec<String>,
     }
 
     impl Collector<'_> {
         fn visit_top_level_instr(&mut self, expr: &InstrTyped) {
-            self.current_ignored_load = typed_copy_store_binding_locations(expr)
-                .and_then(|(_, source)| self.copy_aliases.contains(&source).then_some(source))
-                .or_else(|| removable_generator_instance_func_alias(expr, self.copy_aliases));
+            self.current_ignored_load = ignored_typed_copy_load(expr, self.copy_aliases);
             self.current_top_level = Some(format!("{expr:?}"));
             self.visit_instr(expr);
             self.current_ignored_load = None;
@@ -13256,16 +13408,17 @@ fn collect_typed_non_copy_loaded_binding_contexts(
             if self.contexts.len() >= 4 {
                 return;
             }
-            if let InstrTyped::Load(load) = expr
-                && let Some(location) = typed_binding_location(&load.name)
-                && self.copy_aliases.contains(&location)
-                && self.current_ignored_load != Some(location)
-            {
-                self.contexts.push(format!(
-                    "{location:?} in {}",
-                    self.current_top_level.as_deref().unwrap_or("<term>")
-                ));
+            if self.current_ignored_load == Some(std::ptr::from_ref(expr)) {
+                return;
             }
+            visit_typed_binding_reads(expr, |location| {
+                if self.copy_aliases.contains(&location) && self.contexts.len() < 4 {
+                    self.contexts.push(format!(
+                        "{location:?} in {}",
+                        self.current_top_level.as_deref().unwrap_or("<term>")
+                    ));
+                }
+            });
             expr.visit_children(self);
         }
     }
@@ -13285,14 +13438,6 @@ fn collect_typed_non_copy_loaded_binding_contexts(
         collector.current_top_level = None;
     }
     collector.contexts
-}
-
-fn removable_generator_instance_func_alias(
-    instr: &InstrTyped,
-    aliases: &HashSet<TypedBindingLocation>,
-) -> Option<TypedBindingLocation> {
-    let (target, source) = typed_generator_instance_materialization_binding_locations(instr)?;
-    (aliases.contains(&target) && aliases.contains(&source)).then_some(source)
 }
 
 fn typed_copy_alias_closure_has_only_removable_stores(
@@ -13317,7 +13462,6 @@ fn typed_copy_alias_closure_has_only_removable_stores(
             }
             typed_genexpr_function_materialization_location(instr, synthetic_genexpr_function_ids)
                 == Some(location)
-                || typed_generator_instance_materialization_location(instr) == Some(location)
                 || typed_none_placeholder_store_location(instr, module_constants) == Some(location)
                 || typed_copy_store_binding_locations(instr)
                     .is_some_and(|(_, source)| aliases.contains(&source))
@@ -13337,13 +13481,7 @@ fn remove_unused_typed_genexpr_function_materializations(
             typed_genexpr_function_materialization_location(instr, synthetic_genexpr_function_ids)
         })
         .collect::<HashSet<_>>();
-    let candidate_generator_instance_locations = function
-        .blocks
-        .iter()
-        .flat_map(|block| block.body.iter())
-        .filter_map(typed_generator_instance_materialization_location)
-        .collect::<HashSet<_>>();
-    if candidate_locations.is_empty() && candidate_generator_instance_locations.is_empty() {
+    if candidate_locations.is_empty() {
         return 0;
     }
     tracing::debug!(
@@ -13351,16 +13489,15 @@ fn remove_unused_typed_genexpr_function_materializations(
         function_id = ?function.function_id,
         function_qualname = %function.names.qualname,
         candidate_function_locations = ?candidate_locations,
-        candidate_generator_instance_locations = ?candidate_generator_instance_locations,
         "typed_unused_genexpr_materialization_candidates",
     );
 
-    let candidate_roots = candidate_locations
-        .union(&candidate_generator_instance_locations)
-        .copied()
-        .collect::<HashSet<_>>();
+    // A remaining constructor Call is an effect, not a dead-value artifact.
+    // Successful state lowering replaces its exact origin and performs its own
+    // alias cleanup. This pass only retires unused compiler-generated factories
+    // and their pure aliases; an instance plan alone grants no removal authority.
     let mut removable_locations = HashSet::new();
-    for root in candidate_roots {
+    for root in candidate_locations {
         let root_aliases = collect_typed_copy_alias_closure(function, &HashSet::from([root]));
         let externally_loaded_locations =
             collect_typed_non_copy_loaded_binding_locations(function, &root_aliases);
@@ -13405,8 +13542,6 @@ fn remove_unused_typed_genexpr_function_materializations(
                                 instr,
                                 synthetic_genexpr_function_ids,
                             ) == Some(location)
-                                || typed_generator_instance_materialization_location(instr)
-                                    == Some(location)
                                 || typed_none_placeholder_store_location(instr, module_constants)
                                     == Some(location)
                                 || typed_copy_store_binding_locations(instr).is_some_and(
@@ -13616,6 +13751,7 @@ def keyword(owner, value):
         struct MethodCalls {
             resolved: Vec<(String, usize, InstrId)>,
             ordinary_getattrs: usize,
+            iterator_steps: usize,
         }
 
         impl Visit<InstrTyped> for MethodCalls {
@@ -13632,6 +13768,7 @@ def keyword(owner, value):
                         ));
                     }
                     InstrTyped::GetAttrTyped(_) => self.ordinary_getattrs += 1,
+                    InstrTyped::IteratorStep(_) => self.iterator_steps += 1,
                     _ => {}
                 }
                 expr.visit_children(self);
@@ -13650,6 +13787,7 @@ def keyword(owner, value):
                 &config,
                 HashMap::new(),
                 StaticDirectCallTargets::default(),
+                None,
             )
             .expect("the real typed planning pipeline should preserve immediate method calls");
 
@@ -13683,17 +13821,15 @@ def keyword(owner, value):
                     .expect("immediate-method fixture should retain its target function");
                 let mut calls = MethodCalls::default();
                 calls.visit_fn(function);
-                let expected_calls = if qualname == captured_comprehension_qualname
-                    && mode != SpecializationMode::Profile
-                {
-                    2
-                } else {
-                    1
-                };
                 assert_eq!(
                     calls.resolved.len(),
-                    expected_calls,
+                    1,
                     "{mode:?} {qualname} must preserve each compiler-resolved immediate method"
+                );
+                assert_eq!(
+                    calls.iterator_steps,
+                    usize::from(qualname == captured_comprehension_qualname),
+                    "the comprehension has one direct fetch region, not a None-initialized iterator alias"
                 );
                 assert_eq!(
                     calls.resolved[0].0,
@@ -13764,6 +13900,55 @@ def keyword(owner, value):
                 }
             }
         }
+    }
+
+    #[test]
+    fn class_frame_method_calls_are_not_rewritten_without_context() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def make(callback):\n    class Box:\n        result = callback.query()\n    return Box\n",
+        )
+        .expect("class source should lower")
+        .blockpy_module;
+        let typed = lower_blockpy_module_to_typed(lowered);
+        let class = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.scope.scope_kind == CallableScopeKind::Class)
+            .expect("class namespace function");
+        assert!(immediate_method_call_sources(class, &typed.module_constants).is_empty());
+
+        struct ContextCallFinder(bool);
+        impl Visit<InstrTyped> for ContextCallFinder {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && call.frame_namespace.is_some()
+                    && let InstrTyped::GetAttrTyped(getter) = call.func.as_ref()
+                {
+                    let stale = ImmediateMethodCallSource {
+                        getter_source: getter.semantic_instr_id(),
+                        method_name: "query".to_owned(),
+                        descriptor_function_guards: vec![],
+                    };
+                    assert!(
+                        source_resolved_immediate_method_call_for_source(
+                            call,
+                            call.func.as_ref(),
+                            &stale,
+                            true,
+                        )
+                        .is_none()
+                    );
+                    self.0 = true;
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut finder = ContextCallFinder(false);
+        finder.visit_fn(class);
+        assert!(
+            finder.0,
+            "fixture must exercise a class-context attribute call"
+        );
     }
 
     #[test]
@@ -13883,6 +14068,7 @@ def captured_comprehension(owner, value):
             struct RecoveredDescriptors {
                 guards: Vec<Option<Vec<TypedDirectFunctionCallGuard>>>,
                 owner_guards: Vec<usize>,
+                iterator_steps: usize,
             }
 
             impl Visit<InstrTyped> for RecoveredDescriptors {
@@ -13892,6 +14078,7 @@ def captured_comprehension(owner, value):
                             .push(call.extra.resolved_descriptor_function_guards.clone());
                         self.owner_guards.push(call.method_guards.len());
                     }
+                    self.iterator_steps += usize::from(matches!(expr, InstrTyped::IteratorStep(_)));
                     expr.visit_children(self);
                 }
             }
@@ -13908,9 +14095,10 @@ def captured_comprehension(owner, value):
                     &config,
                     HashMap::new(),
                     StaticDirectCallTargets::default(),
+                    None,
                 )
                 .expect("the whole production pipeline should plan an ownerless method");
-                for (function_id, is_cloned) in [(caller_id, false), (captured_id, true)] {
+                for (function_id, has_iterator) in [(caller_id, false), (captured_id, true)] {
                     let function = plan
                         .module
                         .callable_defs
@@ -13921,17 +14109,20 @@ def captured_comprehension(owner, value):
                         crate::jit::function_targets::collect_typed_call_direct_targets(function);
                     let mut descriptors = RecoveredDescriptors::default();
                     descriptors.visit_fn(function);
-                    assert!(
-                        descriptors.owner_guards.iter().all(|count| *count == 0),
+                    assert_eq!(
+                        descriptors.owner_guards,
+                        vec![0],
                         "the profiled class does not exist during eager planning"
                     );
+                    assert_eq!(descriptors.iterator_steps, usize::from(has_iterator));
                     if mode == SpecializationMode::Profile {
                         assert!(
                             !direct_targets.contains(&target_id),
                             "Profile must preserve original target observations"
                         );
-                        assert!(
-                            descriptors.guards.iter().all(Option::is_none),
+                        assert_eq!(
+                            descriptors.guards,
+                            vec![None],
                             "Profile must not install speculative descriptor guards"
                         );
                     } else {
@@ -13941,18 +14132,15 @@ def captured_comprehension(owner, value):
                              when its class does not exist during eager planning"
                         );
                         assert!(
-                            descriptors.guards.iter().all(|guards| {
-                                matches!(guards.as_deref(), Some([guard]) if guard.function_id == target_id)
-                            }),
-                            "{mode:?} each recovered method must retain the original profiled target"
+                            matches!(descriptors.guards.as_slice(), [Some(guards)]
+                            if matches!(guards.as_slice(), [guard]
+                                if guard.function_id == target_id
+                                    && guard.arg_plan.sources == vec![
+                                        soac_ir_typed::TypedDirectCallArgSource::Provided(0),
+                                        soac_ir_typed::TypedDirectCallArgSource::Provided(1),
+                                    ])),
+                            "{mode:?} the recovered method must retain its original profiled target and receiver/argument binding"
                         );
-                        if is_cloned {
-                            assert_eq!(
-                                descriptors.guards.len(),
-                                2,
-                                "{mode:?} a hot-cloned method must inherit its original source guard"
-                            );
-                        }
                     }
                 }
             }
@@ -13961,6 +14149,24 @@ def captured_comprehension(owner, value):
 
     #[test]
     fn profile_mode_preserves_countered_hot_loop_ids_while_apply_can_split() {
+        #[derive(Default)]
+        struct SourceGetItems(HashMap<(u32, u32), HashSet<InstrId>>);
+
+        impl Visit<InstrTyped> for SourceGetItems {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::GetItem(getitem) = expr {
+                    let range = getitem.meta().range;
+                    if !range.is_empty() {
+                        self.0
+                            .entry((u32::from(range.start()), u32::from(range.end())))
+                            .or_default()
+                            .insert(getitem.semantic_instr_id());
+                    }
+                }
+                expr.visit_children(self);
+            }
+        }
+
         let source = r#"
 class Box:
     def __init__(self):
@@ -13974,8 +14180,6 @@ def run(values):
     alias = None
     if values:
         alias = box
-    else:
-        alias = box
 
     total = 0
     for index in range(len(values)):
@@ -13985,6 +14189,8 @@ def run(values):
             total += values[index]
         else:
             total += alias.value
+    if alias is None:
+        return total, values, None
     return total, values, alias.value
 "#;
         let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
@@ -14064,6 +14270,7 @@ def run(values):
             &profile_config,
             HashMap::new(),
             StaticDirectCallTargets::default(),
+            None,
         )
         .expect("profile-mode hot loop should plan without replacing its original CFG");
         let profiled_run = profile_plan
@@ -14085,6 +14292,16 @@ def run(values):
                 .difference(&profiled_instr_ids)
                 .collect::<Vec<_>>()
         );
+        let mut original_getitems = SourceGetItems::default();
+        original_getitems.visit_fn(profiled_run);
+        assert!(!original_getitems.0.is_empty());
+        assert!(
+            original_getitems
+                .0
+                .values()
+                .all(|ids| ids.is_subset(&countered_instr_ids)),
+            "the clone witness must be an original countered source operation"
+        );
 
         let apply_config =
             SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Apply));
@@ -14094,6 +14311,7 @@ def run(values):
             &apply_config,
             HashMap::new(),
             StaticDirectCallTargets::default(),
+            None,
         )
         .expect("apply-mode hot loop should retain ordinary continuation optimizations");
         let applied_run = apply_plan
@@ -14102,9 +14320,19 @@ def run(values):
             .iter()
             .find(|function| function.function_id == run_function_id)
             .expect("apply plan should retain the hot-loop function");
+        let mut applied_getitems = SourceGetItems::default();
+        applied_getitems.visit_fn(applied_run);
         assert!(
-            applied_run.blocks.len() > original_block_count,
-            "apply mode should continue cloning the joined hot-loop continuation"
+            applied_getitems.0.iter().any(|(range, ids)| {
+                original_getitems
+                    .0
+                    .get(range)
+                    .is_some_and(|original_ids| !ids.is_subset(original_ids))
+            }),
+            "Apply must clone an original joined-loop operation even if later pruning shrinks the CFG: original={:?}, applied={:?}, blocks={original_block_count}->{}",
+            original_getitems.0,
+            applied_getitems.0,
+            applied_run.blocks.len(),
         );
     }
 
@@ -14134,6 +14362,7 @@ def run(values):
                 &SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Apply)),
                 HashMap::new(),
                 static_targets,
+                None,
             )
             .expect("source-backed generator consumer should use the ordinary typed pipeline");
             let consumer = plan
@@ -14172,7 +14401,6 @@ def run(values):
                     instr,
                     synthetic_genexpr_function_ids,
                 )
-                .or_else(|| typed_generator_instance_materialization_location(instr))
             })
             .collect::<HashSet<_>>();
 
@@ -14188,16 +14416,16 @@ def run(values):
             );
             assert!(
                 !aliases.is_disjoint(&externally_loaded) || !has_only_removable_stores,
-                "{context}: unused generator function or instance materialization should have been removed; root={root:?}; aliases={aliases:?}; externally_loaded={externally_loaded:?}; has_only_removable_stores={has_only_removable_stores}; external_load_contexts={:?}",
+                "{context}: unused compiler-generated function materialization should have been removed; root={root:?}; aliases={aliases:?}; externally_loaded={externally_loaded:?}; has_only_removable_stores={has_only_removable_stores}; external_load_contexts={:?}",
                 collect_typed_non_copy_loaded_binding_contexts(function, &aliases),
             );
         }
     }
 
     #[test]
-    fn typed_inline_cfg_budget_prioritizes_generator_resume_then_trusted_protocol() {
+    fn typed_inline_cfg_budget_does_not_schedule_out_of_line_resumes() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-            "def caller():\n    return None\n\ndef target():\n    return None\n",
+            "def caller():\n    return None\n\ndef target():\n    return None\n\ndef suspended():\n    yield 1\n",
         )
         .expect("source should lower")
         .blockpy_module;
@@ -14214,6 +14442,15 @@ def run(values):
             .find(|function| function.names.qualname == "target")
             .map(|function| function.function_id)
             .expect("typed inline target should exist");
+        let suspended = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "suspended")
+            .expect("the real suspended target should exist");
+        assert!(
+            !inline_callee_preserves_activation(suspended),
+            "the candidate must require its own native activation",
+        );
         let template = function
             .blocks
             .first()
@@ -14229,6 +14466,7 @@ def run(values):
         let builtin_source = InstrId::new(2);
         let protocol_source = InstrId::new(3);
         let resume_source = InstrId::new(4);
+        let activation_source = InstrId::new(5);
         let arg_plan = TypedDirectCallArgPlan {
             sources: Vec::new(),
         };
@@ -14236,12 +14474,16 @@ def run(values):
             (ordinary_source, vec![(target, arg_plan.clone())]),
             (builtin_source, vec![(target, arg_plan.clone())]),
             (protocol_source, vec![(target, arg_plan.clone())]),
-            (resume_source, vec![(target, arg_plan)]),
+            (
+                resume_source,
+                vec![(suspended.function_id, arg_plan.clone())],
+            ),
+            (activation_source, vec![(suspended.function_id, arg_plan)]),
         ]);
         let resume_plans = HashMap::from([(
             resume_source,
             TypedGeneratorResumePlan {
-                function_id: target,
+                function_id: suspended.function_id,
                 generator_origin: Some(resume_source),
                 candidate_origins: vec![resume_source],
             },
@@ -14258,11 +14500,12 @@ def run(values):
             &builtin_sources,
             targets.clone(),
             Some(1),
+            &SuppressedTypedInlineTargets::new(),
         );
         assert_eq!(
             selected.keys().copied().collect::<HashSet<_>>(),
-            HashSet::from([resume_source]),
-            "the final CFG space must go to a proven generator resume, not a lower-id helper",
+            HashSet::from([protocol_source]),
+            "out-of-line resume decisions must not reserve the only slot ahead of an executable protocol candidate",
         );
 
         let selected = select_typed_inline_targets_within_cfg_budget_and_priorities(
@@ -14272,13 +14515,179 @@ def run(values):
             &HashMap::new(),
             &protocol_sources,
             &builtin_sources,
-            targets,
+            targets.clone(),
             Some(1),
+            &SuppressedTypedInlineTargets::new(),
         );
         assert_eq!(
             selected.keys().copied().collect::<HashSet<_>>(),
             HashSet::from([protocol_source]),
             "a proven runtime protocol must precede generator consumers and unrelated calls",
+        );
+
+        let selected = select_typed_inline_targets_within_cfg_budget_and_priorities(
+            &function,
+            &typed,
+            &HashMap::new(),
+            &resume_plans,
+            &protocol_sources,
+            &builtin_sources,
+            targets,
+            Some(1),
+            &HashMap::from([(function.function_id, HashSet::from([protocol_source]))]),
+        );
+        assert_eq!(
+            selected.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([builtin_source]),
+            "after retiring the protocol candidate, the executable builtin must not be starved by an impossible activation",
+        );
+    }
+
+    #[test]
+    fn typed_inline_cfg_budget_excludes_a_retained_resume_body_but_not_an_inline_body() {
+        let cases = (0..12)
+            .map(|value| format!("        if item == {value}:\n            yield item\n"))
+            .collect::<String>();
+        let source = format!(
+            "def list_from_iter(value):\n    return value\n\n\
+             class ClosureGenerator:\n    def send(self, value):\n        return value\n\n\
+             def rows(values):\n    for item in values:\n{cases}\n\
+             def ordinary():\n    return None\n\n\
+             def caller(values):\n    return list(rows(values))\n"
+        );
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+            .expect("large retained-generator fixture should lower")
+            .blockpy_module;
+        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+        let helper = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "list_from_iter")
+            .cloned()
+            .expect("consumer implementation should exist");
+        let generator_targets = strict_module_global_generator_targets_for_module(&lowered);
+        let static_targets = StaticDirectCallTargets {
+            runtime_builtin_implementations: HashMap::from([(RuntimeName::List, helper)]),
+            module_global_generators: HashMap::from([(module_id, generator_targets)]),
+            ..StaticDirectCallTargets::default()
+        };
+        let mut typed = lower_blockpy_module_to_typed(lowered);
+        let instance_plans = static_generator_instance_plans_for_module(&typed, &static_targets);
+        for function in &mut typed.callable_defs {
+            annotate_typed_generator_instance_plans(
+                function,
+                instance_plans.get(&function.function_id),
+            )
+            .expect("actual generator instance plans should attach");
+        }
+        let resume = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "rows")
+            .expect("retained resume should exist");
+        let resume_id = resume.function_id;
+        let resume_blocks = resume.blocks.len();
+        assert!(resume_blocks > MAX_GENERATOR_RESUME_INLINE_BLOCKS);
+        assert!(!inline_callee_preserves_activation(resume));
+        assert!(!typed_generator_resume_inline_target_is_small_enough(
+            &typed,
+            &HashMap::new(),
+            resume_id,
+        ));
+        assert!(typed_generator_consumer_resume_target_is_within_budget(
+            &typed,
+            &HashMap::new(),
+            resume_id,
+        ));
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("consumer caller should exist");
+        let plans = trusted_generator_builtin_implementation_plans_for_function(
+            caller,
+            &typed,
+            &HashMap::new(),
+            &typed.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+            &static_targets,
+        );
+        assert_eq!(
+            plans.len(),
+            1,
+            "retained body size must not reject its consumer"
+        );
+        let source = *plans.keys().next().expect("consumer source should exist");
+        let protocol = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "ClosureGenerator.send")
+            .expect("protocol bridge should exist");
+        assert_eq!(
+            typed_builtin_generator_followup_cfg_budget(caller, &typed, &HashMap::new(), source),
+            (
+                protocol.blocks.len().saturating_add(2),
+                typed_inline_function_body_instr_count(protocol).saturating_add(8),
+            ),
+            "retaining the resume body must not waive protocol bridge costs",
+        );
+        let selected = select_typed_inline_targets_within_cfg_budget_and_priorities(
+            caller,
+            &typed,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::from([source]),
+            builtin_implementation_inline_targets(&plans),
+            Some(1),
+            &SuppressedTypedInlineTargets::new(),
+        );
+        assert!(selected.contains_key(&source));
+
+        // Build an ordinary, executable straight-line CFG with exactly the
+        // same block count. No generator instance fact is forged for it.
+        let ordinary = typed
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "ordinary")
+            .expect("ordinary cost control should exist");
+        assert_eq!(ordinary.blocks.len(), 1);
+        let mut template = ordinary.blocks[0].clone();
+        assert!(template.params.is_empty());
+        template.body.clear();
+        while ordinary.blocks.len() < resume_blocks {
+            let mut next = template.clone();
+            next.label = ordinary.name_gen.next_block_name();
+            ordinary
+                .blocks
+                .last_mut()
+                .expect("previous ordinary block exists")
+                .term = BlockTerm::Jump(soac_core::block_py::BlockEdge::new(next.label));
+            ordinary.blocks.push(next);
+        }
+        let ordinary_id = ordinary.function_id;
+        assert_eq!(ordinary.blocks.len(), resume_blocks);
+        assert!(inline_callee_preserves_activation(ordinary));
+        assert!(
+            !typed_generator_consumer_resume_target_is_within_budget(
+                &typed,
+                &HashMap::new(),
+                ordinary_id,
+            ),
+            "a copyable body must still obey the unchanged resume inline limit"
+        );
+
+        typed
+            .callable_defs
+            .retain(|function| function.function_id != resume_id);
+        assert!(
+            !typed_generator_consumer_resume_target_is_within_budget(
+                &typed,
+                &HashMap::new(),
+                resume_id,
+            ),
+            "a missing target must not be mistaken for a retained activation"
         );
     }
 
@@ -14323,6 +14732,7 @@ def run(values):
             &builtin_sources,
             targets,
             Some(1),
+            &SuppressedTypedInlineTargets::new(),
         );
         assert_eq!(
             selected.keys().copied().collect::<HashSet<_>>(),
@@ -14465,6 +14875,161 @@ def caller(left, right):
     }
 
     #[test]
+    fn late_builtin_inline_budget_reclaims_only_unreachable_cfg() {
+        use soac_core::block_py::{Block, BlockEdge};
+
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def tuple_from_iter(value):
+    result = []
+    iterator = iter(value)
+    while True:
+        try:
+            item = next(iterator)
+            result.append(item)
+        except StopIteration:
+            return tuple(result)
+
+def caller(values):
+    return tuple(item for item in values)
+"#,
+        )
+        .expect("source should lower")
+        .blockpy_module;
+        let helper = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "tuple_from_iter")
+            .cloned()
+            .expect("tuple implementation should exist");
+        let static_targets = StaticDirectCallTargets {
+            runtime_builtin_implementations: HashMap::from([(RuntimeName::Tuple, helper)]),
+            ..StaticDirectCallTargets::default()
+        };
+        let mut baseline = lower_blockpy_module_to_typed(lowered);
+        let generator_instances =
+            static_generator_instance_plans_for_module(&baseline, &static_targets);
+        for function in &mut baseline.callable_defs {
+            annotate_typed_generator_instance_plans(
+                function,
+                generator_instances.get(&function.function_id),
+            )
+            .expect("original generator instance plans should attach");
+        }
+        let caller = baseline
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("caller should exist");
+        let consumers = trusted_generator_builtin_implementation_plans_for_function(
+            caller,
+            &baseline,
+            &HashMap::new(),
+            &baseline.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+            &static_targets,
+        );
+        assert_eq!(
+            consumers.len(),
+            1,
+            "fixture must have one eligible consumer"
+        );
+        let source = *consumers.keys().next().unwrap();
+        let original_activations = original_generator_activations(&baseline, "caller");
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        for reachable_padding in [None, Some(false), Some(true)] {
+            let mut typed = baseline.clone();
+            let caller = typed
+                .callable_defs
+                .iter_mut()
+                .find(|function| function.names.qualname == "caller")
+                .unwrap();
+            let mut padding_labels = HashSet::new();
+            if let Some(reachable) = reachable_padding {
+                let mut next = caller.blocks[0].label;
+                let mut padding = Vec::new();
+                for _ in 0..MAX_TYPED_INLINE_FUNCTION_BLOCKS {
+                    let label = caller.name_gen.next_block_name();
+                    padding.push(Block::new_with_extra(
+                        label,
+                        Vec::new(),
+                        BlockTerm::Jump(BlockEdge::new(next)),
+                        Vec::new(),
+                        None,
+                        Default::default(),
+                    ));
+                    padding_labels.insert(label);
+                    next = label;
+                }
+                if reachable {
+                    // The identical blocks form an entry chain instead of
+                    // disconnected code, so pruning must retain their cost.
+                    padding.reverse();
+                    caller.blocks.splice(0..0, padding);
+                } else {
+                    caller.blocks.extend(padding);
+                }
+                assert!(!typed_inline_function_within_cfg_budget(caller));
+            }
+
+            apply_typed_v3_module_rewrites(
+                &mut typed,
+                &profile,
+                None,
+                &HashMap::new(),
+                &static_targets,
+                &HashMap::new(),
+            )
+            .expect("the production rewrite pipeline should preserve a valid budgeted CFG");
+            let caller = typed
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "caller")
+                .unwrap();
+            let live_sources = collect_typed_semantic_instr_ids(caller);
+            assert_eq!(
+                live_sources.contains(&source),
+                reachable_padding == Some(true),
+                "only live CFG pressure may leave the original consumer unconsumed: {reachable_padding:?}",
+            );
+            let retained_padding = caller
+                .blocks
+                .iter()
+                .filter(|block| padding_labels.contains(&block.label))
+                .count();
+            assert_eq!(
+                retained_padding,
+                if reachable_padding == Some(true) {
+                    MAX_TYPED_INLINE_FUNCTION_BLOCKS
+                } else {
+                    0
+                },
+            );
+            let retained = generator_activation_shape(caller);
+            assert_eq!(retained.instances, original_activations.instances);
+            assert_eq!(retained.factories, original_activations.factories);
+            assert_eq!(
+                retained.owns_preserved_state, original_activations.owns_preserved_state,
+                "budget reclamation must not inline the generator's owned activation",
+            );
+        }
+    }
+
+    #[test]
     fn typed_inline_cfg_budget_rejects_functions_at_block_limit() {
         let lowered =
             soac_lowering::lower_python_to_blockpy_for_testing("def caller():\n    return None\n")
@@ -14568,6 +15133,335 @@ def caller(left, right):
             HashSet::from([suppressed_source, first_clone, nested_clone])
         );
         assert!(!suppressed.contains(&unrelated_clone));
+    }
+
+    #[test]
+    fn live_generator_acquisitions_survive_consuming_and_borrowed_binding_reads() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def values():
+    yield 4
+    yield 7
+
+def consume():
+    for value in values():
+        pass
+
+def relay():
+    for value in values():
+        yield value
+"#,
+        )
+        .expect("real iterator source should lower")
+        .blockpy_module;
+        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+        let targets = StaticDirectCallTargets {
+            module_global_generators: HashMap::from([(
+                module_id,
+                strict_module_global_generator_targets_for_module(&lowered),
+            )]),
+            ..StaticDirectCallTargets::default()
+        };
+        let mut typed = lower_blockpy_module_to_typed(lowered);
+        let source_target = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "values")
+            .expect("original generator should exist")
+            .function_id;
+        let plans = static_generator_instance_plans_for_module(&typed, &targets);
+        for function in &mut typed.callable_defs {
+            annotate_typed_generator_instance_plans(function, plans.get(&function.function_id))
+                .expect("production instance plans should attach");
+        }
+        let synthetic = synthetic_genexpr_function_ids_for_module(&typed);
+        for caller_name in ["consume", "relay"] {
+            let caller = typed
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == caller_name)
+                .expect("source caller should exist");
+            let original_plans = typed_generator_instance_plans_by_origin(caller);
+            assert_eq!(
+                original_plans
+                    .values()
+                    .map(|plan| plan.function_id)
+                    .collect::<HashSet<_>>(),
+                HashSet::from([source_target]),
+            );
+            let acquisition = caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .find_map(|instr| match instr {
+                    InstrTyped::Store(store) if store.value.generator_instance_plan().is_some() => {
+                        Some(store.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the source call must acquire its own generator");
+            let step = caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .find_map(|instr| {
+                    let InstrTyped::Store(store) = instr else {
+                        return None;
+                    };
+                    let InstrTyped::IteratorStep(step) = store.value.as_ref() else {
+                        return None;
+                    };
+                    Some(step.clone())
+                })
+                .expect("source for-loop must use borrowed native iteration");
+            let layout = caller.storage_layout.as_ref().expect("resolved layout");
+            step.validate_resolved(layout)
+                .expect("iterator has an explicit Operand owner");
+            let acquisition_location = typed_binding_location(&acquisition.name)
+                .expect("acquisition is a local or preserved binding");
+            let step_location = typed_binding_location(&step.name)
+                .expect("iterator is a local or preserved binding");
+            assert_eq!(
+                matches!(step_location, TypedBindingLocation::Preserved(_)),
+                caller.lowered_kind() == &FunctionKind::Generator,
+                "the same read semantics must cover ordinary and suspended callers",
+            );
+
+            struct FindAcquisitionTake {
+                location: soac_core::block_py::NameLocation,
+                take: Option<InstrTyped>,
+            }
+            impl Visit<InstrTyped> for FindAcquisitionTake {
+                fn visit_instr(&mut self, expr: &InstrTyped) {
+                    if let InstrTyped::TakeOperand(take) = expr
+                        && take.name.location == self.location
+                    {
+                        self.take = Some(expr.clone());
+                    }
+                    expr.visit_children(self);
+                }
+            }
+            let mut finder = FindAcquisitionTake {
+                location: acquisition.name.location,
+                take: None,
+            };
+            finder.visit_fn(caller);
+            let take = finder
+                .take
+                .expect("GetIter must consume the acquired generator operand");
+            let InstrTyped::TakeOperand(op) = &take else {
+                unreachable!()
+            };
+            op.validate_resolved(layout)
+                .expect("acquisition has an explicit Operand owner");
+
+            // Isolate each actual operation so a later cleanup Take cannot
+            // accidentally hide a missing borrowed IteratorStep read.
+            for (operation, location) in [
+                (take, acquisition_location),
+                (InstrTyped::IteratorStep(step), step_location),
+            ] {
+                let mut isolated = caller.clone();
+                isolated.blocks.truncate(1);
+                isolated.blocks[0].body = vec![operation];
+                isolated.blocks[0].term = BlockTerm::implicit_function_return();
+                let aliases = HashSet::from([location]);
+                assert_eq!(
+                    collect_typed_non_copy_loaded_binding_locations(&isolated, &aliases),
+                    aliases,
+                    "operation-owned reads must retain their real binding in {caller_name}",
+                );
+            }
+
+            let mut cleaned = caller.clone();
+            assert_eq!(
+                remove_unused_typed_genexpr_function_materializations(
+                    &mut cleaned,
+                    &typed.module_constants,
+                    &synthetic,
+                ),
+                0,
+                "a live source generator is not dead materialization in {caller_name}",
+            );
+            assert_eq!(
+                typed_generator_instance_plans_by_origin(&cleaned),
+                original_plans,
+                "cleanup must preserve the original call IDs, targets, and argument plans",
+            );
+        }
+    }
+
+    fn named_generator_materialization_fixture(
+        argument: &str,
+    ) -> BlockPyModule<TypedBlockPyModuleShape> {
+        let source = format!(
+            "def caller(argument):\n    def values(value):\n        yield value\n    unused = values({argument})\n    return None\n",
+        );
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+            .expect("named source generator should lower")
+            .blockpy_module;
+        let mut typed = lower_blockpy_module_to_typed(lowered);
+        let plans =
+            static_generator_instance_plans_for_module(&typed, &StaticDirectCallTargets::default());
+        for function in &mut typed.callable_defs {
+            annotate_typed_generator_instance_plans(function, plans.get(&function.function_id))
+                .expect("production local-generator plans should attach");
+        }
+        typed
+    }
+
+    #[test]
+    fn generator_function_load_exemption_keeps_same_binding_argument_reads() {
+        let typed = named_generator_materialization_fixture("values");
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("caller should exist");
+        let store = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                store
+                    .value
+                    .generator_instance_plan()
+                    .is_some()
+                    .then_some(store)
+            })
+            .expect("real source call must have an instance plan");
+        let call = typed_generator_state_constructor_call(store.value.as_ref())
+            .expect("the actual call shape retains its constructor plan");
+        let InstrTyped::Load(callee) = call.func.as_ref() else {
+            panic!("the source callee must read its local function binding");
+        };
+        let instance = typed_binding_location(&store.name).expect("instance binding");
+        let function = typed_binding_location(&callee.name).expect("callee binding");
+        let aliases = HashSet::from([instance, function]);
+        assert!(
+            collect_typed_non_copy_loaded_binding_locations(caller, &aliases).contains(&function),
+            "ignoring the actual callee Load must not ignore the separate argument Load of that binding",
+        );
+    }
+
+    #[test]
+    fn unused_named_generator_call_remains_a_source_owned_binding() {
+        let typed = named_generator_materialization_fixture("argument");
+        let synthetic = synthetic_genexpr_function_ids_for_module(&typed);
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("caller should exist");
+        let original = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .find_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                store
+                    .value
+                    .generator_instance_plan()
+                    .is_some()
+                    .then(|| store.clone())
+            })
+            .expect("real source call must have an instance plan");
+        assert_eq!(original.lifetime, soac_core::block_py::StoreLifetime::Frame);
+        assert_eq!(original.purpose, soac_core::block_py::StorePurpose::Binding);
+        assert_eq!(original.name.id_str(), "unused");
+        assert!(
+            !caller
+                .storage_layout
+                .as_ref()
+                .expect("resolved layout")
+                .is_expression_temporary(
+                    original
+                        .name
+                        .local_location()
+                        .expect("ordinary source local"),
+                ),
+            "this is a source primary, not a compiler Operand",
+        );
+        let original_call = original
+            .value
+            .try_semantic_instr_id()
+            .expect("source call ID");
+        let mut cleaned = caller.clone();
+        assert_eq!(
+            remove_unused_typed_genexpr_function_materializations(
+                &mut cleaned,
+                &typed.module_constants,
+                &synthetic,
+            ),
+            0,
+            "a generator target alone proves neither infallible creation nor unobservable source-frame ownership",
+        );
+        assert_eq!(
+            typed_generator_instance_plans_by_origin(&cleaned).get(&original_call),
+            original.value.generator_instance_plan(),
+            "the original source-owned call and binding must remain",
+        );
+    }
+
+    #[test]
+    fn unused_generator_expression_keeps_its_call_and_factory() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def caller(values):\n    unused = (value for value in values)\n    return None\n",
+        )
+        .expect("source generator expression should lower")
+        .blockpy_module;
+        let mut typed = lower_blockpy_module_to_typed(lowered);
+        let plans =
+            static_generator_instance_plans_for_module(&typed, &StaticDirectCallTargets::default());
+        for function in &mut typed.callable_defs {
+            annotate_typed_generator_instance_plans(function, plans.get(&function.function_id))
+                .expect("production generator plans should attach");
+        }
+        let synthetic = synthetic_genexpr_function_ids_for_module(&typed);
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("caller should exist");
+        let original_calls = typed_generator_instance_plans_by_origin(caller);
+        assert_eq!(original_calls.len(), 1, "one actual generator construction");
+        let factories = |function: &BlockPyFunction<TypedBlockPyModuleShape>| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .filter_map(|instr| {
+                    typed_genexpr_function_materialization_location(instr, &synthetic)
+                })
+                .collect::<Vec<_>>()
+        };
+        let original_factories = factories(caller);
+        assert_eq!(
+            original_factories.len(),
+            1,
+            "one actual compiler-generated factory"
+        );
+
+        let mut cleaned = caller.clone();
+        assert_eq!(
+            remove_unused_typed_genexpr_function_materializations(
+                &mut cleaned,
+                &typed.module_constants,
+                &synthetic,
+            ),
+            0,
+            "a remaining construction call is a real callee use, not a removable factory-alias edge",
+        );
+        assert_eq!(
+            typed_generator_instance_plans_by_origin(&cleaned),
+            original_calls
+        );
+        assert_eq!(factories(&cleaned), original_factories);
     }
 
     #[test]
@@ -14831,6 +15725,140 @@ def caller():\n    it = make()\n    value = next(it)\n    return value\n",
             ),
             HashMap::from([(protocol_instr_id, owner_type_ref)]),
         );
+    }
+
+    fn assert_guarded_helper_inline_keeps_operations(nested: bool) {
+        let entry_helper = if nested { "middle" } else { "advance" };
+        let source = format!(
+            "def advance(iterator):\n    total = 0\n    for item in iterator:\n        total += item\n    return total + abs(total)\n\n\
+def middle(iterator):\n    result = advance(iterator)\n    return result\n\n\
+def caller(iterator, opaque):\n    result = {entry_helper}(iterator)\n    next(opaque)\n    return result\n"
+        );
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+            .expect("the source helper fixture must lower")
+            .blockpy_module;
+        let typed = lower_blockpy_module_to_typed(lowered);
+        let mut caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .unwrap()
+            .clone();
+
+        #[derive(Default)]
+        struct Sites<'a> {
+            constants: &'a [ConstantExpr],
+            calls: HashMap<String, soac_core::block_py::Meta>,
+            ordinary_next: Vec<InstrId>,
+            steps: Vec<(InstrId, ResolvedName, soac_core::block_py::Meta)>,
+        }
+        impl Visit<InstrTyped> for Sites<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr {
+                    if let InstrTyped::Load(load) = call.func.as_ref()
+                        && load.name.location.is_global()
+                    {
+                        self.calls
+                            .insert(load.name.id_str().to_owned(), call.meta());
+                    }
+                    if typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::Next,
+                        self.constants,
+                    ) {
+                        self.ordinary_next
+                            .push(call.try_semantic_instr_id().unwrap());
+                    }
+                }
+                if let InstrTyped::IteratorStep(step) = expr {
+                    self.steps.push((
+                        step.try_semantic_instr_id().unwrap(),
+                        step.name.clone(),
+                        step.meta(),
+                    ));
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut original = Sites {
+            constants: &typed.module_constants,
+            ..Sites::default()
+        };
+        original.visit_fn(&caller);
+        let [ordinary_next] = original.ordinary_next.as_slice() else {
+            panic!("the original caller has exactly one explicit next continuation");
+        };
+        let ordinary_next = *ordinary_next;
+        let original_call_site = original.calls[entry_helper].clone();
+        let helpers = if nested {
+            vec!["middle", "advance"]
+        } else {
+            vec!["advance"]
+        };
+        for helper_name in helpers {
+            let mut current = Sites {
+                constants: &typed.module_constants,
+                ..Sites::default()
+            };
+            current.visit_fn(&caller);
+            let call_site = current.calls[helper_name].clone();
+            if nested && helper_name == "advance" {
+                assert_ne!(
+                    call_site.range, original_call_site.range,
+                    "the second round must rebase a different helper source range"
+                );
+            }
+            let helper = typed
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == helper_name)
+                .unwrap();
+            let arg_plan = TypedDirectCallArgPlan {
+                sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
+            };
+            let mut emissions = TypedCallEmissionPlans::default();
+            emissions.by_source.insert(
+                call_site.instr_id.unwrap(),
+                TypedCallEmissionPlan::DirectCallable {
+                    function_guard: TypedDirectFunctionCallGuard {
+                        function_id: helper.function_id,
+                        arg_plan: arg_plan.clone(),
+                    },
+                },
+            );
+            assert_eq!(
+                lower_typed_function_call_emission_plans(&mut caller, &emissions).unwrap(),
+                1
+            );
+            let stats = soac_opt::passes::inline_typed_function_direct_call_stores(
+                &mut caller,
+                &typed,
+                &HashMap::new(),
+                &HashMap::from([(
+                    call_site.instr_id.unwrap(),
+                    vec![(helper.function_id, arg_plan)],
+                )]),
+            );
+            assert_eq!(stats.rewritten_stores, 1, "{stats:?}");
+            assert!(!stats.instr_id_mappings.is_empty());
+        }
+        let mut copied = Sites {
+            constants: &typed.module_constants,
+            ..Sites::default()
+        };
+        copied.visit_fn(&caller);
+        assert_eq!(
+            copied.steps.len(),
+            1,
+            "the actual iterator advance survives inline"
+        );
+        assert_eq!(copied.ordinary_next, vec![ordinary_next]);
+    }
+
+    #[test]
+    fn guarded_inline_preserves_iterator_step() {
+        assert_guarded_helper_inline_keeps_operations(false);
+        assert_guarded_helper_inline_keeps_operations(true);
     }
 
     #[test]
@@ -15260,6 +16288,7 @@ def caller(limit):
             module_global_generators: HashMap::from([(module_id, generator_targets)]),
             strict_methods: HashMap::new(),
             suppressed_source_generators: HashSet::new(),
+            public_boundary_modules: HashSet::new(),
         };
         let plans = static_generator_instance_plans_for_function(&caller, &targets);
         annotate_typed_generator_instance_plans(&mut caller, Some(&plans))
@@ -15834,6 +16863,404 @@ def multi(values):
         assert!(!registered_sources.contains(&RuntimeName::Set));
     }
 
+    fn native_iterator_pipeline_prepared_fixture(
+        mode: SpecializationMode,
+    ) -> (BlockPyModule<BlockPyModuleShape>, Arc<JitModulePlan>) {
+        native_iterator_pipeline_prepared_source(
+            mode,
+            r#"
+def map_list(callback, values):
+    return list(map(callback, values))
+
+def map_tuple(callback, values):
+    return tuple(map(callback, values))
+
+def filter_list(callback, values):
+    return list(filter(callback, values))
+
+def filter_tuple(callback, values):
+    return tuple(filter(callback, values))
+
+def paired(callback, values):
+    return (list(map(callback, values)), tuple(filter(callback, values)))
+
+def source_genexpr(callback):
+    return list(map(callback, (value for value in range(5))))
+
+def escaping(callback, values):
+    return map(callback, values)
+
+def observed(callback, values, observe):
+    wrapper = filter(callback, values)
+    observe(wrapper)
+    return tuple(wrapper)
+
+def multi(callback, first, second):
+    return list(map(callback, first, second))
+
+def keyword(callback, values):
+    return tuple(map(callback, values, strict=True))
+
+def rebound(map, callback, values):
+    return list(map(callback, values))
+"#,
+        )
+    }
+
+    fn native_iterator_pipeline_prepared_source(
+        mode: SpecializationMode,
+        source: &str,
+    ) -> (BlockPyModule<BlockPyModuleShape>, Arc<JitModulePlan>) {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("native iterator plan fixture should lower")
+            .blockpy_module;
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        // This imposes the production source boundary; it grants no callable
+        // authority. There are deliberately no injected runtime helper bodies,
+        // external callees, callable target observations, or generator permits.
+        let targets = StaticDirectCallTargets {
+            public_boundary_modules: HashSet::from([lowered
+                .module_name_gen
+                .runtime_module_id()
+                .as_u32()]),
+            ..StaticDirectCallTargets::default()
+        };
+        let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
+        let prepared = optimize_blockpy_with_external_inline_callees(
+            &lowered,
+            Some(&profile),
+            &config,
+            HashMap::new(),
+            targets,
+            None,
+        )
+        .expect("actual typed preparation should accept the native iterator fixture");
+        (lowered, prepared)
+    }
+
+    fn native_iterator_pipeline_plans(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    ) -> Vec<soac_ir_typed::TypedNativeIteratorPipelinePlan> {
+        #[derive(Default)]
+        struct Plans(Vec<soac_ir_typed::TypedNativeIteratorPipelinePlan>);
+        impl Visit<InstrTyped> for Plans {
+            fn visit_instr(&mut self, instr: &InstrTyped) {
+                if let Some(plan) = instr.native_iterator_pipeline_plan() {
+                    self.0.push(plan.clone());
+                }
+                instr.visit_children(self);
+            }
+        }
+        let mut plans = Plans::default();
+        plans.visit_fn(function);
+        plans.0
+    }
+
+    #[test]
+    fn native_iterator_pipeline_selects_complete_native_input_templates() {
+        use soac_ir_typed::{
+            NativeIteratorBuiltin as Builtin, NativeIteratorCallee as Callee,
+            NativeIteratorCalleeGuard as Guard, NativeIteratorMaterializer as Sink,
+            NativeIteratorStage as Stage,
+        };
+        for mode in [SpecializationMode::Apply, SpecializationMode::Verify] {
+            let (_, prepared) = native_iterator_pipeline_prepared_fixture(mode);
+            let mut missing = Vec::new();
+            for (name, stage, sink, stage_builtin, sink_builtin) in [
+                (
+                    "map_list",
+                    Stage::Map,
+                    Sink::List,
+                    Builtin::Map,
+                    Builtin::List,
+                ),
+                (
+                    "map_tuple",
+                    Stage::Map,
+                    Sink::Tuple,
+                    Builtin::Map,
+                    Builtin::Tuple,
+                ),
+                (
+                    "filter_list",
+                    Stage::Filter,
+                    Sink::List,
+                    Builtin::Filter,
+                    Builtin::List,
+                ),
+                (
+                    "filter_tuple",
+                    Stage::Filter,
+                    Sink::Tuple,
+                    Builtin::Filter,
+                    Builtin::Tuple,
+                ),
+            ] {
+                let function = prepared
+                    .module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.qualname == name)
+                    .expect("prepared pipeline caller exists");
+                let plans = native_iterator_pipeline_plans(function);
+                let [plan] = plans.as_slice() else {
+                    missing.push((name, plans.len()));
+                    continue;
+                };
+                assert_eq!((plan.stage, plan.materializer), (stage, sink));
+                assert_eq!(
+                    plan.entry_guards,
+                    [
+                        Guard {
+                            operand: Callee::Materializer,
+                            expected: sink_builtin
+                        },
+                        Guard {
+                            operand: Callee::Stage,
+                            expected: stage_builtin
+                        },
+                    ]
+                );
+                assert_eq!(plan.must_eliminate.wrapper_origin, plan.stage_source);
+                assert_eq!(plan.must_eliminate.consumer, plan.source);
+                assert_eq!(plan.must_eliminate.argument_index, 0);
+                assert_ne!(plan.stage_source, plan.source);
+            }
+            assert!(
+                missing.is_empty(),
+                "complete native-input plans missing: {missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_iterator_pipeline_retains_source_activation_and_observed_wrappers() {
+        let (lowered, prepared) =
+            native_iterator_pipeline_prepared_fixture(SpecializationMode::Apply);
+        let suspended = lowered
+            .callable_defs
+            .iter()
+            .filter(|function| {
+                function.blocks.iter().any(|block| {
+                    block.extra.handled_exception
+                        == soac_core::block_py::HandledExceptionContext::Terminal
+                })
+            })
+            .map(|function| function.function_id)
+            .collect::<Vec<_>>();
+        assert!(
+            !suspended.is_empty(),
+            "fixture must contain a real lowered suspension"
+        );
+        for function_id in suspended {
+            let function = prepared
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == function_id)
+                .expect("opaque native input must retain its source resume body");
+            assert!(!inline_callee_preserves_activation(function));
+        }
+        for name in ["escaping", "observed", "multi", "keyword", "rebound"] {
+            let function = prepared
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == name)
+                .expect("negative pipeline caller exists");
+            assert!(
+                native_iterator_pipeline_plans(function).is_empty(),
+                "{name} must retain the actual builtin operation"
+            );
+        }
+        let (_, profiled) = native_iterator_pipeline_prepared_fixture(SpecializationMode::Profile);
+        assert!(
+            profiled
+                .module
+                .callable_defs
+                .iter()
+                .all(|function| native_iterator_pipeline_plans(function).is_empty()),
+            "profile mode measures the original operations rather than enabling its own plan"
+        );
+    }
+
+    #[test]
+    fn native_iterator_pipeline_commit_is_atomic_and_budgeted() {
+        use soac_opt::passes::{
+            commit_typed_native_iterator_pipeline_plans, propose_typed_native_iterator_pipelines,
+        };
+        let (_, prepared) = native_iterator_pipeline_prepared_fixture(SpecializationMode::Apply);
+        let mut function = prepared
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "paired")
+            .expect("paired native pipeline caller exists")
+            .clone();
+        let constants = &prepared.module.module_constants;
+        commit_typed_native_iterator_pipeline_plans(&mut function, constants, &[]).unwrap();
+        let proposals = propose_typed_native_iterator_pipelines(&function, constants);
+        assert_eq!(
+            proposals.len(),
+            2,
+            "test requires two actual eligible source trees"
+        );
+        let slots = function
+            .storage_layout
+            .as_ref()
+            .unwrap()
+            .stack_slots()
+            .to_vec();
+        let blocks = function.blocks.len();
+        let body_instrs = typed_inline_function_body_instr_count(&function);
+
+        assert_eq!(
+            select_typed_native_iterator_pipelines(&mut function, constants, 0, 0).unwrap(),
+            0
+        );
+        assert!(native_iterator_pipeline_plans(&function).is_empty());
+        let mut invalid = proposals.clone();
+        invalid[1].entry_guards[1].expected = soac_ir_typed::NativeIteratorBuiltin::List;
+        assert!(
+            commit_typed_native_iterator_pipeline_plans(&mut function, constants, &invalid)
+                .is_err()
+        );
+        assert!(
+            native_iterator_pipeline_plans(&function).is_empty(),
+            "a later invalid target must not commit the earlier valid bundle"
+        );
+        assert_eq!(function.blocks.len(), blocks);
+        assert_eq!(
+            typed_inline_function_body_instr_count(&function),
+            body_instrs
+        );
+        assert_eq!(
+            function.storage_layout.as_ref().unwrap().stack_slots(),
+            slots.as_slice()
+        );
+        assert_eq!(
+            propose_typed_native_iterator_pipelines(&function, constants),
+            proposals
+        );
+
+        commit_typed_native_iterator_pipeline_plans(&mut function, constants, &proposals).unwrap();
+        assert_eq!(native_iterator_pipeline_plans(&function), proposals);
+    }
+
+    #[test]
+    fn native_iterator_pipeline_rejects_stale_current_operands() {
+        use soac_opt::passes::validate_typed_native_iterator_pipeline_plans;
+        let (_, prepared) = native_iterator_pipeline_prepared_fixture(SpecializationMode::Apply);
+        let mut function = prepared
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "map_list")
+            .expect("map caller exists")
+            .clone();
+        let plans = native_iterator_pipeline_plans(&function);
+        let [plan] = plans.as_slice() else {
+            panic!("fixture must select one real bundle")
+        };
+        validate_typed_native_iterator_pipeline_plans(
+            &function,
+            &prepared.module.module_constants,
+            &plans,
+        )
+        .unwrap();
+        struct ChangeCurrentCall(InstrId);
+        impl VisitMut<InstrTyped> for ChangeCurrentCall {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if expr.try_semantic_instr_id() == Some(self.0) {
+                    let InstrTyped::CallTyped(call) = expr else {
+                        panic!("stage must remain a typed source call")
+                    };
+                    call.args.pop();
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+        ChangeCurrentCall(plan.stage_source).visit_fn_mut(&mut function);
+        assert!(
+            validate_typed_native_iterator_pipeline_plans(
+                &function,
+                &prepared.module.module_constants,
+                &plans,
+            )
+            .is_err(),
+            "a retained sidecar cannot authorize changed current operands"
+        );
+    }
+
+    #[test]
+    fn native_iterator_pipeline_guards_actual_declared_global_loads() {
+        let (_, prepared) = native_iterator_pipeline_prepared_source(
+            SpecializationMode::Apply,
+            r#"
+def install(map_value, list_value):
+    global map, list
+    map = map_value
+    list = list_value
+
+def guarded(callback_factory, iterable_factory):
+    return list(map(callback_factory(), iterable_factory()))
+"#,
+        );
+        let function = prepared
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "guarded")
+            .unwrap();
+        let plans = native_iterator_pipeline_plans(function);
+        assert_eq!(
+            plans.len(),
+            1,
+            "live globals still require the guarded template"
+        );
+        struct GlobalCallees(HashSet<String>);
+        impl Visit<InstrTyped> for GlobalCallees {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::Load(load) = expr {
+                    if matches!(
+                        load.name.location,
+                        NameLocation::GlobalName | NameLocation::Global(_)
+                    ) && matches!(load.name.id.as_str(), "list" | "map")
+                    {
+                        self.0.insert(load.name.id.to_string());
+                    }
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut globals = GlobalCallees(HashSet::new());
+        globals.visit_fn(function);
+        assert_eq!(
+            globals.0,
+            HashSet::from(["map".into(), "list".into()]),
+            "the source global declarations must select real name-binding loads, not runtime constants"
+        );
+        assert_eq!(plans[0].entry_guards.len(), 2);
+        soac_opt::passes::validate_typed_native_iterator_pipeline_plans(
+            function,
+            &prepared.module.module_constants,
+            &plans,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn closed_map_stage_plan_requires_a_proven_generator_input() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
@@ -15921,7 +17348,7 @@ def caller(limit):
     }
 
     #[test]
-    fn list_builtin_implementation_plans_skip_large_generator_resume_bodies() {
+    fn list_builtin_implementation_plans_admit_large_retained_generator_resume_bodies() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def list_from_iter(value):
@@ -16011,18 +17438,26 @@ def caller(limit):
         annotate_typed_generator_instance_plans(&mut caller, Some(&generator_plans))
             .expect("generator instance annotation should succeed");
 
-        assert!(
-            trusted_generator_builtin_implementation_plans_for_function(
-                &caller,
-                &typed,
-                &HashMap::new(),
-                &typed.module_constants,
-                &HashMap::new(),
-                &HashMap::new(),
-                &targets,
-            )
-            .is_empty(),
-            "large generator resume bodies should not trigger builtin-consumer inlining",
+        let resume = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "values")
+            .expect("large generator resume should exist");
+        assert!(resume.blocks.len() > MAX_GENERATOR_RESUME_INLINE_BLOCKS);
+        assert!(!inline_callee_preserves_activation(resume));
+        let plans = trusted_generator_builtin_implementation_plans_for_function(
+            &caller,
+            &typed,
+            &HashMap::new(),
+            &typed.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+            &targets,
+        );
+        assert_eq!(
+            plans.len(),
+            1,
+            "a large retained resume body does not consume the builtin caller's inline budget",
         );
     }
 
@@ -16308,9 +17743,616 @@ def outer(rows):
         );
     }
 
+    // Diagnostic only: source ranges identify original source occurrences,
+    // not clone lineage. Selection/retirement still use exact semantic IDs.
+    fn residual_generator_selection_diagnostic(
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+        static_targets: &StaticDirectCallTargets,
+        retirements: &SuppressedTypedInlineTargets,
+    ) -> String {
+        struct Sites<'a> {
+            constants: &'a [ConstantExpr],
+            rows: Vec<String>,
+        }
+        impl Visit<InstrTyped> for Sites<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                let instance = expr.generator_instance_plan().map(|plan| plan.function_id);
+                let resume = expr.generator_resume_plan().map(|plan| plan.function_id);
+                let runtime = match expr {
+                    InstrTyped::CallTyped(call) => {
+                        typed_expr_runtime_name_provenance(call.func.as_ref(), self.constants)
+                    }
+                    InstrTyped::GuardedCallableCallTyped(call) => {
+                        typed_expr_runtime_name_provenance(call.func.as_ref(), self.constants)
+                    }
+                    InstrTyped::DirectCallableCallTyped(call) => {
+                        typed_expr_runtime_name_provenance(call.func.as_ref(), self.constants)
+                    }
+                    _ => None,
+                };
+                if instance.is_some()
+                    || resume.is_some()
+                    || runtime.is_some_and(|name| {
+                        matches!(
+                            name,
+                            RuntimeName::Set
+                                | RuntimeName::List
+                                | RuntimeName::Tuple
+                                | RuntimeName::Iter
+                                | RuntimeName::Next
+                                | RuntimeName::ResumeGenerator
+                        )
+                    })
+                {
+                    self.rows.push(format!(
+                        "site={:?} range={:?} runtime={runtime:?} instance={instance:?} resume={resume:?}",
+                        expr.try_semantic_instr_id(),
+                        expr.meta().range,
+                    ));
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut placements = Vec::new();
+        for block in &function.blocks {
+            let mut sites = Sites {
+                constants: &module.module_constants,
+                rows: Vec::new(),
+            };
+            sites.visit_block(block);
+            if !sites.rows.is_empty() {
+                placements.push((block.label, block.extra.layout, sites.rows));
+            }
+        }
+        struct ReceiverReads<'a> {
+            constants: &'a [ConstantExpr],
+            names: Vec<(Option<InstrId>, ResolvedName)>,
+            next_names: Vec<(InstrId, ResolvedName)>,
+            call_shapes: Vec<(
+                Option<InstrId>,
+                soac_ir_typed::TypedCallAccessPlan,
+                usize,
+                usize,
+            )>,
+        }
+        impl Visit<InstrTyped> for ReceiverReads<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && matches!(
+                        typed_expr_runtime_name_provenance(call.func.as_ref(), self.constants),
+                        Some(RuntimeName::Iter | RuntimeName::Next)
+                    )
+                    && let Some(CallArgPositional::Positional(receiver)) = call.args.first()
+                    && let Some(name) = typed_protocol_value_name(receiver)
+                {
+                    self.names
+                        .push((expr.try_semantic_instr_id(), name.clone()));
+                    self.call_shapes.push((
+                        expr.try_semantic_instr_id(),
+                        call.access.clone(),
+                        call.args.len(),
+                        call.keywords.len(),
+                    ));
+                    if typed_expr_runtime_name_provenance(call.func.as_ref(), self.constants)
+                        == Some(RuntimeName::Next)
+                        && let Some(source) = expr.try_semantic_instr_id()
+                    {
+                        self.next_names.push((source, name.clone()));
+                    }
+                }
+                expr.visit_children(self);
+            }
+        }
+        fn facts(name: &ResolvedName, state: Option<&TrustedOwnerState>) -> String {
+            let Some(state) = state else {
+                return "unreachable".to_owned();
+            };
+            let origin = trusted_generator_origin_for_name(name, state);
+            let location = name.local_location();
+            format!(
+                "name={name:?} owner={:?} origin={origin:?} candidates={:?} resume={:?} escaped={}",
+                location.and_then(|key| state.locals.get(&key)),
+                location.and_then(|key| state.object_origin_candidates.get(&key)),
+                trusted_generator_resume_function_fact_for_name(name, state),
+                origin.is_some_and(|origin| state.escaped_origins.contains(&origin)),
+            )
+        }
+        let states = analyze_trusted_owner_states(
+            function,
+            &module.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let predecessors = trusted_owner_block_predecessor_edges(function);
+        let mut receiver_rows = Vec::new();
+        let mut receiver_locations = HashSet::new();
+        let mut protocol_call_shapes = Vec::new();
+        let mut raw_next_alias_sources = HashMap::<InstrId, HashSet<InstrId>>::new();
+        for block in &function.blocks {
+            for (instr_index, instr) in block.body.iter().enumerate() {
+                let mut receiver = ReceiverReads {
+                    constants: &module.module_constants,
+                    names: Vec::new(),
+                    next_names: Vec::new(),
+                    call_shapes: Vec::new(),
+                };
+                receiver.visit_instr(instr);
+                protocol_call_shapes.extend(receiver.call_shapes);
+                let state = states.body_before_instr.get(&TypedVirtualBodyInstr {
+                    block: block.label,
+                    instr_index,
+                });
+                for (source, name) in receiver.next_names {
+                    if let Some(origin) =
+                        state.and_then(|state| trusted_generator_origin_for_name(&name, state))
+                    {
+                        raw_next_alias_sources
+                            .entry(origin)
+                            .or_default()
+                            .insert(source);
+                    }
+                }
+                for (site, name) in receiver.names {
+                    receiver_locations.extend(name.local_location());
+                    let key = TypedVirtualBodyInstr {
+                        block: block.label,
+                        instr_index,
+                    };
+                    let components = states.body_before_instr_components.get(&key).map(|rows| {
+                        rows.iter()
+                            .map(|state| facts(&name, Some(state)))
+                            .collect::<Vec<_>>()
+                    });
+                    let incoming = predecessors
+                        .get(&block.label)
+                        .into_iter()
+                        .flatten()
+                        .map(|edge| {
+                            (
+                                edge.clone(),
+                                facts(&name, states.block_before_term.get(&edge.from)),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    receiver_rows.push((
+                        block.label,
+                        instr_index,
+                        site,
+                        facts(&name, states.body_before_instr.get(&key)),
+                        components,
+                        incoming,
+                    ));
+                }
+            }
+        }
+        let receiver_stores = function
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                let receiver_locations = &receiver_locations;
+                let states = &states;
+                block
+                    .body
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, instr)| {
+                        let InstrTyped::Store(store) = instr else {
+                            return None;
+                        };
+                        receiver_locations
+                            .contains(&store.name.local_location()?)
+                            .then(|| {
+                                (
+                                    block.label,
+                                    index,
+                                    store.clone(),
+                                    states
+                                        .body_before_instr
+                                        .get(&TypedVirtualBodyInstr {
+                                            block: block.label,
+                                            instr_index: index,
+                                        })
+                                        .cloned(),
+                                )
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let (resume_plans, resume_report) = trusted_generator_resume_plans_and_report_for_function(
+            function,
+            &module.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let (protocol_calls, protocol_targets, protocol_origins, protocol_resumes) =
+            trusted_static_runtime_protocol_inlines_for_function(
+                function,
+                &module.module_constants,
+                &HashMap::new(),
+                &HashMap::new(),
+                static_targets,
+            );
+        let builtin_plans = trusted_generator_builtin_implementation_plans_for_function(
+            function,
+            module,
+            external_callees,
+            &module.module_constants,
+            &HashMap::new(),
+            &HashMap::new(),
+            static_targets,
+        );
+        let builtin_sources = builtin_plans.keys().copied().collect::<HashSet<_>>();
+        let materialized_owner_blocks = trusted_generator_alias_cleanup_active_blocks(&states);
+        let raw_next_ignored = typed_generator_alias_ignored_instr_ids_by_origin(
+            function,
+            &module.module_constants,
+            &raw_next_alias_sources,
+        );
+        let retired_builtin_sources = builtin_sources
+            .iter()
+            .copied()
+            .filter(|source| {
+                retirements
+                    .get(&function.function_id)
+                    .is_some_and(|retired| retired.contains(source))
+            })
+            .collect::<HashSet<_>>();
+        let protocol_alias_checks = raw_next_ignored
+            .iter()
+            .map(|(&origin, ignored)| {
+                let mut including_retired_builtins = ignored.clone();
+                including_retired_builtins.extend(retired_builtin_sources.iter().copied());
+                (
+                    origin,
+                    ignored,
+                    typed_generator_state_origin_can_lower_aliases_in_blocks(
+                        function,
+                        &module.module_constants,
+                        origin,
+                        ignored,
+                        Some(&materialized_owner_blocks),
+                    ),
+                    // Diagnostic counterfactual only. This result is never an
+                    // admission decision or permission to erase an activation.
+                    typed_generator_state_origin_can_lower_aliases_in_blocks(
+                        function,
+                        &module.module_constants,
+                        origin,
+                        &including_retired_builtins,
+                        Some(&materialized_owner_blocks),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let constructor_stores = function
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .body
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, instr)| {
+                        let InstrTyped::Store(store) = instr else {
+                            return None;
+                        };
+                        store.value.generator_instance_plan().map(|plan| {
+                            (
+                                block.label,
+                                index,
+                                store.name.clone(),
+                                store.value.try_semantic_instr_id(),
+                                plan.function_id,
+                            )
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut residual_targets = builtin_implementation_inline_targets(&builtin_plans);
+        residual_targets.extend(protocol_targets.clone());
+        let retired_count = remove_retired_typed_inline_targets(
+            function.function_id,
+            &mut residual_targets,
+            retirements,
+        );
+        let selected_from_final_catalogue =
+            select_typed_inline_targets_within_cfg_budget_and_priorities(
+                function,
+                module,
+                external_callees,
+                &resume_plans,
+                &protocol_calls.keys().copied().collect(),
+                &builtin_sources,
+                residual_targets.clone(),
+                Some(1),
+                retirements,
+            );
+        let followup_budgets = builtin_sources
+            .iter()
+            .map(|source| {
+                (
+                    *source,
+                    typed_builtin_generator_followup_cfg_budget(
+                        function,
+                        module,
+                        external_callees,
+                        *source,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "function={:?} blocks={} body_instrs={} limits=({},{}) native_reservation={:?}\n             placements={placements:#?}\nprotocol_call_shapes={protocol_call_shapes:#?}\nprotocol_alias_checks={protocol_alias_checks:#?}\nretired_builtin_sources={retired_builtin_sources:#?}\nconstructor_stores={constructor_stores:#?}\nreceiver_rows={receiver_rows:#?}\nreceiver_stores={receiver_stores:#?}\nresume_plans={resume_plans:#?}\nresume_report={resume_report:#?}\n             protocol_targets={protocol_targets:#?}\nprotocol_origins={protocol_origins:#?}\n             protocol_resumes={protocol_resumes:#?}\nbuiltin_plans={builtin_plans:#?}\n             retired_count={retired_count} retirements={:#?}\nresidual_targets={residual_targets:#?}\n             selected_using_final_catalogue={selected_from_final_catalogue:#?}\n             followup_budgets={followup_budgets:#?}",
+            function.function_id,
+            function.blocks.len(),
+            typed_inline_function_body_instr_count(function),
+            MAX_TYPED_INLINE_FUNCTION_BLOCKS,
+            MAX_TYPED_INLINE_FUNCTION_BODY_INSTRS,
+            typed_native_iterator_pipeline_reserved_budget(function),
+            retirements.get(&function.function_id),
+        )
+    }
+
+    fn generator_activation_call_inventory(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    ) -> String {
+        struct Sites {
+            block: String,
+            owner: String,
+            rows: Vec<String>,
+        }
+        impl Visit<InstrTyped> for Sites {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::Store(store) = expr {
+                    let previous = std::mem::replace(&mut self.owner, format!("{:?}", store.name));
+                    expr.visit_children(self);
+                    self.owner = previous;
+                    return;
+                }
+                let site = match expr {
+                    InstrTyped::CallTyped(call) => Some((
+                        "CallTyped",
+                        format!("{:?}", call.func),
+                        format!("{:?}", call.access),
+                    )),
+                    InstrTyped::GuardedCallableCallTyped(call) => Some((
+                        "GuardedCallableCallTyped",
+                        format!("{:?}", call.func),
+                        format!("{:?}", call.function_guards),
+                    )),
+                    InstrTyped::DirectCallableCallTyped(call) => Some((
+                        "DirectCallableCallTyped",
+                        format!("{:?}", call.func),
+                        format!("{:?}", call.guard),
+                    )),
+                    InstrTyped::GuardedMethodCallTyped(call) => Some((
+                        "GuardedMethodCallTyped",
+                        format!("{:?}", call.func),
+                        format!("{:?}: {:?}", call.method_name, call.method_guards),
+                    )),
+                    InstrTyped::DirectMethodCallTyped(call) => Some((
+                        "DirectMethodCallTyped",
+                        format!("{:?}", call.receiver),
+                        format!("{:?}: {:?}", call.method_name, call.guard),
+                    )),
+                    InstrTyped::CallDirect(call) => Some((
+                        "CallDirect",
+                        format!("{:?}", call.callable),
+                        format!("{:?}", call.function_id),
+                    )),
+                    InstrTyped::PreparedCall(call) => Some((
+                        "PreparedCall",
+                        format!("{:?}", call.func),
+                        "public prepared call".to_string(),
+                    )),
+                    InstrTyped::IteratorStep(step) => Some((
+                        "IteratorStep",
+                        format!("{:?}", step.name),
+                        "native borrowed advance".to_string(),
+                    )),
+                    InstrTyped::MakeFunctionWithClosure(op)
+                        if op.kind == FunctionKind::Generator =>
+                    {
+                        Some((
+                            "MakeFunctionWithClosure",
+                            format!("{:?}", op.kind),
+                            format!("{:?}", op.function_id()),
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some((kind, callee, target)) = site {
+                    self.rows.push(format!(
+                        "block={} owner={} id={:?} range={:?} kind={kind} callee={callee} target={target} instance={:?} resume={:?}",
+                        self.block,
+                        self.owner,
+                        expr.try_semantic_instr_id(),
+                        expr.meta().range,
+                        expr.generator_instance_plan(),
+                        expr.generator_resume_plan(),
+                    ));
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut sites = Sites {
+            block: String::new(),
+            owner: String::new(),
+            rows: Vec::new(),
+        };
+        for block in &function.blocks {
+            sites.block = format!("{:?}", block.label);
+            for instr in &block.body {
+                sites.visit_instr(instr);
+            }
+            sites.visit_term(&block.term);
+        }
+        format!(
+            "function={:?} entry={:?}\n{}",
+            function.function_id,
+            function.blocks.first().map(|block| block.label),
+            sites.rows.join("\n"),
+        )
+    }
+
+    #[derive(Debug, Default)]
+    struct RetainedGeneratorShape {
+        instances: HashSet<RuntimeFunctionId>,
+        resumes: HashSet<RuntimeFunctionId>,
+        factories: HashSet<RuntimeFunctionId>,
+        owns_preserved_state: bool,
+    }
+
+    impl Visit<InstrTyped> for RetainedGeneratorShape {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let Some(plan) = expr.generator_instance_plan() {
+                self.instances.insert(plan.function_id);
+            }
+            if let Some(plan) = expr.generator_resume_plan() {
+                self.resumes.insert(plan.function_id);
+            }
+            match expr {
+                InstrTyped::MakeFunctionWithClosure(op) if op.kind == FunctionKind::Generator => {
+                    self.factories.insert(op.function_id());
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    fn generator_activation_shape(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    ) -> RetainedGeneratorShape {
+        let mut shape = RetainedGeneratorShape {
+            owns_preserved_state: function
+                .storage_layout
+                .as_ref()
+                .is_some_and(|layout| !layout.preserved_slots.is_empty()),
+            ..RetainedGeneratorShape::default()
+        };
+        shape.visit_fn(function);
+        shape
+    }
+
+    fn original_generator_activations(
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
+        caller_name: &str,
+    ) -> RetainedGeneratorShape {
+        let caller = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == caller_name)
+            .expect("original caller should exist");
+        let original = generator_activation_shape(caller);
+        assert!(
+            !original.instances.is_empty(),
+            "fixture must select an original generator instance"
+        );
+        assert!(
+            original.factories.is_subset(&original.instances),
+            "every local generator factory in these fixtures must have an instance plan"
+        );
+        original
+    }
+
+    fn assert_generator_activations_retained(
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
+        caller: &BlockPyFunction<TypedBlockPyModuleShape>,
+        original: &RetainedGeneratorShape,
+    ) {
+        assert_generator_activations_with_native_steps_retained(module, caller, original, &[]);
+    }
+
+    fn assert_generator_activations_with_native_steps_retained(
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
+        caller: &BlockPyFunction<TypedBlockPyModuleShape>,
+        original: &RetainedGeneratorShape,
+        native_steps: &[(
+            RuntimeFunctionId,
+            soac_core::block_py::IteratorStep<InstrTyped>,
+        )],
+    ) {
+        let retained = generator_activation_shape(caller);
+        assert_eq!(
+            retained.instances, original.instances,
+            "resume lowering must keep the exact original activation targets"
+        );
+        assert_eq!(
+            retained.factories, original.factories,
+            "selected generator factories must remain materialized, not become dead resume-only artifacts"
+        );
+        let native_targets = native_steps
+            .iter()
+            .map(|(target, _)| *target)
+            .collect::<HashSet<_>>();
+        assert!(native_targets.is_subset(&original.instances));
+        let expected_planned_resumes = original
+            .instances
+            .difference(&native_targets)
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            retained.resumes, expected_planned_resumes,
+            "every optimized resume must match its retained activation; native advances stay explicit",
+        );
+        for (_, original_step) in native_steps {
+            let matching_steps = caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .filter_map(|instr| {
+                    let InstrTyped::Store(store) = instr else {
+                        return None;
+                    };
+                    let InstrTyped::IteratorStep(step) = store.value.as_ref() else {
+                        return None;
+                    };
+                    (step.name.location == original_step.name.location
+                        && step.meta().range == original_step.meta().range)
+                        .then_some(step)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !matching_steps.is_empty(),
+                "the original native iterator boundary must remain"
+            );
+            for step in matching_steps {
+                step.validate_resolved(caller.storage_layout.as_ref().expect("resolved layout"))
+                    .expect("the native step must borrow the same explicit Operand owner");
+            }
+        }
+        assert_eq!(
+            retained.owns_preserved_state, original.owns_preserved_state,
+            "suspended storage must not migrate into an ordinary caller"
+        );
+        validate_typed_preserved_storage_for_function(caller).expect(
+            "retained resumes must not leave unresolved foreign preserved slots in their caller",
+        );
+        for target in &retained.instances {
+            let resume = module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == *target)
+                .expect("retained resume target must remain in the module");
+            assert!(
+                resume.public_scope.is_some(),
+                "a retained generator must keep its original public factory scope"
+            );
+            assert!(
+                resume
+                    .public_storage_layout
+                    .as_ref()
+                    .is_some_and(|layout| { !layout.preserved_slots.is_empty() }),
+                "a retained generator must keep its own suspended-frame layout"
+            );
+        }
+    }
+
     #[test]
-    fn tuple_builtin_rewrites_consume_preserved_local_generator_functions_in_non_inlined_generators()
-     {
+    fn tuple_consumer_retains_nested_generator_activation_in_suspended_caller() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def tuple_from_iter(value):
@@ -16440,6 +18482,7 @@ def outer(rows):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
+        let original_activations = original_generator_activations(&typed, "outer");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -16455,25 +18498,7 @@ def outer(rows):
             .iter()
             .find(|function| function.names.qualname == "outer")
             .expect("typed outer should exist");
-        let retained_generator_materializations = outer
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(|instr| {
-                let InstrTyped::Store(store) = instr else {
-                    return None;
-                };
-                let InstrTyped::MakeFunctionWithClosure(op) = store.value.as_ref() else {
-                    return None;
-                };
-                (op.kind == FunctionKind::Generator)
-                    .then(|| (store.name.id_str().to_string(), op.function_id()))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            retained_generator_materializations.is_empty(),
-            "non-inlined generator resume rewriting should consume nested tuple genexpr materializations: {retained_generator_materializations:?}",
-        );
+        assert_generator_activations_retained(&typed, outer, &original_activations);
     }
 
     #[test]
@@ -16830,7 +18855,7 @@ def caller(limit):
     }
 
     #[test]
-    fn tuple_builtin_rewrites_consume_cross_module_runtime_builtins_alias_helpers() {
+    fn cross_module_tuple_consumer_retains_nested_generator_activation() {
         let mut runtime_lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 import builtins as _builtins
@@ -17041,6 +19066,7 @@ def caller(values):
             )
             .expect("generator instance plans should attach");
         }
+        let original_activations = original_generator_activations(&typed, "outer");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -17056,25 +19082,7 @@ def caller(values):
             .iter()
             .find(|function| function.names.qualname == "outer")
             .expect("typed outer should exist");
-        let retained_generator_materializations = outer
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(|instr| {
-                let InstrTyped::Store(store) = instr else {
-                    return None;
-                };
-                let InstrTyped::MakeFunctionWithClosure(op) = store.value.as_ref() else {
-                    return None;
-                };
-                (op.kind == FunctionKind::Generator)
-                    .then(|| (store.name.id_str().to_string(), op.function_id()))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            retained_generator_materializations.is_empty(),
-            "cross-module runtime helpers that alias builtins should still consume nested tuple genexpr materializations: {retained_generator_materializations:?}",
-        );
+        assert_generator_activations_retained(&typed, outer, &original_activations);
     }
 
     #[test]
@@ -17836,7 +19844,7 @@ def caller(limit):
     }
 
     #[test]
-    fn normal_next_calls_inline_generator_resume_state_to_caller_locals() {
+    fn normal_next_calls_retain_generator_activation_and_resume() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def values(limit):
@@ -17918,6 +19926,7 @@ def caller(limit):
                 ),
             ]),
             suppressed_source_generators: HashSet::new(),
+            public_boundary_modules: HashSet::new(),
         };
         let static_generator_instances =
             static_generator_instance_plans_for_module(&typed, &static_targets);
@@ -17941,6 +19950,7 @@ def caller(limit):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
+        let original_activations = original_generator_activations(&typed, "caller");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -17956,22 +19966,7 @@ def caller(limit):
             .iter()
             .find(|function| function.names.qualname == "caller")
             .expect("typed caller should exist");
-        assert!(
-            caller
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .all(|instr| !matches!(
-                    instr,
-                    InstrTyped::Store(store)
-                        if matches!(
-                            store.value.as_ref(),
-                            InstrTyped::CallTyped(call)
-                                if call.extra.generator_instance_plan().is_some()
-                        )
-                )),
-            "normal next() inlining should remove the generator construction"
-        );
+        assert_generator_activations_retained(&typed, caller, &original_activations);
         assert!(
             caller
                 .blocks
@@ -17994,12 +19989,12 @@ def caller(limit):
                     finder.visit_instr(instr);
                     !finder.0
                 }),
-            "normal next() inlining should remap preserved state to caller locals"
+            "normal next() inlining must keep suspended state out of ordinary caller storage"
         );
     }
 
     #[test]
-    fn local_generator_next_calls_inline_resume_state_to_caller_locals() {
+    fn local_generator_next_calls_retain_generator_activation_and_resume() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 class ClosureGenerator:
@@ -18097,6 +20092,7 @@ def caller(limit):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
+        let original_activations = original_generator_activations(&typed, "caller");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -18112,22 +20108,7 @@ def caller(limit):
             .iter()
             .find(|function| function.names.qualname == "caller")
             .expect("typed caller should exist");
-        assert!(
-            caller
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .all(|instr| !matches!(
-                    instr,
-                    InstrTyped::Store(store)
-                        if matches!(
-                            store.value.as_ref(),
-                            InstrTyped::CallTyped(call)
-                                if call.extra.generator_instance_plan().is_some()
-                        )
-                )),
-            "local generator next() inlining should remove the generator construction"
-        );
+        assert_generator_activations_retained(&typed, caller, &original_activations);
         assert!(
             caller
                 .blocks
@@ -18150,7 +20131,7 @@ def caller(limit):
                     finder.visit_instr(instr);
                     !finder.0
                 }),
-            "local generator next() inlining should remap preserved state to caller locals"
+            "local generator next() inlining must keep suspended state out of ordinary caller storage"
         );
     }
 
@@ -18158,16 +20139,6 @@ def caller(limit):
     fn suppressed_named_generator_for_loops_keep_native_runtime_protocol() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
-class ClosureGenerator:
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.send(None)
-
-    def send(self, value):
-        return resume_generator(self._resume_function, self, self._preserved_values, value, None)
-
 def values(limit):
     yield limit
 
@@ -18182,85 +20153,24 @@ def caller(limit):
         .blockpy_module;
         let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
         let generator_targets = strict_module_global_generator_targets_for_module(&lowered);
-        let suppressed_source_generators = generator_targets
-            .values()
-            .map(|function| function.function_id)
-            .collect();
-        let iter_function = lowered
-            .callable_defs
-            .iter()
-            .find(|function| function.names.qualname == "ClosureGenerator.__iter__")
-            .cloned()
-            .expect("test runtime iter method should exist");
-        let next_function = lowered
-            .callable_defs
-            .iter()
-            .find(|function| function.names.qualname == "ClosureGenerator.__next__")
-            .cloned()
-            .expect("test runtime next method should exist");
-        let send_function = lowered
-            .callable_defs
-            .iter()
-            .find(|function| function.names.qualname == "ClosureGenerator.send")
-            .cloned()
-            .expect("test runtime send method should exist");
+        let generator_id = generator_targets
+            .get("values")
+            .expect("the actual source generator must be a known target")
+            .function_id;
         let mut typed = lower_blockpy_module_to_typed(lowered);
-        for function in &mut typed.callable_defs {
-            if function.names.qualname != "ClosureGenerator.send" {
-                continue;
-            }
-            struct RuntimeResumeMarker;
-            impl VisitMut<InstrTyped> for RuntimeResumeMarker {
-                fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
-                    if let InstrTyped::CallTyped(call) = expr
-                        && matches!(
-                            call.func.as_ref(),
-                            InstrTyped::Load(load) if load.name.id_str() == "resume_generator"
-                        )
-                    {
-                        call.func = Box::new(
-                            Load::new(ResolvedName::runtime_name("resume_generator")).into(),
-                        );
-                        return;
-                    }
-                    expr.visit_children_mut(self);
-                }
-            }
-            RuntimeResumeMarker.visit_fn_mut(function);
-        }
         let static_targets = StaticDirectCallTargets {
             module_global_generators: HashMap::from([(module_id, generator_targets)]),
-            strict_methods: HashMap::from([
-                (
-                    (
-                        "soac.runtime".to_string(),
-                        "ClosureGenerator".to_string(),
-                        "__iter__".to_string(),
-                    ),
-                    iter_function,
-                ),
-                (
-                    (
-                        "soac.runtime".to_string(),
-                        "ClosureGenerator".to_string(),
-                        "__next__".to_string(),
-                    ),
-                    next_function,
-                ),
-                (
-                    (
-                        "soac.runtime".to_string(),
-                        "ClosureGenerator".to_string(),
-                        "send".to_string(),
-                    ),
-                    send_function,
-                ),
-            ]),
-            suppressed_source_generators,
+            suppressed_source_generators: HashSet::from([generator_id]),
             ..StaticDirectCallTargets::default()
         };
         let static_generator_instances =
             static_generator_instance_plans_for_module(&typed, &static_targets);
+        assert!(
+            static_generator_instances
+                .values()
+                .all(|plans| plans.values().all(|plan| plan.function_id != generator_id)),
+            "suppression must retain the actual generator's public call boundary"
+        );
         for function in &mut typed.callable_defs {
             annotate_typed_generator_instance_plans(
                 function,
@@ -18301,6 +20211,8 @@ def caller(limit):
             iter_calls: usize,
             next_calls: usize,
             resume_calls: usize,
+            source_generator_calls: usize,
+            iterator_steps: Vec<ResolvedName>,
         }
         impl Visit<InstrTyped> for RuntimeCallCounter<'_> {
             fn visit_instr(&mut self, expr: &InstrTyped) {
@@ -18320,6 +20232,14 @@ def caller(limit):
                         RuntimeName::ResumeGenerator,
                         self.module_constants,
                     ));
+                    self.source_generator_calls += usize::from(matches!(
+                        call.func.as_ref(),
+                        InstrTyped::Load(load)
+                            if load.name.location.is_global() && load.name.id_str() == "values"
+                    ));
+                }
+                if let InstrTyped::IteratorStep(step) = expr {
+                    self.iterator_steps.push(step.name.clone());
                 }
                 expr.visit_children(self);
             }
@@ -18329,6 +20249,8 @@ def caller(limit):
             iter_calls: 0,
             next_calls: 0,
             resume_calls: 0,
+            source_generator_calls: 0,
+            iterator_steps: Vec::new(),
         };
         runtime_calls.visit_fn(caller);
         assert_eq!(
@@ -18336,14 +20258,38 @@ def caller(limit):
                 runtime_calls.iter_calls,
                 runtime_calls.next_calls,
                 runtime_calls.resume_calls,
+                runtime_calls.source_generator_calls,
             ),
-            (1, 2, 0),
-            "a suppressed source-backed named generator should retain native iter/next calls without exposing SOAC resume calls",
+            (1, 0, 0, 1),
+            "the real source generator stays public, while implicit advance is Step rather than a next() or SOAC resume call",
         );
+        let [iterator] = runtime_calls.iterator_steps.as_slice() else {
+            panic!("the source loop must retain exactly one implicit native advance");
+        };
+        soac_core::block_py::IteratorStep::<InstrTyped>::new(iterator.clone())
+            .validate_resolved(caller.storage_layout.as_ref().unwrap())
+            .expect("native advance must borrow the actual resolved Operand owner");
+        let generator = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == generator_id)
+            .expect("the suppressed original activation must remain in the module");
+        assert!(generator.public_scope.is_some());
+        assert!(
+            generator
+                .public_storage_layout
+                .as_ref()
+                .is_some_and(|layout| !layout.preserved_slots.is_empty()),
+            "the source generator retains its own suspended-frame storage"
+        );
+        let caller_activation = generator_activation_shape(caller);
+        assert!(caller_activation.instances.is_empty());
+        assert!(caller_activation.resumes.is_empty());
+        assert!(!caller_activation.owns_preserved_state);
     }
 
     #[test]
-    fn list_generator_calls_inline_resume_state_to_caller_locals() {
+    fn list_generator_calls_retain_generator_activation_and_resume() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def list_from_iter(value):
@@ -18474,6 +20420,7 @@ def caller(limit):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
+        let original_activations = original_generator_activations(&typed, "caller");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -18524,25 +20471,7 @@ def caller(limit):
             resume_calls: 0,
         };
         runtime_calls.visit_fn(caller);
-        assert!(
-            caller
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .all(|instr| !matches!(
-                    instr,
-                    InstrTyped::Store(store)
-                        if matches!(
-                            store.value.as_ref(),
-                            InstrTyped::CallTyped(call)
-                                if call.extra.generator_instance_plan().is_some()
-                        )
-                )),
-            "list(generator) inlining should remove the generator construction; remaining iter={} next={} resume={}",
-            runtime_calls.iter_calls,
-            runtime_calls.next_calls,
-            runtime_calls.resume_calls,
-        );
+        assert_generator_activations_retained(&typed, caller, &original_activations);
         assert_eq!(
             (
                 runtime_calls.iter_calls,
@@ -18555,7 +20484,7 @@ def caller(limit):
     }
 
     #[test]
-    fn diagonal_set_genexpr_consumers_drop_materializations_after_state_lowering() {
+    fn diagonal_set_consumers_retain_distinct_generator_activations() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def set_from_iter(value):
@@ -18689,7 +20618,8 @@ def caller(queen_count):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
-        apply_typed_v3_module_rewrites(
+        let original_activations = original_generator_activations(&typed, "caller");
+        let inline_retirements = apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
             None,
@@ -18704,54 +20634,23 @@ def caller(queen_count):
             .iter()
             .find(|function| function.names.qualname == "caller")
             .expect("typed caller should exist");
-        let retained_generator_instances = caller
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(|instr| {
-                let InstrTyped::Store(store) = instr else {
-                    return None;
-                };
-                let generator_plan = match store.value.as_ref() {
-                    InstrTyped::CallTyped(call) => call.extra.generator_instance_plan(),
-                    InstrTyped::GuardedCallableCallTyped(call) => {
-                        call.extra.generator_instance_plan()
-                    }
-                    InstrTyped::DirectCallableCallTyped(call) => {
-                        call.extra.generator_instance_plan()
-                    }
-                    _ => None,
-                }?;
-                Some((store.name.id_str().to_string(), generator_plan.function_id))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            retained_generator_instances.is_empty(),
-            "diagonal set(genexpr) inlining should remove generator instance constructions: {retained_generator_instances:?}",
+        assert_eq!(original_activations.instances.len(), 2);
+        assert_eq!(original_activations.factories.len(), 2);
+        eprintln!(
+            "diagonal residual selection diagnostics:\n{}",
+            residual_generator_selection_diagnostic(
+                &typed,
+                caller,
+                &HashMap::new(),
+                &static_targets,
+                &inline_retirements,
+            ),
         );
-        let retained_generator_materializations = caller
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(|instr| {
-                let InstrTyped::Store(store) = instr else {
-                    return None;
-                };
-                let InstrTyped::MakeFunctionWithClosure(op) = store.value.as_ref() else {
-                    return None;
-                };
-                (op.kind == FunctionKind::Generator)
-                    .then(|| (store.name.id_str().to_string(), op.function_id()))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            retained_generator_materializations.is_empty(),
-            "diagonal set(genexpr) inlining should not retain dead generator function materializations: {retained_generator_materializations:?}",
-        );
+        assert_generator_activations_retained(&typed, caller, &original_activations);
     }
 
     #[test]
-    fn tuple_generator_calls_inline_resume_state_to_caller_locals() {
+    fn tuple_generator_calls_retain_generator_activation_and_resume() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def tuple_from_iter(value):
@@ -18882,6 +20781,7 @@ def caller(limit):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
+        let original_activations = original_generator_activations(&typed, "caller");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -18897,26 +20797,11 @@ def caller(limit):
             .iter()
             .find(|function| function.names.qualname == "caller")
             .expect("typed caller should exist");
-        assert!(
-            caller
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .all(|instr| !matches!(
-                    instr,
-                    InstrTyped::Store(store)
-                        if matches!(
-                            store.value.as_ref(),
-                            InstrTyped::CallTyped(call)
-                                if call.extra.generator_instance_plan().is_some()
-                        )
-                )),
-            "tuple(generator) inlining should remove the generator construction",
-        );
+        assert_generator_activations_retained(&typed, caller, &original_activations);
     }
 
     #[test]
-    fn list_named_generator_calls_inline_resume_state_to_caller_locals() {
+    fn list_named_generator_calls_retain_generator_activation_and_resume() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def list_from_iter(value):
@@ -19054,6 +20939,7 @@ def caller(limit):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
+        let original_activations = original_generator_activations(&typed, "caller");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -19069,22 +20955,7 @@ def caller(limit):
             .iter()
             .find(|function| function.names.qualname == "caller")
             .expect("typed caller should exist");
-        assert!(
-            caller
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .all(|instr| !matches!(
-                    instr,
-                    InstrTyped::Store(store)
-                        if matches!(
-                            store.value.as_ref(),
-                            InstrTyped::CallTyped(call)
-                                if call.extra.generator_instance_plan().is_some()
-                        )
-                )),
-            "named list(generator) inlining should remove the generator construction",
-        );
+        assert_generator_activations_retained(&typed, caller, &original_activations);
     }
 
     #[test]
@@ -19934,10 +21805,11 @@ def caller(limit):
             &external_callees,
             &static_targets,
             &mut late_trusted_owner_states,
+            &mut SuppressedTypedInlineTargets::new(),
         )
         .expect("late static-method inlining should inline the cross-module send wrapper");
         assert!(
-            runtime_protocol_stats.rewritten_returns != 0,
+            runtime_protocol_stats.rewritten_returns + runtime_protocol_stats.rewritten_stores != 0,
             "the cross-module send wrapper should inline before checking the nested resume helper",
         );
         let linearization =
@@ -19969,7 +21841,7 @@ def caller(limit):
     }
 
     #[test]
-    fn cross_module_diagonal_set_shell_keeps_resume_targets_plannable() {
+    fn cross_module_diagonal_set_shell_retains_plannable_generator_activation() {
         let mut runtime_lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def list_from_iter(value):
@@ -20254,6 +22126,7 @@ def caller(limit):
             )
             .expect("generator instance plans should attach");
         }
+        let original_activations = original_generator_activations(&typed, "caller");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -20455,53 +22328,9 @@ def caller(limit):
         preserved_finder.visit_fn(caller);
         assert!(
             !preserved_finder.0,
-            "cross-module diagonal-set shell rewrites should remap preserved state to caller locals",
+            "cross-module diagonal-set shell rewrites must keep suspended state out of ordinary caller storage",
         );
-        let retained_generator_instances = caller
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(|instr| {
-                let InstrTyped::Store(store) = instr else {
-                    return None;
-                };
-                let generator_plan = match store.value.as_ref() {
-                    InstrTyped::CallTyped(call) => call.extra.generator_instance_plan(),
-                    InstrTyped::GuardedCallableCallTyped(call) => {
-                        call.extra.generator_instance_plan()
-                    }
-                    InstrTyped::DirectCallableCallTyped(call) => {
-                        call.extra.generator_instance_plan()
-                    }
-                    _ => None,
-                }?;
-                Some((store.name.id_str().to_string(), generator_plan.function_id))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            retained_generator_instances.is_empty(),
-            "cross-module diagonal-set rewrites should remove generator instance constructions: {retained_generator_instances:?}",
-        );
-        let retained_genexpr_functions = caller
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(|instr| {
-                let InstrTyped::Store(store) = instr else {
-                    return None;
-                };
-                let InstrTyped::MakeFunctionWithClosure(make_function) = store.value.as_ref()
-                else {
-                    return None;
-                };
-                (make_function.kind == FunctionKind::Generator)
-                    .then(|| (store.name.id_str().to_string(), make_function.function_id()))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            retained_genexpr_functions.is_empty(),
-            "cross-module diagonal-set rewrites should remove synthetic genexpr function materializations: {retained_genexpr_functions:?}",
-        );
+        assert_generator_activations_retained(&typed, caller, &original_activations);
     }
 
     #[test]
@@ -20757,6 +22586,51 @@ def caller(limit):
             )
             .expect("generator instance plans should attach");
         }
+        let original_nqueens_activations = original_generator_activations(&typed, "n_queens");
+        let original_nqueens = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "n_queens")
+            .expect("original n_queens should exist");
+        let original_nqueens_instance_calls =
+            typed_generator_instance_plans_by_origin(original_nqueens);
+        let permutations_target = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "permutations")
+            .expect("source permutations should exist")
+            .function_id;
+        assert_eq!(
+            original_nqueens_activations
+                .instances
+                .difference(&original_nqueens_activations.factories)
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([permutations_target]),
+            "only the named permutations generator uses the source for-loop boundary",
+        );
+        let original_nqueens_native_steps = original_nqueens
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .filter_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::IteratorStep(step) = store.value.as_ref() else {
+                    return None;
+                };
+                Some((permutations_target, step.clone()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(original_nqueens_native_steps.len(), 1);
+        let original_nqueens_call_inventory = generator_activation_call_inventory(
+            typed
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "n_queens")
+                .expect("original n_queens should exist"),
+        );
         let external_callees = HashMap::from([
             (
                 helper.function_id,
@@ -20807,7 +22681,7 @@ def caller(limit):
                 },
             ),
         ]);
-        apply_typed_v3_module_rewrites(
+        let inline_retirements = apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
             None,
@@ -20856,10 +22730,19 @@ def caller(limit):
             iter_calls: usize,
             next_calls: usize,
             resume_calls: usize,
+            empty_set_calls: usize,
         }
         impl Visit<InstrTyped> for RuntimeProtocolCallCounter<'_> {
             fn visit_instr(&mut self, expr: &InstrTyped) {
                 if let InstrTyped::CallTyped(call) = expr {
+                    self.empty_set_calls += usize::from(
+                        call.args.is_empty()
+                            && typed_expr_is_runtime_name_load(
+                                call.func.as_ref(),
+                                RuntimeName::Set,
+                                self.module_constants,
+                            ),
+                    );
                     self.iter_calls += usize::from(typed_expr_is_runtime_name_load(
                         call.func.as_ref(),
                         RuntimeName::Iter,
@@ -20884,6 +22767,7 @@ def caller(limit):
             iter_calls: 0,
             next_calls: 0,
             resume_calls: 0,
+            empty_set_calls: 0,
         };
         protocol_calls.visit_fn(caller);
         assert_eq!(
@@ -20961,9 +22845,75 @@ def caller(limit):
             &HashMap::new(),
             &static_targets,
         );
+        // Draining eligible calls before optional cloning can remove every
+        // redundant fallback consumer. The positive obligation is to retain
+        // each original generator and its planned resume, not redundant code.
+        if generator_activation_shape(n_queens).instances != original_nqueens_activations.instances
+        {
+            eprintln!(
+                "ORIGINAL NQUEENS CALL INVENTORY\n{original_nqueens_call_inventory}\nFINAL NQUEENS CALL INVENTORY\n{}",
+                generator_activation_call_inventory(n_queens),
+            );
+        }
+        for (source, expected_plan) in &original_nqueens_instance_calls {
+            let retained_call = n_queens
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .find_map(|instr| {
+                    let InstrTyped::Store(store) = instr else {
+                        return None;
+                    };
+                    (store.value.try_semantic_instr_id() == Some(*source))
+                        .then(|| typed_generator_state_constructor_call(store.value.as_ref()))
+                        .flatten()
+                })
+                .expect("every original source generator call must remain executable");
+            assert_eq!(
+                retained_call.extra.generator_instance_plan(),
+                Some(expected_plan)
+            );
+        }
+        assert_generator_activations_with_native_steps_retained(
+            &typed,
+            n_queens,
+            &original_nqueens_activations,
+            &original_nqueens_native_steps,
+        );
+        let mut eligible_nested_targets =
+            builtin_implementation_inline_targets(&nested_builtin_plans);
+        let retired_count = remove_retired_typed_inline_targets(
+            n_queens.function_id,
+            &mut eligible_nested_targets,
+            &inline_retirements,
+        );
+        assert_eq!(
+            retired_count,
+            nested_builtin_plans.len(),
+            "every residual consumer must be a resolved cold fallback, not an unconsumed hot site; diagnostics:\n{}",
+            residual_generator_selection_diagnostic(
+                &typed,
+                n_queens,
+                &external_callees,
+                &static_targets,
+                &inline_retirements,
+            ),
+        );
         assert!(
-            nested_builtin_plans.is_empty(),
-            "nqueens-style nested set(genexpr) consumers should be consumed once typed expression linearization makes them statement-shaped: {nested_builtin_plans:#?}",
+            eligible_nested_targets.is_empty(),
+            "no active nested builtin consumer may remain eligible after the production fixpoint",
+        );
+        let mut nested_calls = RuntimeProtocolCallCounter {
+            module_constants: &typed.module_constants,
+            iter_calls: 0,
+            next_calls: 0,
+            resume_calls: 0,
+            empty_set_calls: 0,
+        };
+        nested_calls.visit_fn(n_queens);
+        assert!(
+            nested_calls.empty_set_calls >= 2,
+            "both hot set(genexpr) bodies must really inline their empty-set construction",
         );
         let synthetic_genexpr_function_ids = synthetic_genexpr_function_ids_for_module(&typed);
         assert_no_dead_synthetic_generator_materializations(
@@ -21000,7 +22950,7 @@ def caller(limit):
     }
 
     #[test]
-    fn list_nqueens_style_named_generator_calls_inline_resume_state_to_caller_locals() {
+    fn list_nqueens_style_named_generator_calls_retain_generator_activation_and_resume() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def list_from_iter(value):
@@ -21161,6 +23111,7 @@ def caller(limit):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
+        let original_activations = original_generator_activations(&typed, "caller");
         apply_typed_v3_module_rewrites(
             &mut typed,
             &profile,
@@ -21182,34 +23133,11 @@ def caller(limit):
             .find(|function| function.names.qualname == "n_queens")
             .map(|function| function.function_id)
             .expect("typed n_queens should exist");
-        let retained_named_list_generator_instances = caller
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .filter_map(|instr| {
-                let InstrTyped::Store(store) = instr else {
-                    return None;
-                };
-                let generator_plan = match store.value.as_ref() {
-                    InstrTyped::CallTyped(call) => call.extra.generator_instance_plan(),
-                    InstrTyped::GuardedCallableCallTyped(call) => {
-                        call.extra.generator_instance_plan()
-                    }
-                    InstrTyped::DirectCallableCallTyped(call) => {
-                        call.extra.generator_instance_plan()
-                    }
-                    _ => None,
-                }?;
-                if generator_plan.function_id != n_queens_function_id {
-                    return None;
-                }
-                Some((store.name.id_str().to_string(), generator_plan.function_id))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            retained_named_list_generator_instances.is_empty(),
-            "nqueens-style named list(generator) inlining should remove the outer n_queens generator construction: {retained_named_list_generator_instances:?}",
+        assert_eq!(
+            original_activations.instances,
+            HashSet::from([n_queens_function_id])
         );
+        assert_generator_activations_retained(&typed, caller, &original_activations);
         struct PreservedFinder(bool);
         impl Visit<InstrTyped> for PreservedFinder {
             fn visit_instr(&mut self, expr: &InstrTyped) {
@@ -21226,7 +23154,7 @@ def caller(limit):
         finder.visit_fn(caller);
         assert!(
             !finder.0,
-            "nqueens-style named list(generator) inlining should remap preserved state to caller locals"
+            "nqueens-style named list(generator) inlining must keep suspended state out of ordinary caller storage"
         );
         struct ForeignClosureCellFinder(bool);
         impl Visit<InstrTyped> for ForeignClosureCellFinder {
@@ -21267,7 +23195,7 @@ def caller(limit):
         finder.visit_fn(caller);
         assert!(
             !finder.0,
-            "resume inlining must not leave callee closure slots addressed through the caller runtime environment"
+            "retained resumes must not leave callee closure slots addressed through the caller runtime environment"
         );
     }
 
@@ -22068,6 +23996,7 @@ def caller(limit):
             )]),
             strict_methods: HashMap::new(),
             suppressed_source_generators: HashSet::new(),
+            public_boundary_modules: HashSet::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let caller = typed
@@ -22143,6 +24072,7 @@ def materialized_map(limit):
         let targets = StaticDirectCallTargets {
             module_global_generators: HashMap::from([(module_id, generator_targets)]),
             suppressed_source_generators: HashSet::from([values_id]),
+            public_boundary_modules: HashSet::new(),
             ..StaticDirectCallTargets::default()
         };
         let typed = lower_blockpy_module_to_typed(lowered);
@@ -22320,6 +24250,7 @@ class IterRange:
                 module_global_generators: HashMap::new(),
                 strict_methods: HashMap::new(),
                 suppressed_source_generators: HashSet::new(),
+                public_boundary_modules: HashSet::new(),
             },
         );
         let plans = plans
@@ -22344,7 +24275,7 @@ class IterRange:
             .expect("typed generator factory should exist");
 
         let runtime_lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-            "class ClosureGenerator:\n    def __init__(self, resume, name, qualname, code, preserved_values, yieldfrom_slot, throw_context_slot):\n        self.resume = resume\n",
+            "class ClosureGenerator:\n    def __init__(self, resume, name, qualname, code, preserved_values, yieldfrom_slot):\n        self.resume = resume\n",
         )
         .expect("runtime source should lower");
         let init_function = runtime_lowered
@@ -22384,6 +24315,7 @@ class IterRange:
                 module_global_generators: HashMap::new(),
                 strict_methods: HashMap::new(),
                 suppressed_source_generators: HashSet::new(),
+                public_boundary_modules: HashSet::new(),
             },
         );
         assert!(
@@ -22425,6 +24357,7 @@ def caller(value):
             module_global_generators: HashMap::new(),
             strict_methods: HashMap::new(),
             suppressed_source_generators: HashSet::new(),
+            public_boundary_modules: HashSet::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let caller = typed
@@ -22472,6 +24405,7 @@ def caller(value):
             module_global_generators: HashMap::new(),
             strict_methods: HashMap::new(),
             suppressed_source_generators: HashSet::new(),
+            public_boundary_modules: HashSet::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let mut caller = typed
@@ -22534,6 +24468,7 @@ def caller(value):
             module_global_generators: HashMap::new(),
             strict_methods: HashMap::new(),
             suppressed_source_generators: HashSet::new(),
+            public_boundary_modules: HashSet::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let caller = typed
@@ -22550,6 +24485,118 @@ def caller(value):
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].target, helper_function_id);
         assert_eq!(plans[0].body.kind, CallBodyKind::DirectCall);
+    }
+
+    #[test]
+    fn source_selected_boundaries_decline_primary_and_profile_only_unchecked_calls() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def helper(value):\n    return value\n\ndef caller(value):\n    return helper(value)\n",
+        ).unwrap().blockpy_module;
+        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+        let mut targets = StaticDirectCallTargets {
+            module_globals: HashMap::from([(
+                module_id,
+                strict_module_global_direct_call_targets_for_module(&lowered, "boundary_fixture"),
+            )]),
+            ..Default::default()
+        };
+        let typed = lower_blockpy_module_to_typed(lowered);
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .unwrap();
+        let plans =
+            static_direct_call_plans_for_function(caller, &typed.module_constants, &targets);
+        let target = plans.values().next().unwrap()[0].target;
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::from([(caller.function_id, plans.clone())]),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let direct_targets = crate::jit::function_targets::collect_typed_call_direct_targets;
+        let mut ordinary = caller.clone();
+        apply_profile_call_emission_plans_to_typed_function(
+            &mut ordinary,
+            &profile,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            direct_targets(&ordinary).contains(&target),
+            "control must exercise a real profiled direct candidate"
+        );
+
+        targets.public_boundary_modules.insert(module_id);
+        assert!(
+            static_direct_call_plans_for_function(caller, &typed.module_constants, &targets)
+                .is_empty(),
+            "even an already populated target catalog must obey the explicit boundary requirement"
+        );
+        let mut primary = caller.clone();
+        apply_call_emission_plans_to_typed_function_with_static_targets(
+            &mut primary,
+            &profile,
+            Some(&plans),
+            &targets,
+        )
+        .unwrap();
+        assert!(
+            !direct_targets(&primary).contains(&target),
+            "stale profile/static plans must not bypass the primary public boundary"
+        );
+        let mut precompile = caller.clone();
+        apply_profile_call_emission_plans_to_typed_function(
+            &mut precompile,
+            &profile,
+            &targets.public_boundary_modules,
+        )
+        .unwrap();
+        assert!(
+            !direct_targets(&precompile).contains(&target),
+            "the profile-only precompile path must make the same refusal"
+        );
+    }
+
+    #[test]
+    fn source_selected_boundaries_decline_generated_instance_and_builtin_targets() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def values(limit):\n    yield limit\n\ndef caller(limit):\n    return values(limit)\n",
+        )
+        .unwrap()
+        .blockpy_module;
+        let module_id = lowered.module_name_gen.runtime_module_id().as_u32();
+        let generators = strict_module_global_generator_targets_for_module(&lowered);
+        let target = generators["values"].clone();
+        let mut targets = StaticDirectCallTargets {
+            module_global_generators: HashMap::from([(module_id, generators)]),
+            runtime_builtin_implementations: HashMap::from([(RuntimeName::List, target)]),
+            ..Default::default()
+        };
+        let typed = lower_blockpy_module_to_typed(lowered);
+        let caller = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .unwrap();
+        assert!(!static_generator_instance_plans_for_function(caller, &targets).is_empty());
+        targets.public_boundary_modules.insert(module_id);
+        assert!(static_generator_instance_plans_for_function(caller, &targets).is_empty());
+        assert!(
+            static_generator_instance_plans_for_module(&typed, &targets)
+                .values()
+                .all(HashMap::is_empty)
+        );
+        targets.retain_unchecked_candidates();
+        assert!(targets.runtime_builtin_implementations.is_empty());
     }
 
     #[test]
@@ -22575,6 +24622,7 @@ helper(1)
             module_global_generators: HashMap::new(),
             strict_methods: HashMap::new(),
             suppressed_source_generators: HashSet::new(),
+            public_boundary_modules: HashSet::new(),
         };
         let typed = lower_blockpy_module_to_typed(lowered);
         let module_init = typed
@@ -23013,6 +25061,67 @@ def large(x):\n{large_body}"
     }
 
     #[test]
+    fn retired_inline_sources_follow_qualified_transitive_clone_identity() {
+        let caller = RuntimeFunctionId::new(RuntimeModuleId::new(3), LocalFunctionId::new(4));
+        let foreign = RuntimeFunctionId::new(RuntimeModuleId::new(5), LocalFunctionId::new(6));
+        let source = InstrId::new(7);
+        let foreign_retired = InstrId::new(13);
+        let first = InstrId::new(19);
+        let second = InstrId::new(23);
+        let collision = InstrId::new(17);
+        let fresh = InstrId::new(9);
+        let fresh_clone = InstrId::new(27);
+        let mut suppressed = HashMap::from([
+            (caller, HashSet::from([source])),
+            (foreign, HashSet::from([foreign_retired])),
+        ]);
+        let mappings = [
+            TypedInlineInstrIdMapping {
+                callee: caller,
+                inline_instance: 1,
+                callee_instr_id: first,
+                caller_instr_id: second,
+            },
+            TypedInlineInstrIdMapping {
+                callee: foreign,
+                inline_instance: 0,
+                callee_instr_id: source,
+                caller_instr_id: collision,
+            },
+            TypedInlineInstrIdMapping {
+                callee: foreign,
+                inline_instance: 0,
+                callee_instr_id: foreign_retired,
+                caller_instr_id: first,
+            },
+            TypedInlineInstrIdMapping {
+                callee: caller,
+                inline_instance: 2,
+                callee_instr_id: fresh,
+                caller_instr_id: fresh_clone,
+            },
+        ];
+        assert_eq!(
+            remap_suppressed_inline_targets(caller, &mappings, &mut suppressed),
+            2
+        );
+        assert_eq!(suppressed[&caller], HashSet::from([source, first, second]));
+        assert!(
+            !suppressed[&caller].contains(&collision),
+            "caller retirement cannot suppress a same-numbered foreign source"
+        );
+        assert!(!suppressed[&caller].contains(&fresh_clone));
+
+        retire_cloned_inline_targets(caller, &mappings, &mut HashMap::new(), &mut suppressed);
+        assert!(suppressed[&caller].contains(&fresh));
+        assert!(
+            !suppressed[&caller].contains(&fresh_clone),
+            "retiring the replaced original must not retire its fresh hot copy"
+        );
+        assert!(!suppressed[&caller].contains(&collision));
+    }
+
+    #[test]
     fn cloned_hot_continuations_remap_generator_state_lowering_ids_by_instance() {
         let function_id = RuntimeFunctionId::new(RuntimeModuleId::new(3), LocalFunctionId::new(4));
         let generator_function_id =
@@ -23241,6 +25350,123 @@ def large(x):\n{large_body}"
     }
 
     #[test]
+    fn exact_int_cell_input_remap_uses_the_actual_copied_load_binding() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def outer(offset):\n    def inner(value):\n        return offset + value\n    return inner\n",
+        ).unwrap().blockpy_module;
+        let mut module = lower_blockpy_module_to_typed(lowered);
+        let function = module
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.fn_name == "inner")
+            .unwrap();
+        #[derive(Default)]
+        struct CellLoad(Option<(InstrId, ResolvedName, soac_core::block_py::CellLoadBinding)>);
+        impl Visit<InstrTyped> for CellLoad {
+            fn visit_instr(&mut self, instr: &InstrTyped) {
+                if let InstrTyped::Load(load) = instr
+                    && load.name.cell_location().is_some()
+                {
+                    self.0 = Some((
+                        instr.try_semantic_instr_id().unwrap(),
+                        load.name.clone(),
+                        load.cell_binding.clone().unwrap(),
+                    ));
+                }
+                instr.visit_children(self);
+            }
+        }
+        let mut load = CellLoad::default();
+        load.visit_fn(function);
+        let (actual_source, actual_name, actual_binding) = load.0.unwrap();
+        let old_source = InstrId::new(999);
+        let mut old_name = actual_name.clone();
+        old_name.location = NameLocation::closure_cell(99);
+        let region = RegionPlan {
+            id: soac_ir_typed::plan_v3::RegionId(0),
+            source: RegionSource::FunctionEntry,
+            inputs: vec![soac_ir_typed::plan_v3::RegionInput {
+                value: soac_ir_typed::plan_v3::PlanValue::new(
+                    0,
+                    soac_ir_typed::plan_v3::Rep::PyObjectBorrowed,
+                ),
+                source: RegionInputSource::CellValue {
+                    source: old_source,
+                    name: old_name,
+                    binding: soac_core::block_py::CellLoadBinding {
+                        logical_name: "stale_name".into(),
+                        kind: soac_core::block_py::CellBindingKind::Owner,
+                    },
+                },
+            }],
+            nodes: Vec::new(),
+            exits: Vec::new(),
+        };
+        let context = TypedInlineExactIntRemapContext {
+            instr_ids: HashMap::from([(old_source, actual_source)]),
+            ..Default::default()
+        };
+        let remapped = remap_exact_int_region_plan(&region, &context).unwrap();
+        let cloned = remap_cloned_exact_int_region_plan(&region, &context.instr_ids);
+        assert_eq!(remapped.inputs, cloned.inputs);
+        struct Attach(RegionPlan);
+        impl VisitMut<InstrTyped> for Attach {
+            fn visit_instr_mut(&mut self, instr: &mut InstrTyped) {
+                if let InstrTyped::BinOp(op) = instr {
+                    let instr_id = op.semantic_instr_id();
+                    let emission = MechanicalRegionEmission {
+                        region: self.0.id,
+                        steps: Vec::new(),
+                        exits: Vec::new(),
+                    };
+                    op.extra_mut()
+                        .set_exact_int_return_plan(TypedExactIntReturnPlan {
+                            source: TypedExactIntPlanSource::OptimizationPlanV3,
+                            instr_id,
+                            hot_plan: self.0.clone(),
+                            hot_region: emission.clone(),
+                            fallback_plan: self.0.clone(),
+                            fallback_region: emission,
+                        });
+                }
+                instr.visit_children_mut(self);
+            }
+        }
+        Attach(remapped).visit_fn_mut(function);
+        refresh_exact_int_cell_inputs(function).unwrap();
+        struct Check<'a>(
+            &'a ResolvedName,
+            InstrId,
+            usize,
+            &'a soac_core::block_py::CellLoadBinding,
+        );
+        impl Visit<InstrTyped> for Check<'_> {
+            fn visit_instr(&mut self, instr: &InstrTyped) {
+                if let Some(plan) = instr
+                    .typed_extra()
+                    .and_then(|extra| extra.exact_int_return_plan())
+                {
+                    for region in [&plan.hot_plan, &plan.fallback_plan] {
+                        assert_eq!(
+                            region.inputs[0].source,
+                            RegionInputSource::CellValue {
+                                source: self.1,
+                                name: self.0.clone(),
+                                binding: self.3.clone(),
+                            }
+                        );
+                        self.2 += 1;
+                    }
+                }
+                instr.visit_children(self);
+            }
+        }
+        let mut check = Check(&actual_name, actual_source, 0, &actual_binding);
+        check.visit_fn(function);
+        assert_eq!(check.2, 2);
+    }
+
+    #[test]
     fn inlined_exact_int_sidecars_remap_module_constant_indices() {
         let callee = RuntimeFunctionId::new(RuntimeModuleId::new(3), LocalFunctionId::new(4));
         let contexts = typed_inline_exact_int_remap_contexts(
@@ -23345,14 +25571,21 @@ def large(x):\n{large_body}"
         );
     }
 
-    fn indexed_field_exact_int_sidecar_fixture(
-        indexed_guard: bool,
-    ) -> (BlockPyFunction<TypedBlockPyModuleShape>, InstrId, InstrId) {
-        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-            "def branch(record):\n    if record.value < 10:\n        return 1\n    return 0\n",
-        )
-        .expect("indexed-field branch fixture should lower")
-        .blockpy_module;
+    fn exact_int_sidecar_fixture(
+        indexed_guard: Option<bool>,
+    ) -> (
+        BlockPyFunction<TypedBlockPyModuleShape>,
+        InstrId,
+        Option<InstrId>,
+    ) {
+        let source = if indexed_guard.is_some() {
+            "def branch(record):\n    if record.value < 10:\n        return 1\n    return 0\n"
+        } else {
+            "def branch(value):\n    if value < 10:\n        return 1\n    return 0\n"
+        };
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("indexed-field branch fixture should lower")
+            .blockpy_module;
         let typed = lower_blockpy_module_to_typed(lowered);
         let mut function = typed
             .callable_defs
@@ -23391,13 +25624,11 @@ def large(x):\n{large_body}"
         }
 
         let mut annotator = GuardAnnotator {
-            indexed_guard,
+            indexed_guard: indexed_guard.unwrap_or(false),
             field_source: None,
         };
         annotator.visit_fn_mut(&mut function);
-        let field_source = annotator
-            .field_source
-            .expect("indexed-field branch fixture should contain an attribute load");
+        let field_source = annotator.field_source;
         let branch = function
             .blocks
             .iter_mut()
@@ -23419,17 +25650,24 @@ def large(x):\n{large_body}"
                     1,
                     soac_ir_typed::plan_v3::Rep::PyObjectBorrowed,
                 ),
-                source: RegionInputSource::IndexedField {
-                    source: field_source,
-                    receiver: IndexedFieldReceiverSource::LocalName {
-                        name: "record".to_string(),
-                    },
-                    owner_type: soac_ir_typed::plan_v3::IndexedFieldOwnerType {
-                        module_name: "fixture".to_string(),
-                        qualname: "Record".to_string(),
-                    },
-                    attr_name: "value".to_string(),
-                    expected_index: 0,
+                source: if let Some(field_source) = field_source {
+                    RegionInputSource::IndexedField {
+                        source: field_source,
+                        receiver: IndexedFieldReceiverSource::LocalName {
+                            name: "record".to_string(),
+                        },
+                        owner_type: soac_ir_typed::plan_v3::IndexedFieldOwnerType {
+                            module_name: "fixture".to_string(),
+                            qualname: "Record".to_string(),
+                        },
+                        attr_name: "value".to_string(),
+                        expected_index: 0,
+                    }
+                } else {
+                    RegionInputSource::FunctionParam {
+                        index: 0,
+                        name: Some("value".to_string()),
+                    }
                 },
             }],
             nodes: Vec::new(),
@@ -23469,6 +25707,18 @@ def large(x):\n{large_body}"
         });
 
         (function, branch_source, field_source)
+    }
+
+    fn indexed_field_exact_int_sidecar_fixture(
+        indexed_guard: bool,
+    ) -> (BlockPyFunction<TypedBlockPyModuleShape>, InstrId, InstrId) {
+        let (function, branch_source, field_source) =
+            exact_int_sidecar_fixture(Some(indexed_guard));
+        (
+            function,
+            branch_source,
+            field_source.expect("indexed-field branch fixture should contain an attribute load"),
+        )
     }
 
     fn exact_int_sidecars_for_branch(
@@ -23605,6 +25855,14 @@ def large(x):\n{large_body}"
             }
             .visit_fn_mut(&mut function);
 
+            let mut linearized = function.clone();
+            assert!(
+                linearize_typed_function_expressions(&mut linearized)
+                    .expect("a mismatched indexed-field region should linearize normally")
+                    .lifted_nested_exprs
+                    > 0,
+                "a mismatched field guard must not preserve an atomic scalar expression",
+            );
             assert_eq!(invalidate_unguarded_exact_int_selections(&mut function), 2);
             assert_eq!(
                 exact_int_sidecars_for_branch(&function, branch_source),
@@ -23813,7 +26071,7 @@ def large(x):\n{large_body}"
             let branches = HashMap::from([(branch_source, branch_plan)]);
             let returns = HashMap::from([(branch_source, return_plan)]);
             assert_eq!(
-                annotate_typed_late_bound_remapped_exact_int_selections(
+                annotate_typed_atomic_remapped_exact_int_selections(
                     &mut function,
                     Some(&branches),
                     Some(&returns),
@@ -23838,6 +26096,12 @@ def large(x):\n{large_body}"
                 stats.lifted_nested_exprs, 0,
                 "corrected remapped late-owner scalar sidecars must protect the complete getter/comparison tree",
             );
+            annotate_typed_remapped_exact_int_selections(
+                &mut function,
+                Some(&branches),
+                Some(&returns),
+            )
+            .expect("matching late-owner selections must survive the late attachment step");
         }
 
         let (mut generic, branch_source, _) = indexed_field_exact_int_sidecar_fixture(false);
@@ -23873,7 +26137,7 @@ def large(x):\n{large_body}"
         extra.clear_exact_int_branch_plan();
         extra.clear_exact_int_return_plan();
         assert_eq!(
-            annotate_typed_late_bound_remapped_exact_int_selections(
+            annotate_typed_atomic_remapped_exact_int_selections(
                 &mut generic,
                 Some(&branches),
                 Some(&returns),
@@ -23886,6 +26150,447 @@ def large(x):\n{large_body}"
             (false, false),
             "ordinary generic scalar sidecars must not be attached early",
         );
+        let stats = linearize_typed_function_expressions(&mut generic)
+            .expect("the generic getter and comparison must retain ordinary lowering");
+        assert!(stats.lifted_nested_exprs > 0);
+        annotate_typed_remapped_exact_int_selections(
+            &mut generic,
+            Some(&branches),
+            Some(&returns),
+        )
+        .expect("missing field guards must decline the selection before late attachment completeness");
+        assert_eq!(
+            invalidate_unguarded_exact_int_selections(&mut generic),
+            1,
+            "the unattached branch must decline; the remaining attached return reaches final guard validation",
+        );
+    }
+
+    #[test]
+    fn remapped_scalar_selections_with_live_nodes_reach_final_guard_validation() {
+        let (mut function, branch_source, _) = indexed_field_exact_int_sidecar_fixture(false);
+        let extra = function
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                BlockTerm::IfTerm(term) => term.test.typed_extra_mut(),
+                _ => None,
+            })
+            .unwrap();
+        let branches = HashMap::from([(
+            branch_source,
+            extra.exact_int_branch_plan().cloned().unwrap(),
+        )]);
+        let returns = HashMap::from([(
+            branch_source,
+            extra.exact_int_return_plan().cloned().unwrap(),
+        )]);
+        extra.clear_exact_int_branch_plan();
+        extra.clear_exact_int_return_plan();
+        annotate_typed_remapped_exact_int_selections(&mut function, Some(&branches), Some(&returns))
+            .expect("live source nodes must preserve the existing later virtualization/invalidation sequence");
+        assert_eq!(
+            exact_int_sidecars_for_branch(&function, branch_source),
+            (true, true)
+        );
+        assert_eq!(invalidate_unguarded_exact_int_selections(&mut function), 2);
+        assert_eq!(
+            exact_int_sidecars_for_branch(&function, branch_source),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn two_field_partial_guard_invalidation_preserves_generic_operand_shape() {
+        use soac_opt::passes::{
+            LocalRefState, RefcountActionKind, annotate_typed_module_value_facts,
+            infer_module_value_facts, plan_typed_ownership_effects, sync_typed_module_value_facts,
+            validate_typed_ownership_effects,
+        };
+
+        fn stored_getters(
+            function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        ) -> Vec<(InstrId, LocalLocation)> {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .filter_map(|instr| {
+                    let InstrTyped::Store(store) = instr else {
+                        return None;
+                    };
+                    let InstrTyped::GetAttrTyped(getter) = store.value.as_ref() else {
+                        return None;
+                    };
+                    Some((
+                        getter.semantic_instr_id(),
+                        store
+                            .name
+                            .local_location()
+                            .expect("operand temporary is local"),
+                    ))
+                })
+                .collect()
+        }
+
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def compare(left, right):\n    if left.value < right.value:\n        return 1\n    return 0\n",
+        )
+        .expect("two actual field inputs should lower")
+        .blockpy_module;
+        let mut facts = infer_module_value_facts(&lowered);
+        let mut module = lower_blockpy_module_to_typed(lowered);
+        annotate_typed_module_value_facts(&mut module, &facts);
+        let index = module
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == "compare")
+            .expect("actual source function");
+        let function = &mut module.callable_defs[index];
+        assign_missing_typed_function_instr_ids(function);
+        let function_id = function.function_id;
+        let original_source = function.scope.source_origin.clone();
+        let branch = function
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                BlockTerm::IfTerm(term) => Some(&mut term.test),
+                _ => None,
+            })
+            .expect("actual comparison branch");
+        let branch_source = branch.semantic_instr_id();
+        let InstrTyped::BinOp(compare) = branch else {
+            panic!("the original branch must compare its two actual fields");
+        };
+        let guard = soac_ir_typed::TypedIndexedFieldGuard {
+            expected_index: 0,
+            owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                module_name: "fixture".into(),
+                qualname: "Record".into(),
+            },
+            type_version: 1,
+        };
+        let indexed = TypedAttrAccessPlan::IndexedField {
+            source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
+            counter_source: None,
+            guards: vec![guard],
+        };
+        let mut field_sources = Vec::new();
+        let mut inputs = Vec::new();
+        for (input_index, operand) in [compare.left.as_mut(), compare.right.as_mut()]
+            .into_iter()
+            .enumerate()
+        {
+            let InstrTyped::GetAttrTyped(getter) = operand else {
+                panic!("each input must retain its source GetAttr");
+            };
+            let InstrTyped::Load(receiver) = getter.value.as_ref() else {
+                panic!("each field receiver must be its actual source parameter");
+            };
+            let source = getter.semantic_instr_id();
+            field_sources.push(source);
+            inputs.push(soac_ir_typed::plan_v3::RegionInput {
+                value: soac_ir_typed::plan_v3::PlanValue::new(
+                    input_index as u32,
+                    soac_ir_typed::plan_v3::Rep::PyObjectBorrowed,
+                ),
+                source: RegionInputSource::IndexedField {
+                    source,
+                    receiver: IndexedFieldReceiverSource::LocalName {
+                        name: receiver.name.id_str().to_owned(),
+                    },
+                    owner_type: soac_ir_typed::plan_v3::IndexedFieldOwnerType {
+                        module_name: "fixture".into(),
+                        qualname: "Record".into(),
+                    },
+                    attr_name: "value".into(),
+                    expected_index: 0,
+                },
+            });
+            // Only the LHS guard survives. The RHS is still the real generic getter.
+            getter.access = if input_index == 0 {
+                indexed.clone()
+            } else {
+                TypedAttrAccessPlan::Generic
+            };
+        }
+        assert_eq!(field_sources.len(), 2);
+        assert_ne!(field_sources[0], field_sources[1]);
+        let hot_plan = RegionPlan {
+            id: soac_ir_typed::plan_v3::RegionId(0),
+            source: RegionSource::Instr {
+                instr_id: branch_source,
+            },
+            inputs,
+            nodes: Vec::new(),
+            exits: Vec::new(),
+        };
+        let mut fallback_plan = hot_plan.clone();
+        fallback_plan.id = soac_ir_typed::plan_v3::RegionId(1);
+        for input in &mut fallback_plan.inputs {
+            input.value.rep = soac_ir_typed::plan_v3::Rep::PyObjectOwned;
+        }
+        let partial_match =
+            typed_exact_int_region_matches_field_expression(branch, &hot_plan, function_id);
+        assert!(
+            partial_match,
+            "the fixture must exercise permitted early partial preservation",
+        );
+        branch
+            .typed_extra_mut()
+            .expect("comparison metadata")
+            .set_exact_int_branch_plan(TypedExactIntBranchPlan {
+                source: TypedExactIntPlanSource::OptimizationPlanV3,
+                instr_id: branch_source,
+                hot_region: MechanicalRegionEmission {
+                    region: hot_plan.id,
+                    steps: Vec::new(),
+                    exits: Vec::new(),
+                },
+                fallback_region: MechanicalRegionEmission {
+                    region: fallback_plan.id,
+                    steps: Vec::new(),
+                    exits: Vec::new(),
+                },
+                hot_plan,
+                fallback_plan,
+            });
+
+        // Positive control: the same two source getters, now with both guards.
+        let mut complete = function.clone();
+        struct AddRightGuard {
+            source: InstrId,
+            access: TypedAttrAccessPlan,
+        }
+        impl VisitMut<InstrTyped> for AddRightGuard {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::GetAttrTyped(getter) = expr
+                    && getter.semantic_instr_id() == self.source
+                {
+                    getter.access = self.access.clone();
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+        AddRightGuard {
+            source: field_sources[1],
+            access: indexed,
+        }
+        .visit_fn_mut(&mut complete);
+        assert_eq!(invalidate_unguarded_exact_int_selections(&mut complete), 0);
+        assert_eq!(
+            linearize_typed_function_expressions(&mut complete)
+                .unwrap()
+                .lifted_nested_exprs,
+            0,
+            "the complete two-field selection remains atomic",
+        );
+        assert!(stored_getters(&complete).is_empty());
+
+        // Run the actual early linearizer and final invalidation sequence.
+        linearize_typed_function_expressions(function).unwrap();
+        assign_missing_typed_function_instr_ids(function);
+        assert_eq!(invalidate_unguarded_exact_int_selections(function), 1);
+        refresh_typed_function_value_facts(function);
+        assert_eq!(
+            exact_int_sidecars_for_branch(function, branch_source),
+            (false, false),
+            "the final all-input validator must reject the incomplete scalar selection",
+        );
+        let generic_branch = function
+            .blocks
+            .iter()
+            .find_map(|block| match &block.term {
+                BlockTerm::IfTerm(term)
+                    if term.test.try_semantic_instr_id() == Some(branch_source) =>
+                {
+                    Some(&term.test)
+                }
+                _ => None,
+            })
+            .expect("invalidation retains the actual branch producer");
+        let InstrTyped::BinOp(generic_compare) = generic_branch else {
+            panic!("invalidation must preserve the ordinary comparison");
+        };
+        for (operand, source) in [
+            generic_compare.left.as_ref(),
+            generic_compare.right.as_ref(),
+        ]
+        .into_iter()
+        .zip(&field_sources)
+        {
+            assert!(
+                matches!(operand, InstrTyped::GetAttrTyped(getter) if getter.semantic_instr_id() == *source),
+                "both original nested getters survive metadata-only invalidation",
+            );
+        }
+        assert!(
+            stored_getters(function).is_empty(),
+            "metadata invalidation does not itself materialize expression owners",
+        );
+        sync_typed_module_value_facts(&module, &mut facts);
+        let raw_plan = plan_typed_ownership_effects(&module, &facts);
+        validate_typed_ownership_effects(&module, &facts, &raw_plan).unwrap();
+
+        // Ownership planning consumes this tree without materializing its SSA
+        // operands. The generic emitter still owns nested operand error cleanup.
+        // This independent control shows ordinary linearization's alternative
+        // explicit-owner representation; neither shape alone proves runtime safety.
+        let mut normalized = module.clone();
+        let normalized_function = &mut normalized.callable_defs[index];
+        linearize_typed_function_expressions(normalized_function).unwrap();
+        assign_missing_typed_function_instr_ids(normalized_function);
+        refresh_typed_function_value_facts(normalized_function);
+        let stores = stored_getters(normalized_function);
+        assert_eq!(
+            stores.iter().map(|(source, _)| *source).collect::<Vec<_>>(),
+            field_sources,
+            "both original getters must materialize once in source evaluation order",
+        );
+        assert_eq!(normalized_function.function_id, function_id);
+        assert_eq!(normalized_function.scope.source_origin, original_source);
+        let layout = normalized_function.storage_layout.as_ref().unwrap();
+        assert!(
+            stores
+                .iter()
+                .all(|(_, local)| layout.is_expression_temporary(*local))
+        );
+        let mut normalized_facts = facts.clone();
+        sync_typed_module_value_facts(&normalized, &mut normalized_facts);
+        let normal_plan = plan_typed_ownership_effects(&normalized, &normalized_facts);
+        validate_typed_ownership_effects(&normalized, &normalized_facts, &normal_plan).unwrap();
+        let actions = normal_plan.function(function_id).unwrap();
+        for (_, location) in &stores {
+            assert!(actions.blocks.values().flat_map(|block| &block.actions).any(|action| {
+                matches!(
+                    &action.kind,
+                    RefcountActionKind::RebindLocal { local, new_state: LocalRefState::Owned, .. }
+                        if local.location == *location
+                )
+            }), "normal field operands need tracked owners");
+        }
+    }
+
+    #[test]
+    fn remapped_indexed_field_scalar_branch_survives_linearization_and_late_attachment() {
+        for preattached in [false, true] {
+            let (mut function, branch_source, _) = indexed_field_exact_int_sidecar_fixture(true);
+            let extra = function
+                .blocks
+                .iter_mut()
+                .find_map(|block| match &mut block.term {
+                    BlockTerm::IfTerm(term) => term.test.typed_extra_mut(),
+                    _ => None,
+                })
+                .expect("indexed-field branch fixture must have typed metadata");
+            let plan = extra.exact_int_branch_plan().cloned().unwrap();
+            extra.clear_exact_int_return_plan();
+            if !preattached {
+                extra.clear_exact_int_branch_plan();
+            }
+            let branches = HashMap::from([(branch_source, plan)]);
+            if !preattached {
+                assert_eq!(
+                    annotate_typed_atomic_remapped_exact_int_selections(
+                        &mut function,
+                        Some(&branches),
+                        None,
+                    )
+                    .unwrap(),
+                    1,
+                    "a selected branch with its matching indexed-field guard must attach before linearization",
+                );
+            }
+            assert_eq!(
+                linearize_typed_function_expressions(&mut function)
+                    .unwrap()
+                    .lifted_nested_exprs,
+                0,
+                "an attached indexed-field region must retain its selected source expression",
+            );
+            annotate_typed_remapped_exact_int_selections(&mut function, Some(&branches), None)
+                .expect("a guarded indexed-field branch must survive late attachment validation");
+            assert_eq!(
+                exact_int_sidecars_for_branch(&function, branch_source),
+                (true, false),
+            );
+        }
+    }
+
+    #[test]
+    fn remapped_parameter_scalar_branch_survives_linearization_and_late_attachment() {
+        let (mut function, branch_source, field_source) = exact_int_sidecar_fixture(None);
+        assert!(field_source.is_none());
+        let extra = function
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                BlockTerm::IfTerm(term) => term.test.typed_extra_mut(),
+                _ => None,
+            })
+            .expect("parameter branch fixture must have typed metadata");
+        let plan = extra.exact_int_branch_plan().cloned().unwrap();
+        extra.clear_exact_int_branch_plan();
+        extra.clear_exact_int_return_plan();
+        let branches = HashMap::from([(branch_source, plan)]);
+        assert_eq!(
+            annotate_typed_atomic_remapped_exact_int_selections(
+                &mut function,
+                Some(&branches),
+                None,
+            )
+            .unwrap(),
+            1,
+        );
+        assert_eq!(
+            linearize_typed_function_expressions(&mut function)
+                .unwrap()
+                .lifted_nested_exprs,
+            0,
+        );
+        annotate_typed_remapped_exact_int_selections(&mut function, Some(&branches), None)
+            .expect("a parameter-only scalar selection needs no indexed field guard");
+        assert_eq!(
+            exact_int_sidecars_for_branch(&function, branch_source),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn remapped_guarded_scalar_selections_reject_missing_and_colliding_nodes() {
+        for missing in [false, true] {
+            let (mut function, branch_source) = late_bound_indexed_field_exact_int_sidecar_fixture(
+                "fixture",
+                "Record",
+                "value",
+                LateBoundOwnerFieldStorage::SplitDict { expected_index: 0 },
+                false,
+            );
+            let mut plan = function
+                .blocks
+                .iter()
+                .find_map(|block| match &block.term {
+                    BlockTerm::IfTerm(term) => term.test.typed_extra()?.exact_int_branch_plan(),
+                    _ => None,
+                })
+                .unwrap()
+                .clone();
+            let source = if missing {
+                InstrId::new(999)
+            } else {
+                branch_source
+            };
+            plan.instr_id = source;
+            if !missing {
+                plan.hot_plan.id = soac_ir_typed::plan_v3::RegionId(999);
+            }
+            let branches = HashMap::from([(source, plan)]);
+            assert!(
+                annotate_typed_remapped_exact_int_selections(&mut function, Some(&branches), None)
+                    .is_err(),
+                "a live guarded selection must not ignore a missing or colliding branch node",
+            );
+        }
     }
 
     #[test]
@@ -23907,18 +26612,29 @@ def large(x):\n{large_body}"
                 }
             }
 
-            let test = function
-                .blocks
-                .iter()
-                .find_map(|block| match &block.term {
-                    BlockTerm::IfTerm(if_term)
-                        if if_term.test.try_semantic_instr_id() == Some(branch_source) =>
-                    {
-                        Some(&if_term.test)
+            struct SourceCollector {
+                source: InstrId,
+                expressions: Vec<InstrTyped>,
+            }
+            impl Visit<InstrTyped> for SourceCollector {
+                fn visit_instr(&mut self, expression: &InstrTyped) {
+                    if expression.try_semantic_instr_id() == Some(self.source) {
+                        self.expressions.push(expression.clone());
                     }
-                    _ => None,
-                })
-                .expect("scalar linearization fixture must retain its planned branch");
+                    expression.visit_children(self);
+                }
+            }
+            let mut source = SourceCollector {
+                source: branch_source,
+                expressions: Vec::new(),
+            };
+            source.visit_fn(function);
+            assert_eq!(
+                source.expressions.len(),
+                1,
+                "the branch producer must survive exactly once, whether nested or materialized for operand cleanup"
+            );
+            let test = &source.expressions[0];
             let mut collector = Collector {
                 sources: Vec::new(),
             };
@@ -23962,12 +26678,27 @@ def large(x):\n{large_body}"
         for indexed_guard in [false, true] {
             let (mut unrelated, branch_source, field_source) =
                 indexed_field_exact_int_sidecar_fixture(indexed_guard);
+            if indexed_guard {
+                // Matching selected indexed regions are covered by the
+                // remapped-branch regression. An indexed getter alone must
+                // not make an unselected scalar expression atomic.
+                let extra = unrelated
+                    .blocks
+                    .iter_mut()
+                    .find_map(|block| match &mut block.term {
+                        BlockTerm::IfTerm(term) => term.test.typed_extra_mut(),
+                        _ => None,
+                    })
+                    .unwrap();
+                extra.clear_exact_int_branch_plan();
+                extra.clear_exact_int_return_plan();
+            }
             let stats = linearize_typed_function_expressions(&mut unrelated)
-                .expect("unrelated exact-int and generic trees should retain normal linearization");
+                .expect("generic and unselected indexed trees should retain normal linearization");
             assert!(stats.lifted_nested_exprs > 0);
             assert!(
                 nested_field_sources(&unrelated, branch_source).is_empty(),
-                "an exact-int tree without a matching late-owner field must still be linearized",
+                "a tree without a selected matching field region must still be linearized",
             );
             assert!(
                 unrelated.blocks.iter().any(|block| {

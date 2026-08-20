@@ -12,8 +12,7 @@ fn maybe_placeholder(expr: Expr) -> (Vec<Stmt>, Expr, bool) {
 
 pub(super) fn desugar_structured_with_stmt_for_blockpy(with_stmt: ast::StmtWith) -> Vec<Stmt> {
     if with_stmt.items.is_empty() {
-        let mut body = with_stmt.body;
-        return std::mem::take(&mut body);
+        return with_stmt.body.into();
     }
 
     let ast::StmtWith {
@@ -23,8 +22,7 @@ pub(super) fn desugar_structured_with_stmt_for_blockpy(with_stmt: ast::StmtWith)
         ..
     } = with_stmt;
 
-    let mut body = body;
-    let mut lowered_body: Vec<Stmt> = std::mem::take(&mut body);
+    let mut lowered_body: Vec<Stmt> = body.into();
 
     for ast::WithItem {
         context_expr,
@@ -32,6 +30,17 @@ pub(super) fn desugar_structured_with_stmt_for_blockpy(with_stmt: ast::StmtWith)
         ..
     } in items.into_iter().rev()
     {
+        // Native async-with attributes aenter and both aexit paths (including
+        // abrupt unwinding) to LOC(item.context_expr). Capture it before a
+        // placeholder replaces the actual expression with a synthetic name.
+        let context_source_range = context_expr.meta().range;
+        let await_at_context = |value| {
+            Expr::Await(ast::ExprAwait {
+                range: context_source_range,
+                node_index: Default::default(),
+                value: Box::new(value),
+            })
+        };
         let target = optional_vars.map(|var| *var);
         let exit_name = fresh_name("with_exit");
         let ok_name = fresh_name("with_ok");
@@ -44,10 +53,10 @@ pub(super) fn desugar_structured_with_stmt_for_blockpy(with_stmt: ast::StmtWith)
         };
 
         let enter_value = if is_async {
-            py_expr!(
-                "await __soac__.asynccontextmanager_aenter({ctx:expr})",
+            await_at_context(py_expr!(
+                "__soac__.asynccontextmanager_aenter({ctx:expr})",
                 ctx = ctx_expr.clone()
-            )
+            ))
         } else {
             py_expr!(
                 "__soac__.contextmanager_enter({ctx:expr})",
@@ -64,6 +73,14 @@ pub(super) fn desugar_structured_with_stmt_for_blockpy(with_stmt: ast::StmtWith)
         };
 
         lowered_body = if is_async {
+            let exceptional_exit = await_at_context(py_expr!(
+                "__soac__.asynccontextmanager_exit({exit_name:id}, __soac__.current_exception())",
+                exit_name = exit_name.as_str(),
+            ));
+            let normal_exit = await_at_context(py_expr!(
+                "__soac__.asynccontextmanager_exit({exit_name:id}, None)",
+                exit_name = exit_name.as_str(),
+            ));
             crate::template::py_stmts!(
                 r#"
 {ctx_placeholder_stmt:stmt}
@@ -74,12 +91,12 @@ try:
     {body:stmt}
 except BaseException:
     {ok_name:id} = False
-    {reraise_name:id} = await __soac__.asynccontextmanager_exit({exit_name:id}, __soac__.current_exception())
+    {reraise_name:id} = {exceptional_exit:expr}
     if {reraise_name:id} is not None:
         raise {reraise_name:id}
 finally:
     if {ok_name:id}:
-        await __soac__.asynccontextmanager_exit({exit_name:id}, None)
+        {normal_exit:expr}
     {exit_name:id} = None
     {ctx_cleanup:stmt}
 "#,
@@ -91,6 +108,8 @@ finally:
                 ok_name = ok_name.as_str(),
                 reraise_name = reraise_name.as_str(),
                 ctx_cleanup = ctx_cleanup,
+                exceptional_exit = exceptional_exit,
+                normal_exit = normal_exit,
             )
         } else {
             crate::template::py_stmts!(

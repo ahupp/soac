@@ -1,3 +1,7 @@
+---
+title: "Typed Local Values"
+---
+
 # Typed Local Values
 
 ## Goal

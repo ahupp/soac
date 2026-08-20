@@ -402,6 +402,10 @@ impl BlockPyFormatter {
             BlockTerm::Return(value) => {
                 self.line(format!("return {}", render_inline_expr(value, self.config)))
             }
+            BlockTerm::GeneratorReturn(value) => self.line(format!(
+                "generator_return {}",
+                render_inline_expr(value, self.config)
+            )),
         }
     }
 
@@ -410,9 +414,17 @@ impl BlockPyFormatter {
         E: Instr,
         E: PrettyPrint,
     {
+        let operation = match raise_stmt.disposition {
+            super::RaiseDisposition::Source => "raise",
+            super::RaiseDisposition::PropagateNormalized => "propagate_normalized",
+            super::RaiseDisposition::SourceNormalized => "source_normalized",
+        };
         match &raise_stmt.exc {
-            Some(exc) => self.line(format!("raise {}", render_inline_expr(exc, self.config))),
-            None => self.line("raise"),
+            Some(exc) => self.line(format!(
+                "{operation} {}",
+                render_inline_expr(exc, self.config)
+            )),
+            None => self.line(operation),
         }
     }
     fn with_indent(&mut self, f: impl FnOnce(&mut Self)) {
@@ -796,7 +808,7 @@ fn collect_top_level_successors_from_term(
             }
             push_top_level_successor(&branch.default_label, label_to_index, seen, out);
         }
-        BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
     }
 }
 
@@ -965,6 +977,6 @@ fn collect_referenced_labels_from_term(
             }
             out.insert(branch.default_label);
         }
-        BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
     }
 }

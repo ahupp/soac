@@ -11,13 +11,13 @@ use soac_core::block_py::{
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
 use std::collections::HashMap;
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_uint, c_void};
 use std::mem::{offset_of, size_of};
 use std::ptr;
 use std::sync::Arc;
 
 #[repr(C)]
-struct PyThreadStateCurrentExceptionPrefix {
+struct RawPyThreadStateCurrentExceptionPrefix {
     prev: *mut ffi::PyThreadState,
     next: *mut ffi::PyThreadState,
     interp: *mut ffi::PyInterpreterState,
@@ -40,6 +40,7 @@ struct PyThreadStateCurrentExceptionPrefix {
     c_profileobj: *mut ffi::PyObject,
     c_traceobj: *mut ffi::PyObject,
     current_exception: *mut ffi::PyObject,
+    exc_info: *mut c_void,
 }
 
 #[repr(C)]
@@ -56,6 +57,9 @@ struct RawPyInterpreterFrameForRecursion {
     return_offset: u16,
     owner: u8,
     visited: u8,
+    soac_dataclass_role: c_uint,
+    soac_dataclass_invocation: *mut ffi::PyObject,
+    soac_dataclass_checked_activation: *mut ffi::PyObject,
     locals_and_stack: [usize; 1],
 }
 
@@ -128,12 +132,6 @@ struct RawPyCodeVersionPrefix {
     co_filename: *mut ffi::PyObject,
     co_name: *mut ffi::PyObject,
     co_qualname: *mut ffi::PyObject,
-    co_linetable: *mut ffi::PyObject,
-    co_weakreflist: *mut ffi::PyObject,
-    co_executors: *mut c_void,
-    co_cached: *mut c_void,
-    co_instrumentation_version: usize,
-    co_monitoring: *mut c_void,
 }
 
 #[repr(C)]
@@ -176,6 +174,18 @@ pub const FUNCTION_ENV_BUILTINS_OBJ_OFFSET: i32 =
     offset_of!(crate::FunctionEnvAbiHeader, builtins_obj) as i32;
 pub const FUNCTION_ENV_LATE_BOUND_OWNER_CELLS_OFFSET: i32 =
     offset_of!(crate::FunctionEnvAbiHeader, late_bound_owner_cells) as i32;
+pub(super) const FUNCTION_ENV_STRICT_FIELD_SLOTS_OFFSET: i32 =
+    offset_of!(crate::FunctionEnvAbiHeader, strict_field_slots) as i32;
+pub(super) const FUNCTION_ENV_STRICT_FIELD_SLOT_COUNT_OFFSET: i32 =
+    offset_of!(crate::FunctionEnvAbiHeader, strict_field_slot_count) as i32;
+pub(super) const FUNCTION_ENV_STRICT_METHOD_SLOTS_OFFSET: i32 =
+    offset_of!(crate::FunctionEnvAbiHeader, strict_method_slots) as i32;
+pub(super) const FUNCTION_ENV_STRICT_METHOD_SLOT_COUNT_OFFSET: i32 =
+    offset_of!(crate::FunctionEnvAbiHeader, strict_method_slot_count) as i32;
+pub(super) const FUNCTION_ENV_ACTIVE_STRICT_CALL_OFFSET: i32 =
+    offset_of!(crate::FunctionEnvAbiHeader, active_strict_call) as i32;
+pub(super) const PY_FUNCTION_VECTORCALL_OFFSET: i32 =
+    offset_of!(ffi::PyFunctionObject, vectorcall) as i32;
 pub const LATE_BOUND_OWNER_FIELD_CELL_SIZE: i32 =
     size_of::<crate::module_type::LateBoundOwnerFieldCell>() as i32;
 pub const LATE_BOUND_OWNER_FIELD_WEAKREF_OFFSET: i32 =
@@ -199,13 +209,65 @@ pub const PY_FUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 =
     offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_soac_function_id) as i32;
 pub const FIRST_VALID_CPYTHON_FUNCTION_VERSION: u32 = 2;
 pub(super) const PY_THREAD_STATE_EVAL_BREAKER_OFFSET: i32 =
-    offset_of!(PyThreadStateCurrentExceptionPrefix, eval_breaker) as i32;
+    offset_of!(RawPyThreadStateCurrentExceptionPrefix, eval_breaker) as i32;
 pub const PY_THREAD_STATE_CURRENT_EXCEPTION_OFFSET: i32 =
-    offset_of!(PyThreadStateCurrentExceptionPrefix, current_exception) as i32;
+    offset_of!(RawPyThreadStateCurrentExceptionPrefix, current_exception) as i32;
+pub(crate) const PY_THREAD_STATE_EXC_INFO_OFFSET: i32 =
+    offset_of!(RawPyThreadStateCurrentExceptionPrefix, exc_info) as i32;
 pub(super) const PY_THREAD_STATE_BASE_FRAME_OFFSET: i32 =
-    offset_of!(PyThreadStateCurrentExceptionPrefix, base_frame) as i32;
+    offset_of!(RawPyThreadStateCurrentExceptionPrefix, base_frame) as i32;
 pub(super) const PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET: i32 =
     offset_of!(RawPyThreadStateEmbeddedFrameTail, c_stack_soft_limit) as i32;
+
+#[cfg(test)]
+pub(super) fn assert_recursion_frame_abi_matches_native(
+    py: pyo3::Python<'_>,
+) -> pyo3::PyResult<()> {
+    use pyo3::prelude::*;
+
+    let native: HashMap<String, usize> = py
+        .import("_testinternalcapi")?
+        .call_method0("soac_dataclass_frame_offsets")?
+        .extract()?;
+    for (name, actual) in [
+        ("frame_size", size_of::<RawPyInterpreterFrameForRecursion>()),
+        (
+            "role",
+            offset_of!(RawPyInterpreterFrameForRecursion, soac_dataclass_role),
+        ),
+        (
+            "invocation",
+            offset_of!(RawPyInterpreterFrameForRecursion, soac_dataclass_invocation),
+        ),
+        (
+            "checked_activation",
+            offset_of!(
+                RawPyInterpreterFrameForRecursion,
+                soac_dataclass_checked_activation
+            ),
+        ),
+        (
+            "localsplus",
+            offset_of!(RawPyInterpreterFrameForRecursion, locals_and_stack),
+        ),
+        (
+            "thread_base_frame_pointer",
+            PY_THREAD_STATE_BASE_FRAME_OFFSET as usize,
+        ),
+        (
+            "thread_soft_limit_from_base_frame",
+            PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET as usize,
+        ),
+    ] {
+        let expected = native.get(name).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "selected CPython recursion ABI probe omitted {name}: {native:?}"
+            ))
+        })?;
+        assert_eq!(actual, *expected, "selected CPython recursion ABI: {name}");
+    }
+    Ok(())
+}
 
 pub(super) fn load_function_env_obj(
     fb: &mut FunctionBuilder<'_>,
@@ -222,17 +284,119 @@ pub(super) fn load_py_function_soac_metadata_obj(
     ptr_ty: ir::Type,
     function_obj: ir::Value,
 ) -> ir::Value {
-    fb.ins().load(
+    // Opaque metadata and its numeric profile ID are public extension slots.
+    // Only the owning destructor identifies our allocation type. This is an
+    // observational probe, not source/contract authentication: foreign data
+    // must take the ordinary miss path without a private-payload dereference.
+    let destructor = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        function_obj,
+        offset_of!(
+            RawPyFunctionObjectSoacMetadataPrefix,
+            func_soac_metadata_destructor
+        ) as i32,
+    );
+    let expected = fb.ins().iconst(
+        ptr_ty,
+        crate::free_clif_function_data as *const () as usize as i64,
+    );
+    let owned = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, destructor, expected);
+    let metadata = fb.ins().load(
         ptr_ty,
         ir::MemFlags::trusted(),
         function_obj,
         offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_soac_metadata) as i32,
-    )
+    );
+    let absent = fb.ins().iconst(ptr_ty, 0);
+    fb.ins().select(owned, metadata, absent)
 }
 
 pub(crate) unsafe fn invalidate_py_function_soac_function_id(function: *mut ffi::PyFunctionObject) {
     let raw_function = function.cast::<RawPyFunctionObjectSoacMetadataPrefix>();
     unsafe { (*raw_function).func_soac_function_id = 0 };
+}
+
+#[cfg(test)]
+#[test]
+fn metadata_probe_selects_only_the_owned_allocation_type() {
+    let mut function = ir::Function::new();
+    function
+        .signature
+        .params
+        .push(ir::AbiParam::new(ir::types::I64));
+    function
+        .signature
+        .returns
+        .push(ir::AbiParam::new(ir::types::I64));
+    let mut context = cranelift_frontend::FunctionBuilderContext::new();
+    let (callable, metadata);
+    {
+        let mut fb = FunctionBuilder::new(&mut function, &mut context);
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        fb.seal_block(entry);
+        callable = fb.block_params(entry)[0];
+        metadata = load_py_function_soac_metadata_obj(&mut fb, ir::types::I64, callable);
+        fb.ins().return_(&[metadata]);
+        fb.finalize();
+    }
+    let defining_instruction = |value| match function.dfg.value_def(value) {
+        ir::ValueDef::Result(instruction, _) => instruction,
+        other => panic!("expected generated metadata instruction, got {other:?}"),
+    };
+    let selection = defining_instruction(metadata);
+    assert_eq!(function.dfg.insts[selection].opcode(), ir::Opcode::Select);
+    let [condition, payload, absent] = function.dfg.inst_args(selection) else {
+        panic!("metadata probe must select an owned payload or NULL");
+    };
+    let comparison = defining_instruction(*condition);
+    assert!(matches!(
+        function.dfg.insts[comparison],
+        ir::InstructionData::IntCompare {
+            cond: ir::condcodes::IntCC::Equal,
+            ..
+        }
+    ));
+    let [destructor, expected] = function.dfg.inst_args(comparison) else {
+        panic!("metadata probe must compare the actual owning destructor");
+    };
+    for (value, offset) in [
+        (
+            *destructor,
+            offset_of!(
+                RawPyFunctionObjectSoacMetadataPrefix,
+                func_soac_metadata_destructor
+            ),
+        ),
+        (
+            *payload,
+            offset_of!(RawPyFunctionObjectSoacMetadataPrefix, func_soac_metadata),
+        ),
+    ] {
+        let instruction = defining_instruction(value);
+        assert!(matches!(
+            function.dfg.insts[instruction],
+            ir::InstructionData::Load { offset: actual, .. } if actual == (offset as i32).into()
+        ));
+        assert_eq!(function.dfg.inst_args(instruction), &[callable]);
+    }
+    for (value, expected_value) in [
+        (
+            *expected,
+            crate::free_clif_function_data as *const () as usize as i64,
+        ),
+        (*absent, 0),
+    ] {
+        assert!(matches!(
+            function.dfg.insts[defining_instruction(value)],
+            ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm }
+                if imm.bits() == expected_value
+        ));
+    }
 }
 
 pub(crate) unsafe fn raw_py_code_version(code: *mut ffi::PyObject) -> u32 {
@@ -256,30 +420,6 @@ pub(crate) unsafe fn raw_py_code_has_function_names(
     code.co_name == name && code.co_qualname == qualname
 }
 
-pub(crate) unsafe fn raw_py_function_activation_is_observed(code: *mut ffi::PyObject) -> bool {
-    let thread_state =
-        unsafe { ffi::PyThreadState_Get() }.cast::<PyThreadStateCurrentExceptionPrefix>();
-    if thread_state.is_null() {
-        return true;
-    }
-    let thread_state = unsafe { &*thread_state };
-    if !thread_state.c_profilefunc.is_null() || !thread_state.c_tracefunc.is_null() {
-        return true;
-    }
-    if thread_state.interp.is_null() {
-        return true;
-    }
-
-    // In the pinned CPython layout, PyInterpreterState starts with ceval and
-    // ceval starts with its global instrumentation version.
-    if unsafe { *thread_state.interp.cast::<usize>() } != 0 {
-        return true;
-    }
-
-    // Local monitoring does not change the interpreter-global version.
-    !unsafe { (*code.cast::<RawPyCodeVersionPrefix>()).co_monitoring }.is_null()
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct FunctionRuntimeDataLayout {
     positional_default_count: usize,
@@ -287,6 +427,7 @@ pub(crate) struct FunctionRuntimeDataLayout {
     kwonly_default_slots: HashMap<String, usize>,
     closure_start: usize,
     closure_len: usize,
+    private_cell_len: usize,
     total_len: usize,
 }
 
@@ -335,13 +476,19 @@ impl FunctionRuntimeDataLayout {
             .map(|layout| layout.freevars.len())
             .unwrap_or(0);
         let closure_len = storage_layout_closure_len.max(max_closure_slot);
-        let total_len = closure_start + closure_len;
+        let private_cell_len = function
+            .scope
+            .private_lexical
+            .as_ref()
+            .map_or(0, |scope| scope.private_captures().count());
+        let total_len = closure_start + closure_len + private_cell_len;
         Self {
             positional_default_count,
             positional_default_slots_by_param_index,
             kwonly_default_slots,
             closure_start,
             closure_len,
+            private_cell_len,
             total_len,
         }
     }
@@ -383,6 +530,15 @@ impl FunctionRuntimeDataLayout {
         self.closure_start + closure_slot
     }
 
+    pub(crate) fn private_cell_len(&self) -> usize {
+        self.private_cell_len
+    }
+
+    pub(crate) fn private_cell_slot(&self, index: usize) -> usize {
+        assert!(index < self.private_cell_len);
+        self.closure_start + self.closure_len + index
+    }
+
     pub(crate) fn total_len(&self) -> usize {
         self.total_len
     }
@@ -400,7 +556,7 @@ fn max_referenced_function_closure_slot(function: &BlockPyFunction<BlockPyModule
                 CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
                     self.max_slot_plus_one = self.max_slot_plus_one.max(slot as usize + 1);
                 }
-                CellLocation::Owned(_) | CellLocation::Preserved(_) => {}
+                CellLocation::Owned(_) | CellLocation::Preserved(_) | CellLocation::Private(_) => {}
             }
         }
 
@@ -443,7 +599,7 @@ fn max_referenced_typed_function_closure_slot(
                 CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
                     self.max_slot_plus_one = self.max_slot_plus_one.max(slot as usize + 1);
                 }
-                CellLocation::Owned(_) | CellLocation::Preserved(_) => {}
+                CellLocation::Owned(_) | CellLocation::Preserved(_) | CellLocation::Private(_) => {}
             }
         }
 

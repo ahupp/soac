@@ -707,6 +707,12 @@ pub(super) fn register_block_display_annotation(
 
 fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
     match expr {
+        InstrTyped::TakeOperand(_) => "TakeOperand",
+        InstrTyped::ComprehensionInsert(_) => "ComprehensionInsert",
+        InstrTyped::IteratorStep(_) => "IteratorStep",
+        InstrTyped::BuildCollection(_) => "BuildCollection",
+        InstrTyped::CallArgumentOp(_) => "CallArgumentOp",
+        InstrTyped::PreparedCall(_) => "PreparedCall",
         InstrTyped::Truthy(_) => "Truthy",
         InstrTyped::Load(_) => "Load",
         InstrTyped::BinOp(_) => "BinOp",
@@ -731,6 +737,23 @@ fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
         InstrTyped::IncrementCounter(_) => "IncrementCounter",
         InstrTyped::CellRef(_) => "CellRef",
         InstrTyped::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
+        InstrTyped::ConstructClass(_) => "ConstructClass",
+        InstrTyped::PrepareClassDecorator(_) => "PrepareClassDecorator",
+        InstrTyped::ApplyClassDecorator(_) => "ApplyClassDecorator",
+        InstrTyped::DiscardClassDecorator(_) => "DiscardClassDecorator",
+        InstrTyped::DiscardClassConstructionCaptures(_) => "DiscardClassConstructionCaptures",
+        InstrTyped::CompleteFunctionDefinition(_) => "CompleteFunctionDefinition",
+        InstrTyped::ApplyFunctionDescriptor(_) => "ApplyFunctionDescriptor",
+        InstrTyped::NewAnnotationSet(_) => "NewAnnotationSet",
+        InstrTyped::SetupAnnotations(_) => "SetupAnnotations",
+        InstrTyped::ConstructTypeParameterScope(_) => "ConstructTypeParameterScope",
+        InstrTyped::SubscriptGeneric(_) => "SubscriptGeneric",
+        InstrTyped::SetFunctionTypeParameters(_) => "SetFunctionTypeParameters",
+        InstrTyped::CreateTypeAlias(_) => "CreateTypeAlias",
+        InstrTyped::CreateTypeParameter(_) => "CreateTypeParameter",
+        InstrTyped::SetTypeParameterDefault(_) => "SetTypeParameterDefault",
+        InstrTyped::CheckAnnotationFormat(_) => "CheckAnnotationFormat",
+        InstrTyped::RecordAnnotation(_) => "RecordAnnotation",
     }
 }
 
@@ -839,6 +862,12 @@ fn render_typed_term(out: &mut String, term: &BlockTerm<InstrTyped>, indent: &st
             out.push_str(&render_typed_expr(value));
             out.push('\n');
         }
+        BlockTerm::GeneratorReturn(value) => {
+            out.push_str(indent);
+            out.push_str("generator_return ");
+            out.push_str(&render_typed_expr(value));
+            out.push('\n');
+        }
     }
 }
 
@@ -868,6 +897,130 @@ fn render_typed_block_arg(arg: &BlockArg) -> String {
 
 fn render_typed_expr(expr: &InstrTyped) -> String {
     match expr {
+        InstrTyped::TakeOperand(op) => render_call_like("TakeOperand", [op.name.id.to_string()]),
+        InstrTyped::IteratorStep(op) => render_call_like("IteratorStep", [op.name.id.to_string()]),
+        InstrTyped::BuildCollection(op) => render_call_like(
+            "BuildCollection",
+            std::iter::once(format!("{:?}", op.kind))
+                .chain(op.values.iter().map(render_typed_expr)),
+        ),
+        InstrTyped::CallArgumentOp(op) => render_call_like(
+            "CallArgumentOp",
+            [
+                format!("{:?}", op.kind),
+                op.callable.id.to_string(),
+                op.buffer.id.to_string(),
+            ]
+            .into_iter()
+            .chain(op.value.as_deref().map(render_typed_expr)),
+        ),
+        InstrTyped::PreparedCall(op) => render_call_like(
+            "PreparedCall",
+            std::iter::once(op.func.as_ref())
+                .chain(std::iter::once(op.arguments.as_ref()))
+                .chain(op.keywords.as_deref())
+                .map(render_typed_expr),
+        ),
+        InstrTyped::ComprehensionInsert(op) => render_call_like(
+            "ComprehensionInsert",
+            [format!("{:?}", op.kind), op.container.id.to_string()]
+                .into_iter()
+                .chain(op.key.as_deref().map(render_typed_expr))
+                .chain(std::iter::once(render_typed_expr(&op.value))),
+        ),
+        InstrTyped::NewAnnotationSet(_) => {
+            render_call_like("NewAnnotationSet", std::iter::empty::<String>())
+        }
+        InstrTyped::CheckAnnotationFormat(op) => {
+            render_call_like("CheckAnnotationFormat", [render_typed_expr(&op.format)])
+        }
+        InstrTyped::SetupAnnotations(op) => render_call_like(
+            "SetupAnnotations",
+            op.namespace.as_deref().map(render_typed_expr).into_iter(),
+        ),
+        InstrTyped::CreateTypeAlias(op) => render_call_like(
+            "CreateTypeAlias",
+            std::iter::once(format!("source={:?}", op.definition))
+                .chain(std::iter::once(op.evaluator_function.to_string()))
+                .chain(op.operands().into_iter().map(render_typed_expr)),
+        ),
+        InstrTyped::ConstructTypeParameterScope(op) => render_call_like(
+            "ConstructTypeParameterScope",
+            op.operands().map(render_typed_expr),
+        ),
+        InstrTyped::SubscriptGeneric(op) => render_call_like(
+            "SubscriptGeneric",
+            op.operands().into_iter().map(render_typed_expr),
+        ),
+        InstrTyped::SetFunctionTypeParameters(op) => render_call_like(
+            "SetFunctionTypeParameters",
+            op.operands().into_iter().map(render_typed_expr),
+        ),
+        InstrTyped::CreateTypeParameter(op) => render_call_like(
+            "CreateTypeParameter",
+            [
+                format!("source={:?}", op.definition),
+                format!("kind={:?}", op.kind),
+                format!("evaluator={:?}", op.evaluator_function),
+            ]
+            .into_iter()
+            .chain(op.operands().map(render_typed_expr)),
+        ),
+        InstrTyped::SetTypeParameterDefault(op) => render_call_like(
+            "SetTypeParameterDefault",
+            std::iter::once(format!("source={:?}", op.definition))
+                .chain(std::iter::once(op.evaluator_function.to_string()))
+                .chain(op.operands().into_iter().map(render_typed_expr)),
+        ),
+        InstrTyped::RecordAnnotation(op) => render_call_like(
+            "RecordAnnotation",
+            [render_typed_expr(&op.indices), op.index.to_string()],
+        ),
+        InstrTyped::ConstructClass(op) => {
+            let mut args = vec![
+                format!("source={:?}", op.definition),
+                format!("construction_function={}", op.construction_function),
+            ];
+            args.extend(op.operands().into_iter().map(render_typed_expr));
+            render_call_like("ConstructClass", args)
+        }
+        InstrTyped::PrepareClassDecorator(op) => render_call_like(
+            "PrepareClassDecorator",
+            std::iter::once(format!(
+                "source={:?}, factory={}",
+                op.definition, op.factory
+            ))
+            .chain(op.operands().map(render_typed_expr)),
+        ),
+        InstrTyped::ApplyClassDecorator(op) => render_call_like(
+            "ApplyClassDecorator",
+            std::iter::once(format!("source={:?}", op.definition))
+                .chain(op.operands().into_iter().map(render_typed_expr)),
+        ),
+        InstrTyped::DiscardClassDecorator(op) => render_call_like(
+            "DiscardClassDecorator",
+            op.operands().map(render_typed_expr),
+        ),
+        InstrTyped::DiscardClassConstructionCaptures(op) => render_call_like(
+            "DiscardClassConstructionCaptures",
+            op.operands().map(render_typed_expr),
+        ),
+        InstrTyped::ApplyFunctionDescriptor(op) => render_call_like(
+            "ApplyFunctionDescriptor",
+            std::iter::once(format!(
+                "source={:?}, function={}",
+                op.definition, op.function_id
+            ))
+            .chain(op.operands().map(render_typed_expr)),
+        ),
+        InstrTyped::CompleteFunctionDefinition(op) => render_call_like(
+            "CompleteFunctionDefinition",
+            [
+                format!("source={:?}", op.definition),
+                op.function_id.to_string(),
+                render_typed_expr(&op.function),
+            ],
+        ),
         InstrTyped::Truthy(op) => render_call_like("Truthy", [render_typed_expr(&op.value)]),
         InstrTyped::Load(op) => render_typed_name(&op.name),
         InstrTyped::BinOp(op) => render_call_like(
@@ -987,10 +1140,9 @@ fn render_typed_expr(expr: &InstrTyped) -> String {
             [
                 format!("function_id={}", op.function_id),
                 format!("kind={:?}", op.kind),
-                render_typed_expr(&op.captures),
-                render_typed_expr(&op.param_defaults),
-                render_typed_expr(&op.annotate_fn),
-            ],
+            ]
+            .into_iter()
+            .chain(op.operands().map(render_typed_expr)),
         ),
     }
 }

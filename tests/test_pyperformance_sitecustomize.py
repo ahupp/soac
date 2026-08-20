@@ -2,6 +2,8 @@ import importlib.util
 import json
 import os
 import signal
+import subprocess
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -10,13 +12,17 @@ import pytest
 
 def load_pyperformance_sitecustomize(monkeypatch):
     monkeypatch.delenv("SOAC_PYPERFORMANCE_ENABLE", raising=False)
+    monkeypatch.delenv("SOAC_PYPERFORMANCE_STRICT_BUNDLE", raising=False)
+    monkeypatch.delenv("SOAC_PYPERFORMANCE_WORK_ROOT", raising=False)
     path = (
         Path(__file__).resolve().parents[1]
         / "scripts"
         / "pyperformance_soac_sitecustomize"
         / "sitecustomize.py"
     )
-    spec = importlib.util.spec_from_file_location("_soac_pyperformance_sitecustomize", path)
+    spec = importlib.util.spec_from_file_location(
+        "_soac_pyperformance_sitecustomize", path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -76,7 +82,14 @@ def test_pyperformance_work_dir_ignores_timeout(monkeypatch, tmp_path, timeout_a
 
 def test_pyperformance_work_dir_includes_benchmark_variant(monkeypatch, tmp_path):
     sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
-    script = tmp_path / "pyperformance" / "data-files" / "benchmarks" / "bm_async_tree" / "run_benchmark.py"
+    script = (
+        tmp_path
+        / "pyperformance"
+        / "data-files"
+        / "benchmarks"
+        / "bm_async_tree"
+        / "run_benchmark.py"
+    )
     script.parent.mkdir(parents=True)
     script.write_text("# benchmark placeholder\n")
     monkeypatch.setenv("SOAC_WORK_DIR", str(tmp_path / "work"))
@@ -140,7 +153,9 @@ def test_pyperformance_work_dir_keeps_worker_task(monkeypatch):
     ) == ["none", "--task-groups", "--worker-task=0"]
 
 
-def test_pyperformance_work_dir_keeps_separate_worker_task_values(monkeypatch, tmp_path):
+def test_pyperformance_work_dir_keeps_separate_worker_task_values(
+    monkeypatch, tmp_path
+):
     sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
     script = (
         tmp_path
@@ -213,54 +228,114 @@ def test_pyperformance_worker_manifest_uses_root_work_dir(monkeypatch, tmp_path)
     ]
 
 
-def test_pyperformance_default_dependency_packages_extend_allow_list(
-    monkeypatch,
-    tmp_path,
+def test_pyperformance_strict_worker_preserves_flags_and_selects_startup_authority(
+    monkeypatch, tmp_path
 ):
     sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
-    benchmark_root = tmp_path / "pyperformance" / "data-files" / "benchmarks"
-    script = benchmark_root / "bm_tomli_loads" / "run_benchmark.py"
+    script = tmp_path / "stock" / "run_benchmark.py"
     script.parent.mkdir(parents=True)
-    script.write_text("# benchmark placeholder\n")
-    package_root = tmp_path / "venv" / "site-packages" / "tomli"
-    package_root.mkdir(parents=True)
-    monkeypatch.setenv("SOAC_MODULE_ENABLED", f"path:{benchmark_root}")
-    monkeypatch.setattr(sitecustomize.sys, "argv", [str(script)])
+    script.write_text("result = 1\n")
+    strict_script = tmp_path / "strict" / "project" / "run_benchmark.py"
+    deployment = str(tmp_path / "strict" / "authority" / "deployment.json")
+    execution = {
+        "deployment": deployment,
+        "source": {"stock_script": str(script), "strict_script": str(strict_script)},
+    }
     monkeypatch.setattr(
-        sitecustomize.importlib.util,
-        "find_spec",
-        lambda package_name: SimpleNamespace(
-            submodule_search_locations=[str(package_root)],
-            origin=str(package_root / "__init__.py"),
-        )
-        if package_name == "tomli"
-        else None,
+        sitecustomize.sys, "argv", [str(script), "--worker", "--loops=3"]
     )
-
-    sitecustomize._enable_default_dependency_packages()
-
-    assert os.environ["SOAC_MODULE_ENABLED"] == (
-        f"path:{benchmark_root},path:{package_root.resolve()}"
+    monkeypatch.setattr(
+        sitecustomize.sys,
+        "orig_argv",
+        [sys.executable, "-B", "-X", "utf8", str(script), "--worker", "--loops=3"],
     )
+    expected = [
+        sys.executable,
+        "-B",
+        "-X",
+        "utf8",
+        "-X",
+        f"soac_strict_config={deployment}",
+        "-m",
+        "soac_strict_worker",
+        str(strict_script),
+        "--worker",
+        "--loops=3",
+    ]
+    assert sitecustomize._strict_worker_command(execution) == expected
+    monkeypatch.setitem(sitecustomize.sys._xoptions, "soac_strict_config", deployment)
+    monkeypatch.setattr(
+        sitecustomize.sys,
+        "orig_argv",
+        [
+            sys.executable,
+            "-B",
+            "-X",
+            "utf8",
+            "-X",
+            f"soac_strict_config={deployment}",
+            str(script),
+            "--worker",
+            "--loops=3",
+        ],
+    )
+    assert sitecustomize._strict_worker_command(execution) == expected
+    monkeypatch.setitem(
+        sitecustomize.sys._xoptions, "soac_strict_config", "/different/config"
+    )
+    with pytest.raises(ValueError, match="different strict startup"):
+        sitecustomize._strict_worker_command(execution)
 
 
-def test_pyperformance_default_dependency_packages_can_be_skipped(
-    monkeypatch,
-    tmp_path,
+def test_pyperformance_strict_worker_directory_stays_stable_after_reexec(
+    monkeypatch, tmp_path
 ):
     sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
-    benchmark_root = tmp_path / "pyperformance" / "data-files" / "benchmarks"
-    script = benchmark_root / "bm_tomli_loads" / "run_benchmark.py"
-    script.parent.mkdir(parents=True)
-    script.write_text("# benchmark placeholder\n")
-    explicit_root = tmp_path / "explicit"
-    monkeypatch.setenv("SOAC_MODULE_ENABLED", f"path:{explicit_root}")
-    monkeypatch.setattr(sitecustomize.sys, "argv", [str(script)])
+    stock = tmp_path / "bm_example" / "run_benchmark.py"
+    strict = tmp_path / "overlay" / "project" / "run_benchmark.py"
+    monkeypatch.setenv("SOAC_PYPERFORMANCE_WORK_ROOT", str(tmp_path / "work"))
+    monkeypatch.setenv("SOAC_WORK_DIR", str(tmp_path / "work"))
+    monkeypatch.setattr(
+        sitecustomize,
+        "_strict_execution",
+        lambda: {"source": {"stock_script": str(stock)}},
+    )
+    monkeypatch.setattr(sitecustomize.sys, "argv", [str(stock), "--worker-task=0"])
+    directory = sitecustomize._benchmark_work_dir()
+    monkeypatch.setenv("SOAC_WORK_DIR", directory)
+    monkeypatch.setattr(sitecustomize.sys, "argv", [str(strict), "--worker-task=0"])
+    assert sitecustomize._benchmark_work_dir() == directory
 
-    if sitecustomize._using_default_module_allowlist():
-        sitecustomize._enable_default_dependency_packages()
 
-    assert os.environ["SOAC_MODULE_ENABLED"] == f"path:{explicit_root}"
+def test_missing_strict_worker_authority_is_fatal_before_original_code(tmp_path):
+    script = tmp_path / "run_benchmark.py"
+    executed = tmp_path / "ordinary-code-ran"
+    script.write_text(f"from pathlib import Path\nPath({str(executed)!r}).touch()\n")
+    hook = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "pyperformance_soac_sitecustomize"
+    )
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("SOAC_PYPERFORMANCE_")
+    }
+    environment.update(
+        SOAC_PYPERFORMANCE_ENABLE="1",
+        PYPERFORMANCE_RUNID="strict-worker-negative",
+        PYTHONPATH=str(hook),
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert result.returncode == 78
+    assert "startup failed" in result.stderr
+    assert not executed.exists()
 
 
 def test_pyperformance_measured_value_hook_pauses_once_before_values(
@@ -352,6 +427,11 @@ def test_pyperformance_worker_timing_records_exact_pyperf_benchmark_name(
     monkeypatch.setenv("SOAC_WORK_DIR", str(work_dir))
     monkeypatch.setenv(sitecustomize._WORKER_START_ENV, "60")
     monkeypatch.setattr(sitecustomize.atexit, "register", flush_callbacks.append)
+    monkeypatch.setattr(
+        sitecustomize,
+        "_strict_seal_evidence",
+        lambda: [{"module_name": "__main__", "sealed": True}],
+    )
 
     sitecustomize._install_measured_value_pause_hook(FakeWorkerTask)
     FakeWorkerTask()._compute_values([], 1)
@@ -366,3 +446,28 @@ def test_pyperformance_worker_timing_records_exact_pyperf_benchmark_name(
     assert records[0]["benchmark_name"] == "bm_async_tree"
     assert records[0]["pyperf_benchmark_name"] == "async_tree_cpu_io_mixed_tg"
     assert records[0]["opt_mode"] == "apply"
+    assert records[0]["sealed_strict_modules"] == [
+        {"module_name": "__main__", "sealed": True}
+    ]
+
+
+def test_measured_value_hook_rejects_unsealed_producer_before_timing(
+    monkeypatch, tmp_path
+):
+    sitecustomize = load_pyperformance_sitecustomize(monkeypatch)
+    calls = []
+
+    class FakeWorkerTask:
+        def _compute_values(self, *args, **kwargs):
+            calls.append("measured")
+
+    def unsealed():
+        raise RuntimeError("producer not sealed")
+
+    monkeypatch.setenv("SOAC_PYPERFORMANCE_MEASURE_READY_FILE", str(tmp_path / "ready"))
+    monkeypatch.setattr(sitecustomize, "_strict_seal_evidence", unsealed)
+    sitecustomize._install_measured_value_pause_hook(FakeWorkerTask)
+    with pytest.raises(RuntimeError, match="producer not sealed"):
+        FakeWorkerTask()._compute_values([], 1)
+    assert not calls
+    assert not (tmp_path / "ready").exists()

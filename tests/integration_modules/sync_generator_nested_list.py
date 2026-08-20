@@ -38,4 +38,5 @@ def peek_genexpr_progress():
 def validate_module(module):
     assert module.collect() == [1, 2, 3, 4]
     assert module.collect_tupled() == [(0, 1, 2)]
+    assert module.collect_single() == [3]
     assert module.peek_genexpr_progress() == [0, 1, 2]

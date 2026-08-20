@@ -1,9 +1,9 @@
-use pyo3::ffi;
 use pyo3::prelude::*;
 use soac_core::block_py::literal::{Literal, NumberLiteralValue};
 use soac_core::block_py::{
-    AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    ChildVisitable, ConstantExpr, NameLike, ParamDefaultSource, RuntimeName, StorageLayout,
+    AbruptKind, BlockArg, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
+    CallArgKeyword, ChildVisitable, ConstantExpr, NameLike, ParamDefaultSource, RuntimeName,
+    StorageLayout,
 };
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
@@ -148,11 +148,7 @@ impl ModuleCodegenConstants {
     }
 
     pub fn build_python_constants(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
-        self.build_python_constants_with_runtime_names(
-            py,
-            RuntimeNameConstantMode::ImportRuntime,
-            |_| Ok(None),
-        )
+        self.build_python_constants_with_runtime_names(py, RuntimeNameConstantMode::ImportRuntime)
     }
 
     pub fn build_python_constants_for_soac_runtime(
@@ -162,36 +158,15 @@ impl ModuleCodegenConstants {
         self.build_python_constants_with_runtime_names(
             py,
             RuntimeNameConstantMode::BootstrapSoacRuntime,
-            |_| Ok(None),
         )
-    }
-
-    pub(crate) fn build_python_constants_with_static_resolver(
-        &self,
-        py: Python<'_>,
-        is_soac_runtime: bool,
-        static_resolver: impl FnMut(ModuleConstantId) -> PyResult<Option<*mut ffi::PyObject>>,
-    ) -> PyResult<Vec<Py<PyAny>>> {
-        let runtime_name_mode = if is_soac_runtime {
-            RuntimeNameConstantMode::BootstrapSoacRuntime
-        } else {
-            RuntimeNameConstantMode::ImportRuntime
-        };
-        self.build_python_constants_with_runtime_names(py, runtime_name_mode, static_resolver)
     }
 
     fn build_python_constants_with_runtime_names(
         &self,
         py: Python<'_>,
         runtime_name_mode: RuntimeNameConstantMode,
-        static_resolver: impl FnMut(ModuleConstantId) -> PyResult<Option<*mut ffi::PyObject>>,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        materialization::build_python_constants(
-            self.values.as_slice(),
-            py,
-            runtime_name_mode,
-            static_resolver,
-        )
+        materialization::build_python_constants(self.values.as_slice(), py, runtime_name_mode)
     }
 
     pub fn len(&self) -> usize {
@@ -329,8 +304,16 @@ impl ModuleCodegenConstants {
     }
 
     pub fn constant_runtime_name_value(&self, constant_id: ModuleConstantId) -> Option<&str> {
+        self.constant_runtime_name(constant_id)
+            .map(RuntimeName::name)
+    }
+
+    pub(crate) fn constant_runtime_name(
+        &self,
+        constant_id: ModuleConstantId,
+    ) -> Option<RuntimeName> {
         match self.values.get(constant_id.0)? {
-            ModuleConstantValue::RuntimeName(name) => Some(name.name()),
+            ModuleConstantValue::RuntimeName(name) => Some(*name),
             ModuleConstantValue::Unicode(_)
             | ModuleConstantValue::Bytes(_)
             | ModuleConstantValue::Int(_)
@@ -413,6 +396,14 @@ impl ModuleConstantCollector {
     }
 
     fn collect_closure_storage_names(&mut self, storage_layout: &StorageLayout) {
+        if storage_layout
+            .block_parameter_roles
+            .iter()
+            .any(|binding| binding.role == BlockParamRole::AbruptKind)
+        {
+            self.constants
+                .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
+        }
         for slot in storage_layout
             .freevars
             .iter()
@@ -432,6 +423,7 @@ impl ModuleConstantCollector {
     }
 
     fn collect_function(&mut self, function: &BlockPyFunction<BlockPyModuleShape>) {
+        self.collect_class_binding_names(&function.scope);
         if let Some(storage_layout) = function.storage_layout() {
             self.collect_closure_storage_names(storage_layout);
             for name in storage_layout.stack_slots() {
@@ -454,10 +446,6 @@ impl ModuleConstantCollector {
         if let Some(storage_layout) = function.storage_layout().as_ref() {
             for name in storage_layout.stack_slots() {
                 self.constants.intern_unicode_bytes(name.as_bytes());
-                if name.starts_with("_dp_try_abrupt_kind_") {
-                    self.constants
-                        .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
-                }
             }
         }
         for block in &function.blocks {
@@ -469,6 +457,7 @@ impl ModuleConstantCollector {
     }
 
     fn collect_typed_function(&mut self, function: &BlockPyFunction<TypedBlockPyModuleShape>) {
+        self.collect_class_binding_names(&function.scope);
         if let Some(storage_layout) = function.storage_layout() {
             self.collect_closure_storage_names(storage_layout);
             for name in storage_layout.stack_slots() {
@@ -491,10 +480,6 @@ impl ModuleConstantCollector {
         if let Some(storage_layout) = function.storage_layout().as_ref() {
             for name in storage_layout.stack_slots() {
                 self.constants.intern_unicode_bytes(name.as_bytes());
-                if name.starts_with("_dp_try_abrupt_kind_") {
-                    self.constants
-                        .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
-                }
             }
         }
         for block in &function.blocks {
@@ -502,6 +487,14 @@ impl ModuleConstantCollector {
                 self.collect_typed_stmt(stmt);
             }
             self.collect_typed_term(&block.term);
+        }
+    }
+
+    fn collect_class_binding_names(&mut self, scope: &soac_core::block_py::CallableScopeInfo) {
+        if let Some(bindings) = &scope.class_bindings {
+            for slot in &bindings.node.slots {
+                self.constants.intern_unicode_bytes(slot.name.as_bytes());
+            }
         }
     }
 
@@ -523,7 +516,9 @@ impl ModuleConstantCollector {
                     self.collect_expr(exc);
                 }
             }
-            BlockTerm::Return(value) => self.collect_expr(value),
+            BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
+                self.collect_expr(value)
+            }
         }
     }
 
@@ -539,7 +534,9 @@ impl ModuleConstantCollector {
                     self.collect_typed_expr(exc);
                 }
             }
-            BlockTerm::Return(value) => self.collect_typed_expr(value),
+            BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
+                self.collect_typed_expr(value)
+            }
         }
     }
 
@@ -607,12 +604,13 @@ impl ModuleConstantCollector {
             {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
-                if op.name.id_str().starts_with("_dp_try_abrupt_kind_") {
+            }
+            InstrBlockPy::Load(op) => {
+                if let Some(binding) = &op.cell_binding {
                     self.constants
-                        .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
+                        .intern_unicode_bytes(binding.logical_name.as_str().as_bytes());
                 }
             }
-            InstrBlockPy::Load(_) => {}
             InstrBlockPy::Store(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
@@ -649,7 +647,40 @@ impl ModuleConstantCollector {
             InstrBlockPy::MakeFunctionWithClosure(op) => {
                 op.visit_children(self);
             }
-            InstrBlockPy::Del(_) | InstrBlockPy::CellRef(_) => {}
+            InstrBlockPy::ConstructClass(op) => op.visit_children(self),
+            InstrBlockPy::PrepareClassDecorator(op) => {
+                // Keyword labels are payloads, not expression children. The
+                // preparation emits the same raw keyword call as Call.
+                for keyword in &op.keywords {
+                    if let CallArgKeyword::Named { arg, .. } = keyword {
+                        self.constants.intern_unicode_bytes(arg.as_str().as_bytes());
+                    }
+                }
+                op.visit_children(self);
+            }
+            InstrBlockPy::ApplyClassDecorator(op) => op.visit_children(self),
+            InstrBlockPy::DiscardClassDecorator(op) => op.visit_children(self),
+            InstrBlockPy::DiscardClassConstructionCaptures(op) => op.visit_children(self),
+            InstrBlockPy::CompleteFunctionDefinition(op) => op.visit_children(self),
+            InstrBlockPy::ApplyFunctionDescriptor(op) => op.visit_children(self),
+            InstrBlockPy::NewAnnotationSet(op) => op.visit_children(self),
+            InstrBlockPy::SetupAnnotations(op) => op.visit_children(self),
+            InstrBlockPy::ConstructTypeParameterScope(op) => op.visit_children(self),
+            InstrBlockPy::SubscriptGeneric(op) => op.visit_children(self),
+            InstrBlockPy::SetFunctionTypeParameters(op) => op.visit_children(self),
+            InstrBlockPy::CreateTypeAlias(op) => op.visit_children(self),
+            InstrBlockPy::CreateTypeParameter(op) => op.visit_children(self),
+            InstrBlockPy::SetTypeParameterDefault(op) => op.visit_children(self),
+            InstrBlockPy::CheckAnnotationFormat(op) => op.visit_children(self),
+            InstrBlockPy::RecordAnnotation(op) => op.visit_children(self),
+            InstrBlockPy::ComprehensionInsert(op) => op.visit_children(self),
+            InstrBlockPy::BuildCollection(op) => op.visit_children(self),
+            InstrBlockPy::CallArgumentOp(op) => op.visit_children(self),
+            InstrBlockPy::PreparedCall(op) => op.visit_children(self),
+            InstrBlockPy::Del(_)
+            | InstrBlockPy::TakeOperand(_)
+            | InstrBlockPy::IteratorStep(_)
+            | InstrBlockPy::CellRef(_) => {}
         }
     }
 
@@ -740,12 +771,13 @@ impl ModuleConstantCollector {
             {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
-                if op.name.id_str().starts_with("_dp_try_abrupt_kind_") {
+            }
+            InstrTyped::Load(op) => {
+                if let Some(binding) = &op.cell_binding {
                     self.constants
-                        .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
+                        .intern_unicode_bytes(binding.logical_name.as_str().as_bytes());
                 }
             }
-            InstrTyped::Load(_) => {}
             InstrTyped::Store(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
@@ -769,7 +801,38 @@ impl ModuleConstantCollector {
             InstrTyped::DelItem(op) => op.visit_children(self),
             InstrTyped::MakeCell(op) => op.visit_children(self),
             InstrTyped::MakeFunctionWithClosure(op) => op.visit_children(self),
-            InstrTyped::Del(_) | InstrTyped::CellRef(_) => {}
+            InstrTyped::ConstructClass(op) => op.visit_children(self),
+            InstrTyped::PrepareClassDecorator(op) => {
+                for keyword in &op.keywords {
+                    if let CallArgKeyword::Named { arg, .. } = keyword {
+                        self.constants.intern_unicode_bytes(arg.as_str().as_bytes());
+                    }
+                }
+                op.visit_children(self);
+            }
+            InstrTyped::ApplyClassDecorator(op) => op.visit_children(self),
+            InstrTyped::DiscardClassDecorator(op) => op.visit_children(self),
+            InstrTyped::DiscardClassConstructionCaptures(op) => op.visit_children(self),
+            InstrTyped::CompleteFunctionDefinition(op) => op.visit_children(self),
+            InstrTyped::ApplyFunctionDescriptor(op) => op.visit_children(self),
+            InstrTyped::NewAnnotationSet(op) => op.visit_children(self),
+            InstrTyped::SetupAnnotations(op) => op.visit_children(self),
+            InstrTyped::ConstructTypeParameterScope(op) => op.visit_children(self),
+            InstrTyped::SubscriptGeneric(op) => op.visit_children(self),
+            InstrTyped::SetFunctionTypeParameters(op) => op.visit_children(self),
+            InstrTyped::CreateTypeAlias(op) => op.visit_children(self),
+            InstrTyped::CreateTypeParameter(op) => op.visit_children(self),
+            InstrTyped::SetTypeParameterDefault(op) => op.visit_children(self),
+            InstrTyped::CheckAnnotationFormat(op) => op.visit_children(self),
+            InstrTyped::RecordAnnotation(op) => op.visit_children(self),
+            InstrTyped::ComprehensionInsert(op) => op.visit_children(self),
+            InstrTyped::BuildCollection(op) => op.visit_children(self),
+            InstrTyped::CallArgumentOp(op) => op.visit_children(self),
+            InstrTyped::PreparedCall(op) => op.visit_children(self),
+            InstrTyped::Del(_)
+            | InstrTyped::TakeOperand(_)
+            | InstrTyped::IteratorStep(_)
+            | InstrTyped::CellRef(_) => {}
         }
     }
 
@@ -826,11 +889,100 @@ fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModuleCodegenConstants, ModuleConstantValue};
+    use super::{ModuleCodegenConstants, ModuleConstantValue, abrupt_kind_tag};
+    use soac_contracts::{DefinitionKind, ModuleContentId, SourceIdentity, SourceRange};
     use soac_core::block_py::{
-        ClosureInit, ClosureSlot, PreservedSlot, PreservedSlotStorage, StorageLayout,
+        AbruptKind, BlockTerm, ClosureInit, ClosureSlot, PrepareClassDecorator, PreservedSlot,
+        PreservedSlotStorage, StorageLayout,
     };
+    use soac_ir_blockpy::InstrBlockPy;
     use soac_ir_typed::lower_blockpy_module_to_typed;
+
+    #[test]
+    fn decorator_preparation_collects_keyword_labels_and_all_call_operands() {
+        let source = "def run():\n    return factory(argument, eq=value, **options)\n";
+        let mut module = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("decorator constant fixture should lower")
+            .blockpy_module;
+        let function = module
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "run")
+            .expect("fixture should contain run");
+        let construction_function = function.function_id;
+        let result = function
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                BlockTerm::Return(value) if matches!(value, InstrBlockPy::Call(_)) => Some(value),
+                _ => None,
+            })
+            .expect("fixture should return its ordinary keyword call");
+        let InstrBlockPy::Call(call) = result.clone() else {
+            unreachable!()
+        };
+        // This tests the constant collector's resolved operation shape, not
+        // runtime admission. No signed/native class authority is manufactured.
+        *result = PrepareClassDecorator::new(
+            SourceIdentity {
+                module: ModuleContentId::new("decorator_constants", 0),
+                lexical_qualname: "Item".into(),
+                source_range: SourceRange::new(0, source.len() as u32),
+                definition_kind: DefinitionKind::Class,
+            },
+            construction_function,
+            call.func,
+            call.args,
+            call.keywords,
+            true,
+            call.frame_namespace,
+        )
+        .into();
+        let typed_module = lower_blockpy_module_to_typed(module.clone());
+        for (kind, constants) in [
+            (
+                "BlockPy",
+                ModuleCodegenConstants::collect_from_module(&module),
+            ),
+            (
+                "typed BlockPy",
+                ModuleCodegenConstants::collect_from_typed_module(&typed_module),
+            ),
+        ] {
+            for name in ["eq", "factory", "argument", "value", "options"] {
+                assert!(
+                    constants
+                        .lookup_id(&ModuleConstantValue::Unicode(name.as_bytes().to_vec()))
+                        .is_some(),
+                    "{kind} preparation constants must include {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_control_spelling_does_not_create_a_fallthrough_constant() {
+        for name in ["ordinary", "_dp_try_abrupt_kind_user"] {
+            let source = format!("def f({name}):\n    return {name}\n");
+            let module = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("ordinary local constant fixture should lower")
+                .blockpy_module;
+            let typed = lower_blockpy_module_to_typed(module.clone());
+            for constants in [
+                ModuleCodegenConstants::collect_from_module(&module),
+                ModuleCodegenConstants::collect_from_typed_module(&typed),
+            ] {
+                assert!(
+                    constants
+                        .lookup_id(&ModuleConstantValue::Int(abrupt_kind_tag(
+                            AbruptKind::Fallthrough
+                        )))
+                        .is_none(),
+                    "ordinary source spelling is not a control declaration"
+                );
+            }
+        }
+    }
 
     #[test]
     fn closure_and_preserved_storage_names_are_available_to_unbound_codegen() {
@@ -844,6 +996,10 @@ mod tests {
             .find(|function| function.names.qualname == "run")
             .expect("closure-storage fixture should contain run");
         function.storage_layout = Some(StorageLayout {
+            generator_resume_abi: None,
+            block_parameter_roles: Vec::new(),
+            class_bindings: None,
+            expression_temporaries: Vec::new(),
             freevars: vec![ClosureSlot {
                 logical_name: "captured_value".to_string(),
                 storage_name: "_dp_free_captured_value".to_string(),
@@ -855,6 +1011,7 @@ mod tests {
                 init: ClosureInit::EmptyCell,
             }],
             preserved_slots: vec![PreservedSlot {
+                generator_control: None,
                 logical_name: "suspended_value".to_string(),
                 storage_name: "_dp_preserved_suspended_value".to_string(),
                 init: ClosureInit::Deferred,

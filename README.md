@@ -1,72 +1,116 @@
 # Repository Components
 
+The current milestone is authenticated offline `ty` contracts, actual runtime
+type/function binding and interpreter enforcement; see [OPT_GOAL.md](OPT_GOAL.md).
+Optimization and benchmarks are deferred. Under the 2026-08-24 (PDT)
+execution-compatibility clarification, SOAC's compiled and entry-interpreter
+paths preserve source semantics, safe ownership, required cleanup and installed
+contracts without matching CPython's transient reference counts or implicit
+finalizer/weakref schedule. The CPython backend uses ordinary CPython execution;
+its specialized bytecodes and supported C APIs still enforce contracts.
+The 2026-08-25 (PDT) amendments make this field-only runtime enforcement:
+annotations do not impose argument, return, or dataclass-factory checks.
+Selected storage writes remain checked regardless of their caller. SOAC
+traceback reconstruction, frame inspection, and CPython-compatible tracing,
+profiling and monitoring are excluded, including mandatory observer refusal.
+Ordinary CPython frames and observers are unchanged. Source identity, exception
+semantics, comprehension scoping, recursion safety and cleanup remain required;
+SOAC's internal compiler counters and diagnostic logging are separate facilities.
+
 ## Rust Crates
 
-- `build_support`
-  Shared build-script helpers for computing the SOAC build identity and linking
-  against the vendored CPython library. Crates with native Python or inspector
-  build steps use it from `build.rs`.
+See [Module Lifecycle](doc/MODULE_LIFECYCLE.md) for the complete dataflow and
+generated dependency graph. Names below are Cargo package names.
 
-- `soac-config`
+### Important Crates
+
+- `soac_config`
   Central typed configuration for SOAC environment variables, logging, work
   directories, optimization modes, and runtime feature flags. Runtime, JIT,
   inspector, and benchmark entrypoints should parse environment state through
   this crate instead of re-reading raw variables.
 
-- `soac-core`
+- `soac_core`
   Core data model crate for BlockPy IR, profile/counter dump formats, runtime
   function IDs, and structured pretty-printing helpers. It owns the serialized
   shapes that are shared between lowering, optimization, JIT, and inspection.
 
-- `soac-cpython`
-  Embedding and test-support utilities for the vendored CPython build. It
-  locates the repository, configures Python home/search paths, stages extension
-  modules for tests, and initializes Python for Rust-side integration tests.
+- `soac_contracts`
+  Owned strict-language policy and type-fact proposals, deterministic module
+  shards, signed generation manifests, and source/configuration/dependency
+  verification. A verified proposal is not a runtime capability; actual
+  construction and sealing must still enforce it. The offline checker is not a
+  dependency of this crate.
 
-- `soac-driver`
-  Codegen-preparation orchestration layered on top of `soac-lowering`. It owns
+- `soac_ir_blockpy`
+  Resolved pre-optimization BlockPy instruction/module shapes, semantic
+  instruction identities, constructor entry preparation, and IR validation.
+
+- `soac_ir_typed`
+  Typed instructions, value facts, resolved field/call operations, and the v3
+  plan/emission vocabulary consumed by optimization and code generation.
+
+- `soac_driver`
+  Codegen-preparation orchestration layered on top of `soac_lowering`. It owns
   pre-optimization module-cache lookup/store, prepared codegen facts,
   env-configured instrumentation, and cache path/metadata helpers used by the
   runtime and optimizer.
 
-- `soac-inspector`
-  Local web inspector and command-line tooling for lowering, counter dumps,
-  optimization plans, CLIF/VCode rendering, and benchmark artifact analysis. It
-  is the main crate for interactive and offline inspection workflows.
+- `soac_jit`
+  Actual strict module/function/type ownership, authenticated interpreter
+  loading, protected field writes, and class admission. Its retained JIT branch
+  turns resolved BlockPy into Cranelift code and manages counters, constants,
+  guards, and deoptimization; interpreter enforcement does not require it.
 
-- `soac-jit`
-  CPython-facing JIT implementation that turns resolved BlockPy functions into
-  Cranelift code, manages module runtime state, counters, constants, guards,
-  deopt paths, and optional precompiled function loading.
-
-- `soac-jit-runtime`
-  Standalone, ABI-shaped runtime helper crate intended to be compiled to CLIF
-  and inlined into generated code. It stays close to raw CPython layouts and
-  keeps hot helper behavior visible to codegen review.
-
-- `soac-lowering`
+- `soac_lowering`
   Parser-to-BlockPy lowering pipeline, transformation passes, pass tracking,
   source fixtures, validation, and structured render helpers. It is where raw
   Python syntax is turned into progressively more resolved compiler IR, and it
   owns the public lowering entrypoints.
 
-- `soac-macros`
-  Procedural macros used by the lowering and IR layers to reduce repetitive
-  enum delegation and match boilerplate. It should stay mechanical and avoid
-  owning compiler semantics.
-
-- `soac-opt`
+- `soac_opt`
   Optimization planning from profile evidence and cached BlockPy modules. It
-  owns v3 plan/emission data, specialization decisions, and
-  optimization-family status reporting.
+  owns fact analyses, ownership/local-environment plans, typed rewrites,
+  specialization decisions, and optimization-family status reporting.
 
-- `soac-pyo3`
-  The `_soac_ext` Python extension module. It bridges CPython import-hook
-  callbacks into SOAC lowering, JIT module creation, and runtime execution.
+- `soac_instrument`
+  Profile/verify counter definitions and typed instrumentation. Counter
+  observations select candidates; they do not grant strict runtime authority.
 
-- `bench/pystone-rust`
-  Rust pystone benchmark package used for baseline or comparison work around
-  the Python pystone benchmark. It is outside the main SOAC workspace members.
+- `soac_pyo3`
+  The `_soac_ext` Python extension module. It bridges startup-authenticated
+  loading into ordinary CPython execution or the retained SOAC lowering/JIT
+  path, and exposes runtime diagnostics without granting execution authority.
+
+### Utility / Helper Crates
+
+- `build_support`
+  Shared build-script identity and vendored-CPython linking helpers.
+
+- `soac_cpython`
+  Embedding and test support for the selected vendored interpreter, including
+  native library/search paths and Rust-side Python initialization.
+
+- `soac_source`
+  Range-preserving validation of Ruff source tokens before lowering or offline
+  literal inference. `validate_source_literals` rejects unsupported surrogate
+  escapes with `UnsupportedSurrogateEscape`; it does not change ordinary
+  CPython strings or add parser dependencies to `soac_contracts`.
+
+- `soac_jit_runtime`
+  ABI-shaped, raw-CPython helpers compiled to CLIF for inlining into generated
+  code. It has no PyO3 wrapper dependency.
+
+- `soac_macros`
+  Mechanical procedural macros for IR delegation and match boilerplate.
+
+- `soac_inspector`
+  The local web inspector and CLI tools for passes, typed plans, counters,
+  CLIF/VCode, and benchmark artifacts. Inspection does not authorize execution.
+
+`bench/pystone-rust` is a separate benchmark package, outside the main workspace.
+The pinned `tools/ty` exporter also has its own workspace and lockfile; it is
+not linked into the runtime.
 
 ## Codex Skills
 
@@ -111,15 +155,89 @@
   Runs the SOAC pystone profile/verify/apply benchmark workflow and summarizes
   the generated `work/bench/` result directory.
 
+- `soac-selfdoc`
+  Refreshes component/CLI/skill inventories and the source-grounded module
+  lifecycle and crate dependency graph.
+
 - `summarize-cpython-failures`
   Summarizes CPython regrtest logs, computes file and test-case totals, and
   groups failures by likely root cause.
 
+## Offline strict-type analysis
+
+Interpreter-enforced strict contracts are under implementation; optimization
+and benchmarks are deferred until separately requested. The complete contract
+and acceptance matrix are in `doc/TYPE_DRIVEN_OPTIMIZATION.md`. Current progress
+and pending evidence are recorded in
+`doc/optimization-attempts/2026-08-21-type-driven-strict-contracts.md`.
+
+Run `just ty-prepare` in the Ubuntu VM to verify the exact committed Ruff/ty
+source at the tracked `vendor/ruff` gitlink. Its configured origin is
+`https://github.com/adamh-oai/ruff.git`; checker changes are logical commits in
+that repository, not an applied SOAC patch series. Verification compares raw
+checkout bytes, modes and index entries against an independently checked-out
+Git tree. It neither fetches nor repairs sources, and rejects partial/promisor
+clones and untracked checker files. The one upstream notebook symlink previously
+materialized by archive preparation is now an explicit regular-file portability
+commit. Preparation emits the actual source path and commit identity as JSON.
+
+`just ty -- ...` builds and runs the separate offline semantic exporter. It uses
+the actual vendored checker, accepts an explicit `[tool.soac.strict]` project
+policy and selected CPython 3.15 executable, and publishes authenticated module
+shards without importing project modules. See [the offline tool guide](tools/ty/README.md)
+for signing-key creation, `check` options, deployment authority, dependency
+invalidation, and focused tests. `just ty --debug-build -- ...` uses the isolated
+debug build; `just ty --update-lockfile` refreshes workspace/path dependencies in
+its separate lockfile while preserving compatible locked external versions.
+Use `just ty --debug-build --test-upstream ty_project --` (or
+`ty_module_resolver`) for vendored upstream library tests. This uses their pinned
+lockfile and verifies the committed source before and after the test run.
+The root compiler workspace and exporter resolve Ruff crates from that same
+submodule. Checker identity includes the actual gitlink, tree and checkout
+digest; exporter identity includes its source, dependency locks and verifier.
+The build-only `SOAC_TY_RUFF_REVISION` value is supplied by the verified runner
+from that gitlink; it is not an environment override for source selection.
+Source verification/use holds a shared checker-source lock, distinct from the
+strict-fixture build-serialization lock. Stop consumers before changing the pin
+or checkout. Regenerate dependency locks in a mutable review checkout, preserve
+compatible external versions, and commit generated locks separately at the top.
+Source preparation, authenticated artifact loading, and runtime
+construction/sealing remain separate boundaries: a signed type fact is not a
+live runtime capability.
+
+The current source targets type-artifact schema 6 and strict-contract version 2.
+Runtime parameter/return policy keys are removed, not accepted as disabled
+aliases. Static signatures remain checker facts; selected field writes are the
+runtime value invariant. Regenerate older publications for the new policy;
+the ongoing native/runtime migration must be built and validated before this
+source checkpoint is a working-runtime claim. Direct bases and logical MRO
+entries distinguish source-class references from semantic builtin types; an
+alias of builtin `object` is not identified by its spelling. Nominal leaves
+explicitly belong to a source function annotation or an exact field declaration; inherited fields
+retain their original declaring class and assignment. Field annotation provenance
+must be present even when explicitly unresolved (`null`). Schema-1 through
+schema-5 publications must be regenerated, not loaded with inferred defaults.
+
+`soac.strict.StrictMutationError` and `StrictRuntimeUnavailableError` are aliases
+of the native per-interpreter exception classes, also exported from `soac`.
+Importing them does not enable strict mode. Missing or stale startup authority
+raises the native `ImportError` subclass without changing it into an unrelated
+Python-defined exception.
+
+For native-linked Cargo commands in the guest, use `just --command cargo ...`.
+This supplies the same selected out-of-tree CPython executable and library
+paths as the test recipes; a bare Cargo invocation may instead discover the
+source directory and try to link a nonexistent in-source `libpython`.
+
 ## CLI Inspection Tools
 
 Most command-line inspection tools live in `soac_inspector` and can be run as
-`cargo run -p soac_inspector --bin <tool> -- ...`. The offline optimization
-planner lives in `soac-opt`.
+`cargo run -p soac_inspector --bin <tool> -- ...` inside the Ubuntu VM.
+Optimization planning is library code, not a separate `soac_opt` CLI.
+
+- `soac-ty` (separate workspace; `just ty -- ...`)
+  Analyzes strict source offline and publishes authenticated type-artifact
+  generations and startup descriptors. It never imports the analyzed modules.
 
 - `soac_inspector`
   Starts the local web inspector server. It serves the interactive pass,
@@ -145,10 +263,14 @@ planner lives in `soac-opt`.
   Reads a `profile.bin` or `verify.bin` counter dump and prints counters,
   key-layout rows, specialization summaries, or JSON.
 
+- `print_blockpy_module_cache`
+  Reads and displays a serialized pre-optimization BlockPy cache for inspection.
+  Cache contents are not trusted strict executable input.
+
 - `precompile_blockpy`
   Uses profile counters and cached BlockPy modules to compile referenced
-  modules into object files and link an offline shared library for
-  `SOAC_PRECOMPILED_LIBRARY`.
+  modules into object files and link an offline shared library for binary
+  inspection. These artifacts do not authorize runtime execution.
 
 - `annotate_cranelift_perf`
   Correlates perf samples with SOAC JIT basic-block maps for a benchmark result
@@ -156,16 +278,29 @@ planner lives in `soac-opt`.
 
 # Setup
 
+## Execution environment
+
+All testing and other project command execution must run inside the Lima
+`ubuntu24` VM, in `/home/adamh.guest/soac` (or the corresponding guest path for
+the active worktree). This includes setup, dependency installation, builds,
+checks, formatting, code generation, Python repros, tests, benchmarks,
+profiling, debugging, and development servers. Run the setup commands below
+inside that guest, not on the macOS host.
+
+VCS operations may run on the host or in the VM. Host commands that launch work
+in the guest are also permitted. Do not substitute host execution when the VM
+is unavailable. See [the execution policy in AGENTS.md](AGENTS.md#execution-environment-ubuntu-vm).
+
 ## Ubuntu 24.04 prerequisites
 
 Install the C compiler and build tools, the libraries needed by the vendored
-CPython build, Git, `just`, Rust's toolchain manager, and `gdb` for test-hang
-diagnostics:
+CPython build, Git, `just`, Rust's toolchain manager, `gdb` for test-hang
+diagnostics, and Graphviz for the repository dependency diagram:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  build-essential curl gdb git just pkg-config rustup \
+  build-essential curl gdb git graphviz just pkg-config rustup \
   libbz2-dev libffi-dev libgdbm-compat-dev libgdbm-dev \
   liblzma-dev libncurses-dev libnss3-dev libreadline-dev \
   libsqlite3-dev libssl-dev libzstd-dev tk-dev uuid-dev zlib1g-dev
@@ -219,12 +354,14 @@ not apply them to a shared machine or production system.
 
 ## Initialize and build the checkout
 
-The vendored CPython submodule must be initialized and built before
-`just setup-dev-env`; the setup recipe expects an existing shared interpreter
-at `vendor/cpython/python`:
+The vendored CPython and Ruff submodules must be initialized before
+`just setup-dev-env`. Each tracked Git submodule pointer is the source revision
+to use; the host and guest must see the same source files at `vendor/cpython`
+and `vendor/ruff`. CPython must also be built before setup.
+On a case-sensitive checkout, the default is an in-source shared-library build:
 
 ```bash
-git submodule update --init --recursive vendor/cpython
+git submodule update --init --recursive vendor/cpython vendor/ruff
 just build-python
 just setup-dev-env
 just test-all
@@ -233,28 +370,272 @@ just test-all
 CPython must be built on a **case-sensitive filesystem** because its `Python/`
 source directory and `python` executable must coexist. A macOS checkout shared
 into a Linux VM over virtiofs usually remains case-insensitive. For that setup,
-bind-mount a guest-local ext4 directory over the submodule path before
-initializing or building it:
+keep the sources on the shared mount and select a separate guest-local ext4
+build directory. Run these commands **inside the Ubuntu guest**:
 
 ```bash
-mkdir -p "$HOME/.local/share/soac/cpython" vendor/cpython
-sudo mount --bind "$HOME/.local/share/soac/cpython" vendor/cpython
-git submodule update --init --recursive vendor/cpython
-just build-python
+git submodule update --init --recursive vendor/cpython vendor/ruff
+CPYTHON_BUILD_DIR="$HOME/.local/share/soac/cpython-build" just build-python
+just cpython-info
 just setup-dev-env
 ```
 
-Add the bind mount to the guest's `/etc/fstab` if it should survive VM
-restarts. The workflows in `AGENTS.md` also require Jujutsu for version-control
+A successful build saves its source/build selection in ignored
+`work/cpython-selected-build.json`. Later ordinary `just` commands reuse it
+without changing the guest's login configuration. To select an existing
+verified build, use `just select-cpython-build /absolute/build/directory`.
+Explicit path environment variables override the saved selection; a saved
+selection for another source checkout is not reused.
+
+Keep selected external builds in persistent guest storage so a VM restart does
+not remove the interpreter and break its dependent virtual environments. Saving
+a selection rejects resolved paths beneath `/tmp`, `/var/tmp`, or the configured
+system temporary directory, including symlink aliases. Checkout-owned build and
+test-fixture paths remain allowed because their lifetime is already tied to the
+checkout. `$HOME/.local/share/soac/builds` is a suitable persistent guest location.
+Guest disk and `/tmp` free-space reports do not represent independent host
+physical capacity: the VM disk consumes host storage. Check both filesystems
+before moving caches, include the peak space needed while both copies exist,
+and never start a cache copy when the host cannot hold that peak.
+
+To build a candidate without switching that saved selection, use a fresh
+`CPYTHON_BUILD_DIR` with `just build-python optimized --no-select` (or
+`development --no-select` / `stackref-debug --no-select`). It performs the same
+source, native-extension and provenance checks;
+`just select-cpython-build /absolute/candidate/build` makes
+the later switch explicit. This does not keep an old build valid after its
+shared source or tracked source commit changes: stop native consumers before a
+source promotion, and do not mix new headers with the old interpreter/library.
+
+Do not bind-mount a separate source checkout over `vendor/cpython`: that hides
+host edits and permits the source revisions to diverge. Existing setups that
+used the old source overlay must preserve both checkouts before removing it.
+`scripts/migrate_cpython_shared_source.py stage` takes the backing
+`--guest-source` directory and the separately verified `--host-revision`. It
+stages a clean copy of the repository's pinned source under ignored `work/`
+without changing either original. After reviewing that staging record and
+stopping source/build users, its explicit `promote` command backs up
+`/etc/fstab`, removes only the recorded source bind, unmounts without force,
+preserves the old host tree, and promotes the shared source. The original
+guest source/build is retained. Promotion requires permission to change the
+mount and fstab; rebuilding uses a **new** guest-local build directory.
+
+`vendor/cpython` is pinned to the complete native implementation commit from
+`https://github.com/adamh-oai/cpython.git`. Maintain native changes as logical
+commits there; generated interpreter cases belong in a separate top commit with
+the regeneration commands. There is no maintained patch manifest or applying
+build prerequisite. `just prepare-cpython` and `just prepare-cpython --check`
+both verify without fetching, resetting, applying patches or changing sources.
+The common committed-source verifier checks raw bytes, executable/link modes,
+and index entries against immutable Git objects using canonical Git attribute
+conversion. Local filters, index flags or uncommitted ignore rules cannot hide
+source changes. CPython permits only its explicit build receipts and outputs
+ignored by committed rules; those build outputs are not source authority.
+In Jujutsu workspaces, the pin comes from the recorded `@` tree, not Git's
+parent index. A failed Jujutsu query fails verification; plain Git checkouts use
+the resolved index pin. This JJ version does not snapshot submodule updates:
+integrate the gitlink change into the JJ revision and verify its actual tree
+before building, rather than relying on `git add` or submodule checkout alone.
+
+Pin-query failures retain the bounded, escaped command, return code and output,
+plus the checkout and submodule paths; they never retry against the Git index.
+The checker runner identifies the verification/build/execution phase. Each
+strict integration fixture keeps its own combined checker log under
+`work/logs/strict-integration-checker-build-*.log`, including failed and timed-out
+invocations, so a later worker cannot overwrite the original diagnostic.
+
+Build provenance schema 2 records the actual gitlink, tree, checkout digest,
+build paths, mode and executable/library identity. Legacy patch-generation
+receipts are rejected before starting the old interpreter: rebuild rather than
+restamping a receipt. The lock remains under `work/cpython-patches/` solely to
+interoperate with earlier in-flight preparers; neighboring old manifests are
+historical evidence, not authority.
+
+CPython's `sys.version` revision label is compiled build metadata, not the
+source-verification result. Its current `GITTAG` command uses `--git-dir`
+without selecting the source worktree, so an out-of-tree build can report
+`-dirty` even when the native checkout matches its gitlink exactly. Use the
+canonical source and schema-2 runtime checks; that label never permits ignoring
+a failed source check. Future version generation should explicitly select the
+source worktree with `git -C` or `--work-tree`. Do not restamp provenance or
+rebuild a verified runtime solely to change this label.
+
+Use `just regenerate-cpython-cases --check` to regenerate and compare the
+generated-only pinned top commit in a disposable checkout. For reviewed native
+development, use `--source /shared/staging/checkout --revision <logical-commit>
+--output work/cpython-generated/<review-name>` to emit generated files for a
+separate commit. This never edits, commits or promotes the selected source.
+
+The 2026-08-23 PDT migration keeps both repositories' new commits local at the
+user's request. Independent local checkout reproduction is required; fetching
+these new pins through the configured remotes or CI remains unverified until
+publication is separately requested. Preserve the local repositories meanwhile.
+
+`just test-source-tooling` runs the focused source/pin/build-wrapper tests with
+guest system Python and the repository's pytest version, without requiring a
+valid selected native build. It is a bootstrap tooling gate, not native
+enforcement validation or a substitute for `just test-all`. It retains a unique
+log under `work/logs/` for every run. Git and Jujutsu are required for its real
+repository fixtures.
+
+`just build-python` (equivalently `just build-python optimized`) builds shared,
+nondebug CPython with PGO/LTO. For faster native iteration, use a separate
+guest-local build directory with `just build-python development`: it keeps the
+same nondebug shared ABI but omits PGO/LTO. The selected mode is part of the
+build provenance. Benchmark and pyperformance entrypoints require an
+`optimized` build; development and stackref-debug results are not performance
+evidence.
+
+Use the nondebug `development` mode for iterative Rust/JIT checks. The JIT's
+generated refcount support rejects `Py_REF_DEBUG`, so a StackRef-debug native
+build is not a supported interpreter for `cargo check -p soac_jit --tests` or
+Rust/JIT execution. Keep the guard and use StackRef-debug for native C/Python
+reference-handle tests instead.
+
+CPython prepare/build commands sharing a source directory must run serially,
+even with separate build directories or modes. A build holds the source lock;
+concurrent source/runtime preflights fail explicitly rather than checking a
+generation while it may change. Wait for the build instead of bypassing the lock.
+
+Guest-local build directories improve I/O isolation, but do not add physical
+disk capacity: the sparse Lima disk and shared checkout use the same host
+volume. Check free space on both before a large build or copy. A cache move
+implemented as copy-then-delete temporarily needs the entire duplicate plus a
+reserve. Host-deleted shared files may remain allocated while VirtioFS holds
+them open; verify actual reclaimed space. After disk-full/I/O errors, pause
+project execution and revalidate source/build hashes before using their results.
+
+For native reference-handle diagnostics, use a fresh guest-local build directory:
+
+```bash
+CPYTHON_BUILD_DIR="$HOME/.local/share/soac/builds/stackref-debug" just build-python stackref-debug --no-select
+CPYTHON_BUILD_DIR="$HOME/.local/share/soac/builds/stackref-debug" python3 scripts/cpython_environment.py check-runtime --require-mode stackref-debug
+```
+
+`stackref-debug` configures `--with-pydebug`, explicitly sets
+`CPPFLAGS=-DPy_STACKREF_DEBUG=1`, uses `-O0 -g`, and omits PGO/LTO. This mode
+deliberately replaces ambient `CPPFLAGS`; optimized and development retain
+their existing environment handling. Neither `Py_DEBUG` alone nor `-X dev`
+proves native StackRef handle checking is enabled.
+
+Signal/watchdog traceback readers cannot consult the debug handle table or
+require an attached thread state. GIL-enabled StackRef-debug frames therefore
+carry a diagnostic-only borrowed executable pointer, atomically published and
+cleared with the existing code support. It adds no Python owner or GC edge;
+normal execution and traversal still use checked handles. This changes only
+the debug frame size, so native probes must use the matching build's layout
+query rather than a fixed header size. Diagnostic reads retain CPython's
+best-effort freed-frame checks, not a general concurrent-snapshot guarantee.
+
+Before publishing provenance or selecting a debug build, the actual candidate
+interpreter runs an isolated proof of its executable, source/build paths,
+loaded libpython identity, debug configuration and `_Py_stackref_*` debug-only
+exports. The probe looks up exports without invoking handle operations. On
+Linux it checks the mapped `INSTSONAME` and its `LDLIBRARY` hard-link identity.
+The versioned `stackref_debug` proof is recorded and rechecked only for this
+mode; existing nondebug runtime records keep their shape and remain subject to
+their unchanged freshness checks. `just cpython-info` includes the proof for a
+verified debug build. No debug interpreter is accepted by optimized benchmark
+readiness. A debug build does not itself prove that native reference controls
+pass; those must run separately with matching native headers and compile flags.
+
+All modes verify the selected committed source before configuring
+and hold the source lock throughout the build. After configure creates
+`pyconfig.h`, they syntax-check public `Python.h` as C++ using `CXX` from that
+build's Makefile, before compilation or PGO training. A header failure stops
+the build without publishing provenance or changing the saved selection.
+They record the source
+gitlink revision, tree and actual checkout fingerprint,
+compiled source/build paths, and interpreter/shared-library identity in
+`.soac-cpython-build.json` inside the build directory. Runtime preflights reject
+a hidden source overlay, a stale submodule checkout, a mismatched build path,
+or sources/artifacts changed since the recorded build. A preexisting build
+without this record needs one `just build-python` rebuild. `just cpython-info`
+reports the source pin, mount, selected interpreter, and verification result
+without claiming that an unverified existing binary matches the source.
+The build also imports `_ctypes`, `_testcapi`, and `_testinternalcapi` before
+publishing its provenance or selecting the interpreter: a successful `make`
+alone does not show that CPython's extension modules are usable.
+
+After editing CPython bytecode definitions, use
+`just regenerate-cpython-cases --source <shared-staging-checkout>
+--revision <logical-commit> --output work/cpython-generated/<review-name>` to
+regenerate review files in a disposable guest checkout of the exact logical
+commit, without editing selected sources. Commit those generated files in a
+separate top commit in CPython and record the regeneration command in its
+message. `just regenerate-cpython-cases --check` verifies the pinned
+generated-only top commit against its logical parent. There is no maintained
+generated patch file to apply.
+
+The workflows in `AGENTS.md` also require Jujutsu for version-control
 operations; install it with `cargo install --locked jj-cli` if `jj` is not
 already available on the machine where those operations run. The pystone
-`just benchmark` recipe itself runs `jj status` and `jj log`, so running that
-benchmark inside the Ubuntu guest requires `jj` to be installed in the guest,
-even when Jujutsu is already installed on the macOS host.
+`just benchmark` recipe itself runs `jj status` and `jj log`. Since benchmarks
+run inside the Ubuntu guest, `jj` must also be installed in the guest even
+when other VCS operations run on the macOS host.
+
+The raw CLIF input crate, `soac_jit_runtime`, is deliberately separate from the
+main Cargo workspace. Use `just test-jit-runtime` for its focused tests;
+`just test-all` includes them as a serial stage. Both `just fmt-rust` and
+`just fmt-rust-check` accept that package alongside ordinary workspace packages.
+After a successful build, `just test-all` attempts workspace Rust tests, raw
+runtime tests, and pytest in that order even if an earlier test stage fails. It
+records each stage's status and returns the first nonzero status; a failed
+build still prevents tests from starting. The workspace Rust stage uses
+`--no-fail-fast` to report later test-target failures too, with one compiler job
+and one test-harness thread. Concurrent large debug-test linkers
+can otherwise exhaust the 12 GiB Lima VM before any tests execute.
+For focused Cargo commands from a fresh guest launcher, use
+`just --command cargo ...` so the selected CPython executable and library
+directory are exported; the shared `vendor/cpython` directory is source, not
+the selected out-of-tree build.
+Extension installation and the fast runtime recipes ask Cargo for its actual
+target directory, including `CARGO_TARGET_DIR` and Cargo configuration. Embedded
+Rust tests use the profile directory recorded by Cargo when their binary was
+built, not a runtime environment override or an assumed `target/debug`. Build
+`soac_pyo3` in that same target/profile before embedded tests; a missing matching
+extension is an explicit setup failure, even if an older staged library exists.
+
+Runtime integration tests use `tests._strict_integration.create_strict_project`
+to analyze explicitly selected source modules with the pinned offline checker,
+then `StrictProject.run` to launch the selected interpreter with the generated
+native startup configuration. Selected sources must include the real
+`from __future__ import strict` opt-in; the shared helper does not insert it.
+For delimiter-based cases, `run_case` also
+checks actual module-seal/source/generation diagnostics before executing the
+validation tail outside the sealed module. `SOAC_MODULE_ENABLED` and test mode
+flags do not grant strict authority. Keep ordinary controls on
+`tests._integration.stock_module`; the old in-process `soac`/`entry` helpers
+fail explicitly until their callers are migrated.
+
+An integration validation tail either declares one synchronous
+`validate_module(module)` or `validate(module)` function, which the dispatcher
+calls exactly once, or contains ordinary top-level assertions. Do not mix both
+forms. Validation mode flags are available only in the validation globals, not
+as mutations of the actual module. Unexpected failures remain failures;
+unsupported behavior needs an explicit, reviewed per-case expectation rather
+than a global exception-message-to-xfail rule.
+The [strict test migration inventory](doc/STRICT_TEST_MIGRATION.md) records the
+legacy coverage gaps, reviewed cohorts, and unresolved compatibility cases.
+
+The development dependency group includes Pydantic, Django, and SQLAlchemy for
+the real framework-fallback compatibility tests. These cover model construction,
+descriptors, validation/coercion, dictionary replacement, and instrumentation
+inside an authenticated strict containing module; the frameworks' own
+implementations remain untransformed.
+After changing these dependencies, regenerate `soac_py/uv.lock` with
+`just --command uv lock --project soac_py --python .venv/bin/python`, then run
+`just update-venv` once with network access before offline test refreshes.
+Native source builds in `.uv-cache` are excluded from the SOAC Cargo workspace;
+give concurrent dependency builds a separate `CARGO_TARGET_DIR`.
+The Django test dependency stays on the 5.2 LTS line: Django 6.1's ordinary
+startup calls `inspect.getfullargspec(annotation_format=...)`, which the pinned
+CPython 3.15 alpha does not yet provide. This is a stock-baseline limitation,
+not a strict-runtime fallback result.
 
 Lima does not automatically copy host package-index credentials or proxy
-settings into guest commands. When benchmark dependencies need that host
-configuration, start the guest command from the host with:
+settings into guest commands. Use the repository helper to launch project
+commands from the host and forward the required configuration:
 
 ```bash
 python3 scripts/run_lima_with_host_environment.py \
@@ -319,6 +700,32 @@ exports are intentionally omitted here.
 
 ## Local Tooling
 
+- `CPYTHON_SOURCE_DIR=/path/to/shared/pinned-cpython`
+  Optional explicit source checkout, defaulting to `vendor/cpython`. The
+  selected checkout must match the repository's tracked submodule revision.
+  This is useful for a separately staged shared source tree or build worktree;
+  it does not fix or hide an existing overlay on `vendor/cpython`.
+  `just cpython-info` reports both the selected source mount and the vendored
+  source mount. Stdlib resolution and embedded Python use the selected source.
+
+- `CPYTHON_BUILD_DIR=/guest-local/path/cpython-build`
+  Build directory for `just build-python`. An explicit `CPYTHON_LIB_DIR` is
+  the next fallback; otherwise the repo-local saved selection is reused when
+  it matches the selected source, then `CPYTHON_SOURCE_DIR` is the fallback.
+  Sources remain in the selected source checkout; use a case-sensitive
+  guest-local directory when that checkout is shared from macOS. Successful
+  builds and `just select-cpython-build` save the selection under ignored
+  `work/`, so later guest commands need no repeated export or login changes.
+
+- `CPYTHON_BIN=/path/to/python`, `CPYTHON_LIB_DIR=/path/to/build`
+  Optional explicit interpreter and shared-library/build directory overrides.
+  They default to `CPYTHON_BUILD_DIR/python` and `CPYTHON_BUILD_DIR`.
+  The selected paths flow through venv creation, tests, benchmarks, Rust
+  linking, and embedded-Python extension-module lookup. `build-python` requires
+  its normal adjacent executable/library layout; runtime preflights verify
+  that the interpreter was built from the current shared source and selected
+  library directory.
+
 - `SOAC_PARENT_REPO=/path/to/parent/checkout`
   Optional override for `just setup-dev-env` inside a jj worktree. The recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
@@ -327,11 +734,11 @@ exports are intentionally omitted here.
   and `.xdg/`.
 
 - `SOAC_PRECOMPILED_LIBRARY=/path/to/libsoac_precompiled.so`
-  Optional runtime source for offline-precompiled direct function bodies. When
-  set, SOAC loads the shared library once, looks up direct-entry symbols by
-  module name, source hash, and function id, patches module-constant pointer
-  slots for matching modules, and falls back to normal lazy JIT when a function
-  symbol is missing.
+  Retired. Any present value, including an empty value, is rejected; unset the
+  variable. The old library lookup did not authenticate strict template,
+  policy, or native ABI identity. Neither executable entries nor cached native
+  object images from these libraries are loaded by the runtime. Offline object
+  emission remains available for inspection, not as an execution cache.
 
 - `UV_OFFLINE=1`
   Normal test and benchmark recipes set this for uv-backed venv refreshes after
@@ -348,16 +755,18 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 
 - `SOAC_MODULE_ENABLED=path:/absolute/or/relative/root[,path:/another/root]`
   In `def _module_is_enabled`, at
-  [soac_py/src/soac/import_hook.py:39](/home/adam/project/soac-profile/soac_py/src/soac/import_hook.py#L39),
+  [soac_py/src/soac/import_hook.py](soac_py/src/soac/import_hook.py),
   restrict the import hook to resolved source paths under the listed
-  file-tree roots. When unset, an installed import hook attempts to
-  transform every transformable Python source import. Compiler-owned
-  `soac` and `soac.*` modules stay transform-eligible regardless of this
-  allow-list so runtime helpers remain available to optimizer planning.
+  file-tree roots. When unset, the hook asks the native loader about every
+  supported source import. Only an authenticated startup-selected strict
+  module is transformed; ordinary imports keep their original source or frozen
+  loader and native CPython execution, without SOAC profiles or JIT metadata.
+  Module names such as `soac.runtime` do not bypass this rule. Compiler-owned
+  intrinsic operations require their own explicit provenance.
 
 - `SOAC_COMPILE_MODE=eager`
   In `fn eager_clif_compile_requested`, at
-  [crates/soac_pyo3/src/jit_runtime.rs:96](/home/adam/project/soac-profile/crates/soac_pyo3/src/jit_runtime.rs#L96),
+  [crates/soac_pyo3/src/jit_runtime.rs](crates/soac_pyo3/src/jit_runtime.rs),
   eagerly compile direct CLIF/JIT entries for outermost transformed modules
   before the lowered module body runs, including nested callable bodies that do
   not yet have a live Python function object. Later function-instance
@@ -366,7 +775,7 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 
 - `SOAC_EXEC_TRACE=<selector>`
   In `SoacEnvConfig::from_env`, at
-  [crates/soac_config/src/runtime.rs](/home/adam/project/soac-profile/crates/soac_config/src/runtime.rs),
+  [crates/soac_config/src/runtime.rs](crates/soac_config/src/runtime.rs),
   enable basic-block tracing. Accepted forms are:
   - `all`, `1`, `*`, or empty selector: trace all functions
   - `<exact-qualname>`: trace one function
@@ -401,7 +810,23 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 - `SOAC_PYTEST_BATCH_TIMEOUT=<seconds>`
   Per-batch timeout for the parallel pytest runner used by `just pytest ...`,
   `just pytest-fast ...`, and `just test-all`. The default is `300` seconds.
-  Set to `0` to disable the timeout.
+  These parallel controls apply to selector-only invocations. Passing pytest
+  options such as `-q` or `-v` uses serial passthrough instead, without per-batch
+  timeouts or progress reports.
+  Use `just pytest-fast --require-batch-runner tests/test_test_all_workflow.py` to reject
+  that fallback before collection. The guard accepts file/node selectors and
+  positive `PYTEST_NUMPROCS` (or `auto`), including a one-worker batch run; it
+  also refuses empty collection without launching pytest again. It is consumed
+  by the runner, not passed to pytest, and works with `just pytest` too.
+  Batches stay file-local and contain at most four collected tests; suite
+  growth cannot enlarge them beyond that ceiling.
+  Integration cohorts execute only this worker's collected case/mode pairs;
+  their reviewed analysis sources, dependencies and admission checks are unchanged.
+  Set to `0` to disable the timeout. Interrupting the parallel runner with
+  SIGINT or SIGTERM cancels queued batches and terminates all active worker
+  process groups, including descendants whose original worker already exited.
+  Cleanup gives the groups one shared five-second grace period before SIGKILL
+  and preserves their captured diagnostics.
 
 - `SOAC_PYTEST_PROGRESS_INTERVAL=<seconds>`
   Interval for live "currently running pytest batch" reports from the parallel
@@ -465,16 +890,17 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   - `events.jsonl`: default tracing JSONL when `SOAC_LOG` is not
     set.
   - `jit-code-summary.jsonl`: compact aggregate generated-code summaries used
-    by ordinary benchmark reports.
-  - `modules/`: root for cached pre-optimization BlockPy modules. Cached modules
+    by benchmark reports.
+  - `modules/`: root for inspectable pre-optimization BlockPy caches. Cached modules
     use stable per-module artifact paths such as
     `project/pkg/submod/mod.blockpy`, with source hash and build identity
-    stored as cache metadata.
+    stored as cache metadata. Strict runtime imports lower verified source
+    afresh; writable IR caches cannot replace authenticated executable input.
 
 - `SOAC_OPT_MODE=none|profile|verify|apply`
   Select the runtime specialization phase:
-  - `none`: run the ordinary unspecialized path, do not instrument
-    specialization counters, do not read `$SOAC_WORK_DIR/profile.bin`,
+  - `none`: execute admitted strict code without profile-guided specialization,
+    do not instrument specialization counters, do not read `$SOAC_WORK_DIR/profile.bin`,
     and do not write counter dumps. This is equivalent to leaving
     `SOAC_OPT_MODE` unset, but is useful when a parent environment may
     already set it.
@@ -493,17 +919,19 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
     indexed specialization hit/fallback and deopt-entry counts long enough to
     emit `soac_specialization_runtime` summary events at module teardown.
   Set `SOAC_WORK_DIR` for any mode that reads or writes counters. Leave
-  `SOAC_OPT_MODE` unset, or set it to `none`, for the ordinary
-  unspecialized/no-counter path.
+  `SOAC_OPT_MODE` unset, or set it to `none`, for the
+  unspecialized/no-counter path. These modes do not optimize ordinary modules
+  or relax any installed strict contract.
 
 - Runtime optimization uses the typed v3 path. `verify` and `apply` build the
-  JIT module by lowering the cached pre-optimization BlockPy module to
+  JIT module by lowering the verified source's pre-optimization BlockPy module to
   `TypedBlockPyModuleShape`, then applying v3 decisions from raw
   `profile.bin` evidence during typed JIT planning. Precompile uses the same
   raw profile evidence and cached pre-optimization BlockPy modules; there is no
   serialized optimization-plan artifact between profiling and codegen.
 
 Notes:
+
 - In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
   run and change only `SOAC_OPT_MODE`.
 - `SOAC_ENABLE_PROFILED_COLD_BLOCKS=1` replays `block_entry` counters
@@ -511,10 +939,9 @@ Notes:
   `verify`/`apply`. This stays disabled by default; `profile` and
   `verify` only insert the underlying `block_entry` counters when this
   flag is enabled.
-- The `apply` phase may emit explicitly marked `BEHAVIOR_CHANGE`
-  fast paths. Today that includes raw indexed module-global / instance
-  field stores outside module-init code, and undeclared known-builtin
-  loads lowered to `RuntimeName` constants.
+- Optimization mode does not establish frozen builtins, immutable ordinary
+  objects, or permission to bypass strict write barriers. Selected fast paths
+  still require their actual runtime capabilities or guards.
 
 ## Perf And Benchmarking
 
@@ -664,7 +1091,14 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   environment, or changed benchmark dependencies, interpreter, environment,
   or lock inputs still uses the normal upstream setup. Initial setup may
   install benchmark-specific dependencies even though SOAC's own venv refresh
-  runs offline. Stock and SOAC runs both pass the caller's configured package
+  runs offline. Declarative entries in `scripts/pyperformance_local_packages.json`
+  prepare a benchmark's pinned, original local packages in both stock and strict
+  environments before offline analysis or worker execution. This includes the
+  suite's own vendored `lib2to3` on Python 3.13+. Preparation retains a deterministic
+  source archive and verifies the installed payload against an accepted receipt;
+  cache reuse and comparison metadata include that payload identity. It does not
+  import the benchmark, change its algorithm, or grant strict execution authority.
+  Stock and SOAC runs both pass the caller's configured package
   indexes, proxies, and TLS certificates into pyperformance's isolated
   benchmark environments. Allow network access for that bootstrap or populate
   the benchmark environments in advance; when launching Lima from the host,
@@ -681,13 +1115,28 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   through to
   `pyperformance run`; `--rigorous` and `--debug-single-value` replace the
   default sample mode, and `--min-time=<seconds>` overrides the default
-  calibration window for both passes. SOAC modes default `SOAC_MODULE_ENABLED`
-  to the pyperformance benchmark source tree so the harness, pip, and pyperf
-  internals stay on stock CPython unless the caller overrides the allow-list;
-  compiler-owned `soac.*` modules remain transform-eligible either way.
-  Pyperformance workers also append the installed `tomli` package path so
-  `tomli_loads` transforms the parser implementation rather than only the
-  benchmark wrapper. They also
+  calibration window for both passes. Before workers start, the real offline
+  `ty` driver analyzes an immutable source overlay using their actual prepared
+  benchmark venv. The fixed `driver-local-static-imports-v1` policy opts in the
+  driver and its statically imported local modules; unimported `.py` input data,
+  dynamically imported dependencies, third-party packages (including `tomli`),
+  and standard-library code remain ordinary. Class policy is automatic, unknown
+  framework classes stay dynamic, parameter/return annotations remain static
+  checker facts, and optional checked fields are disabled for this source policy.
+
+  The `terminal-main-measurement-suffix-v1` preparation preserves definitions
+  and setup in module initialization, then runs the unchanged measurement
+  suffix in an ordinary copied namespace after the real strict loader seals the
+  module. Workload functions retain their actual strict globals. Preparation
+  rejects unsupported main shapes, suffix rebinding of workload globals, and
+  unsupported reflective namespace access; source/AST, input-data, policy, and
+  harness fingerprints record this disclosed split. The worker sets the exact
+  opted-in path allow-list and reexecutes with the offline descriptor in native
+  `-X soac_strict_config=...` startup configuration. Missing/stale authority is
+  fatal before user code, never an ordinary run mislabeled as strict. Immediately
+  before measured values, the worker checks actual native module seal/source
+  diagnostics. Extending an allow-list or editing a provenance manifest grants
+  no runtime authority. Workers also
   default `SOAC_BACKGROUND_JIT=0`, because pyperformance uses short worker
   subprocesses where background compiler threads can outlive interpreter
   shutdown, and default `SOAC_COMPILE_MODE=eager` because lazy first-call
@@ -721,17 +1170,51 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   The examples run the default comparison, the full suite, a comparison
   against a previous SOAC result, and a quick single-round smoke test,
   respectively; replace `<previous-comparison>` with an existing comparison
-  directory. A prior baseline's platform, interpreter, and pyperformance
+  directory. A prior baseline must be a strict-SOAC result; retired ordinary-SOAC
+  measurements are not comparable. Its platform, interpreter, and pyperformance
   metadata are checked before a comparison directory or benchmark round is
   created. Benchmark drivers can emit multiple differently named pyperf
   results; comparisons validate every requested driver, every emitted result,
   and consistent driver-to-result attribution across stock and SOAC rounds.
-  Each generated `summary.txt` and `summary.json` reports
+  Before starting measurements, `comparison-plan.json` fixes the requested
+  drivers, paired-round count, alternating stock/SOAC order, outputs, extra
+  arguments, and prior baseline. `run-status.json` preserves each command's
+  terminal exit status; every phase writes `<output>.status.json` with each
+  driver's dependency-preparation, strict-preparation, or worker outcome.
+  Fresh checker logs are copied beside that phase's output so a later apply
+  attempt cannot overwrite a profile failure's diagnostics.
+  A failed profile does not skip apply or later rounds, and successful drivers
+  still get measured without narrowing the requested set. Missing or failed
+  phases, drivers, results, or requested rounds produce `summary.txt` and
+  `summary.json` with `complete: false` and a nonzero command exit. Such a report
+  has no full-suite geometric mean or merged comparison results. It retains
+  the original phase JSON files, individually comparable results paired over
+  every requested round, and separately labeled partial native-seal/JIT/size
+  evidence from available apply outputs. Any incomplete profile is disclosed
+  alongside its result's diagnostic ratio; partial data is not an acceptance
+  score. Existing result directories cannot be rerun in place, and a directory
+  without its original plan cannot prove the requested round count.
+  Extra arguments may control sampling but cannot replace the comparison's
+  benchmark selection, interpreter, or output files.
+  Every result must retain the same original input fingerprint, strict source
+  selection, and harness policy across rounds and the previous strict revision.
+  The schema-3 strict-source manifest also records the exact policy projection:
+  an upstream `pyproject.toml` keeps its original bytes, comments, and values;
+  only the declared `[tool.soac.strict]` table may be appended. An identical
+  existing policy is reused unchanged, while conflicting policies or sealed
+  TOML namespaces are rejected. Verification regenerates this projection from
+  the original driver metadata, not merely from editable manifest hashes.
+  Each complete `summary.txt` and `summary.json` reports
   benchmark-result-specific transformed project/dependency and standard-library
   module coverage, distinct measured apply-worker process counts, compiled
-  functions, pre-optimization serialized BlockPy
+  functions, available pre-optimization serialized BlockPy
   bytes, optimized typed-IR final basic-block counts, and apply-mode emitted
-  native-code bytes and machine-block counts.
+  native-code bytes and machine-block counts. Module coverage requires matched
+  native-seal snapshots from measured workers, not cache-file existence. A
+  successful import and compiled-function inventory do not establish that the
+  meaningful hot path ran in the JIT; inspect representative measured-worker
+  profiles separately. Missing strict cache sizes are reported unavailable,
+  not interpreted as zero-size IR.
   Use the full fixed pyperformance benchmark selection for authoritative
   optimization claims and compare against both stock CPython and the previous
   SOAC revision. If `chaos` fails on an unsupported compiler/runtime shape,
@@ -745,7 +1228,11 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   body. The SOAC pyperformance wrapper records replay metadata in
   `<result>.soac-work/worker_manifest.jsonl`; this recipe selects a measured
   profile worker, rejects calibration workers, and asks for `worker=<worker-dir>`
-  if the benchmark has more than one measured worker. Artifacts are written
+  if the benchmark has more than one measured worker. Replay requires the same
+  verified strict source bundle, actual selected venv, and startup descriptor;
+  ordinary records or changed source/harness/policy inputs are rejected. It uses
+  the same post-seal worker entrypoint, not an ordinary script with a strict
+  label. Artifacts are written
   beside the selected worker by default under
   `<worker-dir>/worker_perf*`. The replay worker pauses through
   `SOAC_PYPERFORMANCE_MEASURE_READY_FILE` immediately before pyperf starts its
@@ -765,13 +1252,13 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   pre-optimization BlockPy cache entries must still exist in the active
   `$SOAC_WORK_DIR/modules` cache. With the default benchmark cache isolation,
   that cache is the benchmark result's `counters/modules` directory. When
-  `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
-  `SOAC_PRECOMPILED_LIBRARY` to the resulting `.so` to let runtime
-  direct-function setup use matching precompiled entries.
+  `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. The resulting
+  `.so` is an inspection artifact only. It is not loaded by runtime execution;
+  strict code uses its individually authenticated JIT templates.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at
-  [crates/soac_jit/src/jit/specialized_helpers.rs:1700](/home/adam/project/soac-profile/crates/soac_jit/src/jit/specialized_helpers.rs#L1700),
+  [crates/soac_jit/src/jit/specialized_helpers.rs](crates/soac_jit/src/jit/specialized_helpers.rs),
   select profiling-oriented helper wrappers that preserve explicit stack
   frames. This improves perf call stacks but is slower than the default
   fast helper path. The perf recipes default it on.
@@ -782,16 +1269,25 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 
 - `WARMUP_LOOPS=<int>`
   In recipe `perf-pystone-jit-warm`, at
-  [Justfile:271](/home/adam/project/soac-profile/Justfile#L271), and the
-  benchmark recipes near [Justfile:711](/home/adam/project/soac-profile/Justfile#L711),
+  [Justfile](Justfile), and its benchmark recipes,
   control the pre-measurement pystone warmup count.
 
 - `BENCHMARK_CPU=<int>`
-  In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),
+  In [scripts/run_benchmark_with_cpu_mode.sh](scripts/run_benchmark_with_cpu_mode.sh),
   choose the CPU core that the benchmark recipes pin to with `taskset`.
   The default is empty, which runs without CPU pinning. Set an explicit
   CPU core when you want lower scheduler or heterogeneous-core variance.
 
+- `PYPERFORMANCE_RESULTS_DIR=<path>`
+  Overrides the benchmark result and benchmark-venv root (default
+  `work/pyperformance`). Nested comparison/profile/apply recipes preserve the
+  selected root. A new task-owned guest-local directory can keep result I/O off
+  the shared mount, but first verify its physical backing capacity; this does
+  not move source or existing results.
+  Check physical backing capacity too: Lima's sparse guest disk can occupy the
+  same host volume. A large guest free-space number does not create host space.
+  Budget and monitor both artifact-volume and shared/host free space during
+  large copies and builds; stop before exhausting either volume.
 - `PYPERFORMANCE_AFFINITY=<cpu-list>` / `PYPERFORMANCE_TIMEOUT=<seconds>`
   Optional `just pyperformance` pass-throughs to pyperformance's `--affinity`
   and `--timeout` options. If `PYPERFORMANCE_AFFINITY` is unset, the recipe uses
@@ -806,8 +1302,22 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   proxies can break local HTTP benchmarks. SOAC modes continue inheriting their
   required transformed-runtime variables.
 
+- Strict pyperformance worker plumbing
+  `SOAC_PYPERFORMANCE_ENABLE=1` selects strict benchmark preparation and worker
+  checks; `SOAC_PYPERFORMANCE_DRIVER=1` keeps the ordinary pyperformance manager
+  out of worker activation and is not forwarded to measured children.
+  `SOAC_PYPERFORMANCE_CHECKER` identifies the prebuilt offline CLI selected by
+  the recipe. `SOAC_PYPERFORMANCE_STRICT_BUNDLE` identifies its immutable
+  per-driver execution manifest; it is provenance, not startup authority.
+  `SOAC_PYPERFORMANCE_WORK_ROOT` retains the original output root while each
+  worker sets `SOAC_WORK_DIR` to its variant directory.
+  `SOAC_PYPERFORMANCE_EXEC_WRAPPED=1` prevents recursive worker reexec and is
+  accepted only with a matching native startup descriptor. These variables
+  are recipe-owned; stock runs clear activation/bundle flags. Real authority
+  still comes from authenticated native startup, never these environment flags.
+
 - `BENCHMARK_CONSTANT_CLOCKS=0|1`
-  In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),
+  In [scripts/run_benchmark_with_cpu_mode.sh](scripts/run_benchmark_with_cpu_mode.sh),
   control whether the benchmark wrapper temporarily forces steadier CPU clocks for
   the selected benchmark core and its related CPUs by setting the
   governor to `performance`, locking `scaling_min_freq` and
@@ -820,7 +1330,7 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 
 - `SPECIALIZATION_PROFILE_LOOPS=<int>`
   In recipe `perf-pystone-jit-specialized`, at
-  [Justfile:480](/home/adam/project/soac-profile/Justfile#L480), control
+  [Justfile](Justfile), control
   the first-pass profiling loop count used to derive specializations.
 
 - `PERF_FREQUENCY=<int>`
@@ -828,12 +1338,12 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   defaults to `99` so full DWARF call stacks do not produce excessively large
   profiles or lose samples; `perf-pystone-jit-warm` defaults to `999`. In
   `perf-pystone-jit-warm`, at
-  [Justfile:272](/home/adam/project/soac-profile/Justfile#L272), set the
+  [Justfile](Justfile), set the
   sampling frequency for the pystone workflow.
 
 - `PERF_CALL_GRAPH=<mode>`
   In recipe `perf-pystone-jit-warm`, at
-  [Justfile:273](/home/adam/project/soac-profile/Justfile#L273), set the
+  [Justfile](Justfile), set the
   `perf record --call-graph` mode. The default is `dwarf,65528`, which
   captures a much larger user-space stack dump so mixed JIT/CPython
   stacks are less likely to truncate into misleading leaf-only C helper
@@ -841,36 +1351,36 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 
 - `PERF_PERCENT_LIMIT=<float>`
   In recipe `perf-pystone-jit-warm`, at
-  [Justfile:274](/home/adam/project/soac-profile/Justfile#L274), control
+  [Justfile](Justfile), control
   the threshold used when rendering perf text reports.
 
 ## CPython Test Selection
 
 - `SKIP_EXPECTED_FAILURES=1`
-  In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
+  In [scripts/collect_cpython_skip_ids.sh](scripts/collect_cpython_skip_ids.sh),
   include expected-failure IDs when building the CPython skip list. Set
   it to `0` to stop filtering on `EXPECTED_FAILURE.md`.
 
 - `CPYTHON_TEST_SETS_GLOB=<glob>`
-  In [scripts/run_cpython_test_sets.sh](/home/adam/project/soac-profile/scripts/run_cpython_test_sets.sh),
+  In [scripts/run_cpython_test_sets.sh](scripts/run_cpython_test_sets.sh),
   choose which test-set files to run.
 
 - `CPYTHON_TEST_TEMPDIR=/tmp/...`
-  In [scripts/run_cpython_test_sets.sh](/home/adam/project/soac-profile/scripts/run_cpython_test_sets.sh),
+  In [scripts/run_cpython_test_sets.sh](scripts/run_cpython_test_sets.sh),
   choose the tempdir used for CPython regrtest set runs.
 
 - `CPYTHON_TEST_LOG_DIR=/path/to/logs`
-  In [scripts/run_cpython_test_sets.sh](/home/adam/project/soac-profile/scripts/run_cpython_test_sets.sh),
+  In [scripts/run_cpython_test_sets.sh](scripts/run_cpython_test_sets.sh),
   choose where per-set CPython logs are written.
 
 - `SKIP_FILE=/path/to/cpython_skipped_tests.txt`
-  In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
+  In [scripts/collect_cpython_skip_ids.sh](scripts/collect_cpython_skip_ids.sh),
   choose the base skipped-test list file.
 
 - `EXPECTED_FAILURES_FILE=/path/to/EXPECTED_FAILURE.md`
-  In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
+  In [scripts/collect_cpython_skip_ids.sh](scripts/collect_cpython_skip_ids.sh),
   choose the markdown file that contributes expected-failure test IDs.
 
 - `PYTHON_BIN=/path/to/python`
-  In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
+  In [scripts/collect_cpython_skip_ids.sh](scripts/collect_cpython_skip_ids.sh),
   choose which Python binary is used when collecting skip IDs.

@@ -11,7 +11,106 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 const BLOCKPY_MODULE_CACHE_MAGIC: &[u8] = b"SOAC_BLOCKPY_CODEGEN_CACHE\0";
-const BLOCKPY_MODULE_CACHE_FORMAT_VERSION: u32 = 6;
+// Version 12 preserves source ranges and explicit annotation/class-dictionary
+// capture projections. Older generations cannot supply those source-site and
+// cell-object decisions to authenticated runtime consumers.
+// Generation 16 also preserves expression-temporary lifetime categories.
+// Generation 17 adds explicit generic parameter scopes/default-container
+// projections and original local/free cell-load error provenance.
+// Generation 18 adds explicit class-decorator preparation/application operands
+// and the construction carrier; older caches cannot supply those boundaries.
+// Generation 19 preserves each native annotation provider's original header
+// line separately from its decorated source definition's starting line.
+// Generation 20 preserves decorator call argument vectors and exact construction
+// template identities without creating the namespace function prematurely.
+// Generation 21 resolves actual class-cell captures and preserved-cell cleanup.
+// Generation 22 adds source-selected original-function descriptor applications.
+// Generation 23 distinguishes decorated class-provider start lines from
+// function-provider header lines. Older metadata cannot identify the actual
+// native class annotation code.
+// Generation 24 retains a generic wrapper's exact native header/body span
+// separately from the complete signed declaration, which includes decorators.
+// Generation 25 carries explicit private class-construction cells, the paired
+// namespace template, and the class-statement cleanup operation.
+// Generation 26 adds explicit lexical binding/transport projections and private
+// call slots, plus preserved enclosing-exception block context.
+// Version 27 rejects potentially lossy literal outputs from prior caches, so
+// the original-token surrogate guard cannot be bypassed by a cache hit. It also
+// carries the completed handled-region BlockContext representation.
+// Version 28 records producer-selected operand lifetimes and explicit
+// pre-handler unwind blocks; older caches can retain failed assignment values.
+// Version 29 carries exact generator-expression code exposure and explicit
+// GeneratorReturn completion, plus resolved expression-operand unwind order.
+// Version 30 records module-global versus explicit class-mapping call context.
+// Older caches cannot supply the source activation's materialized namespace.
+// Version 31 records pending abrupt-payload scopes and trim-only Unwind
+// contexts, suspension edges consumed by resolved transport ownership, and
+// explicit normalized raise propagation independent of handled-scope lifetime.
+// Older caches can retain exited payloads or retire live suspended transports.
+// Version 32 records explicit block-parameter transport-copy purpose and
+// removes the stale duplicated suspended throw-context snapshot. Older caches
+// can retain replaced/retired caught objects through compiler-only copies.
+// Version 33 records exceptional managed-resume delivery and explicit native
+// async-yield wrapping before suspension, plus async GeneratorReturn completion.
+// Prior caches can redelegate an injected error or allocate after leaving the
+// source yield's error edge, and still use the obsolete completion sentinel.
+// Version 34 carries parser-owned source local/cell inventories and their
+// resolved physical storage projections for traceback lifetime ownership.
+// Version 35 adds explicit authenticated-source activation obligations and
+// terminal SourceFrameExit operations before implicit local cleanup.
+// Version 36 records semantic generator-control slots and fresh resume-ABI
+// bindings; source variables with compiler-like spellings are not controls.
+// Version 37 preserves resolved block-parameter control roles across transport
+// copies and optimization; ordinary _dp_try_* names never select control state.
+// Version 38 records native class code/slot identities, ordered cell recipes,
+// explicit raw-slot transitions and the shared class lifetime projection,
+// including consuming Operand handoffs and native collection insertion.
+// Older helpers preallocate different cells and use the obsolete body ABI.
+// Version 39 distinguishes local and suspended expression-operand ownership;
+// a raw preserved source/cell/control slot cannot authorize a consuming read.
+// Version 40 also retains qualified original source-error sites on committed
+// inline fragments; implicit iterator exhaustion must not become an ordinary
+// caller traceback event when the IteratorStep operation is eliminated.
+// Version 40 gives each emitted native class-comprehension region its own
+// snapshot owners and validated unwind boundary. Duplicated source finally
+// bodies cannot alias one snapshot or reuse another site's acquisition rank.
+// Version 41 records the native code's first line and distinguishes actual
+// capture source ranges from class-annotation body-completion origins. A
+// synthetic creation marker must never be treated as an ordinary source span.
+// Version 42 represents a new source event for an already-normalized error
+// explicitly, including its original range. Cached propagation-only raises
+// cannot substitute for direct or delegated generator injection events.
+// Version 43 resolves lexical forwarding in the creating frame and attributes
+// implicit async waits to original native source ranges. Older lowered
+// carriers and generated template offsets cannot be reused for these bodies.
+// Version 44 gives class activations the original native header range, while
+// their authenticated declaration identity still includes its decorators.
+// Version 45 moves augmented-assignment operands into their sole consuming
+// use and keeps delegated exception classification outside Python handlers.
+// Older bodies can duplicate/retire a suspended operand twice or expose an
+// internal StopIteration/forwarded error through sys.exception().
+// Version 46 retains scalar native source-reference readiness beside the
+// existing physical source-frame projection. Older archives have no such field.
+// Version 49 preserves every original comprehension target and its clause,
+// including attribute stores, beside the lambda/function local-slot carrier.
+// Version 50 preserves the original eager collection kind and distinguishes
+// isolated iteration targets from containing-function named-expression stores.
+// Version 51 keeps each sibling/nested region's native lexical parent, with
+// deduplicated current carriers and separate per-emission snapshot owners.
+// Version 53 removes SOAC traceback/frame inventories, source error sites,
+// native function-comprehension slot projections and frame-exit instructions.
+// Semantic exception disposition, lexical bindings and ownership remain.
+// Version 54 retains strict source builtin references as indexed global loads.
+// Older archives may snapshot an initially absent name as a runtime builtin
+// and miss later legal module bindings or captured-builtin mutations.
+// Version 55 collects enclosing-scope names from lambda parameter defaults,
+// including comprehension walrus stores. Older archives can lose those local
+// or captured bindings even though lambda body assignments remain isolated.
+// Version 56 removes native class-comprehension slot/snapshot operations.
+// Class lexical cells remain explicit; eager regions use ordinary helper scopes.
+// Version 57 initializes set-comprehension helpers with an empty set literal.
+// Older archives call the shadowable source-global `set` constructor instead.
+const BLOCKPY_MODULE_CACHE_FORMAT_VERSION: u32 = 57;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PythonModuleCacheSource {
@@ -354,6 +453,11 @@ fn remap_blockpy_module_function_ids_with_remapper(
 
     for function in &mut module.callable_defs {
         function.function_id = remapper.remap(function.function_id);
+        for scope in std::iter::once(&mut function.scope).chain(function.public_scope.as_mut()) {
+            if let Some(construction) = &mut scope.class_construction {
+                construction.namespace_function = remapper.remap(construction.namespace_function);
+            }
+        }
         function.name_gen = recovered_function_name_gen(function);
     }
     for counter in &mut module.counter_defs {
@@ -398,7 +502,40 @@ impl VisitMut<InstrBlockPy> for FunctionIdRemapper {
             InstrBlockPy::MakeFunctionWithClosure(op) => {
                 op.set_function_id(self.remap(op.function_id()));
             }
+            InstrBlockPy::ConstructClass(op) => {
+                op.construction_function = self.remap(op.construction_function);
+            }
+            InstrBlockPy::PrepareClassDecorator(op) => {
+                op.construction_function = self.remap(op.construction_function);
+            }
+            InstrBlockPy::ApplyClassDecorator(op) => {
+                op.construction_function = self.remap(op.construction_function);
+            }
+            InstrBlockPy::CompleteFunctionDefinition(op) => {
+                op.function_id = self.remap(op.function_id);
+            }
+            InstrBlockPy::ApplyFunctionDescriptor(op) => {
+                op.function_id = self.remap(op.function_id);
+            }
             InstrBlockPy::BinOp(_)
+            | InstrBlockPy::TakeOperand(_)
+            | InstrBlockPy::ComprehensionInsert(_)
+            | InstrBlockPy::BuildCollection(_)
+            | InstrBlockPy::CallArgumentOp(_)
+            | InstrBlockPy::PreparedCall(_)
+            | InstrBlockPy::IteratorStep(_)
+            | InstrBlockPy::DiscardClassDecorator(_)
+            | InstrBlockPy::DiscardClassConstructionCaptures(_)
+            | InstrBlockPy::NewAnnotationSet(_)
+            | InstrBlockPy::SetupAnnotations(_)
+            | InstrBlockPy::ConstructTypeParameterScope(_)
+            | InstrBlockPy::SubscriptGeneric(_)
+            | InstrBlockPy::SetFunctionTypeParameters(_)
+            | InstrBlockPy::CreateTypeAlias(_)
+            | InstrBlockPy::CreateTypeParameter(_)
+            | InstrBlockPy::SetTypeParameterDefault(_)
+            | InstrBlockPy::CheckAnnotationFormat(_)
+            | InstrBlockPy::RecordAnnotation(_)
             | InstrBlockPy::UnaryOp(_)
             | InstrBlockPy::Tuple(_)
             | InstrBlockPy::Call(_)
@@ -622,11 +759,47 @@ def f(x):
 
 def g(y):
     return y
+
+async def values(awaitable):
+    try:
+        result = await awaitable
+        yield result
+    finally:
+        finish()
 "#,
         )
         .expect("transform should succeed")
         .blockpy_module;
         let before = summarize_module(&module);
+        let before_layouts = module
+            .callable_defs
+            .iter()
+            .map(|function| function.storage_layout.clone())
+            .collect::<Vec<_>>();
+        assert!(before_layouts.iter().flatten().any(|layout| {
+            layout
+                .block_parameter_roles
+                .iter()
+                .any(|binding| binding.role == soac_core::block_py::BlockParamRole::AbruptKind)
+        }));
+        let runtime_names = |module: &BlockPyModule<BlockPyModuleShape>| {
+            module
+                .module_constants
+                .iter()
+                .filter_map(|value| match value {
+                    soac_core::block_py::ConstantExpr::RuntimeName(name) => Some(*name),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let before_runtime_names = runtime_names(&module);
+        for name in [
+            soac_core::block_py::RuntimeName::GeneratorResumeDelivery,
+            soac_core::block_py::RuntimeName::InjectGeneratorResumeException,
+            soac_core::block_py::RuntimeName::AsyncGenWrapYield,
+        ] {
+            assert!(before_runtime_names.contains(&name));
+        }
 
         let path = unique_cache_path();
         let _ = std::fs::remove_file(&path);
@@ -640,6 +813,21 @@ def g(y):
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(summarize_module(&loaded), before);
+        assert_eq!(runtime_names(&loaded), before_runtime_names);
+        assert_eq!(
+            loaded
+                .callable_defs
+                .iter()
+                .map(|function| function.storage_layout.clone())
+                .collect::<Vec<_>>(),
+            before_layouts,
+            "resolved control roles and their physical slots must survive the real cache format"
+        );
+        for function in &loaded.callable_defs {
+            if let Some(layout) = &function.storage_layout {
+                layout.validate_block_parameter_roles().unwrap();
+            }
+        }
 
         let max_function_id = loaded
             .callable_defs
@@ -668,6 +856,80 @@ def g(y):
                 .any(|block| block.label == next_block_label),
             "rehydrated function generator should not reissue an existing block label"
         );
+    }
+
+    #[test]
+    fn generator_code_exposure_round_trips_and_survives_runtime_id_remapping() {
+        use soac_contracts::SourceRange;
+        use soac_core::block_py::{BlockTerm, FunctionKind, GeneratorExpressionCode};
+
+        let source = "def make(values):\n    return (value for value in values)\n";
+        let mut module = lower_python_to_blockpy_for_testing(source)
+            .expect("lower ordinary serialization fixture")
+            .blockpy_module;
+        let expression = "(value for value in values)";
+        let start = source.find(expression).unwrap();
+        let iterable = start + expression.rfind("values").unwrap();
+        let projection = GeneratorExpressionCode {
+            expression_range: SourceRange::new(start as u32, (start + expression.len()) as u32),
+            iterable_range: SourceRange::new(iterable as u32, (iterable + "values".len()) as u32),
+        };
+        let function = module
+            .callable_defs
+            .iter_mut()
+            .find(|function| matches!(function.lowered_kind(), FunctionKind::Generator))
+            .expect("lowered generator helper");
+        let local_id = function.function_id.local_function_id();
+        let original_params = function.params.clone();
+        let completion_blocks = function
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.term, BlockTerm::GeneratorReturn(_)))
+            .count();
+        assert!(
+            completion_blocks > 0,
+            "generator completion must be explicit before caching"
+        );
+        // This is a serialization/remapping kernel, not runtime admission.
+        // The lowerer test independently checks the actual parser projection;
+        // this ordinary module has neither signed facts nor a source capability.
+        assert!(function.scope.source_origin.is_none());
+        function.scope.generator_expression_code = Some(projection.clone());
+        function
+            .public_scope
+            .as_mut()
+            .expect("generator public scope")
+            .generator_expression_code = Some(projection.clone());
+
+        let path = unique_cache_path();
+        let metadata = test_metadata("pkg.generators", 42, "genexpr-code-v29");
+        store_blockpy_module_cache(&path, &metadata, &module).expect("store code exposure");
+        let mut loaded = load_blockpy_module_cache(&path)
+            .expect("load code exposure")
+            .module;
+        std::fs::remove_file(&path).expect("remove code exposure cache");
+        remap_blockpy_module_function_ids(&mut loaded, ModuleNameGen::new(99));
+        assert!(loaded.strict_source.is_none());
+        let function = loaded
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id.local_function_id() == local_id)
+            .expect("same helper after runtime-id remapping");
+        assert_eq!(function.function_id.runtime_module_id().as_u32(), 99);
+        assert_eq!(function.params, original_params);
+        assert_eq!(function.lowered_kind(), &FunctionKind::Generator);
+        assert_eq!(
+            function
+                .blocks
+                .iter()
+                .filter(|block| matches!(block.term, BlockTerm::GeneratorReturn(_)))
+                .count(),
+            completion_blocks
+        );
+        for scope in [&function.scope, function.public_scope.as_ref().unwrap()] {
+            assert_eq!(scope.generator_expression_code.as_ref(), Some(&projection));
+            assert!(scope.source_origin.is_none());
+        }
     }
 
     #[test]
@@ -708,6 +970,12 @@ def g(y):
 
     #[test]
     fn remaps_cached_blockpy_module_to_fresh_module_id() {
+        use soac_contracts::{DefinitionKind, ModuleContentId, SourceIdentity, SourceRange};
+        use soac_core::block_py::{
+            CallableSourceOrigin, CallableSourceRole, ClassConstructionScope,
+            LexicalCaptureProjection, LexicalCellBinding, LexicalCellCapture, PrivateLexicalScope,
+        };
+
         let mut module = lower_python_to_blockpy_for_testing(
             r#"
 def outer():
@@ -718,6 +986,50 @@ def outer():
         )
         .expect("transform should succeed")
         .blockpy_module;
+
+        // Cache identity remapping changes runtime addresses, never signed
+        // lexical identities or their exact nominal-leaf projection.
+        let namespace = module.callable_defs[0].function_id;
+        let creator = CallableSourceOrigin {
+            definition: SourceIdentity {
+                module: ModuleContentId::new("pkg.capture", 42),
+                lexical_qualname: "outer".into(),
+                source_range: SourceRange::new(1, 90),
+                definition_kind: DefinitionKind::Function,
+            },
+            role: CallableSourceRole::SourceFunction,
+        };
+        let capture = LexicalCellCapture {
+            binding: LexicalCellBinding {
+                scope: creator.definition.clone(),
+                name: "Target".into(),
+            },
+            nominal_binding_indices: vec![2, 5],
+        };
+        let construction = ClassConstructionScope {
+            producer: creator.clone(),
+            namespace_function: namespace,
+            captures: vec![capture.clone()],
+        };
+        let private = PrivateLexicalScope {
+            creator,
+            captures: vec![LexicalCaptureProjection {
+                cell: capture,
+                native_closure: None,
+            }],
+        };
+        let function = &mut module.callable_defs[1];
+        function.scope.class_construction = Some(construction.clone());
+        function.scope.private_lexical = Some(private.clone());
+        function.public_scope = Some(function.scope.clone());
+
+        // Exercise the serialized DTO before the runtime-id rewrite as well.
+        let path = unique_cache_path();
+        let metadata = test_metadata("pkg.capture", 42, "private-lexical-v26");
+        store_blockpy_module_cache(&path, &metadata, &module).expect("store capture metadata");
+        let cached = load_blockpy_module_cache(&path).expect("load capture metadata");
+        std::fs::remove_file(&path).expect("remove capture cache");
+        module = cached.module;
 
         remap_blockpy_module_function_ids(&mut module, ModuleNameGen::new(99));
 
@@ -737,6 +1049,19 @@ def outer():
                 99,
                 "cached MakeFunctionWithClosure ids must point at the remapped module id"
             );
+        }
+
+        let function = &module.callable_defs[1];
+        for scope in [&function.scope, function.public_scope.as_ref().unwrap()] {
+            let actual = scope.class_construction.as_ref().unwrap();
+            assert_eq!(actual.namespace_function.runtime_module_id().as_u32(), 99);
+            assert_eq!(
+                actual.namespace_function.local_function_id(),
+                namespace.local_function_id()
+            );
+            assert_eq!(actual.producer, construction.producer);
+            assert_eq!(actual.captures, construction.captures);
+            assert_eq!(scope.private_lexical.as_ref(), Some(&private));
         }
 
         let recovered_next_function = module.module_name_gen.next_function_name_gen();

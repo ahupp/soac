@@ -1,3 +1,7 @@
+---
+title: "Borrowed Local Ownership Plan"
+---
+
 # Borrowed local ownership plan
 
 Goal: make local/root slots the owning storage, and make SSA values loaded from

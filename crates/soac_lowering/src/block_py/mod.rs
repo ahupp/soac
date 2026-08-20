@@ -10,7 +10,7 @@ pub(crate) use crate::passes::{
 };
 pub(crate) use scope_impls::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
-    compute_storage_layout_from_scope, is_runtime_closure_name, ScopeExprNode,
+    compute_storage_layout_from_scope, ScopeExprNode,
 };
 pub(crate) use soac_ir_blockpy::InstrBlockPy;
 #[cfg(test)]

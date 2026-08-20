@@ -22,7 +22,7 @@ where
             term: block.term.clone(),
             params: block.bb_params().cloned().collect(),
             exc_edge: block.exc_edge.clone(),
-            extra: Default::default(),
+            extra: block.extra,
         })
         .collect::<Vec<_>>();
     populate_exception_edge_args(&mut bb_blocks);
@@ -124,8 +124,6 @@ where
         fn visit_raise_term_mut(&mut self, raise_term: &mut crate::block_py::TermRaise<E>) {
             if let Some(exc) = raise_term.exc.as_mut() {
                 rewrite_current_exception_in_expr(exc, self.exc_name);
-            } else {
-                raise_term.exc = Some(current_exception_name_expr(self.exc_name));
             }
         }
     }
@@ -184,10 +182,17 @@ where
             continue;
         };
         let source_params = blocks[block_index].param_name_vec();
-        let source_has_owner = source_params
-            .iter()
-            .any(|param| param == "_dp_self" || param == "_dp_state");
+        let source_has_owner = blocks[block_index].params.iter().any(|param| {
+            matches!(param.role, crate::block_py::BlockParamRole::GeneratorResume(role)
+                if role.is_preserved_owner())
+        });
         let target_params = blocks[target_index].param_name_vec();
+        let enclosing_exceptions = blocks[target_index]
+            .params
+            .iter()
+            .filter(|param| param.role == crate::block_py::BlockParamRole::EnclosingException)
+            .map(|param| param.name.as_str())
+            .collect::<HashSet<_>>();
         let exc_name = blocks[target_index]
             .exception_param()
             .map(ToString::to_string);
@@ -207,7 +212,9 @@ where
             .map(|target_param| {
                 if exc_name.as_deref() == Some(target_param.as_str()) {
                     BlockArg::CurrentException
-                } else if current_exception_aliases.contains(target_param.as_str()) {
+                } else if current_exception_aliases.contains(target_param.as_str())
+                    && !enclosing_exceptions.contains(target_param.as_str())
+                {
                     BlockArg::CurrentException
                 } else if source_params.iter().any(|param| param == &target_param)
                     || source_has_owner

@@ -9,12 +9,12 @@ use soac_core::pass_tracker::RecordingPassTracker;
 use soac_driver::blockpy_cache::{PythonModuleCacheSource, hash_module_source};
 use soac_driver::{PreOptimizationCacheRequest, SourceToBlockPyOptions, source_to_blockpy};
 use soac_ir_blockpy::BlockPyModuleShape;
-use soac_jit::module_type::{ModuleInfo, SoacExtModule, match_original_code_to_functions};
+use soac_jit::module_type::{ModuleInfo, SoacExtModule, ensure_module_builtins};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -173,10 +173,12 @@ fn module_cache_source_for_import_path(path: &str) -> PythonModuleCacheSource {
 }
 
 fn pre_optimization_module_cache(
+    py: Python<'_>,
     session: &soac_jit::CompileSession,
     module_name: &str,
     source: PythonModuleCacheSource,
 ) -> PyResult<Option<PreOptimizationCacheRequest>> {
+    session.enter_runtime_blockpy_cache(py)?;
     let Some(cache_root) = session
         .env_config()
         .map_err(PyRuntimeError::new_err)?
@@ -283,13 +285,6 @@ fn module_spec_string_attr(spec: &Bound<'_, PyAny>, attr: &str) -> PyResult<Stri
         .map_err(|_| PyTypeError::new_err(format!("expected a module spec with a string {attr:?}")))
 }
 
-fn compile_original_module_code(py: Python<'_>, source: &str, path: &str) -> PyResult<Py<PyAny>> {
-    let code = PyModule::import(py, "builtins")?
-        .getattr("compile")?
-        .call1((source, path, "exec"))?;
-    Ok(code.unbind())
-}
-
 fn resolve_module_name(module_globals: &Bound<'_, PyAny>, operation: &str) -> PyResult<String> {
     let globals = module_globals
         .cast::<PyDict>()
@@ -360,12 +355,23 @@ fn make_function(
 }
 
 #[pyfunction]
-fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyAny>> {
+fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
     let create_started_at = Instant::now();
     let create_total_start = Instant::now();
     let mut create_timings = Vec::new();
     let spec = spec.bind(py);
     let module_name = module_spec_string_attr(spec.as_any(), "name")?;
+    let session = soac_jit::CompileSession::process();
+    let backend = session.select_strict_backend(py, None)?;
+    let Some(loader) = session.strict_artifact_loader(py)? else {
+        return Ok(None);
+    };
+    if !loader.selects_source(py, &module_name, Path::new(path))? {
+        // PEP451 delegates ordinary creation and execution to the original
+        // loader. Do not decode its source, build SOAC metadata, or compile an
+        // ordinary module merely because profiling or an import hook is on.
+        return Ok(None);
+    }
     let package_name = module_spec_string_attr(spec.as_any(), "parent")?;
     let source = time_phase(&mut create_timings, "source_read", || {
         fs::read_to_string(path)
@@ -378,20 +384,47 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
         hash: source_hash,
         indexed_module_keys: Vec::new(),
     };
-    let session = soac_jit::CompileSession::process();
+    let strict_module = time_phase(&mut create_timings, "authenticate_strict_source", || {
+        loader
+            .load_module(py, &module_name, Path::new(path), source.as_bytes())?
+            .ok_or_else(|| {
+                soac_jit::strict_runtime_unavailable(
+                    py,
+                    "selected strict source lost its startup identity",
+                )
+            })
+    })?;
+    if backend == soac_jit::StrictExecutionBackend::CPython {
+        // The actual native loader is installed independently of SOAC's
+        // compilation pipeline. Never reach cache/lowering as a fallback.
+        return soac_jit::create_interpreter_module(py, spec.as_any(), strict_module).map(Some);
+    }
+    let compiled_source = time_phase(
+        &mut create_timings,
+        "compile_verified_native_source",
+        || soac_jit::CompiledStrictSource::compile(py, &strict_module),
+    )?;
     let runtime_names_as_globals = module_name == "soac.runtime";
-    let pre_optimization_cache =
-        pre_optimization_module_cache(session.as_ref(), module_name.as_str(), module_cache_source)?;
+    let pre_optimization_cache = pre_optimization_module_cache(
+        py,
+        session.as_ref(),
+        module_name.as_str(),
+        module_cache_source,
+    )?;
     let env_config = session.env_config().map_err(PyRuntimeError::new_err)?;
     let preparation_options = SourceToBlockPyOptions {
         lowering: soac_lowering::LoweringOptions {
             runtime_names_as_globals,
+            strict_facts: Some(Arc::new(strict_module.type_facts().clone())),
+            canonical_annotations: Some(compiled_source.canonical_annotations()),
+            canonical_class_bindings: Some(compiled_source.canonical_class_bindings()),
         },
         pre_optimization_cache,
     };
     let mut pass_tracker = RecordingPassTracker::new();
     let lowering_start = Instant::now();
     let blockpy_module = time_phase(&mut create_timings, "lower_blockpy", || {
+        session.enter_runtime_lowering(py)?;
         source_to_blockpy(
             &source,
             session.module_name_gen(),
@@ -412,12 +445,9 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
     let function_count = blockpy_module.callable_defs.len();
     let counter_count = blockpy_module.counter_defs.len();
     let global_name_count = blockpy_module.global_names.len();
-    let module_code = time_phase(&mut create_timings, "compile_original_code", || {
-        compile_original_module_code(py, &source, path)
-    })?;
     let original_code_by_function_id =
-        time_phase(&mut create_timings, "match_original_code", || {
-            match_original_code_to_functions(py, module_code.bind(py), &blockpy_module)
+        time_phase(&mut create_timings, "match_verified_native_code", || {
+            compiled_source.into_function_catalog(py, &strict_module, &blockpy_module)
         })?;
     let original_code_count = original_code_by_function_id.len();
     let module = time_phase(&mut create_timings, "soac_ext_module_create", || {
@@ -429,6 +459,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
             module_info,
             original_code_by_function_id,
             source.as_str(),
+            strict_module,
         )
     })?;
     let create_module_total = create_total_start.elapsed();
@@ -451,35 +482,122 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
             original_code_count,
         },
     );
-    Ok(module)
+    Ok(Some(module))
 }
 
-fn ensure_module_builtins(globals: &Bound<'_, PyAny>) -> PyResult<()> {
-    let globals = globals
-        .cast::<PyDict>()
-        .map_err(|_| PyTypeError::new_err("module_globals must be a dict"))?;
-    if globals.get_item("__builtins__")?.is_some() {
-        return Ok(());
-    }
-    let builtins = unsafe { ffi::PyEval_GetBuiltins() };
-    if builtins.is_null() {
-        return Err(PyRuntimeError::new_err(
-            "PyEval_GetBuiltins returned null while preparing module globals",
-        ));
-    }
-    let builtins = unsafe { Bound::from_borrowed_ptr(globals.py(), builtins) };
-    globals.set_item("__builtins__", builtins)
+#[pyfunction(signature = (backend=None))]
+fn configure_strict_backend(py: Python<'_>, backend: Option<&str>) -> PyResult<&'static str> {
+    let requested = match backend {
+        None => None,
+        Some("soac") => Some(soac_jit::StrictExecutionBackend::Soac),
+        Some("cpython") => Some(soac_jit::StrictExecutionBackend::CPython),
+        Some(_) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "strict backend must be 'soac' or 'cpython'",
+            ));
+        }
+    };
+    soac_jit::CompileSession::process()
+        .select_strict_backend(py, requested)
+        .map(soac_jit::StrictExecutionBackend::as_str)
 }
 
 #[pyfunction]
-fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<()> {
+fn runtime_compilation_activity(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let activity = soac_jit::CompileSession::process().runtime_compilation_activity();
+    let result = PyDict::new(py);
+    result.set_item("schema", 1)?;
+    result.set_item("lowering_entries", activity.lowering_entries)?;
+    result.set_item("blockpy_cache_entries", activity.blockpy_cache_entries)?;
+    result.set_item("jit_engine_entries", activity.jit_engine_entries)?;
+    Ok(result)
+}
+
+#[pyfunction]
+fn exec_module(py: Python<'_>, module: Py<PyAny>) -> PyResult<bool> {
     let module = module.bind(py);
+    if !SoacExtModule::owns_module(module.as_any())? {
+        return Ok(false);
+    }
+    if soac_jit::exec_interpreter_module(py, module.as_any())? {
+        return Ok(true);
+    }
     let exec_total_start = Instant::now();
     let mut exec_timings = Vec::new();
     let result = exec_module_inner(py, module.as_any(), &mut exec_timings);
+    if result.is_err() {
+        // Failed initialization cannot reopen its namespace. Keep the original
+        // body/sealing exception; a replay attempt on an already sealed module
+        // is rejected without revoking that existing seal.
+        let _ = SoacExtModule::with_data(module, |data| {
+            if let Some(strict) = data.strict_runtime {
+                let _ = strict.fail(py);
+            }
+            Ok(())
+        });
+    }
     let exec_module_total = exec_total_start.elapsed();
     append_completed_module_load_log(module.as_ptr(), exec_module_total, exec_timings, &result);
-    result
+    result.map(|()| true)
+}
+
+/// Read-only execution evidence. The returned data never grants admission or
+/// optimization permission, and ordinary lookalike module attributes are not
+/// consulted. A live native owner authenticates every field in this snapshot.
+#[pyfunction]
+fn strict_module_diagnostics<'py>(
+    py: Python<'py>,
+    module: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    if !SoacExtModule::owns_module(module)? {
+        return Ok(None);
+    }
+    if let Some(snapshot) = soac_jit::interpreter_module_diagnostics(py, module)? {
+        return Ok(Some(snapshot));
+    }
+    SoacExtModule::with_data(module, |data| {
+        let unavailable = || {
+            soac_jit::strict_runtime_unavailable(
+                py,
+                "module has no matching strict diagnostic owner",
+            )
+        };
+        let strict = data.strict_runtime.ok_or_else(unavailable)?;
+        let verified = data
+            .shared_state
+            .verified_strict_module()
+            .ok_or_else(unavailable)?;
+        let globals = unsafe { ffi::PyModule_GetDict(module.as_ptr()) };
+        let globals = unsafe { Bound::<PyAny>::from_borrowed_ptr_or_err(py, globals) }?
+            .cast_into::<PyDict>()?;
+        if !strict.matches_verified_source(verified) || !strict.matches_globals(py, &globals)? {
+            return Err(unavailable());
+        }
+        let sealed = strict.is_sealed(py)?;
+        let initializer_entry = strict.initializer_entry_kind(py)?;
+        let facts = verified.type_facts();
+        let result = PyDict::new(py);
+        result.set_item("schema", 1)?;
+        result.set_item("backend", "soac")?;
+        result.set_item("sealed", sealed)?;
+        result.set_item(
+            "initializer_entry_kind",
+            initializer_entry.map(soac_jit::StrictFunctionEntryKind::as_str),
+        )?;
+        result.set_item("module_name", &data.shared_state.module_name)?;
+        result.set_item(
+            "source_path",
+            verified.source_path().to_string_lossy().as_ref(),
+        )?;
+        result.set_item("source_sha256", facts.facts().source_digest.to_hex())?;
+        result.set_item(
+            "artifact_generation",
+            facts.generation().fingerprint().to_hex(),
+        )?;
+        result.set_item("startup_identity", verified.startup_identity().to_hex())?;
+        result.set_item("interpreter_id", verified.interpreter_id())?;
+        Ok(Some(result))
+    })
 }
 
 fn exec_module_inner(
@@ -489,7 +607,37 @@ fn exec_module_inner(
 ) -> PyResult<()> {
     let exec_depth = ExecModuleDepthGuard::enter();
     let module_globals = time_phase(exec_timings, "get_module_globals", || {
-        module.getattr("__dict__")
+        let dictionary = unsafe { ffi::PyModule_GetDict(module.as_ptr()) };
+        if dictionary.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        Ok(unsafe { Bound::<PyAny>::from_borrowed_ptr(py, dictionary) })
+    })?;
+    SoacExtModule::with_data(module, |data| {
+        let strict = data.strict_runtime.ok_or_else(|| {
+            soac_jit::strict_runtime_unavailable(
+                py,
+                "SOAC module lacks authenticated strict execution authority",
+            )
+        })?;
+        if !data
+            .shared_state
+            .verified_strict_module()
+            .is_some_and(|verified| strict.matches_verified_source(verified))
+        {
+            return Err(soac_jit::strict_runtime_unavailable(
+                py,
+                "strict execution source owner mismatch",
+            ));
+        }
+        if !strict.matches_globals(py, module_globals.cast::<PyDict>()?)? {
+            return Err(soac_jit::strict_runtime_unavailable(
+                py,
+                "strict execution globals identity mismatch",
+            ));
+        }
+        strict.begin_execution(py)?;
+        Ok(())
     })?;
     time_phase(exec_timings, "ensure_builtins", || {
         ensure_module_builtins(&module_globals)
@@ -497,15 +645,17 @@ fn exec_module_inner(
     let execute_lowered_start = Instant::now();
     let result = SoacExtModule::with_data(module.as_any(), |module_data| {
         let module_name = resolve_module_name(&module_globals, "module execution")?;
-        assert_eq!(
-            module_name, module_data.shared_state.module_name,
-            "module.__dict__['__name__'] did not match the module spec captured at create_module time"
-        );
+        if module_name != module_data.shared_state.module_name {
+            return Err(PyRuntimeError::new_err(
+                "module.__dict__['__name__'] did not match the module spec captured at create_module time",
+            ));
+        }
         let package_name = resolve_module_package(&module_globals, "module execution")?;
-        assert_eq!(
-            package_name, module_data.shared_state.package_name,
-            "module.__dict__['__package__'] did not match the module spec captured at create_module time"
-        );
+        if package_name != module_data.shared_state.package_name {
+            return Err(PyRuntimeError::new_err(
+                "module.__dict__['__package__'] did not match the module spec captured at create_module time",
+            ));
+        }
         let function =
             lookup_module_init_function(&module_data.shared_state.lowered_module, &module_name)?;
         let is_soac_runtime = module_name == "soac.runtime";
@@ -563,8 +713,29 @@ fn exec_module_inner(
                 &module_runtime,
             )
         })?;
-        let result = time_phase(exec_timings, "call_module_init", || module_init.call0(py));
+        let result = time_phase(exec_timings, "call_module_init", || {
+            let strict = module_data.strict_runtime.ok_or_else(|| {
+                soac_jit::strict_runtime_unavailable(py, "module initializer has no strict owner")
+            })?;
+            let entry =
+                soac_jit::strict_function_entry_kind(module_init.bind(py))?.ok_or_else(|| {
+                    soac_jit::strict_runtime_unavailable(
+                        py,
+                        "module initializer has no authenticated public entry",
+                    )
+                })?;
+            // Only callback-free native validation and a Rust-only observation
+            // separate the final public-entry snapshot from this actual call.
+            strict.record_initializer_entry(py, entry)?;
+            module_init.call0(py)
+        });
         result?;
+        if let Some(strict) = module_data.strict_runtime {
+            strict.begin_sealing(py)?;
+            time_phase(exec_timings, "finalize_strict_module_contents", || {
+                soac_jit::finalize_strict_module_contents(py, strict, module_data.shared_state)
+            })?;
+        }
         if let Some(bootstrap) = &soac_runtime_bootstrap {
             let globals = module_globals.cast::<PyDict>()?;
             time_phase(exec_timings, "restore_soac_runtime_bootstrap", || {
@@ -603,6 +774,9 @@ fn exec_module_inner(
                         }
                     })
             })?;
+        }
+        if let Some(strict) = module_data.strict_runtime {
+            strict.finish_sealing(py)?;
         }
         Ok(())
     });
@@ -651,6 +825,35 @@ fn force_entry_interpreter_for_tests(enabled: bool) -> bool {
     soac_jit::force_entry_interpreter_vectorcall_for_tests(enabled)
 }
 
+#[pyfunction]
+fn strict_function_entry_kind(function: &Bound<'_, PyAny>) -> PyResult<Option<&'static str>> {
+    soac_jit::strict_function_entry_kind(function)
+        .map(|kind| kind.map(soac_jit::StrictFunctionEntryKind::as_str))
+}
+
+/// The ordinary-interpreter lane reports its real native owner and entry
+/// witness. A missing compiler entry is not evidence of native execution.
+#[pyfunction]
+fn strict_function_diagnostics<'py>(
+    py: Python<'py>,
+    function: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    soac_jit::interpreter_function_diagnostics(py, function)
+}
+
+#[pyfunction]
+fn strict_function_call_statistics<'py>(
+    function: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let Some(counts) = soac_jit::strict_function_call_statistics(function)? else {
+        return Ok(None);
+    };
+    let result = PyDict::new(function.py());
+    result.set_item("direct_body_calls", counts.direct_body_calls)?;
+    result.set_item("fixed_body_calls", counts.fixed_body_calls)?;
+    Ok(Some(result))
+}
+
 #[pyfunction(signature = (name, globals, fromlist=None, level=0))]
 fn import_(
     py: Python<'_>,
@@ -669,6 +872,45 @@ fn import_attr(
     name: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     soac_jit::import_helpers::import_from(py, module, name)
+}
+
+#[pyfunction]
+fn suspended_handled_exception(
+    py: Python<'_>,
+    preserved_state: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let value = unsafe {
+        soac_jit::preserved_state::suspended_handled_exception_owned(preserved_state.as_ptr())
+    };
+    unsafe { Bound::from_owned_ptr_or_err(py, value) }.map(Bound::unbind)
+}
+
+#[pyfunction]
+fn generator_resume_delivery(py: Python<'_>, preserved_state: &Bound<'_, PyAny>) -> PyResult<i64> {
+    let delivery = unsafe { soac_jit::generator_resume_delivery(preserved_state.as_ptr()) };
+    if delivery < 0 {
+        Err(PyErr::fetch(py))
+    } else {
+        Ok(delivery)
+    }
+}
+
+#[pyfunction]
+fn inject_generator_resume_exception(
+    py: Python<'_>,
+    preserved_state: &Bound<'_, PyAny>,
+    exception: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let result = unsafe {
+        soac_jit::inject_generator_resume_exception(preserved_state.as_ptr(), exception.as_ptr())
+    };
+    unsafe { Bound::from_owned_ptr_or_err(py, result) }.map(Bound::unbind)
+}
+
+#[pyfunction]
+fn async_gen_wrap_yield(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let result = unsafe { soac_jit::async_gen_wrap_yield(value.as_ptr()) };
+    unsafe { Bound::from_owned_ptr_or_err(py, result) }.map(Bound::unbind)
 }
 
 #[pyfunction]
@@ -779,9 +1021,14 @@ fn make_preserved_state(
     py: Python<'_>,
     initial_values: &Bound<'_, PyTuple>,
     slot_kinds: &Bound<'_, PyTuple>,
+    operand_slots: Vec<usize>,
 ) -> PyResult<Py<PyAny>> {
     let state = unsafe {
-        soac_jit::preserved_state::new_preserved_state(initial_values.as_ptr(), slot_kinds.as_ptr())
+        soac_jit::preserved_state::new_preserved_state(
+            initial_values.as_ptr(),
+            slot_kinds.as_ptr(),
+            &operand_slots,
+        )
     };
     unsafe { Bound::from_owned_ptr_or_err(py, state) }.map(Bound::unbind)
 }
@@ -798,11 +1045,17 @@ fn load_preserved_state(
 }
 
 pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(configure_strict_backend, module)?)?;
+    module.add_function(wrap_pyfunction!(runtime_compilation_activity, module)?)?;
     module.add_function(wrap_pyfunction!(create_module, module)?)?;
     module.add_function(wrap_pyfunction!(exec_module, module)?)?;
+    module.add_function(wrap_pyfunction!(strict_module_diagnostics, module)?)?;
     module.add_function(wrap_pyfunction!(make_function, module)?)?;
     module.add_function(wrap_pyfunction!(profile_watch_type_key_layout, module)?)?;
     module.add_function(wrap_pyfunction!(force_entry_interpreter_for_tests, module)?)?;
+    module.add_function(wrap_pyfunction!(strict_function_entry_kind, module)?)?;
+    module.add_function(wrap_pyfunction!(strict_function_diagnostics, module)?)?;
+    module.add_function(wrap_pyfunction!(strict_function_call_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(import_, module)?)?;
     module.add_function(wrap_pyfunction!(import_attr, module)?)?;
     // Retain PyO3's exact keyword parsing and argument errors off the hot path.
@@ -814,5 +1067,9 @@ pub(crate) fn add_module_functions(module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(wrap_pyfunction!(resume_async_generator, module)?)?;
     module.add_function(wrap_pyfunction!(make_preserved_state, module)?)?;
     module.add_function(wrap_pyfunction!(load_preserved_state, module)?)?;
+    module.add_function(wrap_pyfunction!(suspended_handled_exception, module)?)?;
+    module.add_function(wrap_pyfunction!(generator_resume_delivery, module)?)?;
+    module.add_function(wrap_pyfunction!(inject_generator_resume_exception, module)?)?;
+    module.add_function(wrap_pyfunction!(async_gen_wrap_yield, module)?)?;
     Ok(())
 }

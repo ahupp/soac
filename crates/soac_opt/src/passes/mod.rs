@@ -57,18 +57,20 @@ pub fn allocate_codegen_stack_temp(
 }
 
 pub use crate::typed::{
-    TrustedGeneratorResumePlanLookup, TrustedGeneratorResumePlanMissReason, TrustedOwnerBranchGate,
-    TrustedOwnerPredecessorEdge, TrustedOwnerState, TrustedOwnerStateAnalysis,
-    TrustedResumeFunctionFact, TrustedResumeFunctionOrigins, TypedConstructorFieldBinding,
-    TypedConstructorFieldBindings, TypedConstructorInitBodyInlineStats,
-    TypedExpressionLinearizationStats, TypedExternalInlineCallee, TypedFieldScalarizationStats,
-    TypedFullyVirtualObjectLoweringStats, TypedGeneratorResumeStateLoweringOutcome,
-    TypedGeneratorResumeStateLoweringStats, TypedGeneratorStateConstructor,
-    TypedGeneratorStateLoweringOutcome, TypedGeneratorStateLoweringPlan,
-    TypedGeneratorStateLoweringStats, TypedHotContinuationClone, TypedHotContinuationSplitStats,
-    TypedInlineConstantMapping, TypedInlineInstanceSource, TypedInlineInstrIdMapping,
-    TypedInlineLocalMapping, TypedInlineMaterializedGeneratorArg, TypedInlineRewriteStats,
-    TypedInlineSyntheticInstrId, TypedNestedBuiltinImplementationHoistStats, TypedVirtualBodyInstr,
+    NATIVE_ITERATOR_PIPELINE_BLOCK_BUDGET, NATIVE_ITERATOR_PIPELINE_BODY_BUDGET,
+    NativeIteratorPipelineOperands, TrustedGeneratorResumePlanLookup,
+    TrustedGeneratorResumePlanMissReason, TrustedOwnerBranchGate, TrustedOwnerPredecessorEdge,
+    TrustedOwnerState, TrustedOwnerStateAnalysis, TrustedResumeFunctionFact,
+    TrustedResumeFunctionOrigins, TypedConstructorFieldBinding, TypedConstructorFieldBindings,
+    TypedConstructorInitBodyInlineStats, TypedExpressionLinearizationStats,
+    TypedExternalInlineCallee, TypedFieldScalarizationStats, TypedFullyVirtualObjectLoweringStats,
+    TypedGeneratorResumeStateLoweringOutcome, TypedGeneratorResumeStateLoweringStats,
+    TypedGeneratorStateConstructor, TypedGeneratorStateLoweringOutcome,
+    TypedGeneratorStateLoweringPlan, TypedGeneratorStateLoweringStats, TypedHotContinuationClone,
+    TypedHotContinuationSplitStats, TypedInlineConstantMapping, TypedInlineInstanceSource,
+    TypedInlineInstrIdMapping, TypedInlineLocalMapping, TypedInlineMaterializedGeneratorArg,
+    TypedInlineRewriteStats, TypedInlineSyntheticInstrId,
+    TypedNestedBuiltinImplementationHoistStats, TypedVirtualBodyInstr,
     TypedVirtualBodyMaterializationStats, TypedVirtualBoundaryKind, TypedVirtualBoundaryLocation,
     TypedVirtualConstructorStats, TypedVirtualFieldEdge, TypedVirtualFieldRef,
     TypedVirtualFieldStateAnalysis, TypedVirtualMaterializationBoundary,
@@ -79,7 +81,7 @@ pub use crate::typed::{
     annotate_typed_function_planned_results, annotate_typed_function_result_demands,
     annotate_typed_function_value_facts, annotate_typed_module_value_facts,
     cleanup_lowered_typed_generator_alias_setup_with_existing_constructor,
-    ensure_typed_generator_resume_boundary_writebacks,
+    commit_typed_native_iterator_pipeline_plans, ensure_typed_generator_resume_boundary_writebacks,
     hoist_typed_nested_builtin_implementation_calls,
     inline_typed_constructor_init_bodies_with_external_callees,
     inline_typed_function_direct_call_stores,
@@ -97,13 +99,15 @@ pub use crate::typed::{
     materialize_typed_virtual_body_boundaries_with_plan,
     materialize_typed_virtual_return_boundaries_with_plan,
     materialize_typed_virtual_store_boundaries_with_plan, merge_trusted_owner_states,
-    plan_typed_fully_virtual_objects, plan_typed_virtual_objects, prune_unreachable_typed_blocks,
-    refresh_typed_function_value_facts, remap_trusted_owner_state_for_edge,
+    native_iterator_pipeline_operands, plan_typed_fully_virtual_objects,
+    plan_typed_virtual_objects, propose_typed_native_iterator_pipelines,
+    prune_unreachable_typed_blocks, refresh_typed_function_value_facts,
+    remap_trusted_owner_state_for_edge,
     remap_typed_generator_preserved_instrs_with_existing_locals,
     rewrite_lowered_typed_generator_state_helper_calls_with_existing_constructor,
-    rewrite_typed_stop_iteration_raises_to_handler_jumps, simplify_typed_virtual_tuple_ops,
-    split_typed_alias_hot_continuations, split_typed_alias_hot_continuations_with_budget,
-    split_typed_constructor_hot_continuations,
+    rewrite_typed_stop_iteration_raises_to_handler_jumps, select_typed_native_iterator_pipelines,
+    simplify_typed_virtual_tuple_ops, split_typed_alias_hot_continuations,
+    split_typed_alias_hot_continuations_with_budget, split_typed_constructor_hot_continuations,
     split_typed_constructor_hot_continuations_with_budget,
     split_typed_generator_alias_hot_continuations,
     split_typed_generator_alias_hot_continuations_with_budget,
@@ -121,12 +125,14 @@ pub use crate::typed::{
     typed_constructor_field_bindings_from_inline_stats,
     typed_constructor_field_bindings_from_inline_stats_with_external_callees,
     typed_constructor_init_plans_from_inline_stats_with_external_callees,
+    typed_exact_int_region_matches_field_expression,
     typed_generator_alias_ignored_instr_ids_by_origin,
     typed_generator_constructor_capture_bindings_by_origin,
     typed_generator_state_origin_can_lower_aliases,
     typed_generator_state_origin_can_lower_aliases_in_blocks,
-    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
-    validate_typed_module_call_access_plans, visit_trusted_owner_term_instrs,
+    typed_native_iterator_pipeline_reserved_budget, validate_typed_function_call_access_plans,
+    validate_typed_function_value_facts, validate_typed_module_call_access_plans,
+    validate_typed_native_iterator_pipeline_plans, visit_trusted_owner_term_instrs,
 };
 pub use escape_analysis::{
     ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
@@ -136,6 +142,7 @@ pub use escape_analysis::{
 pub use inline_plan::{
     FunctionInlinePlan, InlinePlanModule, StraightlineConstructorInlinePlan, plan_module_inlining,
 };
+pub(crate) use inline_transform::InlineHandledContext;
 pub use inline_transform::{
     InlineFragment, InlineLocal, InlineUnsupportedReason, InlineValueBindings,
     bind_simple_direct_call_inline_args, bind_simple_direct_method_inline_args,
@@ -143,7 +150,7 @@ pub use inline_transform::{
     build_cross_module_direct_method_inline_fragment_to_target,
     build_direct_call_inline_fragment_to_target, build_direct_method_inline_fragment_to_target,
     build_single_block_inline_fragment, build_single_block_inline_fragment_to_target,
-    build_single_block_inline_fragment_with_bindings,
+    build_single_block_inline_fragment_with_bindings, inline_callee_preserves_activation,
 };
 pub use local_env_plan::{
     BlockLocalPlan, BlockParamFacts, FunctionLocalEnvResumePlan, FunctionLocalPlan,
@@ -161,6 +168,7 @@ pub use local_env_plan::{
     validate_typed_local_env_module_plan_with_precise_immortal_states,
     validate_typed_local_env_resume_module_plan,
 };
+pub(crate) use ownership_effects::plan_typed_function_refcounts;
 pub use ownership_effects::{
     BlockRefcountPlan, FunctionRefcountPlan, LocalRefState, REFCOUNT_STACK_SLOT_CLEAR_PREVIOUS,
     REFCOUNT_STACK_SLOT_DECREF_PURPOSES, REFCOUNT_STACK_SLOT_EXIT_SWEEP,

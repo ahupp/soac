@@ -16,6 +16,9 @@ packages = ["soac"]
 
 [dependency-groups]
 dev = [
+    "Django>=5.2,<6",
+    "pydantic>=2.13,<3",
     "pyperformance>=1.14.0",
     "pytest>=8,<9",
+    "SQLAlchemy>=2,<3",
 ]

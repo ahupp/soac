@@ -33,11 +33,6 @@ def _enabled_module_roots() -> list[Path] | None:
     return roots
 
 
-def _runtime_bootstrap_in_progress() -> bool:
-    runtime = sys.modules.get("soac.runtime")
-    return runtime is not None and not getattr(runtime, "_SOAC_RUNTIME_READY", False)
-
-
 def _create_module_from_path(path: str, spec):
     absolute_path = os.path.abspath(path)
     try:
@@ -45,6 +40,10 @@ def _create_module_from_path(path: str, spec):
     except SyntaxError as err:
         if err.filename is None:
             err.filename = absolute_path
+        raise
+    except _soac_ext.StrictRuntimeUnavailableError:
+        # The native ImportError subclass identifies missing/stale strict
+        # authority. Preserve it instead of replacing it with a generic error.
         raise
     except Exception as err:
         raise ImportError(f"diet-python failed for {absolute_path}: {err}") from err
@@ -58,9 +57,7 @@ def _module_is_enabled(resolved: Path) -> bool:
 
 
 def _should_transform(path: str) -> bool:
-    """Return ``True`` if ``path`` should be passed through the transform."""
-    if _runtime_bootstrap_in_progress():
-        return False
+    """Return whether to ask the native loader about this source path."""
     try:
         resolved = Path(path).resolve()
     except OSError:
@@ -70,16 +67,6 @@ def _should_transform(path: str) -> bool:
     return True
 
 
-def _should_transform_module(fullname: str, path: str) -> bool:
-    if fullname == "soac.bootstrap":
-        return False
-    if fullname == "soac" or fullname.startswith("soac."):
-        if _runtime_bootstrap_in_progress():
-            return False
-        return True
-    return _should_transform(path)
-
-
 def _source_path_for_frozen_spec(spec):
     loader_state = getattr(spec, "loader_state", None)
     filename = getattr(loader_state, "filename", None)
@@ -87,14 +74,10 @@ def _source_path_for_frozen_spec(spec):
         return filename
 
     origname = getattr(loader_state, "origname", spec.name)
+    source_dir = REPO_ROOT / os.environ.get("CPYTHON_SOURCE_DIR", "vendor/cpython")
     candidates = [
-        REPO_ROOT / "vendor" / "cpython" / "Lib" / f"{origname.replace('.', os.sep)}.py",
-        REPO_ROOT
-        / "vendor"
-        / "cpython"
-        / "Lib"
-        / origname.replace(".", os.sep)
-        / "__init__.py",
+        source_dir / "Lib" / f"{origname.replace('.', os.sep)}.py",
+        source_dir / "Lib" / origname.replace(".", os.sep) / "__init__.py",
     ]
     for candidate in candidates:
         if candidate.is_file():
@@ -102,27 +85,44 @@ def _source_path_for_frozen_spec(spec):
     return None
 
 
-def _is_cpython_frozen_fixture(spec) -> bool:
-    """CPython's frozen test fixtures assert the public FrozenImporter loader."""
-    loader_state = getattr(spec, "loader_state", None)
-    origname = getattr(loader_state, "origname", spec.name)
-    fixture_roots = (
-        "__hello__",
-        "__hello_alias__",
-        "__phello__",
-        "__phello_alias__",
-    )
-    return any(origname == root or origname.startswith(f"{root}.") for root in fixture_roots)
-
-
 class SoacLoader(importlib.machinery.SourceFileLoader):
-    """Loader that applies the SOAC transform before executing a module."""
+    """Authenticate strict imports and leave ordinary imports on their loader."""
+
+    def __init__(self, fullname, path, native_loader=None):
+        super().__init__(fullname, path)
+        self._native_loader = (
+            importlib.machinery.SourceFileLoader(fullname, path)
+            if native_loader is None
+            else native_loader
+        )
 
     def create_module(self, spec):
-        return _create_module_from_path(self.path, spec)
+        frozen = self._native_loader is importlib.machinery.FrozenImporter
+        origin, has_location = spec.origin, spec.has_location
+        if frozen:
+            # An authenticated strict replacement executes its verified source.
+            # A declined ordinary import must retain FrozenImporter's code and
+            # metadata, not execute the corresponding Lib source instead.
+            spec.origin, spec.has_location = self.path, True
+        try:
+            module = _create_module_from_path(self.path, spec)
+        except BaseException:
+            if frozen:
+                spec.origin, spec.has_location = origin, has_location
+            raise
+        if module is None:
+            if frozen:
+                spec.origin, spec.has_location = origin, has_location
+            spec.loader = self._native_loader
+            return self._native_loader.create_module(spec)
+        return module
 
     def exec_module(self, module):
-        _soac_ext.exec_module(module)
+        # Only native module-definition identity selects this branch. An
+        # exception from an owned (including terminal) strict module never
+        # retries ordinary source execution.
+        if not _soac_ext.exec_module(module):
+            self._native_loader.exec_module(module)
         return None
 
 
@@ -148,24 +148,26 @@ class SoacFinder(importlib.machinery.PathFinder):
         if (
             isinstance(spec.loader, importlib.machinery.SourceFileLoader)
             and spec.origin
-            and _should_transform_module(fullname, spec.origin)
+            and _should_transform(spec.origin)
         ):
-            spec.loader = SoacLoader(fullname, spec.origin)
+            spec.loader = SoacLoader(fullname, spec.origin, spec.loader)
         elif (
             spec.loader is importlib.machinery.FrozenImporter
             and spec.origin == "frozen"
-            and not _is_cpython_frozen_fixture(spec)
         ):
             source_path = _source_path_for_frozen_spec(spec)
-            if source_path and _should_transform_module(fullname, source_path):
-                spec.origin = source_path
-                spec.has_location = True
-                spec.loader = SoacLoader(fullname, source_path)
+            if source_path and _should_transform(source_path):
+                spec.loader = SoacLoader(fullname, source_path, spec.loader)
         return spec
 
 
-def install():
-    """Install the SOAC import hook."""
+def install(*, backend=None):
+    """Select an immutable native execution backend and install the import hook.
+
+    Omitting the backend preserves an existing selection, or selects SOAC on
+    first use. This choice never grants strict source/deployment authority.
+    """
+    _soac_ext.configure_strict_backend(backend)
     if any(finder is SoacFinder for finder in sys.meta_path):
         return
 

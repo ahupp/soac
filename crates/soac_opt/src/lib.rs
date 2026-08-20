@@ -12,3 +12,6 @@ pub mod region_emission_v3;
 pub mod region_v3;
 mod typed;
 pub mod v3_status;
+
+/// Shared activation-safety precondition for inlining and its cost planning.
+pub use passes::inline_callee_preserves_activation;

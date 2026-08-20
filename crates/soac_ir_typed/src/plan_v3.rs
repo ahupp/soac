@@ -1,6 +1,6 @@
 use soac_core::block_py::{
-    BinOpKind, InstrId, RuntimeName, SerializedFunctionId, SerializedIdentityTables,
-    SerializedModuleId,
+    BinOpKind, CellLoadBinding, InstrId, ResolvedName, RuntimeName, SerializedFunctionId,
+    SerializedIdentityTables, SerializedModuleId,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -559,6 +559,14 @@ pub enum RegionInputSource {
     FunctionParam {
         index: u32,
         name: Option<String>,
+    },
+    /// Load the contents of this resolved Python cell, not the cell's storage
+    /// object or a local with the same spelling. A borrowed hot-region view is
+    /// backed by an owning snapshot until the region exits (including misses).
+    CellValue {
+        source: InstrId,
+        name: ResolvedName,
+        binding: CellLoadBinding,
     },
     ModuleConstant {
         index: u32,
@@ -1912,6 +1920,23 @@ fn validate_region_input_source(
                 errors.push(format!(
                     "region {region:?} function-param input {:?} has empty name",
                     input.value
+                ));
+            }
+        }
+        RegionInputSource::CellValue { name, binding, .. } => {
+            if name.cell_location().is_none()
+                || name.id.as_str().is_empty()
+                || binding.logical_name.as_str().is_empty()
+            {
+                errors.push(format!(
+                    "region {region:?} cell input {:?} has no resolved cell binding",
+                    input.value,
+                ));
+            }
+            if !matches!(input.value.rep, Rep::PyObjectBorrowed | Rep::PyObjectOwned) {
+                errors.push(format!(
+                    "region {region:?} cell input {:?} has unsupported rep {:?}",
+                    input.value.id, input.value.rep,
                 ));
             }
         }

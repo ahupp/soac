@@ -20,6 +20,9 @@ pub(crate) struct DirectFunctionCompileResult {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct JitCodegenStats {
+    pub(crate) strict_sealed_field_site_count: usize,
+    pub(crate) strict_sealed_method_site_count: usize,
+    pub(crate) strict_checked_fixed_body_site_count: usize,
     pub(crate) clif_block_count: usize,
     pub(crate) clif_inst_count: usize,
     pub(crate) machine_code_size_bytes: usize,
@@ -49,11 +52,6 @@ impl CompiledFunctionHandle {
                 deopt_table,
             ),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_runner_info(&self) -> Result<(*const u8, *const u8, usize), String> {
-        compiled_direct_runner_info(self.handle)
     }
 
     pub(crate) fn direct_code_ptr(&self) -> Result<ObjPtr, String> {
@@ -113,16 +111,18 @@ fn compiled_direct_runner_info(
         return Err("invalid null compiled handle for direct vectorcall trampoline".to_string());
     }
     let compiled = unsafe { &*(compiled_handle as *const CompiledSpecializedRunner) };
-    debug_assert!(
-        compiled.direct_deopt_table.is_some(),
-        "compiled direct handle should carry a deopt table"
-    );
     match compiled.entry {
         Some(CompiledRunnerEntry::Direct {
             code_ptr,
             default_code_ptr,
             param_count,
-        }) => Ok((code_ptr, default_code_ptr, param_count)),
+        }) => {
+            debug_assert!(
+                compiled.direct_deopt_table.is_some(),
+                "compiled direct handle should carry a deopt table"
+            );
+            Ok((code_ptr, default_code_ptr, param_count))
+        }
         None => Err("invalid compiled handle without entrypoint".to_string()),
     }
 }

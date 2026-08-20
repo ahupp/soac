@@ -120,9 +120,4 @@ pub fn pre_optimization_module_cache_metadata(
     )
 }
 
-pub(crate) fn precompiled_library_path() -> Result<Option<PathBuf>, String> {
-    Ok(SoacEnvConfig::from_env()?
-        .precompiled_library_path()
-        .map(Path::to_path_buf))
-}
 pub use soac_driver::blockpy_cache::PythonModuleCacheSource;

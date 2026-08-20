@@ -1,3 +1,7 @@
+---
+title: "Virtual Object Lowering"
+---
+
 # Virtual Object Lowering
 
 ## Goal

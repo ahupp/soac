@@ -1,13 +1,13 @@
 use crate::artifacts_v3::ExactIntBranchV3Artifacts;
 use soac_core::block_py::InstrId;
-use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
+use soac_core::profile::CounterDumpTypeKey;
 use soac_ir_typed::emit_v3::MechanicalIndexedFieldGuard;
 use soac_ir_typed::plan_v3::{
     ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemGuardKind, ExactListItemShape,
     IndexedFieldAccessKind, IndexedFieldFallbackKind, IndexedFieldGuardKind,
     IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalGuardKind,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExactListItemAccessPlan {
@@ -23,12 +23,6 @@ pub struct IndexedFieldAccessPlan {
     pub access: IndexedFieldAccessKind,
     pub guard: MechanicalIndexedFieldGuard,
     pub fallback: IndexedFieldFallbackKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexedFieldLayoutGroup {
-    pub type_key: CounterDumpTypeKey,
-    pub layouts: Vec<CollectedTypeKeyLayout>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,50 +102,6 @@ pub fn indexed_field_runtime_access_request(
         type_key: indexed_field_type_key(plan),
         expected_index: plan.guard.expected_index,
     }
-}
-
-pub fn indexed_field_layout_groups<'a>(
-    plans: impl IntoIterator<Item = &'a IndexedFieldAccessPlan>,
-) -> Vec<IndexedFieldLayoutGroup> {
-    let mut layouts_by_type = HashMap::<CounterDumpTypeKey, Vec<CollectedTypeKeyLayout>>::new();
-    let mut seen_layouts = HashSet::<(CounterDumpTypeKey, String, u32)>::new();
-    for plan in plans {
-        let request = indexed_field_runtime_access_request(plan);
-        if !seen_layouts.insert((
-            request.type_key.clone(),
-            request.attr_name.clone(),
-            request.expected_index,
-        )) {
-            continue;
-        }
-        layouts_by_type
-            .entry(request.type_key)
-            .or_default()
-            .push(CollectedTypeKeyLayout {
-                owner_type_id: 0,
-                key: request.attr_name,
-                index: request.expected_index,
-            });
-    }
-
-    let mut groups = layouts_by_type
-        .into_iter()
-        .map(|(type_key, mut layouts)| {
-            layouts.sort_by(|lhs, rhs| {
-                lhs.index
-                    .cmp(&rhs.index)
-                    .then_with(|| lhs.key.cmp(&rhs.key))
-            });
-            IndexedFieldLayoutGroup { type_key, layouts }
-        })
-        .collect::<Vec<_>>();
-    groups.sort_by(|lhs, rhs| {
-        lhs.type_key
-            .module_name
-            .cmp(&rhs.type_key.module_name)
-            .then_with(|| lhs.type_key.qualname.cmp(&rhs.type_key.qualname))
-    });
-    groups
 }
 
 pub fn prepare_indexed_field_accesses_for_codegen<T: PartialEq>(
@@ -324,39 +274,6 @@ mod tests {
             },
             fallback: emitted.fallback.kind,
         }
-    }
-
-    #[test]
-    fn indexed_field_layout_groups_are_deduped_and_sorted() {
-        let duplicate = field_plan("zmod", "B", "z", 2, IndexedFieldAccessKind::Load);
-        let plans = [
-            duplicate.clone(),
-            field_plan("amod", "A", "b", 3, IndexedFieldAccessKind::Store),
-            field_plan("amod", "A", "a", 1, IndexedFieldAccessKind::Load),
-            duplicate,
-        ];
-
-        let groups = indexed_field_layout_groups(plans.iter());
-
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].type_key.module_name, "amod");
-        assert_eq!(
-            groups[0]
-                .layouts
-                .iter()
-                .map(|layout| (layout.key.as_str(), layout.index))
-                .collect::<Vec<_>>(),
-            vec![("a", 1), ("b", 3)]
-        );
-        assert_eq!(groups[1].type_key.module_name, "zmod");
-        assert_eq!(
-            groups[1]
-                .layouts
-                .iter()
-                .map(|layout| (layout.key.as_str(), layout.index))
-                .collect::<Vec<_>>(),
-            vec![("z", 2)]
-        );
     }
 
     #[test]

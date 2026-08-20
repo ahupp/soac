@@ -54,62 +54,18 @@ fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrBlockPy)
     }
 
     match expr {
-        InstrBlockPy::GetAttr(operation) => {
-            out.push("__dp_getattr".to_string());
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::SetAttr(operation) => {
-            out.push("__dp_setattr".to_string());
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::GetItem(operation) => {
-            out.push("__dp_getitem".to_string());
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::SetItem(operation) => {
-            out.push("__dp_setitem".to_string());
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
+        InstrBlockPy::GetAttr(_) => out.push("__dp_getattr".to_string()),
+        InstrBlockPy::SetAttr(_) => out.push("__dp_setattr".to_string()),
+        InstrBlockPy::GetItem(_) => out.push("__dp_getitem".to_string()),
+        InstrBlockPy::SetItem(_) => out.push("__dp_setitem".to_string()),
         InstrBlockPy::Call(operation) => {
             if let InstrBlockPy::Load(op) = &*operation.func {
                 out.push(op.name.id_str().to_string());
             }
-            operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrBlockPy::BinOp(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::UnaryOp(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::Tuple(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::Load(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::Store(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::Del(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::MakeCell(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::IncrementCounter(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::CellRef(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::MakeFunctionWithClosure(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrBlockPy::DelItem(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
+        _ => {}
     }
+    expr.visit_children(&mut HelperNameVisitor { out });
 }
 
 #[test]
@@ -187,22 +143,34 @@ def f(obj, mapping, key, value):
 }
 
 #[test]
-fn replaces_lone_surrogate_escaped_string_literals() {
-    for (source, expected) in [
-        ("def f():\n    return \"\\udca7\" \"b\"\n", "\u{FFFD}b"),
-        ("def f(x):\n    return f\"\\udca7{x}\"\n", "\u{FFFD}"),
-        ("def f(x):\n    return f\"{x:\\udca7}\"\n", "\u{FFFD}"),
+fn rejects_unsupported_surrogate_escapes_before_lowering() {
+    for source in [
+        "def f():\n    return \"\\udca7\" \"b\"\n",
+        "def f(x):\n    return f\"\\udca7{x}\"\n",
+        "def f(x):\n    return f\"{x:\\udca7}\"\n",
+        "def f(x):\n    return t\"\\udca7{x}\"\n",
+        "def f(x):\n    return t\"{x:\\udca7}\"\n",
     ] {
-        let values = lowered_string_values(source);
-        assert!(
-            values.iter().any(|value| value == expected),
-            "expected {expected:?} in {values:?}"
-        );
+        let error = match lower_python_to_blockpy_for_testing(source) {
+            Err(crate::LoweringError::Other(error)) => error,
+            _ => panic!("unsupported surrogate literal must fail before AST rewriting"),
+        };
+        let unsupported = error
+            .downcast_ref::<soac_source::UnsupportedSurrogateEscape>()
+            .expect("structured source-literal diagnostic");
+        assert_eq!(unsupported.code_point(), 0xDCA7);
+        assert_eq!(&source[unsupported.range()], r"\udca7");
     }
+}
 
+#[test]
+fn preserves_raw_backslashes_and_genuine_replacement_characters() {
     for (source, expected) in [
         ("def f():\n    return r\"\\udca7\" \"b\"\n", "\\udca7b"),
         ("def f(x):\n    return rf\"\\udca7{x}\"\n", "\\udca7"),
+        ("def f():\n    return \"\\\\udca7\"\n", "\\udca7"),
+        ("def f():\n    return \"�\"\n", "�"),
+        ("def f(x):\n    return f\"\\ufffd{x}\"\n", "�"),
     ] {
         let values = lowered_string_values(source);
         assert!(

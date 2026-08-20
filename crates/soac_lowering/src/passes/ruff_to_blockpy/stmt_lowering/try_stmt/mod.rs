@@ -4,7 +4,7 @@ use crate::passes::ast_to_ast::body::Suite;
 use crate::template::{py_expr, py_stmt};
 
 fn body_to_vec(body: Suite) -> Vec<Stmt> {
-    body
+    body.into()
 }
 
 fn quiet_delete_marker(name: &str) -> Stmt {
@@ -317,7 +317,7 @@ where
                 .finalbody
                 .into_iter()
                 .map(crate::passes::ast_to_instr::into_ast_stmt)
-                .collect::<Vec<_>>(),
+                .collect::<Suite>(),
         ))
     } else {
         None

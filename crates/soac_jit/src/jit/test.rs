@@ -35,23 +35,32 @@ use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
     CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot, ConstantExpr, CounterDef,
-    CounterSite, Del, DelItem, FunctionExecutionMode, FunctionKind, FunctionName, GetAttr, GetItem,
-    HasMeta, HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta,
-    ModuleNameGen, NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName,
-    RuntimeFunctionId, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
-    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
-    StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    CounterSite, Del, DelItem, FunctionKind, FunctionName, GetAttr, GetItem, HasMeta,
+    HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
+    NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName, RuntimeFunctionId,
+    RuntimeName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+    SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, StorageLayout, Store, Tuple,
+    UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy, validate_blockpy_instr_ids};
 mod tests {
+    use crate::module_constants::ModuleCodegenConstants;
+
     use super::super::direct_abi;
     use super::super::function_targets::collect_planned_typed_call_direct_targets;
+    use super::super::imports::{
+        PY_SOAC_OBJECT_CALL_CONTEXT_IMPORT, PY_SOAC_VECTORCALL_CONTEXT_IMPORT,
+    };
     use super::super::inspection::clif_refcount_family_from_source_loc_bits;
     use super::super::operation_specializations::{
         FieldIndexSpecialization, OptV3ResolvedIndexedFieldAccess,
-        owner_type_supports_field_layout_priming, prime_field_index_layout,
+        field_index_specialization_from_opt_v3,
     };
     use super::super::planning::{PlannedLocalBinding, RuntimeBlockParamRepr};
+    use super::super::runtime_context::{
+        FUNCTION_ENV_ACTIVE_STRICT_CALL_OFFSET, FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+        FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET,
+    };
     use super::super::specialization_profile::{
         DirectCallEmissionScope, planned_optimization_inputs_from_v3_artifacts,
         planned_optimization_inputs_from_v3_artifacts_for_blockpy_module,
@@ -66,12 +75,12 @@ mod tests {
         BlockParamFacts, BlockPyBlock, ClifBlockDisplayAnnotations,
         DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT, DP_JIT_DECREF_IMPORT,
         DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
-        DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
+        DP_JIT_PY_CALL_OBJECT_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
         DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DirectCallArgPlan,
         DirectCallArgSource, DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
-        IntFacts, IntRange, JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage,
-        LocalRefKind, ModuleConstantId, ModuleFuncImports, ObjPtr, ParamBindingFacts,
-        ParamProvenance, ParsedRuntimeClifFunction, PlannedJitDeoptPointId,
+        FUNCTION_ENV_GLOBALS_OBJ_OFFSET, IntFacts, IntRange, JitDeoptExitRef, LocalEnv,
+        LocalEnvEntry, LocalEnvStorage, LocalRefKind, ModuleConstantId, ModuleFuncImports, ObjPtr,
+        ParamBindingFacts, ParamProvenance, ParsedRuntimeClifFunction, PlannedJitDeoptPointId,
         PlannedLocalEnvEntryMaterialization, PlannedLocalEnvEntrySource, PlannedLocalStorage,
         PrecompileModuleIndex, PrecompileModuleIndexEntry, ProcessJitEngine, PyLong_Type,
         RefcountEmitter, RefcountFamily, RefcountLowering, RelocTypeRef, ResultDemand,
@@ -113,13 +122,13 @@ mod tests {
         CallArgPositional, CellLocation, CellRef, ChildVisitable, CleanupRootSlotState,
         ClifFunctionDisplayAlias, ClifFunctionDisplayAliases, ClosureInit, ClosureSlot,
         ConstantExpr, CounterDef, CounterSite, CpythonTypeSymbol, DeclaredJitFunction, Del,
-        DelItem, FuncBuildImports, FunctionExecutionMode, FunctionKind, FunctionName,
-        FunctionRuntimeDataLayout, GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter,
-        InstrBlockPy, Literal, LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta,
-        ModuleNameGen, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
-        ParamSpec, ResolvedName, RuntimeFunctionEntryPlan, RuntimeFunctionId,
-        RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
-        RuntimeJitDeoptRecord, RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason, RuntimeName,
+        DelItem, FuncBuildImports, FunctionKind, FunctionName, FunctionRuntimeDataLayout, GetAttr,
+        GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrBlockPy, Literal,
+        LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
+        NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec,
+        ResolvedName, RuntimeFunctionEntryPlan, RuntimeFunctionId, RuntimeJitDeoptContinuation,
+        RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord,
+        RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason, RuntimeName,
         SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
         SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, SpecializationProfile,
         StackSlots, StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit,
@@ -154,15 +163,16 @@ mod tests {
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_jit::JITModule;
     use cranelift_module::{DataId, FuncId, Module};
-    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
-    use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
+    use pyo3::types::{PyAnyMethods, PyDictMethods, PyModule};
+    use pyo3::{Python, ffi};
     use ruff_python_ast as ast;
     use soac_config::{SoacEnvConfig, SpecializationMode};
-    use soac_core::block_py::{CounterId, CounterScope, InstrId, InstrKey};
+    use soac_core::block_py::{
+        CellBindingKind, CellLoadBinding, CounterId, CounterScope, InstrId, InstrKey,
+    };
     use soac_core::profile::{
-        CollectedTypeKeyLayout, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
-        CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
-        write_counter_dump_records,
+        CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
+        CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, write_counter_dump_records,
     };
     use soac_driver::blockpy_cache::pre_optimization_module_cache_identity;
     use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
@@ -205,10 +215,11 @@ mod tests {
     };
     use soac_opt::pipeline_v3::plan_and_emit_function_exact_int_branches_v3_with_module_constants;
     use soac_opt::plan::FunctionProfileEvidence;
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{HashMap, HashSet};
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::path::{Path, PathBuf};
+    use std::ptr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     unsafe extern "C" {
@@ -303,34 +314,6 @@ mod tests {
         define_module_counter_defs_for_profile(module, false, true);
     }
 
-    fn runtime_branch_counter_for(
-        counter_defs: &[CounterDef],
-        function_id: RuntimeFunctionId,
-        instr_id: InstrId,
-        kind: &str,
-        branch: &str,
-    ) -> (CounterId, soac_core::block_py::CounterBranchId) {
-        counter_defs
-            .iter()
-            .find_map(|counter| match &counter.site {
-                CounterSite::Runtime {
-                    function_id: Some(counter_function_id),
-                    instr_id: Some(counter_instr_id),
-                } if counter.kind == kind
-                    && *counter_function_id == function_id
-                    && *counter_instr_id == instr_id =>
-                {
-                    counter
-                        .branch_id(branch)
-                        .map(|branch_id| (counter.id, branch_id))
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| {
-                panic!("missing {kind}.{branch} counter for {function_id} at {instr_id}")
-            })
-    }
-
     fn test_v3_call_body(kind: CallBodyKind) -> CallBodyPlan {
         CallBodyPlan {
             kind,
@@ -371,10 +354,9 @@ mod tests {
         live_value_count: i64,
     ) -> ObjPtr {
         unsafe {
-            crate::jit::specialized_helpers::dp_jit_deopt_resume(
+            test_dp_jit_deopt_resume_with_function_data(
                 deopt_table,
                 globals_obj,
-                ffi::PyEval_GetBuiltins().cast(),
                 std::ptr::null_mut(),
                 record_ordinal,
                 live_values,
@@ -391,7 +373,11 @@ mod tests {
         live_values: ObjPtr,
         live_value_count: i64,
     ) -> ObjPtr {
-        unsafe {
+        use crate::handled_exception::{HandledExceptionState, OwnedHandledExceptionState};
+        let plan = &unsafe { &*deopt_table.cast::<RuntimeJitDeoptTable>() }.handled_plan;
+        let mut owner = OwnedHandledExceptionState::new(plan, false).expect("test handled state");
+        let handled = unsafe { OwnedHandledExceptionState::enter(owner.as_mut()).unwrap() };
+        let result = unsafe {
             crate::jit::specialized_helpers::dp_jit_deopt_resume(
                 deopt_table,
                 globals_obj,
@@ -400,30 +386,19 @@ mod tests {
                 record_ordinal,
                 live_values,
                 live_value_count,
+                handled.cast(),
+                std::ptr::null_mut(),
             )
+        };
+        unsafe {
+            HandledExceptionState::retire_scopes_and_detach(handled, false);
+            HandledExceptionState::release_residual(handled);
         }
+        result
     }
 
     static CAPSULE_DESTROYED: AtomicBool = AtomicBool::new(false);
     static NEXT_TEST_WORK_DIR_ID: AtomicUsize = AtomicUsize::new(0);
-
-    struct ForceEntryInterpreterVectorcallGuard {
-        previous: bool,
-    }
-
-    impl ForceEntryInterpreterVectorcallGuard {
-        fn new() -> Self {
-            Self {
-                previous: crate::force_entry_interpreter_vectorcall_for_tests(true),
-            }
-        }
-    }
-
-    impl Drop for ForceEntryInterpreterVectorcallGuard {
-        fn drop(&mut self) {
-            crate::force_entry_interpreter_vectorcall_for_tests(self.previous);
-        }
-    }
 
     #[repr(C)]
     struct RawPyDictKeysObject {
@@ -444,6 +419,8 @@ mod tests {
 
     unsafe extern "C" {
         fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
+        fn PyErr_GetHandledException() -> *mut ffi::PyObject;
+        fn PyErr_SetHandledException(exception: *mut ffi::PyObject);
     }
 
     #[test]
@@ -564,6 +541,97 @@ mod tests {
             &HashMap::new(),
             &built.direct_func_id_to_qualname,
         )
+    }
+
+    #[test]
+    fn strict_checked_fixed_body_emits_guarded_direct_and_same_activation_virtual_calls() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module = new_jit_module(&compile_session).unwrap();
+        let ptr_ty = jit_module.target_config().pointer_type();
+        // The same body region must accept a zero-argument source function,
+        // one explicit value, or the full two-value binding after a default.
+        for bound_arguments in [0, 1, 2] {
+            let operand_count = 2 + bound_arguments; // actual environment + thread
+            let mut body_signature = jit_module.make_signature();
+            body_signature
+                .params
+                .extend((0..operand_count).map(|_| ir::AbiParam::new(ptr_ty)));
+            body_signature.returns.push(ir::AbiParam::new(ptr_ty));
+            let target_id = declare_local_fn(
+                &mut jit_module,
+                &format!("checked_body_target_{bound_arguments}"),
+                &body_signature,
+            )
+            .unwrap();
+            for fixed in [false, true] {
+                let mut function = ir::Function::new();
+                function.signature = body_signature.clone();
+                function.signature.params.push(ir::AbiParam::new(ptr_ty));
+                let mut builder_context = FunctionBuilderContext::new();
+                let operands;
+                let actual_body;
+                let target;
+                {
+                    let mut fb = FunctionBuilder::new(&mut function, &mut builder_context);
+                    let entry = fb.create_block();
+                    fb.append_block_params_for_function_params(entry);
+                    fb.switch_to_block(entry);
+                    operands = fb.block_params(entry)[..operand_count].to_vec();
+                    actual_body = fb.block_params(entry)[operand_count];
+                    target = jit_module.declare_func_in_func(target_id, fb.func);
+                    let expected = fb.ins().func_addr(ptr_ty, target);
+                    let result = super::super::emit_guarded_checked_body_call(
+                        &mut fb,
+                        fixed.then_some(target),
+                        expected,
+                        actual_body,
+                        &operands,
+                        ptr_ty,
+                        &mut jit_module,
+                    );
+                    fb.ins().return_(&[result]);
+                    fb.seal_all_blocks();
+                    fb.finalize();
+                }
+                cranelift_codegen::verify_function(&function, jit_module.isa()).unwrap();
+                let instructions = function
+                    .layout
+                    .blocks()
+                    .flat_map(|block| function.layout.block_insts(block))
+                    .collect::<Vec<_>>();
+                let direct = instructions.iter().copied().filter(|instruction| {
+                matches!(function.dfg.insts[*instruction], ir::InstructionData::Call { func_ref, .. } if func_ref == target)
+            }).collect::<Vec<_>>();
+                assert_eq!(direct.len(), usize::from(fixed));
+                for instruction in direct {
+                    assert_eq!(function.dfg.inst_args(instruction), operands);
+                }
+                let virtual_calls = instructions
+                    .iter()
+                    .copied()
+                    .filter(|instruction| {
+                        function.dfg.insts[*instruction].opcode() == ir::Opcode::CallIndirect
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(virtual_calls.len(), 1);
+                let virtual_arguments = function.dfg.inst_args(virtual_calls[0]);
+                assert_eq!(virtual_arguments[0], actual_body);
+                assert_eq!(
+                    &virtual_arguments[1..],
+                    operands,
+                    "both calls use the same prepared environment, thread, and bound values"
+                );
+                assert_eq!(
+                    instructions
+                        .iter()
+                        .filter(|instruction| {
+                            function.dfg.insts[**instruction].opcode() == ir::Opcode::Icmp
+                        })
+                        .count(),
+                    usize::from(fixed)
+                );
+            }
+        }
     }
 
     fn build_nested_dominator_render_function() -> (
@@ -1706,6 +1774,178 @@ def get_value():
         );
     }
 
+    // These are raw binder/frame ownership tests; they never register source
+    // functions. Source-object creation and public entry behavior are exercised
+    // through signed source in tests/test_strict_entry_runtime.py.
+    #[test]
+    fn operand_take_entry_hands_off_once_and_cleans_failed_siblings() {
+        use pyo3::types::PyModuleMethods;
+        use soac_core::block_py::{StoreLifetime, TakeOperand};
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let callbacks = PyModule::from_code(
+                py,
+                cr#"
+import sys
+import weakref
+events = []
+saved = None
+error = RuntimeError('later operand failed')
+class Value:
+    def __del__(self): events.append('drop')
+def make():
+    global saved
+    value = Value()
+    saved = weakref.ref(value)
+    events.append('make')
+    return value
+def consume(value, other):
+    raise AssertionError('failed argument must prevent invocation')
+def fail():
+    assert saved() is not None
+    assert sys.getrefcount(saved()) == 2
+    events.append('fail')
+    raise error
+"#,
+                c"operand_take.py",
+                c"operand_take",
+            )
+            .unwrap();
+            let events = callbacks.getattr("events").unwrap();
+            // This exercises the actual entry/deopt evaluator's physical
+            // Operand operation. Source comprehension production is tested
+            // separately through authenticated transformed modules.
+            for mode in 0..3 {
+                events.call_method0("clear").unwrap();
+                let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+                    "def run(make, consume, fail):\n    return None\n",
+                )
+                .unwrap()
+                .blockpy_module;
+                let function = lowered
+                    .callable_defs
+                    .iter_mut()
+                    .find(|function| function.names.bind_name == "run")
+                    .unwrap();
+                let layout = function.storage_layout.as_mut().unwrap();
+                let callback = |name: &str| {
+                    let index = layout
+                        .stack_slots()
+                        .iter()
+                        .position(|slot| slot == name)
+                        .unwrap();
+                    ResolvedName {
+                        id: name.into(),
+                        location: NameLocation::Local(LocalLocation(index as u32)),
+                    }
+                };
+                let [make, consume, fail] =
+                    [callback("make"), callback("consume"), callback("fail")];
+                let operand = LocalLocation(layout.stack_slots().len() as u32);
+                layout.ensure_stack_slot("operand_owner");
+                layout.mark_expression_temporary(operand);
+                let name = ResolvedName {
+                    id: "display_alias_is_not_storage".into(),
+                    location: NameLocation::Local(operand),
+                };
+                let take = || InstrBlockPy::TakeOperand(TakeOperand::new(name.clone()));
+                let call = |name: ResolvedName, args: Vec<InstrBlockPy>| {
+                    InstrBlockPy::Call(Call::new(
+                        InstrBlockPy::Load(Load::new(name)),
+                        args.into_iter()
+                            .map(CallArgPositional::Positional)
+                            .collect::<Vec<_>>(),
+                        Vec::new(),
+                    ))
+                };
+                let store = InstrBlockPy::Store(
+                    Store::new(
+                        ResolvedName {
+                            id: "operand_owner".into(),
+                            location: NameLocation::Local(operand),
+                        },
+                        call(make, vec![]),
+                    )
+                    .with_lifetime(StoreLifetime::Operand { unwind_order: 0 }),
+                );
+                let returned = match mode {
+                    0 => take(),
+                    1 => call(consume, vec![take(), call(fail, vec![])]),
+                    _ => InstrBlockPy::Tuple(Tuple::new(vec![take(), take()])),
+                };
+                function.blocks =
+                    vec![test_source_block(function, vec![store], ret_term(returned))];
+                assign_missing_test_module_instr_ids(&mut lowered);
+                let shared = crate::module_type::build_shared_state_for_testing(
+                    py,
+                    lowered,
+                    "operand_take_entry",
+                    "",
+                )
+                .unwrap();
+                let function = shared
+                    .lowered_module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.bind_name == "run")
+                    .unwrap();
+                let plan = RuntimeFunctionEntryPlan::from_function(function).unwrap();
+                let arguments =
+                    ["make", "consume", "fail"].map(|name| callbacks.getattr(name).unwrap());
+                let context = BlockPyEntryRuntimeContext::new(
+                    std::sync::Arc::new(crate::session::CompileSession::new()),
+                    std::sync::Arc::clone(&shared),
+                    callbacks.dict().as_ptr().cast(),
+                    ffi::PyEval_GetBuiltins().cast(),
+                    ptr::null_mut(),
+                    &plan,
+                );
+                let result = run_blockpy_function_from_entry(
+                    function,
+                    context,
+                    &arguments
+                        .each_ref()
+                        .map(|argument| argument.as_ptr().cast()),
+                )
+                .unwrap();
+                if mode == 0 {
+                    assert!(!result.is_null());
+                    assert!(ffi::PyErr_Occurred().is_null());
+                    assert_eq!(
+                        ffi::Py_REFCNT(result.cast()),
+                        1,
+                        "the result has no remaining slot owner"
+                    );
+                    assert_eq!(events.extract::<Vec<String>>().unwrap(), ["make"]);
+                    ffi::Py_DECREF(result.cast());
+                } else {
+                    assert!(result.is_null());
+                    let raised = pyo3::PyErr::fetch(py);
+                    if mode == 1 {
+                        assert!(raised.value(py).is(&callbacks.getattr("error").unwrap()));
+                    } else {
+                        assert!(raised.is_instance_of::<pyo3::exceptions::PyUnboundLocalError>(py));
+                    }
+                }
+                let expected = if mode == 1 {
+                    vec!["make", "fail", "drop"]
+                } else {
+                    vec!["make", "drop"]
+                };
+                assert_eq!(events.extract::<Vec<String>>().unwrap(), expected);
+                assert!(
+                    callbacks
+                        .getattr("saved")
+                        .unwrap()
+                        .call0()
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        });
+    }
+
     #[test]
     fn blockpy_entry_interpreter_binds_positional_args() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
@@ -1884,71 +2124,6 @@ def add_default(left, right=9):
         });
     }
 
-    unsafe fn run_named_blockpy_entry_for_test(
-        py: Python<'_>,
-        source: &str,
-        function_name: &str,
-        globals_obj: ObjPtr,
-        positional_args: &[ObjPtr],
-    ) -> Result<ObjPtr, String> {
-        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
-            .map_err(|err| format!("lowering entry interpreter source failed: {err}"))?
-            .blockpy_module;
-        let module_code = compile_original_module_code_for_test(py, source)
-            .map_err(|err| format!("compiling original entry interpreter source failed: {err}"))?;
-        let original_code_by_function_id =
-            match_original_code_to_functions_for_test(py, module_code.bind(py), &lowered).map_err(
-                |err| format!("mapping original code to lowered functions failed: {err}"),
-            )?;
-        let shared_state = crate::module_type::build_shared_state_for_testing_with_original_code(
-            py,
-            lowered,
-            "entry_test",
-            "",
-            original_code_by_function_id,
-        )
-        .map_err(|err| format!("building entry interpreter shared state failed: {err}"))?;
-        let function = shared_state
-            .lowered_module
-            .callable_defs
-            .iter()
-            .find(|function| function.names.bind_name == function_name)
-            .ok_or_else(|| format!("lowered module should contain function {function_name:?}"))?;
-        let entry_plan = RuntimeFunctionEntryPlan::from_function(function)
-            .expect("entry interpreter plan should build");
-        let context = BlockPyEntryRuntimeContext::new(
-            std::sync::Arc::new(crate::session::CompileSession::new()),
-            std::sync::Arc::clone(&shared_state),
-            globals_obj,
-            ffi::PyEval_GetBuiltins().cast(),
-            std::ptr::null_mut(),
-            &entry_plan,
-        );
-        unsafe { run_blockpy_function_from_entry(function, context, positional_args) }
-    }
-
-    unsafe fn entry_test_globals(py: Python<'_>) -> *mut ffi::PyObject {
-        let globals = unsafe { ffi::PyDict_New() };
-        assert!(!globals.is_null(), "test globals dict should allocate");
-        let builtins = py.import("builtins").expect("builtins should import");
-        assert_eq!(
-            unsafe {
-                ffi::PyDict_SetItemString(globals, c"__builtins__".as_ptr(), builtins.as_ptr())
-            },
-            0,
-            "test globals should store builtins"
-        );
-        let module_name = unsafe { ffi::PyUnicode_FromStringAndSize(c"entry_test".as_ptr(), 10) };
-        assert!(!module_name.is_null(), "test module name should allocate");
-        assert_eq!(
-            unsafe { ffi::PyDict_SetItemString(globals, c"__name__".as_ptr(), module_name) },
-            0,
-            "test globals should store __name__"
-        );
-        unsafe { ffi::Py_DECREF(module_name) };
-        globals
-    }
-
     unsafe fn entry_test_kwnames(names: &[&str]) -> *mut ffi::PyObject {
         let tuple = ffi::PyTuple_New(names.len() as ffi::Py_ssize_t);
         assert!(!tuple.is_null(), "kwnames tuple should allocate");
@@ -1965,781 +2140,6 @@ def add_default(left, right=9):
             );
         }
         tuple
-    }
-
-    unsafe fn entry_test_tuple<'py>(
-        py: Python<'py>,
-        values: &[*mut ffi::PyObject],
-    ) -> Bound<'py, PyTuple> {
-        let tuple = ffi::PyTuple_New(values.len() as ffi::Py_ssize_t);
-        assert!(!tuple.is_null(), "test tuple should allocate");
-        for (index, value) in values.iter().copied().enumerate() {
-            assert!(!value.is_null(), "test tuple value should be non-null");
-            ffi::Py_INCREF(value);
-            assert_eq!(
-                ffi::PyTuple_SetItem(tuple, index as ffi::Py_ssize_t, value),
-                0,
-                "test tuple item should insert"
-            );
-        }
-        Bound::from_owned_ptr(py, tuple)
-            .cast_into::<PyTuple>()
-            .expect("test tuple should cast")
-    }
-
-    unsafe fn entry_test_int_tuple<'py>(py: Python<'py>, values: &[i64]) -> Bound<'py, PyTuple> {
-        let tuple = ffi::PyTuple_New(values.len() as ffi::Py_ssize_t);
-        assert!(!tuple.is_null(), "test int tuple should allocate");
-        for (index, value) in values.iter().copied().enumerate() {
-            let item = ffi::PyLong_FromLongLong(value);
-            assert!(!item.is_null(), "test int tuple value should allocate");
-            if ffi::PyTuple_SetItem(tuple, index as ffi::Py_ssize_t, item) != 0 {
-                ffi::Py_DECREF(item);
-                ffi::Py_DECREF(tuple);
-                panic!("test int tuple item should insert");
-            }
-        }
-        Bound::from_owned_ptr(py, tuple)
-            .cast_into::<PyTuple>()
-            .expect("test int tuple should cast")
-    }
-
-    type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
-    type OriginalCodeMap = HashMap<RuntimeFunctionId, Py<PyAny>>;
-
-    fn compile_original_module_code_for_test(py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
-        let code = PyModule::import(py, "builtins")?
-            .getattr("compile")?
-            .call1((source, "<entry_test>", "exec"))?;
-        Ok(code.unbind())
-    }
-
-    fn collect_original_code_objects_for_test(
-        code: &Bound<'_, PyAny>,
-        code_type: &Bound<'_, PyAny>,
-        by_qualname: &mut OriginalCodeByQualname,
-    ) -> PyResult<()> {
-        let qualname = code.getattr("co_qualname")?.extract::<String>()?;
-        by_qualname
-            .entry(qualname)
-            .or_default()
-            .push_back(code.clone().unbind());
-
-        let consts = code.getattr("co_consts")?;
-        let const_count = unsafe { ffi::PyTuple_Size(consts.as_ptr()) };
-        if const_count < 0 {
-            return Err(PyErr::fetch(code.py()));
-        }
-        for index in 0..const_count {
-            let item = unsafe { ffi::PyTuple_GetItem(consts.as_ptr(), index) };
-            if item.is_null() {
-                return Err(PyErr::fetch(code.py()));
-            }
-            let item = unsafe { Bound::from_borrowed_ptr(code.py(), item) };
-            if item.is_instance(code_type)? {
-                collect_original_code_objects_for_test(&item, code_type, by_qualname)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn is_synthetic_class_helper_for_original_code(
-        function: &BlockPyFunction<BlockPyModuleShape>,
-    ) -> bool {
-        function.names.bind_name.starts_with("_dp_class_ns_")
-            || function.names.bind_name.starts_with("_dp_define_class_")
-    }
-
-    fn original_code_lookup_key_for_test(
-        function: &BlockPyFunction<BlockPyModuleShape>,
-    ) -> Option<&str> {
-        if function.execution_mode() == FunctionExecutionMode::Interpreted {
-            return None;
-        }
-        let qualname = function.names.qualname.as_str();
-        if qualname == "_dp_module_init" || is_synthetic_class_helper_for_original_code(function) {
-            return None;
-        }
-        Some(qualname)
-    }
-
-    fn match_original_code_to_functions_for_test(
-        py: Python<'_>,
-        module_code: &Bound<'_, PyAny>,
-        lowered_module: &BlockPyModule<BlockPyModuleShape>,
-    ) -> PyResult<OriginalCodeMap> {
-        let code_type = PyModule::import(py, "types")?.getattr("CodeType")?;
-        let mut code_by_qualname = HashMap::new();
-        collect_original_code_objects_for_test(module_code, &code_type, &mut code_by_qualname)?;
-
-        let mut code_by_function_id = HashMap::new();
-        for function in &lowered_module.callable_defs {
-            let Some(qualname) = original_code_lookup_key_for_test(function) else {
-                continue;
-            };
-            let Some(codes) = code_by_qualname.get_mut(qualname) else {
-                continue;
-            };
-            let Some(code) = codes.pop_front() else {
-                continue;
-            };
-            code_by_function_id.insert(function.function_id, code);
-        }
-        Ok(code_by_function_id)
-    }
-
-    unsafe fn run_registered_module_init_entry_for_test<'py>(
-        py: Python<'py>,
-        source: &str,
-    ) -> Bound<'py, PyDict> {
-        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
-            .expect("lowering module init source should succeed")
-            .blockpy_module;
-        let module_code = compile_original_module_code_for_test(py, source)
-            .expect("original module source should compile for entry test");
-        let original_code_by_function_id =
-            match_original_code_to_functions_for_test(py, module_code.bind(py), &lowered)
-                .expect("original code should map to lowered entry-test functions");
-        let shared_state = crate::module_type::build_shared_state_for_testing_with_original_code(
-            py,
-            lowered,
-            "entry_test",
-            "",
-            original_code_by_function_id,
-        )
-        .expect("shared state should build for module init test");
-        let function_id = shared_state
-            .lowered_module
-            .callable_defs
-            .iter()
-            .find(|function| function.names.bind_name == "_dp_module_init")
-            .expect("lowered module should contain module init")
-            .function_id;
-        let globals = PyDict::new(py);
-        let builtins = py.import("builtins").expect("builtins should import");
-        globals
-            .set_item("__builtins__", &builtins)
-            .expect("module globals should accept builtins");
-        globals
-            .set_item("__name__", "entry_test")
-            .expect("module globals should accept __name__");
-
-        let captures = entry_test_tuple(py, &[]);
-        let param_defaults = entry_test_tuple(py, &[]);
-        let annotate_fn = py.None();
-        let module_init = crate::function_instantiation::make_function_in_shared_state(
-            py,
-            std::sync::Arc::new(crate::session::CompileSession::new()),
-            std::sync::Arc::clone(&shared_state),
-            function_id,
-            FunctionKind::Function,
-            captures.as_any(),
-            param_defaults.as_any(),
-            annotate_fn.bind(py),
-            globals.as_any(),
-        )
-        .expect("registered module init should instantiate");
-        let module_init = module_init.bind(py);
-        assert!(
-            !crate::PyFunction_GetSoacMetadata(module_init.as_ptr()).is_null(),
-            "module init should have SOAC metadata"
-        );
-
-        let result = module_init
-            .call0()
-            .expect("entry-interpreter vectorcall should execute module init");
-        assert!(
-            result.is_none(),
-            "module init should return None through Python call dispatch"
-        );
-        assert!(
-            ffi::PyErr_Occurred().is_null(),
-            "successful module init run should not leave a Python exception"
-        );
-        globals
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_uses_registered_function_env() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-                r#"
-def add_default(left, right=9):
-    return left + right
-"#,
-            )
-            .expect("lowering registered entry source should succeed")
-            .blockpy_module;
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
-                    .expect("shared state should build for registered entry test");
-            let function_id = shared_state
-                .lowered_module
-                .callable_defs
-                .iter()
-                .find(|function| function.names.bind_name == "add_default")
-                .expect("lowered module should contain add_default")
-                .function_id;
-            let module = PyModule::new(py, "entry_test").expect("module should allocate");
-            let globals = module.dict();
-            let builtins = py.import("builtins").expect("builtins should import");
-            globals
-                .set_item("__builtins__", &builtins)
-                .expect("module globals should accept builtins");
-            globals
-                .set_item("__name__", "entry_test")
-                .expect("module globals should accept __name__");
-
-            let captures = entry_test_tuple(py, &[]);
-            let default = ffi::PyLong_FromLong(9);
-            assert!(!default.is_null(), "default value should allocate");
-            let param_defaults = entry_test_tuple(py, &[default]);
-            ffi::Py_DECREF(default);
-            let annotate_fn = py.None();
-            let function_obj = crate::function_instantiation::make_function_in_shared_state(
-                py,
-                std::sync::Arc::new(crate::session::CompileSession::new()),
-                std::sync::Arc::clone(&shared_state),
-                function_id,
-                FunctionKind::Function,
-                captures.as_any(),
-                param_defaults.as_any(),
-                annotate_fn.bind(py),
-                globals.as_any(),
-            )
-            .expect("registered function should instantiate");
-            let function_obj = function_obj.bind(py);
-            assert!(
-                !crate::PyFunction_GetSoacMetadata(function_obj.as_ptr()).is_null(),
-                "instantiated function should have SOAC metadata"
-            );
-
-            let left = ffi::PyLong_FromLong(33);
-            assert!(!left.is_null(), "left value should allocate");
-            let args = [left];
-            let result = crate::run_registered_clif_function_from_vectorcall_entry(
-                function_obj.as_ptr(),
-                args.as_ptr(),
-                args.len(),
-                std::ptr::null_mut(),
-            )
-            .expect("registered entry interpreter should execute");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result),
-                42,
-                "entry interpreter should read the default from FunctionEnv runtime objects"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful registered entry run should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result);
-            ffi::Py_DECREF(left);
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_vectorcall_executes_class_creation() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = run_registered_module_init_entry_for_test(
-                py,
-                r#"
-class C:
-    marker = 40
-
-    def method(self):
-        return self.marker + 2
-
-RESULT = C().method()
-"#,
-            );
-            let stored_result = globals
-                .get_item("RESULT")
-                .expect("RESULT lookup should succeed")
-                .expect("module init should store RESULT");
-            assert_eq!(
-                stored_result
-                    .extract::<i64>()
-                    .expect("RESULT should be int"),
-                42,
-                "class creation and method call should execute through entry interpreter dispatch"
-            );
-            let stored_class = globals
-                .get_item("C")
-                .expect("C lookup should succeed")
-                .expect("module init should store class C");
-            assert!(
-                ffi::PyType_Check(stored_class.as_ptr()) != 0,
-                "class creation should store a Python type"
-            );
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_vectorcall_executes_class_super_closure() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = run_registered_module_init_entry_for_test(
-                py,
-                r#"
-class Base:
-    def value(self):
-        return 40
-
-class C(Base):
-    def value(self):
-        return super().value() + 2
-
-RESULT = C().value()
-"#,
-            );
-            let stored_result = globals
-                .get_item("RESULT")
-                .expect("RESULT lookup should succeed")
-                .expect("module init should store RESULT");
-            assert_eq!(
-                stored_result
-                    .extract::<i64>()
-                    .expect("RESULT should be int"),
-                42,
-                "entry interpreter dispatch should preserve __class__ closure for super()"
-            );
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_vectorcall_executes_decorator_and_metaclass() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = run_registered_module_init_entry_for_test(
-                py,
-                r#"
-def decorate(cls):
-    cls.decorated = cls.flag + 1
-    return cls
-
-class Meta(type):
-    def __new__(mcls, name, bases, ns, **kw):
-        cls = type.__new__(mcls, name, bases, ns)
-        cls.flag = kw["flag"]
-        return cls
-
-@decorate
-class C(metaclass=Meta, flag=41):
-    pass
-
-RESULT = C.decorated
-"#,
-            );
-            let stored_result = globals
-                .get_item("RESULT")
-                .expect("RESULT lookup should succeed")
-                .expect("module init should store RESULT");
-            assert_eq!(
-                stored_result
-                    .extract::<i64>()
-                    .expect("RESULT should be int"),
-                42,
-                "entry interpreter dispatch should handle decorators and metaclass kwargs"
-            );
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_vectorcall_preserves_generator_call_semantics() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = run_registered_module_init_entry_for_test(
-                py,
-                r#"
-def gen():
-    yield 40
-    yield 2
-
-RESULT = list(gen())
-"#,
-            );
-            let stored_result = globals
-                .get_item("RESULT")
-                .expect("RESULT lookup should succeed")
-                .expect("module init should store RESULT");
-            assert_eq!(
-                stored_result
-                    .extract::<Vec<i64>>()
-                    .expect("RESULT should be list[int]"),
-                vec![40, 2],
-                "forced entry dispatch should leave generator calls as generator-object creation"
-            );
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_vectorcall_preserves_coroutine_call_semantics() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = run_registered_module_init_entry_for_test(
-                py,
-                r#"
-async def coro():
-    return 42
-
-OBJ = coro()
-RESULT = hasattr(OBJ, "__await__")
-OBJ.close()
-"#,
-            );
-            let stored_result = globals
-                .get_item("RESULT")
-                .expect("RESULT lookup should succeed")
-                .expect("module init should store RESULT");
-            assert!(
-                stored_result
-                    .extract::<bool>()
-                    .expect("RESULT should be bool"),
-                "forced entry dispatch should leave coroutine calls as coroutine-object creation"
-            );
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_vectorcall_preserves_async_generator_call_semantics() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = run_registered_module_init_entry_for_test(
-                py,
-                r#"
-async def agen():
-    yield 42
-
-OBJ = agen()
-RESULT = hasattr(OBJ, "__anext__")
-"#,
-            );
-            let stored_result = globals
-                .get_item("RESULT")
-                .expect("RESULT lookup should succeed")
-                .expect("module init should store RESULT");
-            assert!(
-                stored_result
-                    .extract::<bool>()
-                    .expect("RESULT should be bool"),
-                "forced entry dispatch should leave async-generator calls as async-generator object creation"
-            );
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_executes_module_init_globals() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let globals = ffi::PyDict_New();
-            assert!(!globals.is_null(), "test globals dict should allocate");
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-VALUE = 41
-
-def add_one(value):
-    return value + 1
-
-RESULT = add_one(VALUE)
-"#,
-                "_dp_module_init",
-                globals.cast(),
-                &[],
-            )
-            .expect("entry interpreter should execute module init");
-
-            assert_eq!(
-                result,
-                ffi::Py_None().cast(),
-                "module init should return owned None"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful module init should not leave a Python exception"
-            );
-            let stored_result = ffi::PyDict_GetItemString(globals, c"RESULT".as_ptr());
-            assert!(
-                !stored_result.is_null(),
-                "module init should store RESULT in globals"
-            );
-            assert_eq!(
-                ffi::PyLong_AsLong(stored_result),
-                42,
-                "module init should call the nested function through globals"
-            );
-            let stored_function = ffi::PyDict_GetItemString(globals, c"add_one".as_ptr());
-            assert!(
-                !stored_function.is_null(),
-                "module init should store the nested function in globals"
-            );
-            assert!(
-                ffi::PyCallable_Check(stored_function) != 0,
-                "stored nested function should be callable"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(globals);
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_executes_attr_and_item_mutation() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let obj = ffi::PyModule_New(c"entry_attr_item_target".as_ptr());
-            assert!(!obj.is_null(), "test module object should allocate");
-            let data = ffi::PyDict_New();
-            assert!(!data.is_null(), "test data dict should allocate");
-            let start = ffi::PyLong_FromLong(10);
-            assert!(!start.is_null(), "test start value should allocate");
-            assert_eq!(
-                ffi::PyDict_SetItemString(data, c"start".as_ptr(), start),
-                0,
-                "test dict setup should store start"
-            );
-
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def mutate(obj, data):
-    obj.value = data["start"]
-    data["next"] = obj.value + 1
-    del data["start"]
-    return obj.value, data["next"], "start" in data
-"#,
-                "mutate",
-                std::ptr::null_mut(),
-                &[obj.cast(), data.cast()],
-            )
-            .expect("entry interpreter should execute attr/item mutation");
-
-            if result.is_null() {
-                ffi::PyErr_Print();
-                panic!("entry interpreter attr/item mutation should produce a result");
-            }
-            assert!(
-                ffi::PyTuple_Check(result.cast::<ffi::PyObject>()) != 0,
-                "mutation result should be a tuple"
-            );
-            assert_eq!(
-                ffi::PyTuple_Size(result.cast::<ffi::PyObject>()),
-                3,
-                "mutation result should have three values"
-            );
-            let first = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 0);
-            let second = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 1);
-            let third = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 2);
-            assert_eq!(
-                ffi::PyLong_AsLong(first),
-                10,
-                "entry interpreter should return the assigned attribute"
-            );
-            assert_eq!(
-                ffi::PyLong_AsLong(second),
-                11,
-                "entry interpreter should return the updated item"
-            );
-            assert_eq!(
-                third,
-                ffi::Py_False(),
-                "entry interpreter should observe the deleted item as absent"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful attr/item mutation should not leave a Python exception"
-            );
-            let stored_attr = ffi::PyObject_GetAttrString(obj, c"value".as_ptr());
-            assert!(!stored_attr.is_null(), "mutate should store obj.value");
-            assert_eq!(
-                ffi::PyLong_AsLong(stored_attr),
-                10,
-                "stored obj.value should match data['start']"
-            );
-            assert!(
-                ffi::PyDict_GetItemString(data, c"start".as_ptr()).is_null(),
-                "mutate should delete data['start']"
-            );
-            assert!(
-                !ffi::PyDict_GetItemString(data, c"next".as_ptr()).is_null(),
-                "mutate should store data['next']"
-            );
-            ffi::Py_DECREF(stored_attr);
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(start);
-            ffi::Py_DECREF(data);
-            ffi::Py_DECREF(obj);
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_executes_local_store_and_tuple_return() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let input = ffi::PyLong_FromLong(41);
-            assert!(!input.is_null(), "test input allocation should succeed");
-            let args = [input.cast::<c_void>()];
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def build(value):
-    next_value = value + 1
-    return (next_value, value)
-"#,
-                "build",
-                std::ptr::null_mut(),
-                &args,
-            )
-            .expect("entry interpreter should execute local store and tuple return");
-
-            assert_eq!(
-                ffi::PyTuple_Size(result.cast::<ffi::PyObject>()),
-                2,
-                "entry interpreter should return a 2-tuple"
-            );
-            let first = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 0);
-            let second = ffi::PyTuple_GetItem(result.cast::<ffi::PyObject>(), 1);
-            assert_eq!(
-                ffi::PyLong_AsLong(first),
-                42,
-                "entry interpreter should store and return the computed local"
-            );
-            assert_eq!(
-                ffi::PyLong_AsLong(second),
-                41,
-                "entry interpreter should preserve the original arg local"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful entry interpreter run should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(input);
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_executes_branch_and_global_load() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let globals = ffi::PyDict_New();
-            assert!(!globals.is_null(), "test globals allocation should succeed");
-            let value = ffi::PyLong_FromLong(40);
-            assert!(
-                !value.is_null(),
-                "test global value allocation should succeed"
-            );
-            assert_eq!(
-                ffi::PyDict_SetItemString(globals, c"VALUE".as_ptr(), value),
-                0,
-                "test global value should insert"
-            );
-            let flag = ffi::PyBool_FromLong(1);
-            assert!(!flag.is_null(), "test flag allocation should succeed");
-            let args = [flag.cast::<c_void>()];
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def choose(flag):
-    if flag:
-        return VALUE + 2
-    return 5
-"#,
-                "choose",
-                globals.cast(),
-                &args,
-            )
-            .expect("entry interpreter should execute branch and global load");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                42,
-                "entry interpreter should take the true branch and load VALUE from globals"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful entry interpreter run should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(flag);
-            ffi::Py_DECREF(value);
-            ffi::Py_DECREF(globals);
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_executes_global_keyword_call() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let helper_module = PyModule::from_code(
-                py,
-                c"
-def helper(value, scale=1):
-    return value * scale + 7
-",
-                c"entry_helper.py",
-                c"entry_helper",
-            )
-            .expect("helper module should execute");
-            let helper = helper_module
-                .getattr("helper")
-                .expect("helper function should exist");
-            let globals = ffi::PyDict_New();
-            assert!(!globals.is_null(), "test globals allocation should succeed");
-            assert_eq!(
-                ffi::PyDict_SetItemString(globals, c"helper".as_ptr(), helper.as_ptr()),
-                0,
-                "helper should insert into globals"
-            );
-            let input = ffi::PyLong_FromLong(11);
-            assert!(!input.is_null(), "test input allocation should succeed");
-            let args = [input.cast::<c_void>()];
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def call_helper(value):
-    return helper(value, scale=3)
-"#,
-                "call_helper",
-                globals.cast(),
-                &args,
-            )
-            .expect("entry interpreter should execute global keyword call");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                40,
-                "entry interpreter should call the global helper with a keyword"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful entry interpreter run should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(input);
-            ffi::Py_DECREF(globals);
-        });
     }
 
     #[test]
@@ -2961,562 +2361,449 @@ def takes_one(value):
     }
 
     #[test]
-    fn blockpy_entry_interpreter_executes_nested_function_with_closure() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let globals = ffi::PyDict_New();
-            assert!(!globals.is_null(), "test globals allocation should succeed");
-            let input = ffi::PyLong_FromLong(37);
-            assert!(!input.is_null(), "test input allocation should succeed");
-            let args = [input.cast::<c_void>()];
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def outer(x):
-    def inner(y):
-        return x + y
-    return inner(5)
-"#,
-                "outer",
-                globals.cast(),
-                &args,
-            )
-            .expect("entry interpreter should instantiate and call a nested closure");
+    fn blockpy_entry_frame_call_provenance_distinguishes_shared_runtime_aliases() {
+        use pyo3::types::PyDict;
 
+        let guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let observations = Python::attach(|py| unsafe {
+            let source = r#"
+def globals_value():
+    return globals()
+def locals_value():
+    return locals()
+def through_argument(target):
+    return target()
+"#;
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .expect("frame-call provenance source should lower")
+                .blockpy_module;
+            let shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                lowered,
+                "entry_frame_calls",
+                "",
+            )
+            .expect("frame-call provenance shared state should build");
+            let globals = PyDict::new(py);
+            globals.set_item("module_marker", 41).unwrap();
+            let runtime = py.import("soac.runtime").unwrap();
+            let rejection_helper = runtime.getattr("locals").unwrap();
             assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                42,
-                "entry interpreter should preserve closure capture through nested function call"
+                rejection_helper.as_ptr(),
+                runtime.getattr("globals").unwrap().as_ptr(),
+                "the regression requires the actual shared rejection helper"
             );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful entry interpreter run should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(input);
-            ffi::Py_DECREF(globals);
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_catches_raised_exception() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def catch_value_error():
-    try:
-        raise ValueError("boom")
-    except ValueError:
-        return 42
-"#,
-                "catch_value_error",
-                std::ptr::null_mut(),
-                &[],
-            )
-            .expect("entry interpreter should execute try/except");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                42,
-                "entry interpreter should dispatch raised ValueError to the except handler"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "caught exception should not remain active after entry execution"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_reraises_current_exception() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def reraise_value_error():
-    try:
-        raise ValueError("boom")
-    except ValueError:
-        raise
-"#,
-                "reraise_value_error",
-                std::ptr::null_mut(),
-                &[],
-            )
-            .expect("entry interpreter should execute bare reraise");
-
-            assert!(
-                result.is_null(),
-                "bare reraise should propagate the active exception"
-            );
-            assert!(
-                ffi::PyErr_ExceptionMatches(ffi::PyExc_ValueError) != 0,
-                "bare reraise should restore the caught ValueError"
-            );
-            ffi::PyErr_Clear();
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_runs_finally_before_return() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def return_through_finally():
-    value = 40
-    try:
-        return value
-    finally:
-        value = 99
-"#,
-                "return_through_finally",
-                std::ptr::null_mut(),
-                &[],
-            )
-            .expect("entry interpreter should execute try/finally return dispatch");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                40,
-                "finally should run but preserve the original return value"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "successful try/finally return should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_finally_return_overrides_exception() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def finally_overrides_exception():
-    try:
-        raise ValueError("boom")
-    finally:
-        return 42
-"#,
-                "finally_overrides_exception",
-                std::ptr::null_mut(),
-                &[],
-            )
-            .expect("entry interpreter should let finally return suppress an exception");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                42,
-                "return from finally should suppress the pending ValueError"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "suppressed exception should not remain active after finally return"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_preserves_exception_through_finally() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def exception_through_finally():
-    marker = 0
-    try:
-        try:
-            raise ValueError("boom")
-        finally:
-            marker = 40
-    except ValueError:
-        return marker + 2
-"#,
-                "exception_through_finally",
-                std::ptr::null_mut(),
-                &[],
-            )
-            .expect("entry interpreter should propagate an exception through finally");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                42,
-                "finally should run while preserving the exception for the outer handler"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "handled exception-through-finally should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_runs_finally_before_loop_break() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def break_through_finally():
-    total = 0
-    for value in (1, 2, 3):
-        try:
-            break
-        finally:
-            total = total + 40
-    return total + value
-"#,
-                "break_through_finally",
-                std::ptr::null_mut(),
-                &[],
-            )
-            .expect("entry interpreter should run finally before loop break");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                41,
-                "finally should run once before the break leaves the loop"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "break-through-finally should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_runs_finally_before_loop_continue() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def continue_through_finally():
-    total = 0
-    for value in (1, 2, 3):
-        try:
-            if value == 2:
-                continue
-            total = total + value
-        finally:
-            total = total + 10
-    return total
-"#,
-                "continue_through_finally",
-                std::ptr::null_mut(),
-                &[],
-            )
-            .expect("entry interpreter should run finally before loop continue");
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                34,
-                "finally should run for normal and continue loop iterations"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "continue-through-finally should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_executes_with_statement_value_flow() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = entry_test_globals(py);
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def use_manager():
-    class Manager:
-        def __enter__(self):
-            return 40
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    with Manager() as value:
-        result = value + 2
-    return result
-"#,
-                "use_manager",
-                globals.cast(),
-                &[],
-            )
-            .expect("entry interpreter should execute normal with-statement flow");
-            if result.is_null() {
-                ffi::PyErr_Print();
-                panic!("normal with-statement execution returned null");
+            let builtins = py.import("builtins").unwrap();
+            let native_globals = builtins.getattr("globals").unwrap();
+            let native_locals = builtins.getattr("locals").unwrap();
+            let mut observations = Vec::new();
+            for (label, name, argument, expected_globals) in [
+                ("compiler globals", "globals_value", None, true),
+                ("compiler locals", "locals_value", None, false),
+                (
+                    "dynamic rejection helper",
+                    "through_argument",
+                    Some(rejection_helper.as_ptr()),
+                    false,
+                ),
+                (
+                    "native globals alias",
+                    "through_argument",
+                    Some(native_globals.as_ptr()),
+                    true,
+                ),
+                (
+                    "native locals alias",
+                    "through_argument",
+                    Some(native_locals.as_ptr()),
+                    false,
+                ),
+            ] {
+                let function = shared_state
+                    .lowered_module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.bind_name == name)
+                    .expect("frame-call source function should exist");
+                let plan = RuntimeFunctionEntryPlan::from_function(function).unwrap();
+                let context = BlockPyEntryRuntimeContext::new(
+                    std::sync::Arc::new(crate::session::CompileSession::new()),
+                    std::sync::Arc::clone(&shared_state),
+                    globals.as_ptr().cast(),
+                    ffi::PyEval_GetBuiltins().cast(),
+                    std::ptr::null_mut(),
+                    &plan,
+                );
+                let arguments = argument
+                    .into_iter()
+                    .map(|value| value.cast())
+                    .collect::<Vec<_>>();
+                let result = run_blockpy_function_from_entry(function, context, &arguments)
+                    .expect("frame-call entry should return a Python result or exception");
+                let (correct, detail) = if result.is_null() {
+                    let error = pyo3::PyErr::fetch(py);
+                    (
+                        !expected_globals
+                            && error.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py),
+                        error.to_string(),
+                    )
+                } else {
+                    let result =
+                        pyo3::Bound::<pyo3::types::PyAny>::from_owned_ptr(py, result.cast());
+                    (
+                        expected_globals && result.as_ptr() == globals.as_ptr(),
+                        "returned a value instead of an explicit unsupported-frame error"
+                            .to_owned(),
+                    )
+                };
+                observations.push((label, correct, detail));
             }
-
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
-                42,
-                "entry interpreter should bind the __enter__ value and leave through __exit__"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "normal with-statement execution should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(globals);
+            for (label, role, expected_globals) in [
+                ("deopt globals constant", RuntimeName::Globals, true),
+                ("deopt locals constant", RuntimeName::Locals, false),
+            ] {
+                let function = with_single_test_block(
+                    test_function(),
+                    vec![],
+                    ret_term(op_expr(Call::new(
+                        name_expr(test_constant_name(0)),
+                        vec![],
+                        vec![],
+                    ))),
+                );
+                let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+                module
+                    .module_constants
+                    .push(ConstantExpr::RuntimeName(role));
+                let constants = ModuleCodegenConstants::collect_from_module(&module);
+                let owners = constants.build_python_constants(py).unwrap();
+                let pointers = owners
+                    .iter()
+                    .map(|value| value.as_ptr())
+                    .collect::<Vec<_>>();
+                let function = &module.callable_defs[0];
+                let plan =
+                    plan_typed_v3_jit_module_for_test(&module, infer_module_value_facts(&module))
+                        .unwrap();
+                let table = RuntimeJitDeoptTable::from_plan(
+                    function,
+                    plan.deopt_resume.function(function.function_id).unwrap(),
+                    &pointers,
+                    &constants,
+                )
+                .unwrap();
+                let record = table
+                    .record_for_point(LocalEnvResumePoint::BeforeTerm {
+                        function_id: function.function_id,
+                        block: function.entry_block().label,
+                    })
+                    .unwrap();
+                let result = test_dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    globals.as_ptr().cast(),
+                    i64::try_from(record.ordinal()).unwrap(),
+                    std::ptr::null_mut(),
+                    0,
+                );
+                let (correct, detail) = if result.is_null() {
+                    let error = pyo3::PyErr::fetch(py);
+                    (
+                        !expected_globals
+                            && error.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py),
+                        error.to_string(),
+                    )
+                } else {
+                    let result =
+                        pyo3::Bound::<pyo3::types::PyAny>::from_owned_ptr(py, result.cast());
+                    (
+                        expected_globals && result.as_ptr() == globals.as_ptr(),
+                        "deopt constant used the shared callable instead of its compiler role"
+                            .to_owned(),
+                    )
+                };
+                observations.push((label, correct, detail));
+            }
+            observations
         });
+        drop(guard);
+        for (label, correct, detail) in observations {
+            assert!(correct, "{label}: {detail}");
+        }
     }
 
     #[test]
-    fn blockpy_entry_interpreter_executes_with_statement_exception_suppression() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+    fn blockpy_entry_frame_call_provenance_preserves_deleted_super_argument_error() {
+        use pyo3::types::PyDict;
+
+        let guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = entry_test_globals(py);
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def suppress_with_exception():
-    class Manager:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            self.saw_value_error = exc_type is ValueError
-            return True
-
-    manager = Manager()
-    with manager:
-        raise ValueError("boom")
-    return manager.saw_value_error
-"#,
-                "suppress_with_exception",
-                globals.cast(),
-                &[],
+        let observations = Python::attach(|py| unsafe {
+            let source = r#"
+class Host:
+    def valid(self):
+        return super()
+    def deleted(self):
+        del self
+        return super()
+    def ordinary_deleted(self):
+        del self
+        return self
+"#;
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .expect("implicit-super source should lower")
+                .blockpy_module;
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, "entry_super", "")
+                    .expect("implicit-super shared state should build");
+            let globals = PyDict::new(py);
+            py.run(
+                &std::ffi::CString::new(source).unwrap(),
+                Some(&globals),
+                None,
             )
-            .expect("entry interpreter should execute with-statement exception suppression");
-            if result.is_null() {
-                ffi::PyErr_Print();
-                panic!("with-statement exception suppression returned null");
+            .unwrap();
+            let class = globals.get_item("Host").unwrap().unwrap();
+            let instance = class.call0().unwrap();
+            let mut observations = Vec::new();
+            for name in ["valid", "deleted", "ordinary_deleted"] {
+                let function = shared_state
+                    .lowered_module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.bind_name == name)
+                    .expect("implicit-super method should exist");
+                let method = class.getattr(name).unwrap();
+                let closure = method.getattr("__closure__").unwrap();
+                let layout = FunctionRuntimeDataLayout::from_function(function);
+                let mut function_data =
+                    vec![std::ptr::null_mut::<ffi::PyObject>(); layout.total_len()];
+                if !closure.is_none() {
+                    for index in 0..closure.len().unwrap() {
+                        function_data[layout.closure_cell_slot(index)] =
+                            closure.get_item(index).unwrap().as_ptr();
+                    }
+                }
+                let plan = RuntimeFunctionEntryPlan::from_function(function).unwrap();
+                let context = BlockPyEntryRuntimeContext::new(
+                    std::sync::Arc::new(crate::session::CompileSession::new()),
+                    std::sync::Arc::clone(&shared_state),
+                    globals.as_ptr().cast(),
+                    ffi::PyEval_GetBuiltins().cast(),
+                    function_data.as_mut_ptr().cast(),
+                    &plan,
+                );
+                let result =
+                    run_blockpy_function_from_entry(function, context, &[instance.as_ptr().cast()])
+                        .expect("implicit-super entry should return a Python result or exception");
+                let (correct, detail) = if result.is_null() {
+                    let error = pyo3::PyErr::fetch(py);
+                    let correct = match name {
+                        "deleted" => {
+                            error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py)
+                                && error.to_string() == "RuntimeError: super(): arg[0] deleted"
+                        }
+                        "ordinary_deleted" => {
+                            error.is_instance_of::<pyo3::exceptions::PyUnboundLocalError>(py)
+                        }
+                        _ => false,
+                    };
+                    (correct, error.to_string())
+                } else {
+                    let result =
+                        pyo3::Bound::<pyo3::types::PyAny>::from_owned_ptr(py, result.cast());
+                    (
+                        name == "valid"
+                            && result.getattr("__self__").unwrap().as_ptr() == instance.as_ptr()
+                            && result.getattr("__thisclass__").unwrap().as_ptr() == class.as_ptr(),
+                        "returned a value instead of the source operation's error".to_owned(),
+                    )
+                };
+                observations.push((name, correct, detail));
             }
-
-            assert_eq!(
-                result.cast::<ffi::PyObject>(),
-                ffi::Py_True(),
-                "entry interpreter should pass the active exception to __exit__ and honor suppression"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "suppressed with-statement exception should not remain active"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(globals);
+            observations
         });
+        drop(guard);
+        for (name, correct, detail) in observations {
+            assert!(correct, "{name}: {detail}");
+        }
     }
 
     #[test]
-    fn blockpy_entry_interpreter_executes_comprehensions_with_captures() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = entry_test_globals(py);
-            let input = entry_test_int_tuple(py, &[1, 2, 3]);
-            let args = [input.as_ptr().cast()];
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def build(values):
-    scale = 2
-    odd_list = [value + scale for value in values if value % 2]
-    odd_dict = {value: value + scale for value in values if value % 2}
-    odd_set = {value + scale for value in values if value % 2}
-    return odd_list == [3, 5] and odd_dict == {1: 3, 3: 5} and odd_set == {3, 5}
-"#,
-                "build",
-                globals.cast(),
-                &args,
-            )
-            .expect("entry interpreter should execute comprehension helpers");
-            if result.is_null() {
-                ffi::PyErr_Print();
-                panic!("comprehension execution returned null");
-            }
+    fn frame_namespace_module_entry_uses_its_defining_globals() {
+        use pyo3::types::PyDict;
 
-            assert_eq!(
-                result.cast::<ffi::PyObject>(),
-                ffi::Py_True(),
-                "entry interpreter should execute list/dict/set comprehensions with captured locals"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "comprehension execution should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(globals);
+        let guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let observations = Python::attach(|py| unsafe {
+            let module = soac_lowering::lower_python_to_blockpy_for_testing("snapshot = query()\n")
+                .unwrap()
+                .blockpy_module;
+            let shared = crate::module_type::build_shared_state_for_testing(
+                py,
+                module,
+                "module_frame_namespace",
+                "",
+            )
+            .unwrap();
+            let function = shared
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| {
+                    function.scope.scope_kind == soac_core::block_py::CallableScopeKind::Module
+                })
+                .expect("actual module initializer");
+            let plan = RuntimeFunctionEntryPlan::from_function(function).unwrap();
+            let builtins = py.import("builtins").unwrap();
+            let mut observations = Vec::new();
+            for marker in ["first_defining_module", "second_defining_module"] {
+                for name in ["locals", "vars", "dir"] {
+                    let globals = PyDict::new(py);
+                    globals.set_item(marker, 42).unwrap();
+                    globals
+                        .set_item("query", builtins.getattr(name).unwrap())
+                        .unwrap();
+                    let context = BlockPyEntryRuntimeContext::new(
+                        std::sync::Arc::new(crate::session::CompileSession::new()),
+                        std::sync::Arc::clone(&shared),
+                        globals.as_ptr().cast(),
+                        ffi::PyEval_GetBuiltins().cast(),
+                        std::ptr::null_mut(),
+                        &plan,
+                    );
+                    let result = run_blockpy_function_from_entry(function, context, &[])
+                        .expect("module context entry should return a Python result or error");
+                    let (correct, detail) = if result.is_null() {
+                        (false, pyo3::PyErr::fetch(py).to_string())
+                    } else {
+                        ffi::Py_DECREF(result.cast());
+                        let snapshot = globals.get_item("snapshot").unwrap().unwrap();
+                        let correct = if name == "dir" {
+                            let mut expected = vec![marker.to_owned(), "query".to_owned()];
+                            expected.sort();
+                            snapshot.extract::<Vec<String>>().unwrap() == expected
+                        } else {
+                            snapshot.as_ptr() == globals.as_ptr()
+                        };
+                        globals.del_item("snapshot").unwrap();
+                        (
+                            correct,
+                            "context must be this module's live dictionary".to_owned(),
+                        )
+                    };
+                    observations.push((marker, name, correct, detail));
+                }
+            }
+            observations
         });
+        drop(guard);
+        for (marker, name, correct, detail) in observations {
+            assert!(correct, "{marker} {name}: {detail}");
+        }
     }
 
     #[test]
-    fn blockpy_entry_interpreter_executes_generator_expression_with_capture() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = entry_test_globals(py);
-            let input = entry_test_int_tuple(py, &[1, 2, 3]);
-            let args = [input.as_ptr().cast()];
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def build(values):
-    scale = 2
-    return tuple(value + scale for value in values if value % 2) == (3, 5)
-"#,
-                "build",
-                globals.cast(),
-                &args,
-            )
-            .expect("entry interpreter should execute generator expression");
-            if result.is_null() {
-                ffi::PyErr_Print();
-                panic!("generator expression execution returned null");
+    fn frame_namespace_module_codegen_keeps_the_source_scope_context() {
+        use soac_core::block_py::CallableScopeKind;
+
+        for (source, scope) in [
+            ("snapshot = query()\n", CallableScopeKind::Module),
+            (
+                "def function():\n    return query()\n",
+                CallableScopeKind::Function,
+            ),
+            (
+                "class Host:\n    snapshot = query()\n",
+                CallableScopeKind::Class,
+            ),
+        ] {
+            let module = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .unwrap()
+                .blockpy_module;
+            let function = module
+                .callable_defs
+                .iter()
+                .find(|function| function.scope.scope_kind == scope)
+                .expect("source scope should be represented");
+            let query_start = source.find("query()").expect("source query call");
+            let query_range = query_start..query_start + "query()".len();
+            struct SourceQueryCalls {
+                range: std::ops::Range<usize>,
+                count: usize,
             }
-
-            assert_eq!(
-                result.cast::<ffi::PyObject>(),
-                ffi::Py_True(),
-                "entry interpreter should create generator expressions with captured locals"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "generator expression execution should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(globals);
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_executes_import_statements() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = entry_test_globals(py);
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def build():
-    import collections as c
-    from collections import deque
-    values = deque()
-    values.append(41)
-    return c.deque is deque and values.pop() == 41
-"#,
-                "build",
-                globals.cast(),
-                &[],
-            )
-            .expect("entry interpreter should execute import statements");
-            if result.is_null() {
-                ffi::PyErr_Print();
-                panic!("import statement execution returned null");
+            impl soac_core::block_py::Visit<InstrBlockPy> for SourceQueryCalls {
+                fn visit_instr(&mut self, instruction: &InstrBlockPy) {
+                    if let InstrBlockPy::Call(call) = instruction
+                        && usize::from(call.meta().range.start()) == self.range.start
+                        && usize::from(call.meta().range.end()) == self.range.end
+                        && call.args.is_empty()
+                        && call.keywords.is_empty()
+                    {
+                        self.count += 1;
+                    }
+                    soac_core::block_py::walk_expr(self, instruction);
+                }
             }
-
+            // Class-name lookup also inserts zero-argument globals() calls.
+            // Those inherit the name's range, not the enclosing source call.
+            let mut source_calls = SourceQueryCalls {
+                range: query_range,
+                count: 0,
+            };
+            soac_core::block_py::Visit::visit_fn(&mut source_calls, function);
             assert_eq!(
-                result.cast::<ffi::PyObject>(),
-                ffi::Py_True(),
-                "entry interpreter should bind import aliases and from-import names"
+                source_calls.count, 1,
+                "one call at the exact source query range in {scope:?}"
             );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "import statement execution should not leave a Python exception"
+            let constants = ModuleCodegenConstants::collect_from_module(&module);
+            let blocks = (1..=function.blocks.len())
+                .map(|i| i as ObjPtr)
+                .collect::<Vec<_>>();
+            let built =
+                build_test_jit_function_with_constants(&module, function, &blocks, &constants);
+            let names =
+                import_user_names_for_symbols(&built, &[PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol]);
+            // The source operation is query(), not the three-argument class
+            // name-lookup helpers that prepare its callable. Match its actual
+            // vectorcall shape after identifying the exact source call.
+            let calls = direct_calls_to_runtime_helpers(&built.ctx.func, &names)
+                .into_iter()
+                .filter(|call| {
+                    let args = built.ctx.func.dfg.inst_args(*call);
+                    value_is_iconst_imm(&built.ctx.func, args[2], 0)
+                        && value_is_iconst_imm(&built.ctx.func, args[3], 0)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                calls.len(),
+                1,
+                "one emitted zero-argument query in {scope:?}"
             );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(globals);
-        });
-    }
-
-    #[test]
-    fn blockpy_entry_interpreter_executes_for_loop_control_flow() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let _entry_vectorcall = ForceEntryInterpreterVectorcallGuard::new();
-        Python::attach(|py| unsafe {
-            let globals = entry_test_globals(py);
-            let input = entry_test_int_tuple(py, &[1, 2, 3]);
-            let args = [input.as_ptr().cast()];
-            let result = run_named_blockpy_entry_for_test(
-                py,
-                r#"
-def build(values):
-    exhausted = []
-    for value in values:
-        if value == 2:
-            continue
-        exhausted.append(value)
-    else:
-        exhausted.append(99)
-    exhausted_last = value
-
-    stopped = []
-    for value in values:
-        if value == 2:
-            continue
-        if value == 3:
-            break
-        stopped.append(value)
-    else:
-        stopped.append(99)
-    stopped_last = value
-
-    return exhausted == [1, 3, 99] and exhausted_last == 3 and stopped == [1] and stopped_last == 3
-"#,
-                "build",
-                globals.cast(),
-                &args,
-            )
-            .expect("entry interpreter should execute for-loop control flow");
-            if result.is_null() {
-                ffi::PyErr_Print();
-                panic!("for-loop execution returned null");
+            let args = built.ctx.func.dfg.inst_args(calls[0]);
+            assert_eq!(args.len(), 7);
+            let entry = built.ctx.func.layout.entry_block().unwrap();
+            assert_eq!(
+                assert_function_env_load_base(
+                    &built.ctx.func,
+                    args[6],
+                    FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+                ),
+                built.ctx.func.dfg.block_params(entry)[0],
+            );
+            match scope {
+                CallableScopeKind::Module => {
+                    assert_eq!(args[4], args[5], "module locals are its defining globals")
+                }
+                CallableScopeKind::Class => {
+                    assert_ne!(args[4], args[5], "class locals are a separate namespace");
+                    assert!(!value_is_iconst_imm(&built.ctx.func, args[5], 0));
+                }
+                CallableScopeKind::Function => {
+                    assert!(value_is_iconst_imm(&built.ctx.func, args[5], 0))
+                }
             }
-
-            assert_eq!(
-                result.cast::<ffi::PyObject>(),
-                ffi::Py_True(),
-                "entry interpreter should handle for-loop exhaustion, else, continue, and break"
-            );
-            assert!(
-                ffi::PyErr_Occurred().is_null(),
-                "for-loop execution should not leave a Python exception"
-            );
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(globals);
-        });
+        }
     }
 
     #[test]
@@ -3586,6 +2873,14 @@ def build(values):
             id: name.into(),
             location: NameLocation::owned_cell(slot),
         }
+    }
+
+    fn cell_value_expr(name: ResolvedName, kind: CellBindingKind) -> InstrBlockPy {
+        let binding = CellLoadBinding {
+            logical_name: name.id.clone(),
+            kind,
+        };
+        op_expr(Load::new(name).with_cell_binding(Some(binding)))
     }
 
     fn test_constant_name(index: u32) -> ResolvedName {
@@ -3921,6 +3216,20 @@ def build(values):
         }
     }
 
+    fn assert_indexed_field_reads_current_key_layout(built: &BuiltSpecializedFunction) {
+        let offset = std::mem::offset_of!(ffi::PyHeapTypeObject, ht_cached_keys) as i32;
+        assert!(
+            built.ctx.func.layout.blocks().any(|block| {
+                built.ctx.func.layout.block_insts(block).any(|inst| {
+                    let instruction = &built.ctx.func.dfg.insts[inst];
+                    instruction.opcode() == ir::Opcode::Load
+                        && instruction.load_store_offset() == Some(offset)
+                })
+            }),
+            "indexed access must guard the current shared key, not only type/version and a profiled index"
+        );
+    }
+
     fn cached_split_key_layout(
         py: Python<'_>,
         owner_type: *mut ffi::PyTypeObject,
@@ -3966,7 +3275,10 @@ def build(values):
     }
 
     fn raise_term() -> BlockTerm<InstrBlockPy> {
-        BlockTerm::Raise(soac_core::block_py::TermRaise { exc: None })
+        BlockTerm::Raise(soac_core::block_py::TermRaise {
+            exc: None,
+            disposition: soac_core::block_py::RaiseDisposition::Source,
+        })
     }
 
     fn test_source_block(
@@ -4016,6 +3328,7 @@ def build(values):
         callable_defs: Vec<BlockPyFunction<BlockPyModuleShape>>,
     ) -> BlockPyModule<BlockPyModuleShape> {
         let mut module = BlockPyModule {
+            strict_source: None,
             module_name_gen,
             global_names: Vec::new(),
             callable_defs,
@@ -4223,6 +3536,27 @@ def build(values):
         module_constants: &crate::module_constants::ModuleCodegenConstants,
         compile_session: &crate::session::CompileSession,
     ) -> BuiltSpecializedFunction {
+        build_test_specialized_function_with_module_data(
+            blocks,
+            module,
+            function,
+            module_constants,
+            compile_session,
+        )
+        .0
+    }
+
+    fn build_test_specialized_function_with_module_data(
+        blocks: &[ObjPtr],
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
+        module_constants: &crate::module_constants::ModuleCodegenConstants,
+        compile_session: &crate::session::CompileSession,
+    ) -> (
+        BuiltSpecializedFunction,
+        cranelift_jit::JITModule,
+        Vec<DataId>,
+    ) {
         let mut jit_module =
             new_jit_module(compile_session).expect("test jit module should construct");
         let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
@@ -4231,7 +3565,7 @@ def build(values):
                 .expect("module constant object data should declare");
         let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
             define_test_counter_storage(&mut jit_module, module, &module.counter_defs);
-        build_test_cranelift_run_bb_specialized_function(
+        let built = build_test_cranelift_run_bb_specialized_function(
             &mut jit_module,
             blocks,
             module,
@@ -4248,7 +3582,117 @@ def build(values):
             None,
             BuildSpecializedFunctionOptions::default(),
         )
-        .expect("test specialized JIT function should build")
+        .expect("test specialized JIT function should build");
+        (built, jit_module, module_constant_object_data_ids)
+    }
+
+    fn build_error_codegen_fixture(source: &str) -> BuiltSpecializedFunction {
+        let module = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("exception cleanup fixture should lower")
+            .blockpy_module;
+        let function = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .expect("fixture contains f");
+        let constants = ModuleCodegenConstants::collect_from_module(&module);
+        build_test_specialized_function(&[], &module, function, &constants)
+    }
+
+    #[test]
+    fn caught_error_forwarding_does_not_acquire_owners_on_success_paths() {
+        let compile = |calls: usize| {
+            let source = format!(
+                "def f(owner, callback):\n    try:\n{}        yield owner\n    except ValueError:\n        yield owner\n",
+                "        callback()\n".repeat(calls),
+            );
+            // Exercise the same mechanical exception-edge lowering without
+            // inventing a source activation after generator lowering has run.
+            // The genuine strict GC cases supply the runtime after-proof.
+            build_error_codegen_fixture(&source)
+        };
+        let once = compile(1);
+        let repeated = compile(5);
+        let hot_forwarded_clones = |function: &ir::Function| {
+            // Refcount expansion can split a cold block into unmarked child
+            // blocks. Count actual success-reachable control flow, not merely
+            // blocks lacking a cold layout hint.
+            let mut reachable = HashSet::new();
+            let mut pending = vec![function.layout.entry_block().unwrap()];
+            while let Some(block) = pending.pop() {
+                if function.layout.is_cold(block) || !reachable.insert(block) {
+                    continue;
+                }
+                pending.extend(block_successor_targets(function, block));
+            }
+            reachable
+                .into_iter()
+                .flat_map(|block| function.layout.block_insts(block))
+                .filter(|inst| {
+                    clif_refcount_family_from_source_loc_bits(function.srcloc(*inst).bits())
+                        == Some(RefcountFamily::ForwardedValueClone)
+                })
+                .count()
+        };
+        let raised = import_user_names_for_symbols(
+            &repeated,
+            &[super::super::DP_JIT_HANDLED_STATE_RAISED_IMPORT.symbol],
+        );
+        assert!(
+            count_direct_calls_to_runtime_helpers(&repeated.ctx.func, &raised) > 0,
+            "the fixture must contain actual caught-error dispatch",
+        );
+        assert_eq!(
+            hot_forwarded_clones(&once.ctx.func),
+            hot_forwarded_clones(&repeated.ctx.func),
+            "adding fallible statements must not acquire exception-only owners on success paths",
+        );
+    }
+
+    #[test]
+    fn exception_error_paths_compile_with_valid_cleanup_blocks() {
+        for source in [
+            "def f(value):\n    return value\n",
+            "def f(callback):\n    value = callback()\n    return value\n",
+            "def f(callback):\n    try:\n        return callback()\n    except ValueError:\n        return None\n",
+            "def f(callback):\n    value = callback()\n    raise ValueError('failure')\n",
+            "def f(callback):\n    value = callback()\n    try:\n        raise ValueError('failure')\n    except ValueError:\n        return value\n",
+            "def f(callback):\n    value = callback()\n    try:\n        callback()\n    except ValueError:\n        raise\n",
+            "def f(callback):\n    value = callback()\n    try:\n        raise ValueError('failure')\n    finally:\n        callback()\n",
+        ] {
+            let built = build_error_codegen_fixture(source);
+            let target = new_jit_module(&crate::session::CompileSession::new()).unwrap();
+            cranelift_codegen::verify_function(&built.ctx.func, target.isa())
+                .expect("exception cleanup must form valid SSA/control flow");
+        }
+    }
+
+    #[test]
+    fn source_control_spellings_keep_checked_unbound_local_codegen() {
+        for name in [
+            "ordinary",
+            "_dp_try_abrupt_kind_user",
+            "_dp_try_exc_user",
+            "_dp_try_abrupt_payload_user",
+        ] {
+            let source = format!("def f({name}):\n    del {name}\n    return {name}\n");
+            let module = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("ordinary local fixture should lower")
+                .blockpy_module;
+            let function = module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "f")
+                .expect("fixture contains f");
+            let constants = ModuleCodegenConstants::collect_from_module(&module);
+            let built = build_test_specialized_function(&[], &module, function, &constants);
+            let unbound =
+                import_user_names_for_symbols(&built, &["dp_jit_raise_unbound_local_error"]);
+            assert!(
+                count_direct_calls_to_runtime_helpers(&built.ctx.func, &unbound) > 0,
+                "source local {name} must raise after its explicit deletion"
+            );
+        }
     }
 
     #[test]
@@ -4288,6 +3732,7 @@ def build(values):
         };
         let function = with_test_blocks(function, vec![entry, then_block, else_block]);
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function.clone()],
@@ -4874,10 +4319,12 @@ def build(values):
             function,
             vec![],
             BlockTerm::Raise(soac_core::block_py::TermRaise {
+                disposition: soac_core::block_py::RaiseDisposition::Source,
                 exc: Some(constants.int_expr(1)),
             }),
         );
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function.clone()],
@@ -4925,6 +4372,7 @@ def build(values):
         };
         let function = with_test_blocks(function, vec![entry, case_block, default_block]);
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function.clone()],
@@ -4949,6 +4397,7 @@ def build(values):
             ret_term(constants.int_expr(2)),
         );
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function.clone()],
@@ -4973,6 +4422,7 @@ def build(values):
             ret_term(constants.int_expr(3)),
         );
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function.clone()],
@@ -5001,6 +4451,7 @@ def build(values):
         );
         set_stack_slots(&mut function, &["x"]);
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function.clone()],
@@ -5021,6 +4472,7 @@ def build(values):
             ret_term(constants.int_expr(2)),
         );
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function.clone()],
@@ -5549,6 +5001,77 @@ def build(values):
     }
 
     #[test]
+    fn fixed_unpack_intrinsic_identity_survives_runtime_profile_planning() {
+        let module = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def pair(value):\n    first, second = value\n    return first, second\n\ndef nested(value):\n    first, (second, third) = value\n    return first, second, third\n\ndef with_pair(manager):\n    with manager as (first, second):\n        return first, second\n",
+        )
+        .expect("original fixed-unpack source lowers")
+        .blockpy_module;
+        let constants = ModuleCodegenConstants::collect_from_module(&module);
+        let environment = typed_v3_env_config();
+        let session = crate::session::CompileSession::new_with_env_config(environment.clone());
+        // This is the same Some(profile) route used even before observations
+        // select an optional optimization. No profile must not hide the rewrite.
+        let profile = SpecializationProfile::from_runtime_state_with_session(None, Some(&session))
+            .expect("production-shaped empty runtime profile");
+        let planned = optimize_blockpy(&module, Some(&profile), &environment)
+            .expect("production typed rewrite and linearization");
+
+        #[derive(Default)]
+        struct FixedUnpackSites(HashSet<InstrId>);
+        impl Visit<InstrBlockPy> for FixedUnpackSites {
+            fn visit_instr(&mut self, instr: &InstrBlockPy) {
+                if let InstrBlockPy::Call(call) = instr
+                    && let InstrBlockPy::Load(load) = call.func.as_ref()
+                    && load.name.runtime_name_id() == Some(RuntimeName::UnpackFixed)
+                {
+                    assert!(self.0.insert(call.semantic_instr_id()));
+                }
+                instr.visit_children(self);
+            }
+        }
+
+        for (name, expected_count) in [("pair", 1), ("nested", 2), ("with_pair", 1)] {
+            let original = module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == name)
+                .unwrap();
+            let mut sites = FixedUnpackSites::default();
+            sites.visit_fn(original);
+            assert_eq!(sites.0.len(), expected_count, "{name}");
+            let function = planned
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == original.function_id)
+                .unwrap();
+            let count = count_typed_instrs(function, |instr| {
+                let InstrTyped::CallTyped(call) = instr else {
+                    return false;
+                };
+                if !call
+                    .try_semantic_instr_id()
+                    .is_some_and(|id| sites.0.contains(&id))
+                {
+                    return false;
+                }
+                let descriptor =
+                    super::super::static_runtime_primitive_desc_for_typed_call(call, &constants);
+                assert_eq!(
+                    descriptor.map(|desc| desc.target),
+                    Some(super::super::direct_abi::DirectTargetId::RuntimePrimitive(
+                        RuntimePrimitiveId::UnpackFixed,
+                    )),
+                    "{name}: a compiler language operation cannot become a mutable Python helper",
+                );
+                true
+            });
+            assert_eq!(count, expected_count, "{name}");
+        }
+    }
+
+    #[test]
     fn runtime_builtin_i64_demand_accepts_ord_and_i64_constants() {
         let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
         module.module_constants.push(runtime_name_constant("ord"));
@@ -5939,6 +5462,7 @@ def build(values):
             test_function(),
             vec![],
             BlockTerm::Raise(soac_core::block_py::TermRaise {
+                disposition: soac_core::block_py::RaiseDisposition::Source,
                 exc: Some(with_instr_id(constants.int_expr(2), raise_instr_id)),
             }),
         );
@@ -5958,6 +5482,7 @@ def build(values):
             test_function(),
             vec![],
             BlockTerm::Raise(soac_core::block_py::TermRaise {
+                disposition: soac_core::block_py::RaiseDisposition::Source,
                 exc: Some(with_instr_id(name_expr(test_name("x")), raise_instr_id)),
             }),
         );
@@ -6128,6 +5653,261 @@ def build(values):
     }
 
     #[test]
+    fn local_env_failure_cleanup_orders_marked_expression_temporaries_only() {
+        let mut layout = StorageLayout::default();
+        layout.set_stack_slots(
+            [
+                "source_first",
+                "newer",
+                "source_second",
+                "older",
+                "forwarded",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        );
+        // Acquisition order is explicit, not the physical slot number.
+        for slot in [3, 1, 4] {
+            layout.mark_expression_temporary(LocalLocation(slot));
+        }
+        let bindings = [
+            (Some(LocalLocation(2)), "source_second"),
+            (Some(LocalLocation(3)), "older"),
+            (Some(LocalLocation(0)), "source_first"),
+            (Some(LocalLocation(1)), "newer"),
+            (Some(LocalLocation(4)), "forwarded"),
+            (None, "_dp_unmarked"),
+        ];
+        let env = LocalEnv {
+            entries: bindings
+                .iter()
+                .enumerate()
+                .map(|(index, (location, name))| {
+                    local_env_entry(
+                        *location,
+                        name,
+                        ir::Value::from_u32(u32::try_from(index).unwrap()),
+                        LocalRefKind::Owned,
+                        LocalEnvStorage::LocalOnly,
+                    )
+                })
+                .collect(),
+        };
+        let forwarded = HashSet::from([LocalLocation(4)]);
+        let names = |entries: Vec<super::super::LocalFailureCleanupValue>| {
+            entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(env.local_only_cleanup_entries_excluding(&forwarded, Some(&layout))),
+            [
+                "newer",
+                "older",
+                "source_second",
+                "source_first",
+                "_dp_unmarked"
+            ],
+        );
+        assert_eq!(
+            names(env.local_only_cleanup_entries_excluding(&forwarded, None)),
+            [
+                "source_second",
+                "older",
+                "source_first",
+                "newer",
+                "_dp_unmarked"
+            ],
+        );
+    }
+
+    #[test]
+    fn assignment_target_error_releases_linearized_replacement_operand() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def partial_target(make, record, reject):\n    try:\n        first, reject().field = make(2)\n    except AttributeError:\n        record('handler')\n    del first\n    record('after')\n",
+        )
+        .expect("assignment target fixture should lower")
+        .blockpy_module;
+        let environment = typed_v3_env_config();
+        let session = crate::session::CompileSession::new_with_env_config(environment.clone());
+        // Production supplies a profile object even without recorded counters.
+        // An absent profile skips the shared typed rewrite/linearization path.
+        let profile = SpecializationProfile::from_runtime_state_with_session(None, Some(&session))
+            .expect("empty runtime profile");
+        assert!(profile.counter_dump_path.is_none());
+        let planned = optimize_blockpy(&lowered, Some(&profile), &environment)
+            .expect("production typed rewrite pipeline");
+        let function = planned
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "partial_target")
+            .expect("assignment target function");
+        let layout = function.storage_layout.as_ref().expect("function storage");
+        let locals = planned
+            .locals
+            .function(function.function_id)
+            .expect("function locals plan");
+        let mut checked = 0;
+        for (index, block) in function.blocks.iter().enumerate() {
+            for instr in &block.body {
+                let InstrTyped::SetAttrTyped(setter) = instr else {
+                    continue;
+                };
+                let InstrTyped::Load(replacement) = setter.replacement.as_ref() else {
+                    panic!("the shared pipeline must materialize the nested unpack element")
+                };
+                assert!(layout.is_expression_temporary(replacement.name.local_location().unwrap()));
+                let dispatch = locals.exc_dispatches[index]
+                    .as_ref()
+                    .expect("setter exception dispatch");
+                let replacement_name = replacement.name.id.to_string();
+                assert!(
+                    !dispatch.forwarded_local_names.contains(&replacement_name),
+                    "a failed setter must unwind its materialized operand, not carry it into its handler"
+                );
+                let target = &function.blocks[dispatch.target_index];
+                let binding = locals
+                    .local_plan
+                    .block(target.label)
+                    .unwrap()
+                    .entry_locals
+                    .iter()
+                    .find(|binding| binding.name == replacement_name)
+                    .expect("operand retains a declared storage location");
+                assert_eq!(binding.param_facts.ownership, LocalRefKind::Unbound);
+                assert!(
+                    !locals.runtime_block_params[dispatch.target_index]
+                        .iter()
+                        .any(|param| param.binding.name == replacement_name)
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 1);
+    }
+
+    #[test]
+    fn unpacked_setitem_selects_explicit_operand_transfer_candidate() {
+        for body in [
+            "    reject()[0], = make(1)\n",
+            "    try:\n        reject()[0], = make(1)\n    except TypeError:\n        record('handler')\n",
+        ] {
+            let source = format!("def f(make, record, reject):\n{body}");
+            let module = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("unpacked setitem fixture should lower")
+                .blockpy_module;
+            let environment = typed_v3_env_config();
+            let session = crate::session::CompileSession::new_with_env_config(environment.clone());
+            let profile =
+                SpecializationProfile::from_runtime_state_with_session(None, Some(&session))
+                    .expect("production-shaped empty profile");
+            let planned = optimize_blockpy(&module, Some(&profile), &environment)
+                .expect("production typed rewrite/linearization pipeline");
+            let function = planned
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "f")
+                .unwrap();
+            let layout = function.storage_layout.as_ref().unwrap();
+            let transfers = function
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.windows(2))
+                .filter_map(|pair| {
+                    super::super::typed_setitem_owned_transfer_temp(&pair[0], Some(&pair[1]))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                transfers.len(),
+                1,
+                "fixture must reach the real transfer selector"
+            );
+            assert!(
+                layout.is_expression_temporary(transfers[0].0),
+                "the selected replacement is an explicit operand owner, not a source-name guess"
+            );
+        }
+    }
+
+    #[test]
+    fn setitem_transfer_does_not_consume_a_source_binding_with_a_compiler_prefix() {
+        for name in [
+            "replacement",
+            "_dp_tmp_source",
+            "_dp_typed_linearized_expr_source",
+            "_dp_typed_inline_source",
+        ] {
+            let source = format!(
+                "def f(make, target):\n    {name} = make()\n    target[0] = {name}\n    del {name}\n"
+            );
+            let module = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("source binding transfer fixture should lower")
+                .blockpy_module;
+            let environment = typed_v3_env_config();
+            let session = crate::session::CompileSession::new_with_env_config(environment.clone());
+            let profile =
+                SpecializationProfile::from_runtime_state_with_session(None, Some(&session))
+                    .expect("production-shaped empty profile");
+            let planned = optimize_blockpy(&module, Some(&profile), &environment)
+                .expect("production typed rewrite pipeline");
+            let function = planned
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "f")
+                .unwrap();
+            let layout = function.storage_layout.as_ref().unwrap();
+            let source_location = LocalLocation(
+                layout
+                    .stack_slots()
+                    .iter()
+                    .position(|slot| slot == name)
+                    .unwrap() as u32,
+            );
+            assert!(!layout.is_expression_temporary(source_location));
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.body.windows(2))
+                    .filter_map(|pair| {
+                        super::super::typed_setitem_owned_transfer_temp(&pair[0], Some(&pair[1]))
+                    })
+                    .all(|(location, _)| location != source_location),
+                "an unreached source del does not authorize consuming {name} before a failed assignment",
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_typed_function_rejects_stale_expression_lifetime_layout() {
+        let lowered =
+            soac_lowering::lower_python_to_blockpy_for_testing("def f(value):\n    return value\n")
+                .expect("lifetime layout fixture should lower");
+        let module = soac_ir_typed::lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let function = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "f")
+            .unwrap();
+        let mut candidate = function.clone();
+        super::super::validate_typed_function_preserves_codegen_cfg(function, &candidate)
+            .expect("identical prepared function");
+        candidate
+            .storage_layout
+            .as_mut()
+            .unwrap()
+            .mark_expression_temporary(LocalLocation(0));
+        assert!(
+            super::super::validate_typed_function_preserves_codegen_cfg(function, &candidate)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn local_env_semantic_cleanup_names_excluding_only_reports_unforwarded_locations() {
         let env = LocalEnv {
             entries: vec![
@@ -6230,6 +6010,7 @@ def build(values):
                 null_tstate,
                 decref_ref,
                 RefcountFamily::EdgeRelease,
+                None,
             );
         }));
 
@@ -6297,6 +6078,7 @@ def build(values):
                 null_tstate,
                 decref_ref,
                 RefcountFamily::EdgeRelease,
+                None,
             );
             fb.ins().return_(&[]);
             fb.seal_all_blocks();
@@ -6316,6 +6098,7 @@ def build(values):
             )],
         };
         let stack_slots = StackSlots {
+            parameter_roles: Vec::new(),
             names: Vec::new(),
             storage_layout_indices: Vec::new(),
             slots: Vec::new(),
@@ -6342,12 +6125,17 @@ def build(values):
             )],
         };
         let stack_slots = StackSlots {
+            parameter_roles: Vec::new(),
             names: Vec::new(),
             storage_layout_indices: Vec::new(),
             slots: Vec::new(),
             cleanup_root_names: HashSet::new(),
         };
         let storage_layout = StorageLayout {
+            generator_resume_abi: None,
+            block_parameter_roles: Vec::new(),
+            class_bindings: None,
+            expression_temporaries: Vec::new(),
             freevars: Vec::new(),
             cellvars: Vec::new(),
             preserved_slots: Vec::new(),
@@ -6375,12 +6163,17 @@ def build(values):
             )],
         };
         let stack_slots = StackSlots {
+            parameter_roles: vec![Vec::new()],
             names: vec!["x".to_string()],
             storage_layout_indices: vec![0],
             slots: Vec::new(),
             cleanup_root_names: HashSet::new(),
         };
         let storage_layout = StorageLayout {
+            generator_resume_abi: None,
+            block_parameter_roles: Vec::new(),
+            class_bindings: None,
+            expression_temporaries: Vec::new(),
             freevars: Vec::new(),
             cellvars: Vec::new(),
             preserved_slots: Vec::new(),
@@ -6414,6 +6207,7 @@ def build(values):
             )],
         };
         let stack_slots = StackSlots {
+            parameter_roles: Vec::new(),
             names: Vec::new(),
             storage_layout_indices: Vec::new(),
             slots: Vec::new(),
@@ -6513,6 +6307,7 @@ def build(values):
             )],
         };
         let stack_slots = StackSlots {
+            parameter_roles: Vec::new(),
             names: Vec::new(),
             storage_layout_indices: Vec::new(),
             slots: Vec::new(),
@@ -6900,6 +6695,7 @@ def build(values):
                 refcounts,
                 &cleanup_root_states,
                 &HashMap::new(),
+                None,
                 None,
             );
             fb.ins().return_(&[]);
@@ -7401,6 +7197,7 @@ def build(values):
             LocalEnvStorage::StackMirror,
         );
         let stack_slots = StackSlots {
+            parameter_roles: vec![Vec::new()],
             names: vec!["x".to_string()],
             storage_layout_indices: vec![0],
             slots: Vec::new(),
@@ -7664,651 +7461,327 @@ def build(values):
     }
 
     #[test]
-    fn field_index_layouts_prime_owner_type_key_layouts() {
+    fn specialization_profile_field_maps_do_not_execute_owner_callbacks() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialization_profile_field_maps_do_not_execute_owner_callbacks",
+        ) {
+            return;
+        }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
-
         Python::attach(|py| {
             let module = PyModule::from_code(
                 py,
                 c"
-class Point:
+EVENTS = []
+
+class Descriptor:
+    def __get__(self, instance, owner=None):
+        return 23
+    def __set__(self, instance, value):
+        EVENTS.append('descriptor-set')
+
+class Base:
+    marker = Descriptor()
+    def __init__(self):
+        EVENTS.append('init')
+        self.value = 17
+        self.marker = 23
+    def __setattr__(self, name, value):
+        EVENTS.append('set:' + name)
+        object.__setattr__(self, name, value)
+    def __del__(self):
+        EVENTS.append('del')
+
+class Child(Base):
     pass
 ",
-                c"field_type_test.py",
-                c"field_type_test",
+                c"field_map_callback_unit.py",
+                c"field_map_callback_unit",
             )
-            .expect("test module should execute");
-            let sys = PyModule::import(py, "sys").expect("sys should import");
+            .expect("ordinary callback source should execute");
+            let sys = PyModule::import(py, "sys").unwrap();
             let modules = sys
                 .getattr("modules")
-                .expect("sys.modules should exist")
+                .unwrap()
                 .cast_into::<pyo3::types::PyDict>()
-                .expect("sys.modules should be a dict");
+                .unwrap();
             modules
-                .set_item("field_type_test", module.as_any())
-                .expect("test module should be registered");
-            let owner_type = module
-                .getattr("Point")
-                .expect("Point should exist")
-                .as_ptr() as *mut ffi::PyTypeObject;
-
+                .set_item("field_map_callback_unit", module.as_any())
+                .unwrap();
+            let child = module.getattr("Child").unwrap();
+            let owner_type = child.as_ptr().cast::<ffi::PyTypeObject>();
+            let actual_alloc = unsafe { (*owner_type).tp_alloc }.unwrap();
+            assert!(std::ptr::fn_addr_eq(
+                actual_alloc,
+                ffi::PyType_GenericAlloc
+                    as unsafe extern "C" fn(
+                        *mut ffi::PyTypeObject,
+                        ffi::Py_ssize_t,
+                    ) -> *mut ffi::PyObject,
+            ));
+            assert_ne!(unsafe { (*owner_type).tp_flags } & (1 << 2), 0);
+            let before = cached_split_key_layout(py, owner_type);
+            let module_names = ModuleNameGen::new(0);
+            let function = test_function_in_module(&module_names, "read_value");
+            let source = InstrId::new(1);
+            let profile = SpecializationProfile {
+                module_name: Some("field_map_callback_unit"),
+                counter_dump_path: None,
+                direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+                opt_v3_emitted_direct_calls: HashMap::new(),
+                opt_v3_emitted_exact_list_items: HashMap::new(),
+                opt_v3_emitted_indexed_fields: HashMap::from([(
+                    function.function_id,
+                    HashMap::from([(
+                        source,
+                        vec![OptV3IndexedFieldAccessPlan {
+                            access: IndexedFieldAccessKind::Load,
+                            guard: MechanicalIndexedFieldGuard {
+                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                                owner_type: IndexedFieldOwnerType {
+                                    module_name: "field_map_callback_unit".to_string(),
+                                    qualname: "Child".to_string(),
+                                },
+                                attr_name: "value".to_string(),
+                                expected_index: 0,
+                            },
+                            fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                        }],
+                    )]),
+                )]),
+                opt_v3_emitted_indexed_globals: HashMap::new(),
+                opt_v3_exact_int_branch_artifacts: HashMap::new(),
+                behavior_change_indexed_stores: false,
+                profiled_cold_blocks: false,
+                guard_miss_deopt: false,
+            };
+            let (_, _, fields) = profile
+                .field_index_specialization_maps(function.function_id)
+                .expect("guard resolution should decline custom setattr without executing it");
+            PyModule::import(py, "gc")
+                .unwrap()
+                .call_method0("collect")
+                .unwrap();
+            let events = module
+                .getattr("EVENTS")
+                .unwrap()
+                .extract::<Vec<String>>()
+                .unwrap();
             assert!(
-                unsafe { owner_type_supports_field_layout_priming(owner_type) },
-                "expected Point to support field-layout priming"
+                events.is_empty(),
+                "field map resolution executed callbacks: {events:?}"
             );
+            assert!(
+                fields.is_empty(),
+                "custom setattr must retain generic access"
+            );
+            assert_eq!(cached_split_key_layout(py, owner_type), before);
+
+            // The callbacks are live ordinary behavior; only explicit source
+            // construction is allowed to run them. Check cleanup quiescently.
+            drop(child.call0().unwrap());
+            PyModule::import(py, "gc")
+                .unwrap()
+                .call_method0("collect")
+                .unwrap();
             assert_eq!(
-                cached_split_key_layout(py, owner_type),
-                Vec::<(String, u32)>::new()
+                module
+                    .getattr("EVENTS")
+                    .unwrap()
+                    .extract::<Vec<String>>()
+                    .unwrap(),
+                ["init", "set:value", "set:marker", "descriptor-set", "del"],
             );
-
-            prime_field_index_layout(
-                owner_type,
-                &[
-                    CollectedTypeKeyLayout {
-                        owner_type_id: 7,
-                        key: "x".to_string(),
-                        index: 0,
-                    },
-                    CollectedTypeKeyLayout {
-                        owner_type_id: 7,
-                        key: "y".to_string(),
-                        index: 1,
-                    },
-                ],
-            )
-            .expect("field-layout priming should succeed");
-
-            assert!(
-                cached_split_key_layout(py, owner_type)
-                    .starts_with(&[("x".to_string(), 0), ("y".to_string(), 1)]),
-                "expected priming to recreate Point split-key layout"
-            );
-
-            modules
-                .del_item("field_type_test")
-                .expect("test module should be removed");
+            modules.del_item("field_map_callback_unit").unwrap();
         });
     }
 
+    fn native_field_policy_eligibility_fixture<'py>(py: Python<'py>) -> pyo3::Bound<'py, PyModule> {
+        // These existing C fixtures install real native policies. They grant
+        // no offline-checker or public source-admission authority.
+        PyModule::from_code(
+            py,
+            cr#"
+import _testinternalcapi
+
+def namespace_function():
+    pass
+
+class Unchecked:
+    pass
+
+Checked = _testinternalcapi.dict_new_soac_type_state_type(
+    'Checked', (), {'__module__': __name__}, ('field',), namespace_function,
+)
+class Inherited(Checked):
+    pass
+
+class UncheckedSlots:
+    __slots__ = ('field',)
+
+CheckedSlots = _testinternalcapi.slot_new_soac_type_state_type(
+    'CheckedSlots', (), {'__module__': __name__, '__slots__': ('field',)},
+    ('field',), namespace_function,
+)
+class InheritedSlots(CheckedSlots):
+    __slots__ = ('other',)
+"#,
+            c"checked_field_policy_eligibility.py",
+            c"checked_field_policy_eligibility",
+        )
+        .expect("actual native policy fixture should construct")
+    }
+
     #[test]
-    fn field_index_specialized_setattr_hits_apply_mode_insert_and_overwrite() {
+    fn indexed_field_resolution_declines_actual_ordinary_write_policies() {
+        unsafe extern "C" {
+            fn _PySOAC_HasOrdinaryInstanceWrites(owner: *mut ffi::PyTypeObject) -> i32;
+        }
+
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "field_index_specialized_setattr_hits_apply_mode_insert_and_overwrite",
+            "indexed_field_resolution_declines_actual_ordinary_write_policies",
         ) {
             return;
         }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        let soac_work_dir = fresh_test_work_dir("test-work");
-
-        unsafe {
-            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "apply");
-        }
         crate::initialize_test_python();
-
         Python::attach(|py| {
-            let owner_module = PyModule::from_code(
-                py,
-                c"
-class Point:
-    pass
-",
-                c"field_type_test.py",
-                c"field_type_test",
-            )
-            .expect("owner module should execute");
-            let sys = PyModule::import(py, "sys").expect("sys should import");
-            let modules = sys
+            let fixture = native_field_policy_eligibility_fixture(py);
+            let modules = PyModule::import(py, "sys")
+                .unwrap()
                 .getattr("modules")
-                .expect("sys.modules should exist")
+                .unwrap()
                 .cast_into::<pyo3::types::PyDict>()
-                .expect("sys.modules should be a dict");
+                .unwrap();
             modules
-                .set_item("field_type_test", owner_module.as_any())
-                .expect("owner module should be registered");
-
-            write_test_counter_dump(
-                soac_work_dir.join("profile.bin").as_path(),
-                &CounterDumpRecord {
-                    source_hash: 0,
-                    module_name: "counter_test".to_string(),
-                    package_name: None,
-                    rows: Vec::new(),
-                    module_keys: Vec::new(),
-                    type_keys: vec![CounterDumpTypeKeyLayout {
-                        owner_type_id: 7,
-                        key: "x".to_string(),
-                        index: 0,
-                    }],
-                    type_table: vec![CounterDumpTypeTableEntry {
-                        type_id: 7,
-                        key: CounterDumpTypeKey {
-                            module_name: "field_type_test".to_string(),
-                            qualname: "Point".to_string(),
-                        },
-                    }],
-                },
-            );
-            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-                r#"
-def write_point(point, value):
-    point.x = value
-    return point.x
-"#,
-            )
-            .expect("lowering should succeed")
-            .blockpy_module;
-            define_module_call_target_counters(&mut lowered);
-            let function = lowered
-                .callable_defs
-                .iter()
-                .find(|function| function.names.bind_name == "write_point")
-                .expect("missing lowered function write_point")
-                .clone();
-            let setattr_instr_id = function
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .find_map(|expr| match expr {
-                    InstrBlockPy::SetAttr(_) => Some(expr.semantic_instr_id()),
-                    _ => None,
-                })
-                .expect("write_point should contain a SetAttr");
-            let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
-                &lowered.counter_defs,
-                function.function_id,
-                setattr_instr_id,
-                "field_access",
-                "indexed_hit",
-            );
-            let (fallback_counter_id, fallback_branch_id) = runtime_branch_counter_for(
-                &lowered.counter_defs,
-                function.function_id,
-                setattr_instr_id,
-                "field_access",
-                "indexed_fallback",
-            );
-
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
-                    .expect("shared state should build");
-            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let compile_session = crate::session::CompileSession::process();
-            let compiled_handle = unsafe {
-                compile_cranelift_run_bb_specialized_cached(
-                    &compile_session,
-                    &blocks,
-                    &shared_state.lowered_module,
-                    &function,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(shared_state.as_ref()),
-                )
-            }
-            .expect("specialized write_point should compile");
-            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
-                .handle
-                .direct_runner_info()
-                .expect("compiled direct runner should expose entrypoint");
-            assert_eq!(param_count, 2, "write_point should take two direct args");
-            let entry: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-            ) -> *mut c_void = unsafe { std::mem::transmute(code_ptr) };
-
-            let point_type = owner_module
-                .getattr("Point")
-                .expect("Point should exist on owner module");
-            let point = unsafe { ffi::PyObject_CallNoArgs(point_type.as_ptr()) };
-            assert!(!point.is_null(), "Point() should create a test instance");
-            unsafe { ffi::Py_INCREF(point) };
-            let value = unsafe { ffi::PyLong_FromLong(1_234_567) };
-            assert!(!value.is_null(), "test value should allocate");
-
-            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
-            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
-            let result = unsafe {
-                entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
-                    point.cast(),
-                    value.cast(),
-                )
-            };
-            assert!(
-                !result.is_null(),
-                "write_point should return the stored value"
-            );
-
-            assert_eq!(
-                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
-                1,
-                "apply-mode SetAttr should take the indexed-store first-insert fast path"
-            );
-            assert_eq!(
-                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
-                0,
-                "apply-mode SetAttr first insert should avoid the generic setattr fallback"
-            );
-
-            let point_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, point) };
-            let stored = point_obj
-                .getattr("x")
-                .expect("Point instance should now expose x");
-            assert_eq!(
-                stored.extract::<i64>().expect("stored x should be an int"),
-                1_234_567
-            );
-            let result_obj = unsafe { pyo3::Bound::from_owned_ptr(py, result.cast()) };
-            assert_eq!(
-                result_obj
-                    .extract::<i64>()
-                    .expect("write_point result should be an int"),
-                1_234_567
-            );
-
-            let next_value = unsafe { ffi::PyLong_FromLong(7_654_321) };
-            assert!(
-                !next_value.is_null(),
-                "overwrite test value should allocate"
-            );
-            let overwrite_result = unsafe {
-                entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
-                    point.cast(),
-                    next_value.cast(),
-                )
-            };
-            assert!(
-                !overwrite_result.is_null(),
-                "write_point should return the overwritten value"
-            );
-
-            assert_eq!(
-                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
-                2,
-                "apply-mode SetAttr should take the indexed-store overwrite fast path"
-            );
-            assert_eq!(
-                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
-                0,
-                "apply-mode SetAttr overwrite should avoid the generic setattr fallback"
-            );
-            let stored = point_obj
-                .getattr("x")
-                .expect("Point instance should expose overwritten x");
-            assert_eq!(
-                stored.extract::<i64>().expect("stored x should be an int"),
-                7_654_321
-            );
-            let overwrite_result_obj =
-                unsafe { pyo3::Bound::from_owned_ptr(py, overwrite_result.cast()) };
-            assert_eq!(
-                overwrite_result_obj
-                    .extract::<i64>()
-                    .expect("overwrite result should be an int"),
-                7_654_321
-            );
-
-            unsafe { ffi::Py_DECREF(value) };
-            unsafe { ffi::Py_DECREF(next_value) };
-            unsafe { ffi::Py_DECREF(point) };
-            modules
-                .del_item("field_type_test")
-                .expect("owner module should be removed");
-        });
-
-        unsafe {
-            match old_soac_work_dir {
-                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
-                None => std::env::remove_var("SOAC_WORK_DIR"),
-            }
-            match old_soac_opt_mode {
-                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
-                None => std::env::remove_var("SOAC_OPT_MODE"),
-            }
-        }
-    }
-
-    #[test]
-    fn field_index_specialized_constructor_stores_hit_verify_mode_first_inserts() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "field_index_specialized_constructor_stores_hit_verify_mode_first_inserts",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        let soac_work_dir = fresh_test_work_dir("test-work");
-
-        unsafe {
-            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "verify");
-        }
-        crate::initialize_test_python();
-
-        Python::attach(|py| {
-            let owner_module = PyModule::from_code(
-                py,
-                c"
-class Record:
-    pass
-",
-                c"field_record_test.py",
-                c"field_record_test",
-            )
-            .expect("test module should execute");
-            let sys = PyModule::import(py, "sys").expect("sys should import");
-            let modules = sys
-                .getattr("modules")
-                .expect("sys.modules should exist")
-                .cast_into::<pyo3::types::PyDict>()
-                .expect("sys.modules should be a dict");
-            modules
-                .set_item("field_record_test", owner_module.as_any())
-                .expect("owner module should be registered");
-            let record_type = owner_module
-                .getattr("Record")
-                .expect("Record should exist on owner module");
-            let owner_type = record_type.as_ptr() as *mut ffi::PyTypeObject;
-            assert_eq!(
-                cached_split_key_layout(py, owner_type),
-                Vec::<(String, u32)>::new(),
-                "empty __static_attributes__ should leave SOAC's profile input as the split-key source"
-            );
-
-            write_test_counter_dump(
-                soac_work_dir.join("profile.bin").as_path(),
-                &CounterDumpRecord {
-                    source_hash: 0,
-                    module_name: "counter_test".to_string(),
-                    package_name: None,
-                    rows: Vec::new(),
-                    module_keys: Vec::new(),
-                    type_keys: vec![
-                        CounterDumpTypeKeyLayout {
-                            owner_type_id: 7,
-                            key: "PtrComp".to_string(),
-                            index: 0,
-                        },
-                        CounterDumpTypeKeyLayout {
-                            owner_type_id: 7,
-                            key: "Discr".to_string(),
-                            index: 1,
-                        },
-                        CounterDumpTypeKeyLayout {
-                            owner_type_id: 7,
-                            key: "EnumComp".to_string(),
-                            index: 2,
-                        },
-                        CounterDumpTypeKeyLayout {
-                            owner_type_id: 7,
-                            key: "IntComp".to_string(),
-                            index: 3,
-                        },
-                        CounterDumpTypeKeyLayout {
-                            owner_type_id: 7,
-                            key: "StringComp".to_string(),
-                            index: 4,
-                        },
-                    ],
-                    type_table: vec![CounterDumpTypeTableEntry {
-                        type_id: 7,
-                        key: CounterDumpTypeKey {
-                            module_name: "field_record_test".to_string(),
-                            qualname: "Record".to_string(),
-                        },
-                    }],
-                },
-            );
-            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-                r#"
-class Record:
-    def __init__(self, PtrComp=None, Discr=0, EnumComp=0, IntComp=0, StringComp=0):
-        self.PtrComp = PtrComp
-        self.Discr = Discr
-        self.EnumComp = EnumComp
-        self.IntComp = IntComp
-        self.StringComp = StringComp
-"#,
-            )
-            .expect("lowering should succeed")
-            .blockpy_module;
-            define_module_call_target_counters(&mut lowered);
-            let function = lowered
-                .callable_defs
-                .iter()
-                .find(|function| function.names.qualname == "Record.__init__")
-                .expect("missing lowered function Record.__init__")
-                .clone();
-            let setattr_instr_ids = function
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .filter_map(|expr| match expr {
-                    InstrBlockPy::SetAttr(_) => Some(expr.semantic_instr_id()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                setattr_instr_ids.len(),
-                5,
-                "Record.__init__ should contain five SetAttr operations"
-            );
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
-                    .expect("shared state should build");
-            let hit_counter_ids = setattr_instr_ids
-                .iter()
-                .map(|setattr_instr_id| {
-                    runtime_branch_counter_for(
-                        &shared_state.lowered_module.counter_defs,
-                        function.function_id,
-                        *setattr_instr_id,
-                        "field_access",
-                        "indexed_hit",
-                    )
-                })
-                .collect::<Vec<_>>();
-            let fallback_counter_ids = setattr_instr_ids
-                .iter()
-                .map(|setattr_instr_id| {
-                    runtime_branch_counter_for(
-                        &shared_state.lowered_module.counter_defs,
-                        function.function_id,
-                        *setattr_instr_id,
-                        "field_access",
-                        "indexed_fallback",
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let compile_session = crate::session::CompileSession::process();
-            let compiled_handle = unsafe {
-                compile_cranelift_run_bb_specialized_cached(
-                    &compile_session,
-                    &blocks,
-                    &shared_state.lowered_module,
-                    &function,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(shared_state.as_ref()),
-                )
-            }
-            .expect("specialized Record.__init__ should compile");
-            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
-                .handle
-                .direct_runner_info()
-                .expect("compiled direct runner should expose entrypoint");
-            assert_eq!(
-                param_count, 6,
-                "Record.__init__ should take six direct args"
-            );
-            let entry: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-            ) -> *mut c_void = unsafe { std::mem::transmute(code_ptr) };
-
-            let record = unsafe { ffi::PyType_GenericAlloc(owner_type, 0) };
-            assert!(
-                !record.is_null(),
-                "PyType_GenericAlloc should create a fresh uninitialized Record instance"
-            );
-            let none = unsafe { ffi::Py_None() };
-            unsafe { ffi::Py_INCREF(none) };
-            let discr = unsafe { ffi::PyLong_FromLong(1) };
-            let enum_comp = unsafe { ffi::PyLong_FromLong(2) };
-            let int_comp = unsafe { ffi::PyLong_FromLong(3) };
-            let string_comp = unsafe { ffi::PyUnicode_FromString(c"value".as_ptr()) };
-            assert!(
-                !discr.is_null()
-                    && !enum_comp.is_null()
-                    && !int_comp.is_null()
-                    && !string_comp.is_null(),
-                "test values should allocate"
-            );
-
-            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
-            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
-            let result = unsafe {
-                entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
-                    record.cast(),
-                    none.cast(),
-                    discr.cast(),
-                    enum_comp.cast(),
-                    int_comp.cast(),
-                    string_comp.cast(),
-                )
-            };
-            assert!(!result.is_null(), "Record.__init__ should return None");
-            unsafe { ffi::Py_DECREF(result.cast::<ffi::PyObject>()) };
-
-            for (counter_id, branch_id) in hit_counter_ids {
+                .set_item("checked_field_policy_eligibility", fixture.as_any())
+                .unwrap();
+            for (name, checked) in [("Unchecked", false), ("Checked", true), ("Inherited", true)] {
+                let owner = fixture.getattr(name).unwrap();
                 assert_eq!(
-                    shared_state.counter_branch_value(counter_id, branch_id),
-                    1,
-                    "constructor SetAttr should take the indexed-store fast path"
+                    unsafe { _PySOAC_HasOrdinaryInstanceWrites(owner.as_ptr().cast()) } != 0,
+                    checked,
+                    "{name} must have the intended actual native policy"
                 );
-            }
-            for (counter_id, branch_id) in fallback_counter_ids {
-                assert_eq!(
-                    shared_state.counter_branch_value(counter_id, branch_id),
-                    0,
-                    "verify-mode constructor SetAttr should avoid the generic setattr fallback"
-                );
-            }
-
-            let record_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, record) };
-            assert_eq!(
-                record_obj
-                    .getattr("IntComp")
-                    .expect("Record should expose IntComp")
-                    .extract::<i64>()
-                    .expect("IntComp should be an int"),
-                3
-            );
-
-            unsafe { ffi::Py_DECREF(record) };
-            modules
-                .del_item("field_record_test")
-                .expect("owner module should be removed");
-        });
-
-        unsafe {
-            match old_soac_work_dir {
-                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
-                None => std::env::remove_var("SOAC_WORK_DIR"),
-            }
-            match old_soac_opt_mode {
-                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
-                None => std::env::remove_var("SOAC_OPT_MODE"),
-            }
-        }
-    }
-
-    fn first_getattr_instr_id(function: &BlockPyFunction<BlockPyModuleShape>) -> InstrId {
-        struct GetAttrFinder {
-            instr_id: Option<InstrId>,
-        }
-
-        impl Visit<InstrBlockPy> for GetAttrFinder {
-            fn visit_instr(&mut self, expr: &InstrBlockPy)
-            where
-                InstrBlockPy: ChildVisitable<InstrBlockPy>,
-            {
-                if self.instr_id.is_none()
-                    && let InstrBlockPy::GetAttr(_) = expr
-                {
-                    self.instr_id = Some(expr.semantic_instr_id());
+                for access in [IndexedFieldAccessKind::Load, IndexedFieldAccessKind::Store] {
+                    let resolved = super::super::operation_specializations::field_index_specialization_from_opt_v3(
+                        &soac_opt::access_emission_v3::IndexedFieldRuntimeAccessRequest {
+                            access,
+                            attr_name: "field".to_string(),
+                            guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                            fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                            type_key: CounterDumpTypeKey {
+                                module_name: "checked_field_policy_eligibility".to_string(),
+                                qualname: name.to_string(),
+                            },
+                            expected_index: 0,
+                        },
+                    )
+                    .expect("field resolution must not raise or invoke a policy callback");
+                    assert_eq!(
+                        resolved.is_some(),
+                        !checked,
+                        "{name} {access:?}: an actual write policy cannot authorize a raw indexed access"
+                    );
                 }
-                expr.visit_children(self);
             }
-        }
-
-        let mut finder = GetAttrFinder { instr_id: None };
-        for block in &function.blocks {
-            for expr in &block.body {
-                finder.visit_instr(expr);
-            }
-            finder.visit_term(&block.term);
-        }
-        finder.instr_id.expect("function should contain a GetAttr")
+            modules
+                .del_item("checked_field_policy_eligibility")
+                .unwrap();
+        });
     }
 
     #[test]
-    fn field_index_specialized_getattr_hits_apply_mode_fast_path() {
+    fn raw_slot_offsets_decline_actual_inherited_slot_policies() {
+        unsafe extern "C" {
+            fn _PySOAC_UsesObjectSlotPolicy(owner: *mut ffi::PyTypeObject) -> i32;
+        }
+
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "field_index_specialized_getattr_hits_apply_mode_fast_path",
+            "raw_slot_offsets_decline_actual_inherited_slot_policies",
         ) {
             return;
         }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        let soac_work_dir = fresh_test_work_dir("test-work");
-
-        unsafe {
-            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "apply");
-        }
         crate::initialize_test_python();
-
         Python::attach(|py| {
-            let owner_module = PyModule::from_code(
+            let fixture = native_field_policy_eligibility_fixture(py);
+            for (name, field, checked) in [
+                ("UncheckedSlots", c"field", false),
+                ("CheckedSlots", c"field", true),
+                // Use this child's own descriptor so an absent inherited
+                // dictionary entry cannot accidentally satisfy the negative.
+                ("InheritedSlots", c"other", true),
+            ] {
+                let owner = fixture.getattr(name).unwrap();
+                assert_eq!(
+                    unsafe { _PySOAC_UsesObjectSlotPolicy(owner.as_ptr().cast()) } != 0,
+                    checked,
+                    "{name} must have the intended actual native slot policy"
+                );
+                for access in [IndexedFieldAccessKind::Load, IndexedFieldAccessKind::Store] {
+                    let offset = unsafe {
+                        crate::late_bound_slot_offset_for_owner(
+                            owner.as_ptr().cast(),
+                            field,
+                            access,
+                        )
+                    };
+                    assert_eq!(
+                        offset.is_some(),
+                        !checked,
+                        "{name} {access:?}: shared raw slot resolution must preserve actual field policies"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn field_index_resolution_declines_callback_namespaces_without_invoking_them() {
+        use pyo3::types::PyModuleMethods;
+
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_index_resolution_declines_callback_namespaces_without_invoking_them",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let module = PyModule::from_code(
                 py,
                 c"
+EVENTS = []
 class Point:
     pass
+class Outer:
+    class Nested:
+        pass
+class Meta(type):
+    def __getattribute__(cls, name):
+        EVENTS.append('metaclass:' + name)
+        return type.__getattribute__(cls, name)
+class Hooked(metaclass=Meta):
+    pass
+class Name(str):
+    __hash__ = str.__hash__
+    def __eq__(self, other):
+        EVENTS.append('key-eq')
+        return str.__eq__(self, other)
+def __getattr__(name):
+    EVENTS.append('module:' + name)
+    return Point
 ",
-                c"field_type_test.py",
-                c"field_type_test",
+                c"field_namespace_test.py",
+                c"field_namespace_test",
             )
-            .expect("owner module should execute");
+            .expect("test module should execute");
             let sys = PyModule::import(py, "sys").expect("sys should import");
             let modules = sys
                 .getattr("modules")
@@ -8316,150 +7789,155 @@ class Point:
                 .cast_into::<pyo3::types::PyDict>()
                 .expect("sys.modules should be a dict");
             modules
-                .set_item("field_type_test", owner_module.as_any())
-                .expect("owner module should be registered");
-
-            write_test_counter_dump(
-                soac_work_dir.join("profile.bin").as_path(),
-                &CounterDumpRecord {
-                    source_hash: 0,
-                    module_name: "counter_test".to_string(),
-                    package_name: None,
-                    rows: Vec::new(),
-                    module_keys: Vec::new(),
-                    type_keys: vec![CounterDumpTypeKeyLayout {
-                        owner_type_id: 7,
-                        key: "x".to_string(),
-                        index: 0,
-                    }],
-                    type_table: vec![CounterDumpTypeTableEntry {
-                        type_id: 7,
-                        key: CounterDumpTypeKey {
-                            module_name: "field_type_test".to_string(),
-                            qualname: "Point".to_string(),
+                .set_item("field_namespace_test", module.as_any())
+                .expect("test module should be registered");
+            let point = module.getattr("Point").unwrap();
+            let owner_type = point.as_ptr().cast::<ffi::PyTypeObject>();
+            let before = cached_split_key_layout(py, owner_type);
+            let resolve = |qualname: &str| {
+                field_index_specialization_from_opt_v3(
+                    &soac_opt::access_emission_v3::IndexedFieldRuntimeAccessRequest {
+                        access: IndexedFieldAccessKind::Load,
+                        attr_name: "x".to_string(),
+                        guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                        fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                        type_key: CounterDumpTypeKey {
+                            module_name: "field_namespace_test".to_string(),
+                            qualname: qualname.to_string(),
                         },
-                    }],
-                },
-            );
-
-            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-                r#"
-def read_point(point):
-    return point.x
-"#,
-            )
-            .expect("lowering should succeed")
-            .blockpy_module;
-            define_module_call_target_counters(&mut lowered);
-            let function = lowered
-                .callable_defs
-                .iter()
-                .find(|function| function.names.bind_name == "read_point")
-                .expect("missing lowered function read_point")
-                .clone();
-            let getattr_instr_id = first_getattr_instr_id(&function);
-            let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
-                &lowered.counter_defs,
-                function.function_id,
-                getattr_instr_id,
-                "field_access",
-                "indexed_hit",
-            );
-            let (fallback_counter_id, fallback_branch_id) = runtime_branch_counter_for(
-                &lowered.counter_defs,
-                function.function_id,
-                getattr_instr_id,
-                "field_access",
-                "indexed_fallback",
-            );
-
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
-                    .expect("shared state should build");
-            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let compile_session = crate::session::CompileSession::process();
-            let compiled_handle = unsafe {
-                compile_cranelift_run_bb_specialized_cached(
-                    &compile_session,
-                    &blocks,
-                    &shared_state.lowered_module,
-                    &function,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(shared_state.as_ref()),
+                        expected_index: 0,
+                    },
                 )
-            }
-            .expect("specialized read_point should compile");
-            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
-                .handle
-                .direct_runner_info()
-                .expect("compiled direct runner should expose entrypoint");
-            assert_eq!(param_count, 1, "read_point should take one direct arg");
-            let entry: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
-                unsafe { std::mem::transmute(code_ptr) };
-
-            let point_type = owner_module
-                .getattr("Point")
-                .expect("Point should exist on owner module");
-            let point = unsafe { ffi::PyObject_CallNoArgs(point_type.as_ptr()) };
-            assert!(!point.is_null(), "Point() should create a test instance");
-            let point_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, point) };
-            point_obj
-                .setattr("x", 98_765_i64)
-                .expect("Point instance should accept x");
-
-            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
-            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
-            let result = unsafe {
-                entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
-                    point.cast(),
-                )
+                .unwrap()
             };
-            assert!(
-                !result.is_null(),
-                "read_point should return the stored value"
-            );
+            assert!(resolve("Point").is_some());
+            assert!(resolve("Outer.Nested").is_some());
+            assert!(resolve("Missing").is_none());
+            assert!(resolve("Hooked").is_none());
+            assert_eq!(cached_split_key_layout(py, owner_type), before);
+            let events = module.getattr("EVENTS").unwrap();
+            assert!(events.extract::<Vec<String>>().unwrap().is_empty());
 
-            assert_eq!(
-                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
-                1,
-                "apply-mode GetAttr should take the indexed-load fast path"
-            );
-            assert_eq!(
-                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
-                0,
-                "apply-mode GetAttr should avoid the generic getattr fallback"
-            );
+            // A str-subclass key would make ordinary lookup invoke __eq__.
+            // The field resolver must decline the actual MRO namespace instead.
+            let name = module.getattr("Name").unwrap();
+            let key = name.call1(("x",)).unwrap();
+            let dictionary = unsafe {
+                pyo3::Bound::<pyo3::PyAny>::from_owned_ptr(py, ffi::PyType_GetDict(owner_type))
+            }
+            .cast_into::<pyo3::types::PyDict>()
+            .unwrap();
+            dictionary.set_item(&key, 17).unwrap();
+            unsafe { ffi::PyType_Modified(owner_type) };
+            assert!(resolve("Point").is_none());
+            assert!(events.extract::<Vec<String>>().unwrap().is_empty());
+            dictionary.del_item(&key).unwrap();
+            unsafe { ffi::PyType_Modified(owner_type) };
 
-            let result_obj = unsafe { pyo3::Bound::from_owned_ptr(py, result.cast()) };
-            assert_eq!(
-                result_obj
-                    .extract::<i64>()
-                    .expect("read_point result should be an int"),
-                98_765
-            );
+            let module_key = name.call1(("other",)).unwrap();
+            module.dict().set_item(&module_key, &point).unwrap();
+            assert!(resolve("Point").is_none());
+            assert!(events.extract::<Vec<String>>().unwrap().is_empty());
+            module.dict().del_item(&module_key).unwrap();
+            assert!(resolve("Point").is_some());
 
-            unsafe { ffi::Py_DECREF(point) };
+            // A registry entry is an address, not ownership or a namespace.
+            // Point remains pinned here, but an absent module cannot resolve it.
             modules
-                .del_item("field_type_test")
-                .expect("owner module should be removed");
+                .del_item("field_namespace_test")
+                .expect("test module should be removed");
+            assert!(resolve("Point").is_none());
+            assert!(events.extract::<Vec<String>>().unwrap().is_empty());
         });
+    }
 
-        unsafe {
-            match old_soac_work_dir {
-                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
-                None => std::env::remove_var("SOAC_WORK_DIR"),
-            }
-            match old_soac_opt_mode {
-                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
-                None => std::env::remove_var("SOAC_OPT_MODE"),
-            }
+    #[test]
+    fn field_index_profiles_never_authorize_ordinary_runtime_compilation() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "field_index_profiles_never_authorize_ordinary_runtime_compilation",
+        ) {
+            return;
         }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let work = fresh_test_work_dir("unverified-field-profile");
+        let _work = EnvVarGuard::set_os("SOAC_WORK_DIR", work.as_os_str());
+        write_test_counter_dump(
+            work.join("profile.bin").as_path(),
+            &CounterDumpRecord {
+                source_hash: 0,
+                module_name: "counter_test".into(),
+                package_name: None,
+                rows: Vec::new(),
+                module_keys: Vec::new(),
+                type_keys: vec![CounterDumpTypeKeyLayout {
+                    owner_type_id: 7,
+                    key: "x".into(),
+                    index: 0,
+                }],
+                type_table: vec![CounterDumpTypeTableEntry {
+                    type_id: 7,
+                    key: CounterDumpTypeKey {
+                        module_name: "field_type_test".into(),
+                        qualname: "Point".into(),
+                    },
+                }],
+            },
+        );
+        Python::attach(|py| {
+            for mode in ["profile", "apply", "verify"] {
+                let _mode = set_opt_mode(mode);
+                for (source, name) in [
+                    ("def read_point(point):\n    return point.x\n", "read_point"),
+                    (
+                        "def write_point(point, value):\n    point.x = value\n    return point.x\n",
+                        "write_point",
+                    ),
+                    (
+                        "class Point:\n    def __init__(self, value):\n        self.x = value\n",
+                        "__init__",
+                    ),
+                ] {
+                    let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                        .unwrap()
+                        .blockpy_module;
+                    let function = lowered
+                        .callable_defs
+                        .iter()
+                        .find(|function| function.names.bind_name == name)
+                        .unwrap()
+                        .clone();
+                    let shared = crate::module_type::build_shared_state_for_testing(
+                        py,
+                        lowered,
+                        "counter_test",
+                        source,
+                    )
+                    .unwrap();
+                    let session = std::sync::Arc::new(crate::session::CompileSession::new());
+                    let result = unsafe {
+                        compile_cranelift_run_bb_specialized_cached(
+                            &session,
+                            &[],
+                            &shared.lowered_module,
+                            &function,
+                            &shared.codegen_constants,
+                            &shared.lowered_module.counter_defs,
+                            &shared.module_constant_ptrs(),
+                            Some(shared.as_ref()),
+                        )
+                    };
+                    let Err(error) = result else {
+                        panic!("ordinary {name} acquired runtime compilation authority in {mode}");
+                    };
+                    assert_eq!(
+                        error,
+                        "runtime compilation requires an individually authenticated strict template"
+                    );
+                }
+            }
+        });
     }
 
     fn build_field_indexed_specialization_for_source(
@@ -8589,6 +8067,7 @@ def read_point(point):
 "#,
                 "read_point",
             );
+            assert_indexed_field_reads_current_key_layout(&built);
             let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
             let getattr_helpers =
                 import_user_names_for_symbols(&built, &["dp_jit_pyobject_getattr"]);
@@ -8752,6 +8231,18 @@ class Other:
                 .set_item("field_type_test", owner_module.as_any())
                 .expect("owner module should be registered");
 
+            // The profile below proposes x at index 0, but ordinary execution
+            // established y first. Exact type/version must not authorize
+            // reading that different key through the normal indexed path.
+            let point_type = owner_module.getattr("Point").unwrap();
+            let point = point_type.call0().unwrap();
+            point.setattr("y", 998_877_i64).unwrap();
+            point.setattr("x", 445_566_i64).unwrap();
+            assert_eq!(
+                cached_split_key_layout(py, point_type.as_ptr().cast()),
+                vec![("y".to_string(), 0), ("x".to_string(), 1)],
+            );
+
             write_test_counter_dump(
                 soac_work_dir.join("profile.bin").as_path(),
                 &CounterDumpRecord {
@@ -8829,6 +8320,7 @@ def read_point(point):
                 BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
+            assert_indexed_field_reads_current_key_layout(&built);
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
             let module_plan =
                 plan_typed_v3_jit_module_for_test(&shared_state.lowered_module, facts.clone())
@@ -8837,9 +8329,13 @@ def read_point(point):
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("read_point should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
+            let deopt_table = RuntimeJitDeoptTable::from_plan(
+                &function,
+                function_plan,
+                &module_constant_ptrs,
+                &shared_state.codegen_constants,
+            )
+            .expect("runtime deopt table should build from plan");
 
             let mut ctx = built.ctx;
             define_prepared_function(
@@ -8874,6 +8370,12 @@ def read_point(point):
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
                 late_bound_owner_cells: std::ptr::null(),
+                namespace_execution: std::ptr::null(),
+                strict_field_slots: std::ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: std::ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -8894,6 +8396,25 @@ def read_point(point):
 
             ffi::Py_DECREF(result.cast::<ffi::PyObject>());
             ffi::Py_DECREF(other);
+
+            assert_eq!(ffi::Py_TYPE(point.as_ptr()), point_type.as_ptr().cast());
+            let result = entry(
+                std::ptr::addr_of!(function_env).cast_mut().cast(),
+                ffi::PyThreadState_Get().cast(),
+                point.as_ptr().cast(),
+            );
+            assert!(ffi::PyErr_Occurred().is_null());
+            assert!(!result.is_null());
+            assert_eq!(
+                ffi::PyLong_AsLong(result.cast::<ffi::PyObject>()),
+                445_566,
+                "same-owner wrong-index access must return actual point.x, not point.y",
+            );
+            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
+            assert_eq!(
+                point.getattr("y").unwrap().extract::<i64>().unwrap(),
+                998_877
+            );
             modules
                 .del_item("field_type_test")
                 .expect("owner module should be removed");
@@ -9023,9 +8544,13 @@ def write_point(point, value):
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("write_point should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
+            let deopt_table = RuntimeJitDeoptTable::from_plan(
+                &function,
+                function_plan,
+                &module_constant_ptrs,
+                &shared_state.codegen_constants,
+            )
+            .expect("runtime deopt table should build from plan");
 
             let mut ctx = built.ctx;
             define_prepared_function(
@@ -9058,6 +8583,12 @@ def write_point(point, value):
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
                 late_bound_owner_cells: std::ptr::null(),
+                namespace_execution: std::ptr::null(),
+                strict_field_slots: std::ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: std::ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -9380,16 +8911,6 @@ def write_point(point, value):
         }
     }
 
-    fn test_function_jit_context(
-        runtime: &crate::jit::ModuleRuntimeContext,
-        runtime_objects: *mut c_void,
-    ) -> [*mut c_void; 2] {
-        [
-            std::ptr::addr_of!(runtime.mod_ctx).cast_mut().cast(),
-            runtime_objects,
-        ]
-    }
-
     fn count_direct_calls_to_runtime_helpers(
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
@@ -9490,6 +9011,62 @@ def write_point(point, value):
         )
     }
 
+    fn assert_function_env_load_base(
+        function: &ir::Function,
+        value: ir::Value,
+        expected_offset: i32,
+    ) -> ir::Value {
+        let value = function.dfg.resolve_aliases(value);
+        let ir::ValueDef::Result(load, _) = function.dfg.value_def(value) else {
+            panic!("deopt environment operand must be loaded from the actual FunctionEnv");
+        };
+        assert!(matches!(
+            function.dfg.insts[load],
+            ir::InstructionData::Load { offset, .. } if offset == expected_offset.into()
+        ));
+        let [environment] = function.dfg.inst_args(load) else {
+            panic!("FunctionEnv field load must have one base operand");
+        };
+        function.dfg.resolve_aliases(*environment)
+    }
+
+    fn assert_deopt_activation_operands(
+        function: &ir::Function,
+        arguments: &[ir::Value],
+    ) -> (ir::Value, ir::Value) {
+        let [
+            deopt_table,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            handled_state,
+            strict_activation,
+        ] = arguments
+        else {
+            panic!(
+                "deopt ABI must carry table, globals, captured builtins, function data, record ordinal, live buffer, live count, handled state, and strict activation"
+            );
+        };
+        let environment = assert_function_env_load_base(
+            function,
+            *deopt_table,
+            FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
+        );
+        assert_eq!(
+            assert_function_env_load_base(
+                function,
+                *strict_activation,
+                FUNCTION_ENV_ACTIVE_STRICT_CALL_OFFSET,
+            ),
+            environment,
+            "deopt must forward the strict source-frame activation from its table's FunctionEnv"
+        );
+        (environment, *handled_state)
+    }
+
     fn count_cold_block_direct_calls_to_runtime_helpers(
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
@@ -9521,9 +9098,10 @@ def write_point(point, value):
         count
     }
 
-    fn count_deopt_helper_success_returns(
+    fn count_deopt_returns_after_handled_state_finish(
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
+        finish_helpers: &[ir::UserExternalName],
     ) -> usize {
         let mut count = 0usize;
         for block in function.layout.blocks() {
@@ -9547,35 +9125,74 @@ def write_point(point, value):
                 let [deopt_result] = function.dfg.inst_results(inst) else {
                     panic!("deopt helper call should have one result");
                 };
-                let Some(term) = function.layout.last_inst(block) else {
-                    continue;
-                };
-                for destination in function.dfg.insts[term]
-                    .branch_destination(&function.dfg.jump_tables, &function.dfg.exception_tables)
-                {
-                    let args = destination
-                        .args(&function.dfg.value_lists)
-                        .collect::<Vec<_>>();
-                    if !args.iter().any(
-                        |arg| matches!(arg, ir::BlockArg::Value(value) if value == deopt_result),
-                    ) {
+                let (_, handled_state) =
+                    assert_deopt_activation_operands(function, function.dfg.inst_args(inst));
+                // Terminal-root retirement and its error cleanup can split
+                // the tail across blocks. Follow those actual successors;
+                // neither a same-block Return nor a native frame is required.
+                let mut pending = vec![(block, true, 0usize)];
+                let mut seen = HashSet::new();
+                let mut returns_result = false;
+                while let Some((tail, after_deopt, mut finishes)) = pending.pop() {
+                    if !seen.insert((tail, after_deopt, finishes)) {
                         continue;
                     }
-                    let target = destination.block(&function.dfg.value_lists);
-                    let Some(target_term) = function.layout.last_inst(target) else {
-                        continue;
-                    };
-                    if function.dfg.insts[target_term].opcode() != ir::Opcode::Return {
-                        continue;
-                    }
-                    let return_args = function.dfg.inst_args(target_term);
-                    let target_params = function.dfg.block_params(target);
-                    if return_args.len() == 1
-                        && target_params.len() == 1
-                        && return_args[0] == target_params[0]
+                    for candidate in function
+                        .layout
+                        .block_insts(tail)
+                        .skip_while(|candidate| after_deopt && *candidate != inst)
+                        .skip(usize::from(after_deopt))
                     {
-                        count += 1;
+                        let callee = match function.dfg.insts[candidate] {
+                            ir::InstructionData::Call { func_ref, .. }
+                            | ir::InstructionData::TryCall { func_ref, .. } => func_ref,
+                            _ => continue,
+                        };
+                        let ir::ExternalName::User(name_ref) = &function.dfg.ext_funcs[callee].name
+                        else {
+                            continue;
+                        };
+                        if finish_helpers.contains(&function.params.user_named_funcs()[*name_ref]) {
+                            assert_eq!(
+                                function.dfg.inst_args(candidate).first().copied(),
+                                Some(handled_state),
+                                "deopt cleanup must finish its original handled state",
+                            );
+                            finishes += 1;
+                            assert_eq!(finishes, 1, "deopt cleanup must not finish twice");
+                        }
                     }
+                    let term = function
+                        .layout
+                        .last_inst(tail)
+                        .expect("cleanup block terminator");
+                    if function.dfg.insts[term].opcode() == ir::Opcode::Return {
+                        assert_eq!(
+                            finishes, 1,
+                            "every deopt return must finish its handled state once"
+                        );
+                        let [returned] = function.dfg.inst_args(term) else {
+                            panic!("deopt cleanup must return one Python result");
+                        };
+                        let returned = function.dfg.resolve_aliases(*returned);
+                        if returned == function.dfg.resolve_aliases(*deopt_result) {
+                            returns_result = true;
+                        } else {
+                            assert!(
+                                value_is_iconst_imm(function, returned, 0),
+                                "only terminal cleanup failure may replace the deopt result with NULL",
+                            );
+                        }
+                    } else {
+                        pending.extend(
+                            block_successor_targets(function, tail)
+                                .into_iter()
+                                .map(|next| (next, false, finishes)),
+                        );
+                    }
+                }
+                if returns_result {
+                    count += 1;
                 }
             }
         }
@@ -9588,6 +9205,7 @@ def write_point(point, value):
         case_name: &str,
     ) {
         let deopt_helpers = import_user_names_for_symbols(built, &["dp_jit_deopt_resume"]);
+        let finish_helpers = import_user_names_for_symbols(built, &["dp_jit_handled_state_finish"]);
         let fallback_helpers = import_user_names_for_symbols(built, fallback_symbols);
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
@@ -9600,9 +9218,13 @@ def write_point(point, value):
             "{case_name}: deopt helper call should be cold"
         );
         assert_eq!(
-            count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
+            count_deopt_returns_after_handled_state_finish(
+                &built.ctx.func,
+                &deopt_helpers,
+                &finish_helpers
+            ),
             1,
-            "{case_name}: deopt should return a successful continuation result"
+            "{case_name}: deopt must finish its original activation once and tail-return its result"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &fallback_helpers),
@@ -9829,7 +9451,366 @@ def write_point(point, value):
     }
 
     #[test]
+    fn deopt_admission_failure_releases_the_whole_owned_buffer_and_preserves_pending_error() {
+        use pyo3::exceptions::{PyMemoryError, PyRuntimeError};
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def f(a, b, c):\n    try:\n        a()\n    except Exception:\n        return c\n    return b\n",
+        ).unwrap().blockpy_module;
+        let handled_function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "f")
+            .unwrap()
+            .clone();
+        Python::attach(|py| unsafe {
+            for missing_middle_value in [true, false] {
+                let function = handled_function.clone();
+                let function_id = function.function_id;
+                let block = function.entry_block().label;
+                let locals = ["a", "b", "c"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, name)| {
+                        let location = LocalLocation(slot as u32);
+                        LocalEnvResumeBinding {
+                            name: name.into(),
+                            location,
+                            binding: LocalEnvResumeBindingState::Bound,
+                            source: LocalEnvResumeValueSource::BlockParam(location),
+                            ownership: LocalRefKind::Owned,
+                            value: None,
+                        }
+                    })
+                    .collect();
+                let table = RuntimeJitDeoptTable {
+                    entry_counters: None,
+                    module_constant_runtime_names: Vec::new(),
+                    function_id,
+                    handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                        &function,
+                    ),
+                    function: Box::new(function),
+                    module_constant_ptrs: Vec::new(),
+                    points: vec![RuntimeJitDeoptRecord {
+                        id: PlannedJitDeoptPointId {
+                            function_id,
+                            ordinal: 0,
+                        },
+                        resume_point: LocalEnvResumePoint::BlockEntry { function_id, block },
+                        precision: LocalEnvResumeStatePrecision::BlockEntry,
+                        locals,
+                        continuation: RuntimeJitDeoptContinuation::unsupported(
+                            RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+                        ),
+                    }],
+                };
+                let values = [
+                    py.eval(c"object()", None, None).unwrap(),
+                    py.eval(c"object()", None, None).unwrap(),
+                    py.eval(c"object()", None, None).unwrap(),
+                ];
+                let expected = values
+                    .iter()
+                    .map(|value| ffi::Py_REFCNT(value.as_ptr()))
+                    .collect::<Vec<_>>();
+                let mut buffer = values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        if index == 1 && missing_middle_value {
+                            std::ptr::null_mut()
+                        } else {
+                            value.clone().into_ptr().cast::<c_void>()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let pending = PyMemoryError::new_err("deopt scalar boxing").into_value(py);
+                if missing_middle_value {
+                    ffi::PyErr_SetRaisedException(pending.clone_ref(py).into_ptr());
+                }
+                let result = crate::jit::specialized_helpers::dp_jit_deopt_resume(
+                    std::ptr::addr_of!(table).cast_mut().cast(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as i64,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                let error = pyo3::PyErr::fetch(py);
+                let observed = values
+                    .iter()
+                    .map(|value| ffi::Py_REFCNT(value.as_ptr()))
+                    .collect::<Vec<_>>();
+                // Preserve a useful RED without leaking the test's transferred
+                // references into the rest of the embedded interpreter suite.
+                for ((value, before), after) in values.iter().zip(&expected).zip(&observed) {
+                    for _ in *before..*after {
+                        ffi::Py_DECREF(value.as_ptr());
+                    }
+                }
+                assert!(result.is_null());
+                assert_eq!(
+                    observed, expected,
+                    "deopt must release prefix and unvisited tail after admission failure; missing_middle={missing_middle_value}, error={error}"
+                );
+                if missing_middle_value {
+                    assert!(
+                        error.value(py).is(pending.bind(py)),
+                        "a scalar-boxing MemoryError must not become a deopt protocol error"
+                    );
+                } else {
+                    assert!(error.is_instance_of::<PyRuntimeError>(py));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("missing its original handled-state activation")
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_class_slot_deopt_transfers_nullable_owners_before_finalizers() {
+        struct Observation {
+            current: *const std::ffi::c_void,
+            snapshot: *const std::ffi::c_void,
+            expected: ObjPtr,
+            called: bool,
+            restored: bool,
+        }
+        unsafe extern "C" fn observe(capsule: *mut ffi::PyObject) {
+            let observation = unsafe { ffi::PyCapsule_GetContext(capsule) }.cast::<Observation>();
+            if !observation.is_null() {
+                let observation = unsafe { &mut *observation };
+                observation.called = true;
+                observation.restored = unsafe {
+                    let current = observation
+                        .current
+                        .cast::<super::super::deopt::RuntimeJitDeoptLocal<'_>>();
+                    let snapshot = observation
+                        .snapshot
+                        .cast::<super::super::deopt::RuntimeJitDeoptLocal<'_>>();
+                    (*current).value() == observation.expected && (*snapshot).value().is_null()
+                };
+                unsafe {
+                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c"destructor error".as_ptr())
+                };
+            }
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            let value = py.eval(c"[]", None, None).unwrap();
+            let before = ffi::Py_REFCNT(value.as_ptr());
+            let binding = |slot, ownership| LocalEnvResumeBinding {
+                name: format!("slot_{slot}"),
+                location: LocalLocation(slot),
+                binding: LocalEnvResumeBindingState::MaybeUnbound,
+                source: LocalEnvResumeValueSource::StackSlot(LocalLocation(slot)),
+                ownership,
+                value: None,
+            };
+            let bindings = [
+                binding(0, LocalRefKind::Owned),
+                binding(1, LocalRefKind::Owned),
+            ];
+            let inputs: [ObjPtr; 2] = [value.clone().into_ptr().cast(), ptr::null_mut()];
+            let mut locals =
+                super::super::deopt::RuntimeJitDeoptLocals::from_prevalidated_live_values(
+                    &bindings, &inputs,
+                )
+                .unwrap();
+            let saved = locals
+                .get_by_location_mut(LocalLocation(0))
+                .unwrap()
+                .replace_nullable_owner_without_release(ptr::null_mut());
+            assert!(
+                locals
+                    .get_by_location_mut(LocalLocation(1))
+                    .unwrap()
+                    .replace_nullable_owner_without_release(saved)
+                    .is_null()
+            );
+            assert_eq!(ffi::Py_REFCNT(value.as_ptr()), before + 1);
+
+            let mut observation = Observation {
+                current: ptr::null_mut(),
+                snapshot: ptr::null_mut(),
+                expected: value.as_ptr().cast(),
+                called: false,
+                restored: false,
+            };
+            let capsule = ffi::PyCapsule_New(
+                ptr::from_mut(&mut observation).cast(),
+                c"soac.class_slot".as_ptr(),
+                Some(observe),
+            );
+            assert!(!capsule.is_null());
+            assert_eq!(
+                ffi::PyCapsule_SetContext(capsule, ptr::from_mut(&mut observation).cast()),
+                0
+            );
+            assert!(
+                locals
+                    .get_by_location_mut(LocalLocation(0))
+                    .unwrap()
+                    .replace_nullable_owner_without_release(capsule.cast())
+                    .is_null()
+            );
+            // Read the real local owners after the transaction. No inventory
+            // or special source-frame owner-address API participates.
+            observation.current =
+                ptr::from_ref(locals.get_by_location_mut(LocalLocation(0)).unwrap()).cast();
+            observation.snapshot =
+                ptr::from_ref(locals.get_by_location_mut(LocalLocation(1)).unwrap()).cast();
+            let pending =
+                pyo3::exceptions::PyValueError::new_err("original failure").into_value(py);
+            ffi::PyErr_SetRaisedException(pending.clone_ref(py).into_ptr());
+            let restored = locals
+                .get_by_location_mut(LocalLocation(1))
+                .unwrap()
+                .replace_nullable_owner_without_release(ptr::null_mut());
+            let replaced = locals
+                .get_by_location_mut(LocalLocation(0))
+                .unwrap()
+                .replace_nullable_owner_without_release(restored);
+            assert!(!observation.called);
+            super::super::deopt_interpreter::release_raw_class_owner(replaced);
+            let error = pyo3::PyErr::fetch(py);
+            assert!(error.value(py).is(pending.bind(py)));
+            assert!(observation.called && observation.restored);
+            assert_eq!(ffi::Py_REFCNT(value.as_ptr()), before + 1);
+            drop(locals);
+            assert_eq!(ffi::Py_REFCNT(value.as_ptr()), before);
+
+            let bindings = [
+                binding(0, LocalRefKind::Borrowed),
+                binding(1, LocalRefKind::Unbound),
+            ];
+            let inputs = [value.as_ptr().cast(), ptr::null_mut()];
+            let mut locals =
+                super::super::deopt::RuntimeJitDeoptLocals::from_prevalidated_live_values(
+                    &bindings, &inputs,
+                )
+                .unwrap();
+            assert!(
+                !locals
+                    .get_by_location(LocalLocation(0))
+                    .unwrap()
+                    .has_transferable_nullable_owner()
+            );
+            assert!(
+                locals
+                    .get_by_location_mut(LocalLocation(1))
+                    .unwrap()
+                    .replace_nullable_owner_without_release(ptr::null_mut())
+                    .is_null()
+            );
+            drop(locals);
+            assert_eq!(ffi::Py_REFCNT(value.as_ptr()), before);
+        });
+    }
+
+    #[test]
+    fn entry_local_admission_failure_keeps_the_entire_buffer_caller_owned() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            for invalid in 0..3 {
+                let mut bindings = ["a", "b", "c"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, name)| {
+                        let location = LocalLocation(slot as u32);
+                        LocalEnvResumeBinding {
+                            name: name.into(),
+                            location,
+                            binding: LocalEnvResumeBindingState::Bound,
+                            source: LocalEnvResumeValueSource::BlockParam(location),
+                            ownership: LocalRefKind::Owned,
+                            value: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if invalid == 1 {
+                    bindings[1].location = bindings[0].location;
+                } else if invalid == 2 {
+                    bindings[1].binding = LocalEnvResumeBindingState::Unbound;
+                }
+                let values = [
+                    py.eval(c"object()", None, None).unwrap(),
+                    py.eval(c"object()", None, None).unwrap(),
+                    py.eval(c"object()", None, None).unwrap(),
+                ];
+                let before = values
+                    .iter()
+                    .map(|value| ffi::Py_REFCNT(value.as_ptr()))
+                    .collect::<Vec<_>>();
+                let buffer = values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        if invalid == 0 && index == 1 {
+                            std::ptr::null_mut()
+                        } else {
+                            value.clone().into_ptr().cast::<c_void>()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let expected = values
+                    .iter()
+                    .map(|value| ffi::Py_REFCNT(value.as_ptr()))
+                    .collect::<Vec<_>>();
+                let result =
+                    super::super::deopt::RuntimeJitDeoptLocals::from_prevalidated_live_values(
+                        &bindings, &buffer,
+                    );
+                let rejected = result.is_err();
+                drop(result);
+                let observed = values
+                    .iter()
+                    .map(|value| ffi::Py_REFCNT(value.as_ptr()))
+                    .collect::<Vec<_>>();
+                // Repair a regression before emulating the caller's complete
+                // error cleanup, so a useful assertion cannot double-free it.
+                for ((value, expected), observed) in values.iter().zip(&expected).zip(&observed) {
+                    for _ in *observed..*expected {
+                        ffi::Py_INCREF(value.as_ptr());
+                    }
+                    for _ in *expected..*observed {
+                        ffi::Py_DECREF(value.as_ptr());
+                    }
+                }
+                for value in buffer {
+                    ffi::Py_XDECREF(value.cast());
+                }
+                assert!(rejected);
+                assert_eq!(
+                    observed, expected,
+                    "entry admission consumed caller-owned input; invalid={invalid}"
+                );
+                assert_eq!(
+                    values
+                        .iter()
+                        .map(|value| ffi::Py_REFCNT(value.as_ptr()))
+                        .collect::<Vec<_>>(),
+                    before
+                );
+            }
+        });
+    }
+
+    #[test]
     fn runtime_deopt_invocation_materializes_live_local_snapshot() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
         let function = test_function();
         let function_id = function.function_id;
         let block = BlockLabel::from_index(0);
@@ -9843,7 +9824,10 @@ def write_point(point, value):
             value: None,
         };
         let table = RuntimeJitDeoptTable {
+            entry_counters: None,
+            module_constant_runtime_names: Vec::new(),
             function_id,
+            handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(&function),
             function: Box::new(function),
             module_constant_ptrs: Vec::new(),
             points: vec![RuntimeJitDeoptRecord {
@@ -9859,10 +9843,12 @@ def write_point(point, value):
                 ),
             }],
         };
-        let expected_value = 0x1234usize as ObjPtr;
-        let mut live_values = vec![expected_value];
-        let invocation = unsafe {
-            RuntimeJitDeoptInvocation::from_raw(
+        Python::attach(|py| unsafe {
+            let object = py.eval(c"object()", None, None).unwrap();
+            let expected_value = object.as_ptr().cast::<c_void>();
+            let before = ffi::Py_REFCNT(object.as_ptr());
+            let mut live_values = vec![object.clone().into_ptr().cast::<c_void>()];
+            let invocation = RuntimeJitDeoptInvocation::from_raw(
                 std::ptr::addr_of!(table).cast_mut().cast(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -9870,32 +9856,45 @@ def write_point(point, value):
                 0,
                 live_values.as_mut_ptr().cast(),
                 live_values.len() as i64,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
-            .expect("well-formed live value buffer should validate")
-        };
-        let locals = invocation
-            .materialize_locals()
-            .expect("validated live bindings should materialize into runtime locals");
+            .expect("well-formed live value buffer should validate");
+            let locals = invocation
+                .materialize_locals()
+                .expect("validated live bindings should materialize into runtime locals");
 
-        assert_eq!(locals.len(), 1);
-        let local = locals
-            .get_by_name("x")
-            .expect("runtime locals should be addressable by source name");
-        assert_eq!(local.binding().location, location);
-        assert_eq!(local.value(), expected_value);
-        assert_eq!(
-            locals
-                .get_by_location(location)
-                .expect("runtime locals should be addressable by location")
-                .value(),
-            expected_value
-        );
-        assert!(
-            locals
-                .describe()
-                .contains(format!("x@{}=", location.slot()).as_str()),
-            "runtime locals diagnostics should include local names and slots"
-        );
+            assert_eq!(locals.len(), 1);
+            let local = locals
+                .get_by_name("x")
+                .expect("runtime locals should be addressable by source name");
+            assert_eq!(local.binding().location, location);
+            assert_eq!(local.value(), expected_value);
+            assert_eq!(
+                locals
+                    .get_by_location(location)
+                    .expect("runtime locals should be addressable by location")
+                    .value(),
+                expected_value
+            );
+            assert!(
+                locals
+                    .describe()
+                    .contains(format!("x@{}=", location.slot()).as_str()),
+                "runtime locals diagnostics should include local names and slots"
+            );
+            drop(locals);
+            assert_eq!(
+                ffi::Py_REFCNT(object.as_ptr()),
+                before,
+                "dropping accepted locals consumes their transferred owner"
+            );
+            assert!(
+                invocation.materialize_locals().is_err(),
+                "one incoming buffer cannot transfer its owners a second time"
+            );
+            assert_eq!(ffi::Py_REFCNT(object.as_ptr()), before);
+        });
     }
 
     #[test]
@@ -9920,8 +9919,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&lowered),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: function.entry_block().label,
@@ -9961,8 +9965,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: function.entry_block().label,
@@ -10001,8 +10010,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: function.entry_block().label,
@@ -10041,8 +10055,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: function.entry_block().label,
@@ -10081,8 +10100,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: function.entry_block().label,
@@ -10107,6 +10131,7 @@ def f(x):
             test_function(),
             vec![],
             BlockTerm::Raise(soac_core::block_py::TermRaise {
+                disposition: soac_core::block_py::RaiseDisposition::Source,
                 exc: Some(name_expr(test_constant_name(0))),
             }),
         );
@@ -10119,8 +10144,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: function.entry_block().label,
@@ -10159,8 +10189,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeInstr {
             key: InstrKey::new(function.function_id, body_instr_id),
         };
@@ -10188,8 +10223,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BlockEntry {
             function_id: function.function_id,
             block: block.label,
@@ -10226,8 +10266,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
 
         let block_entry_record = table
             .record_for_point(LocalEnvResumePoint::BlockEntry {
@@ -10271,6 +10316,8 @@ def f(x):
                     empty_tuple_expr(),
                     empty_tuple_expr(),
                     none_expr(),
+                    None,
+                    Vec::new(),
                 ),
             ))],
             ret_term(none_expr()),
@@ -10285,8 +10332,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let block_entry_record = table
             .record_for_point(LocalEnvResumePoint::BlockEntry {
                 function_id: function.function_id,
@@ -10324,6 +10376,23 @@ def f(x):
             !runtime_jit_typed_deopt_guard_operand_replay_safe(&typed_tuple),
             "typed guard miss deopt should reject operands that could repeat side effects"
         );
+        let take = InstrTyped::TakeOperand(soac_core::block_py::TakeOperand::new(test_name("x")));
+        assert!(!runtime_jit_typed_deopt_guard_operand_replay_safe(&take));
+        let global = InstrTyped::Load(Load::<InstrTyped>::new(ResolvedName {
+            id: "guarded_global".into(),
+            location: NameLocation::global(0),
+        }));
+        assert!(
+            super::super::deopt::typed_nested_guard_misses_can_resume_before_instr(
+                &InstrTyped::Tuple(Tuple::new(vec![global.clone(), take.clone()])),
+            )
+        );
+        assert!(
+            !super::super::deopt::typed_nested_guard_misses_can_resume_before_instr(
+                &InstrTyped::Tuple(Tuple::new(vec![take, global])),
+            ),
+            "a guard after a consuming read cannot restart before that read"
+        );
     }
 
     #[test]
@@ -10346,8 +10415,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
 
         let block_entry_record = table
             .record_for_point(LocalEnvResumePoint::BlockEntry {
@@ -10395,8 +10469,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
 
         let block_entry_record = table
             .record_for_point(LocalEnvResumePoint::BlockEntry {
@@ -10443,8 +10522,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: block.label,
@@ -10470,6 +10554,10 @@ def f(x):
             ))),
         );
         function.storage_layout = Some(StorageLayout {
+            generator_resume_abi: None,
+            block_parameter_roles: Vec::new(),
+            class_bindings: None,
+            expression_temporaries: Vec::new(),
             freevars: vec![],
             cellvars: vec![ClosureSlot {
                 logical_name: "cell".to_string(),
@@ -10489,8 +10577,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: block.label,
@@ -10525,8 +10618,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: block.label,
@@ -10561,8 +10659,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: block.label,
@@ -10583,9 +10686,16 @@ def f(x):
         let mut function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(name_expr(test_owned_cell_name("cell", 0))),
+            ret_term(cell_value_expr(
+                test_owned_cell_name("cell", 0),
+                CellBindingKind::Owner,
+            )),
         );
         function.storage_layout = Some(StorageLayout {
+            generator_resume_abi: None,
+            block_parameter_roles: Vec::new(),
+            class_bindings: None,
+            expression_temporaries: Vec::new(),
             freevars: vec![],
             cellvars: vec![ClosureSlot {
                 logical_name: "cell".to_string(),
@@ -10605,8 +10715,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: block.label,
@@ -10636,6 +10751,10 @@ def f(x):
             ret_term(none_expr()),
         );
         function.storage_layout = Some(StorageLayout {
+            generator_resume_abi: None,
+            block_parameter_roles: Vec::new(),
+            class_bindings: None,
+            expression_temporaries: Vec::new(),
             freevars: vec![],
             cellvars: vec![ClosureSlot {
                 logical_name: "cell".to_string(),
@@ -10658,8 +10777,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
 
         let block_entry_record = table
             .record_for_point(LocalEnvResumePoint::BlockEntry {
@@ -10730,8 +10854,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
 
         let block_entry_record = table
             .record_for_point(LocalEnvResumePoint::BlockEntry {
@@ -10780,8 +10909,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: entry.label,
@@ -10830,8 +10964,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: entry.label,
@@ -10880,8 +11019,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: entry.label,
@@ -10930,8 +11074,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: entry.label,
@@ -10960,8 +11109,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: block.label,
@@ -11006,8 +11160,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: entry.label,
@@ -11053,8 +11212,13 @@ def f(x):
         let function_plan = module_plan
             .function(function.function_id)
             .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
+        let table = RuntimeJitDeoptTable::from_plan(
+            function,
+            function_plan,
+            &[],
+            &ModuleCodegenConstants::collect_from_module(&module),
+        )
+        .expect("runtime deopt table should build from plan");
         let point = LocalEnvResumePoint::BeforeTerm {
             function_id: function.function_id,
             block: entry.label,
@@ -11079,7 +11243,12 @@ def f(x):
             let function_id = function.function_id;
             let block = function.entry_block().label;
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -11141,7 +11310,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -11208,7 +11382,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -11274,7 +11453,12 @@ def f(x):
             let function_id = function.function_id;
             let block = function.entry_block().label;
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -11346,7 +11530,12 @@ def f(x):
             let function_id = function.function_id;
             let block = function.entry_block().label;
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -11388,6 +11577,8 @@ def f(x):
                 0,
                 std::ptr::null_mut(),
                 0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
             assert_eq!(
                 result,
@@ -11420,7 +11611,12 @@ def f(x):
             let function_id = function.function_id;
             let block = function.entry_block().label;
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -11536,7 +11732,12 @@ def f(x):
                 "test failing int input allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![int_callable.cast(), input.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -11624,9 +11825,13 @@ def f(x):
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
-            let table =
-                RuntimeJitDeoptTable::from_plan(function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
+            let table = RuntimeJitDeoptTable::from_plan(
+                function,
+                function_plan,
+                &module_constant_ptrs,
+                &ModuleCodegenConstants::collect_from_module(&module),
+            )
+            .expect("runtime deopt table should build from plan");
             let point = LocalEnvResumePoint::BlockEntry {
                 function_id: function.function_id,
                 block: block.label,
@@ -11695,8 +11900,13 @@ def f(x):
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
-            let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-                .expect("runtime deopt table should build from plan");
+            let table = RuntimeJitDeoptTable::from_plan(
+                function,
+                function_plan,
+                &[],
+                &ModuleCodegenConstants::collect_from_module(&module),
+            )
+            .expect("runtime deopt table should build from plan");
             let point = LocalEnvResumePoint::BlockEntry {
                 function_id: function.function_id,
                 block: block.label,
@@ -11746,7 +11956,12 @@ def f(x):
             let function = with_test_blocks(function, vec![entry.clone(), target]);
             let function_id = function.function_id;
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -11833,7 +12048,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -11934,7 +12154,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -12028,7 +12253,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -12126,7 +12356,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -12242,7 +12477,12 @@ def f(x):
                 "test else-value allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![condition.cast(), then_value.cast(), else_value.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -12353,7 +12593,12 @@ def f(x):
                 "test default-value allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![
                     index.cast(),
@@ -12429,7 +12674,12 @@ def f(x):
                 "test module constant allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![constant.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -12528,7 +12778,12 @@ def f(x):
                 "test right PyLong allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![left.cast(), right.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -12614,7 +12869,12 @@ def f(x):
                     "test unary operand PyLong allocation should succeed"
                 );
                 let table = RuntimeJitDeoptTable {
+                    entry_counters: None,
+                    module_constant_runtime_names: Vec::new(),
                     function_id,
+                    handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                        &function,
+                    ),
                     function: Box::new(function),
                     module_constant_ptrs: vec![operand.cast()],
                     points: vec![RuntimeJitDeoptRecord {
@@ -12696,7 +12956,12 @@ def f(x):
                 "test getattr attr string allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![value.cast(), attr.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -12781,7 +13046,12 @@ def f(x):
                 "test getitem index allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![list.cast(), index.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -12860,7 +13130,12 @@ def f(x):
                 "test setattr replacement allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![module.cast(), attr.cast(), replacement.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -12943,7 +13218,12 @@ def f(x):
                 "test setitem replacement allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![dict.cast(), key.cast(), replacement.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13029,7 +13309,12 @@ def f(x):
                 "test delitem dict setup should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![dict.cast(), key.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13081,6 +13366,303 @@ def f(x):
     }
 
     #[test]
+    fn named_keyword_codegen_uses_only_a_names_tuple_and_raw_values() {
+        for (source, positional_count) in [
+            (
+                "def invoke(callback, first, second):\n    return callback(first=first, second=second)\n",
+                0,
+            ),
+            (
+                "def invoke(callback, positional, first, second):\n    return callback(positional, first=first, second=second)\n",
+                1,
+            ),
+        ] {
+            let module = soac_lowering::lower_python_to_blockpy_for_testing(source)
+                .expect("named keyword fixture should lower")
+                .blockpy_module;
+            let function = module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "invoke")
+                .unwrap();
+            let constants =
+                crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+            let blocks: Vec<_> = (1..=function.blocks.len())
+                .map(|index| index as ObjPtr)
+                .collect();
+            let built =
+                build_test_jit_function_with_constants(&module, function, &blocks, &constants);
+            let emitted = &built.ctx.func;
+            let vectorcall =
+                import_user_names_for_symbols(&built, &["PySoac_VectorcallWithContext"]);
+            let calls = direct_calls_to_runtime_helpers(emitted, &vectorcall);
+            assert_eq!(calls.len(), 1);
+            let arguments = emitted.dfg.inst_args(calls[0]);
+            assert_eq!(arguments.len(), 7);
+            let entry = emitted.layout.entry_block().unwrap();
+            assert_eq!(
+                assert_function_env_load_base(
+                    emitted,
+                    arguments[6],
+                    FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+                ),
+                emitted.dfg.block_params(entry)[0],
+            );
+            assert!(value_is_iconst_imm(emitted, arguments[2], positional_count));
+            assert!(!value_is_iconst_imm(emitted, arguments[3], 0));
+            let tuple_new =
+                declared_user_names_for_symbols(&built, &[SOAC_RUNTIME_TUPLE_NEW_IMPORT.symbol]);
+            let tuples = direct_calls_to_runtime_helpers(emitted, &tuple_new);
+            assert_eq!(tuples.len(), 1, "only keyword names need a tuple");
+            assert!(value_is_iconst_imm(
+                emitted,
+                emitted.dfg.inst_args(tuples[0])[0],
+                2
+            ));
+            let mapping_path = import_user_names_for_symbols(
+                &built,
+                &[
+                    "PySoac_ObjectCallWithContext",
+                    "PyDict_New",
+                    "PyDict_SetItem",
+                ],
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(emitted, &mapping_path),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn deopt_call_operands_do_not_publish_staging_containers() {
+        use pyo3::types::PyDict;
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let get_referrers = py.import("gc").unwrap().getattr("get_referrers").unwrap();
+            let globals = PyDict::new(py);
+            py.run(
+                cr#"
+import gc
+def keyword_target(*, value):
+    return gc.get_referrers(value)
+"#,
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let keyword_target = globals.get_item("keyword_target").unwrap().unwrap();
+            let exception = py
+                .import("builtins")
+                .unwrap()
+                .getattr("RuntimeError")
+                .unwrap()
+                .call1(("call operand",))
+                .unwrap();
+            for named in [false, true] {
+                let (target, positional, keywords) = if named {
+                    (
+                        &keyword_target,
+                        vec![],
+                        vec![CallArgKeyword::Named {
+                            arg: "value".into(),
+                            value: name_expr(test_constant_name(1)),
+                        }],
+                    )
+                } else {
+                    (
+                        &get_referrers,
+                        vec![CallArgPositional::Positional(name_expr(
+                            test_constant_name(1),
+                        ))],
+                        vec![],
+                    )
+                };
+                let function = with_single_test_block(
+                    test_function(),
+                    vec![],
+                    ret_term(op_expr(Call::new(
+                        name_expr(test_constant_name(0)),
+                        positional,
+                        keywords,
+                    ))),
+                );
+                let function_id = function.function_id;
+                let block = function.entry_block().label;
+                let table = RuntimeJitDeoptTable {
+                    entry_counters: None,
+                    module_constant_runtime_names: Vec::new(),
+                    function_id,
+                    handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                        &function,
+                    ),
+                    function: Box::new(function),
+                    module_constant_ptrs: vec![target.as_ptr().cast(), exception.as_ptr().cast()],
+                    points: vec![RuntimeJitDeoptRecord {
+                        id: PlannedJitDeoptPointId {
+                            function_id,
+                            ordinal: 0,
+                        },
+                        resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                        precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                        locals: vec![],
+                        continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                            cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                        },
+                    }],
+                };
+                let result = unsafe {
+                    test_dp_jit_deopt_resume(
+                        std::ptr::addr_of!(table).cast_mut().cast(),
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                let result = unsafe {
+                    pyo3::Bound::<pyo3::types::PyAny>::from_owned_ptr_or_err(py, result.cast())
+                }
+                .unwrap();
+                assert_eq!(
+                    result.len().unwrap(),
+                    0,
+                    "call operands must not acquire a staging tuple or mapping visible through gc.get_referrers (named={named})"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn deopt_call_operands_release_keyword_stack_on_native_errors() {
+        use pyo3::exceptions::PyTypeError;
+        use pyo3::types::PyDict;
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            py.run(
+                cr#"
+class Keyword(str):
+    pass
+key = Keyword('value')
+value = object()
+marker = RuntimeError('body exception')
+def target(positional, **keywords):
+    assert positional is value
+    assert next(iter(keywords)) is key
+    assert keywords[key] is value
+    raise marker
+def named_target(positional, *, value):
+    assert positional is value
+    raise marker
+"#,
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let target = globals.get_item("target").unwrap().unwrap();
+            let value = globals.get_item("value").unwrap().unwrap();
+            let marker = globals.get_item("marker").unwrap().unwrap();
+            let key = globals.get_item("key").unwrap().unwrap();
+            let named_target = globals.get_item("named_target").unwrap().unwrap();
+            for shape in ["named", "starred", "invalid"] {
+                let invalid_key = shape == "invalid";
+                let keywords = PyDict::new(py);
+                if invalid_key {
+                    keywords.set_item(1, &value).unwrap();
+                } else {
+                    keywords.set_item(&key, &value).unwrap();
+                }
+                let before_value = unsafe { ffi::Py_REFCNT(value.as_ptr()) };
+                let (target, keyword) = if shape == "named" {
+                    (
+                        &named_target,
+                        CallArgKeyword::Named {
+                            arg: "value".into(),
+                            value: name_expr(test_constant_name(1)),
+                        },
+                    )
+                } else {
+                    (
+                        &target,
+                        CallArgKeyword::Starred(name_expr(test_constant_name(2))),
+                    )
+                };
+                let function = with_single_test_block(
+                    test_function(),
+                    vec![],
+                    ret_term(op_expr(Call::new(
+                        name_expr(test_constant_name(0)),
+                        vec![CallArgPositional::Positional(name_expr(
+                            test_constant_name(1),
+                        ))],
+                        vec![keyword],
+                    ))),
+                );
+                let function_id = function.function_id;
+                let block = function.entry_block().label;
+                let table = RuntimeJitDeoptTable {
+                    entry_counters: None,
+                    module_constant_runtime_names: Vec::new(),
+                    function_id,
+                    handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                        &function,
+                    ),
+                    function: Box::new(function),
+                    module_constant_ptrs: vec![
+                        target.as_ptr().cast(),
+                        value.as_ptr().cast(),
+                        keywords.as_ptr().cast(),
+                    ],
+                    points: vec![RuntimeJitDeoptRecord {
+                        id: PlannedJitDeoptPointId {
+                            function_id,
+                            ordinal: 0,
+                        },
+                        resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                        precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                        locals: vec![],
+                        continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                            cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                        },
+                    }],
+                };
+                let result = unsafe {
+                    test_dp_jit_deopt_resume(
+                        std::ptr::addr_of!(table).cast_mut().cast(),
+                        globals.as_ptr().cast(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert!(result.is_null());
+                let error = pyo3::PyErr::fetch(py);
+                if invalid_key {
+                    assert!(error.is_instance_of::<PyTypeError>(py));
+                } else {
+                    assert_eq!(
+                        error.value(py).as_ptr(),
+                        marker.as_ptr(),
+                        "keyword cleanup must retain the original body exception"
+                    );
+                    marker.setattr("__traceback__", py.None()).unwrap();
+                }
+                drop(error);
+                assert_eq!(
+                    unsafe { ffi::Py_REFCNT(value.as_ptr()) },
+                    before_value,
+                    "native keyword entries own copies, but native positional entries borrow the interpreter's operands"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn deopt_block_tail_continuation_executes_return_positional_call() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
@@ -13108,7 +13690,12 @@ def f(x):
                 "test call input string allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![int_callable.cast(), input.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13145,7 +13732,7 @@ def f(x):
             assert_eq!(
                 unsafe { ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()) },
                 222_333_444,
-                "return-call deopt should execute PyObject_CallObject"
+                "return-call deopt should execute the native public call boundary"
             );
             assert_eq!(
                 unsafe { ffi::Py_REFCNT(input) },
@@ -13196,7 +13783,12 @@ def f(x):
                 "test starred args tuple should accept the input item"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![int_callable.cast(), starred_args.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13277,7 +13869,12 @@ def f(x):
                 "test keyword value PyLong allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![dict_callable.cast(), value.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13388,7 +13985,12 @@ def f(x):
                 ffi::Py_DECREF(value);
             }
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![dict_callable.cast(), kwargs.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13507,7 +14109,12 @@ def f(x):
                 "test duplicate keyword value allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![dict_callable.cast(), kwargs.cast(), duplicate.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13570,7 +14177,12 @@ def f(x):
                 "test cell value allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![cell_value.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13653,7 +14265,12 @@ def f(x):
             let function_id = function.function_id;
             let block = function.entry_block().label;
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13722,6 +14339,10 @@ def f(x):
                 ))),
             );
             function.storage_layout = Some(StorageLayout {
+                generator_resume_abi: None,
+                block_parameter_roles: Vec::new(),
+                class_bindings: None,
+                expression_temporaries: Vec::new(),
                 freevars: vec![],
                 cellvars: vec![ClosureSlot {
                     logical_name: "cell".to_string(),
@@ -13749,7 +14370,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13830,7 +14456,12 @@ def f(x):
             let mut function_data: Vec<ObjPtr> = vec![std::ptr::null_mut(); layout.total_len()];
             function_data[layout.closure_cell_slot(0)] = cell.cast();
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13888,9 +14519,16 @@ def f(x):
             let mut function = with_single_test_block(
                 test_function(),
                 vec![],
-                ret_term(name_expr(test_owned_cell_name("cell", 0))),
+                ret_term(cell_value_expr(
+                    test_owned_cell_name("cell", 0),
+                    CellBindingKind::Owner,
+                )),
             );
             function.storage_layout = Some(StorageLayout {
+                generator_resume_abi: None,
+                block_parameter_roles: Vec::new(),
+                class_bindings: None,
+                expression_temporaries: Vec::new(),
                 freevars: vec![],
                 cellvars: vec![ClosureSlot {
                     logical_name: "cell".to_string(),
@@ -13918,7 +14556,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![],
                 points: vec![RuntimeJitDeoptRecord {
@@ -13995,6 +14638,10 @@ def f(x):
                 ))),
             );
             function.storage_layout = Some(StorageLayout {
+                generator_resume_abi: None,
+                block_parameter_roles: Vec::new(),
+                class_bindings: None,
+                expression_temporaries: Vec::new(),
                 freevars: vec![],
                 cellvars: vec![ClosureSlot {
                     logical_name: "cell".to_string(),
@@ -14027,7 +14674,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![replacement.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -14110,6 +14762,10 @@ def f(x):
                 ret_term(op_expr(Del::new(test_owned_cell_name("cell", 0), false))),
             );
             function.storage_layout = Some(StorageLayout {
+                generator_resume_abi: None,
+                block_parameter_roles: Vec::new(),
+                class_bindings: None,
+                expression_temporaries: Vec::new(),
                 freevars: vec![],
                 cellvars: vec![ClosureSlot {
                     logical_name: "cell".to_string(),
@@ -14137,7 +14793,12 @@ def f(x):
                 value: None,
             };
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![],
                 points: vec![RuntimeJitDeoptRecord {
@@ -14208,6 +14869,7 @@ def f(x):
                 test_function(),
                 vec![],
                 BlockTerm::Raise(soac_core::block_py::TermRaise {
+                    disposition: soac_core::block_py::RaiseDisposition::Source,
                     exc: Some(name_expr(test_constant_name(0))),
                 }),
             );
@@ -14219,7 +14881,12 @@ def f(x):
                 "test exception instance allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![exc.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -14282,6 +14949,126 @@ def f(x):
     }
 
     #[test]
+    fn deopt_block_tail_raise_disposition_preserves_or_chains_context() {
+        use soac_core::block_py::{RaiseDisposition, TermRaise};
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            struct RestoreHandledException(*mut ffi::PyObject);
+            impl Drop for RestoreHandledException {
+                fn drop(&mut self) {
+                    unsafe {
+                        let raised = ffi::PyErr_GetRaisedException();
+                        PyErr_SetHandledException(self.0);
+                        ffi::Py_XDECREF(self.0);
+                        ffi::PyErr_SetRaisedException(raised);
+                    }
+                }
+            }
+
+            for disposition in [
+                RaiseDisposition::Source,
+                RaiseDisposition::PropagateNormalized,
+                RaiseDisposition::SourceNormalized,
+            ] {
+                let function = with_single_test_block(
+                    test_function(),
+                    vec![],
+                    BlockTerm::Raise(TermRaise {
+                        disposition,
+                        exc: Some(name_expr(test_constant_name(0))),
+                    }),
+                );
+                let function_id = function.function_id;
+                let block = function.entry_block().label;
+                let exc = unsafe { ffi::PyObject_CallNoArgs(ffi::PyExc_ValueError) };
+                let original_context = unsafe { ffi::PyObject_CallNoArgs(ffi::PyExc_KeyError) };
+                let caller = unsafe { ffi::PyObject_CallNoArgs(ffi::PyExc_RuntimeError) };
+                assert!(!exc.is_null() && !original_context.is_null() && !caller.is_null());
+                let before_exc = unsafe { ffi::Py_REFCNT(exc) };
+                let before_context = unsafe { ffi::Py_REFCNT(original_context) };
+                let before_caller = unsafe { ffi::Py_REFCNT(caller) };
+                let restore_handled =
+                    RestoreHandledException(unsafe { PyErr_GetHandledException() });
+                unsafe {
+                    // SetContext steals a reference; SetHandledException retains one.
+                    ffi::Py_INCREF(original_context);
+                    ffi::PyException_SetContext(exc, original_context);
+                    PyErr_SetHandledException(caller);
+                }
+                let table = RuntimeJitDeoptTable {
+                    entry_counters: None,
+                    module_constant_runtime_names: Vec::new(),
+                    function_id,
+                    handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                        &function,
+                    ),
+                    function: Box::new(function),
+                    module_constant_ptrs: vec![exc.cast()],
+                    points: vec![RuntimeJitDeoptRecord {
+                        id: PlannedJitDeoptPointId {
+                            function_id,
+                            ordinal: 0,
+                        },
+                        resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
+                        precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                        locals: vec![],
+                        continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
+                            cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                        },
+                    }],
+                };
+                let result = unsafe {
+                    test_dp_jit_deopt_resume(
+                        std::ptr::addr_of!(table).cast_mut().cast(),
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                let raised = unsafe { ffi::PyErr_GetRaisedException() };
+                let context = unsafe { ffi::PyException_GetContext(exc) };
+                let active = unsafe { PyErr_GetHandledException() };
+                let expected_context = match disposition {
+                    RaiseDisposition::Source => caller,
+                    RaiseDisposition::PropagateNormalized | RaiseDisposition::SourceNormalized => {
+                        original_context
+                    }
+                };
+                assert!(
+                    result.is_null(),
+                    "all dispositions must propagate the error"
+                );
+                assert_eq!(raised, exc, "{disposition:?} must keep exception identity");
+                assert_eq!(
+                    context, expected_context,
+                    "{disposition:?} context semantics"
+                );
+                assert_eq!(
+                    active, caller,
+                    "deopt must preserve the caller's handled state"
+                );
+                unsafe {
+                    ffi::Py_XDECREF(raised);
+                    ffi::Py_XDECREF(context);
+                    ffi::Py_XDECREF(active);
+                }
+                drop(restore_handled);
+                assert_eq!(unsafe { ffi::Py_REFCNT(exc) }, before_exc);
+                unsafe { ffi::Py_DECREF(exc) };
+                assert_eq!(unsafe { ffi::Py_REFCNT(original_context) }, before_context);
+                assert_eq!(unsafe { ffi::Py_REFCNT(caller) }, before_caller);
+                unsafe {
+                    ffi::Py_DECREF(original_context);
+                    ffi::Py_DECREF(caller);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn deopt_block_tail_continuation_executes_raise_class() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
@@ -14290,6 +15077,7 @@ def f(x):
                 test_function(),
                 vec![],
                 BlockTerm::Raise(soac_core::block_py::TermRaise {
+                    disposition: soac_core::block_py::RaiseDisposition::Source,
                     exc: Some(name_expr(test_constant_name(0))),
                 }),
             );
@@ -14300,7 +15088,12 @@ def f(x):
                 ffi::Py_INCREF(exc_class);
             }
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![exc_class.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -14356,6 +15149,17 @@ def f(x):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|_| {
+            struct RestoreHandledException(*mut ffi::PyObject);
+            impl Drop for RestoreHandledException {
+                fn drop(&mut self) {
+                    unsafe {
+                        let raised = ffi::PyErr_GetRaisedException();
+                        PyErr_SetHandledException(self.0);
+                        ffi::Py_XDECREF(self.0);
+                        ffi::PyErr_SetRaisedException(raised);
+                    }
+                }
+            }
             let function = with_single_test_block(test_function(), vec![], raise_term());
             let function_id = function.function_id;
             let block = function.entry_block().label;
@@ -14365,7 +15169,12 @@ def f(x):
                 "test current exception allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -14382,9 +15191,9 @@ def f(x):
                 }],
             };
             let before_exc = unsafe { ffi::Py_REFCNT(exc) };
+            let restore_handled = RestoreHandledException(unsafe { PyErr_GetHandledException() });
             unsafe {
-                ffi::Py_INCREF(exc);
-                ffi::PyErr_SetRaisedException(exc);
+                PyErr_SetHandledException(exc);
             }
             let result = unsafe {
                 test_dp_jit_deopt_resume(
@@ -14416,6 +15225,7 @@ def f(x):
             unsafe {
                 ffi::Py_DECREF(raised);
             }
+            drop(restore_handled);
             assert!(
                 unsafe { ffi::PyErr_Occurred() }.is_null(),
                 "fetching the raised exception should clear it"
@@ -14452,7 +15262,12 @@ def f(x):
                 "test module constant allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![constant.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -14532,7 +15347,12 @@ def f(x):
             let function_id = function.function_id;
             let block = function.entry_block().label;
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -14640,7 +15460,12 @@ def f(x):
                 "test module constant allocation should succeed"
             );
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: vec![new_value.cast()],
                 points: vec![RuntimeJitDeoptRecord {
@@ -14724,7 +15549,12 @@ def f(x):
             let value = unsafe { ffi::PyLong_FromLong(333_333_333) };
             assert!(!value.is_null(), "test local allocation should succeed");
             let table = RuntimeJitDeoptTable {
+                entry_counters: None,
+                module_constant_runtime_names: Vec::new(),
                 function_id,
+                handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                    &function,
+                ),
                 function: Box::new(function),
                 module_constant_ptrs: Vec::new(),
                 points: vec![RuntimeJitDeoptRecord {
@@ -14784,7 +15614,9 @@ def f(x):
             new_jit_module(&compile_session).expect("test jit module should construct");
         let ptr_ty = jit_module.target_config().pointer_type();
         let mut signature = jit_module.make_signature();
-        signature.params.push(ir::AbiParam::new(ptr_ty));
+        for _ in 0..4 {
+            signature.params.push(ir::AbiParam::new(ptr_ty));
+        }
         signature.returns.push(ir::AbiParam::new(ptr_ty));
         let wrapper_id = declare_local_fn(&mut jit_module, "test_deopt_exit_call", &signature)
             .expect("test wrapper should declare");
@@ -14807,8 +15639,9 @@ def f(x):
                 &DP_JIT_DEOPT_RESUME_IMPORT,
             );
             let function_env_value = fb.block_params(entry)[0];
-            let globals_obj = fb.ins().iconst(ptr_ty, 0);
-            let live_values = fb.ins().iconst(ptr_ty, 0);
+            let globals_obj = fb.block_params(entry)[1];
+            let live_values = fb.block_params(entry)[2];
+            let handled_state = fb.block_params(entry)[3];
             let result = emit_deopt_resume_call(
                 &mut fb,
                 JitDeoptExitRef {
@@ -14818,9 +15651,10 @@ def f(x):
                 deopt_ref,
                 globals_obj,
                 live_values,
-                0,
+                3,
                 ptr_ty,
                 ir::types::I64,
+                handled_state,
             );
             fb.ins().return_(&[result]);
             fb.finalize();
@@ -14833,25 +15667,45 @@ def f(x):
                 (*symbol == "dp_jit_deopt_resume").then(|| ir::UserExternalName::new(0, *import_id))
             })
             .expect("deopt helper import should be declared");
+        let calls = direct_call_args_to_runtime_helpers(&ctx.func, &[deopt_import]);
+        let [arguments] = calls.as_slice() else {
+            panic!("deopt exit must have exactly one helper call");
+        };
+        let entry = ctx.func.layout.entry_block().unwrap();
+        let parameters = ctx.func.dfg.block_params(entry);
+        let (environment, handled_state) = assert_deopt_activation_operands(&ctx.func, arguments);
+        assert_eq!(environment, parameters[0]);
+        assert_eq!(arguments[1], parameters[1], "forward the actual globals");
         assert_eq!(
-            count_direct_calls_to_runtime_helpers(&ctx.func, &[deopt_import]),
-            1,
-            "deopt exit call should target the runtime deopt helper"
+            assert_function_env_load_base(
+                &ctx.func,
+                arguments[2],
+                FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+            ),
+            environment,
+            "captured builtins must come from the same FunctionEnv"
         );
-        assert!(
-            function_contains_iconst_imm(&ctx.func, 42),
-            "deopt exit call should materialize the planned record ordinal"
+        let ir::ValueDef::Result(function_data, _) = ctx.func.dfg.value_def(arguments[3]) else {
+            panic!("function data must address the FunctionEnv runtime-object array");
+        };
+        assert!(matches!(
+            ctx.func.dfg.insts[function_data],
+            ir::InstructionData::BinaryImm64 {
+                opcode: ir::Opcode::IaddImm,
+                imm,
+                ..
+            } if imm.bits() == i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET)
+        ));
+        assert_eq!(ctx.func.dfg.inst_args(function_data), &[environment]);
+        assert!(value_is_iconst_imm(&ctx.func, arguments[4], 42));
+        assert_eq!(
+            arguments[5], parameters[2],
+            "forward the actual live buffer"
         );
-        assert!(
-            ctx.func.layout.blocks().any(|block| {
-                ctx.func.layout.block_insts(block).any(|inst| {
-                    matches!(
-                        ctx.func.dfg.insts[inst].load_store_offset(),
-                        Some(offset) if offset == FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET
-                    )
-                })
-            }),
-            "deopt exit call should load the deopt table pointer from the function env"
+        assert!(value_is_iconst_imm(&ctx.func, arguments[6], 3));
+        assert_eq!(
+            handled_state, parameters[3],
+            "the handled-state owner is forwarded separately from the strict activation"
         );
     }
 
@@ -15436,6 +16290,68 @@ def f(x):
     }
 
     #[test]
+    fn explicit_refcount_lowering_accesses_only_the_low_header_word() {
+        for facts in [None, Some(PyObjFacts::known_not_none())] {
+            let (_session, _module, context, _id, _helpers) =
+                unsafe { build_explicit_refcount_smoke_context(facts) };
+            let function = &context.func;
+            let entry = function.layout.entry_block().unwrap();
+            let receiver = function.dfg.block_params(entry)[1];
+            let mut loads = Vec::new();
+            let mut stores = 0;
+            for block in function.layout.blocks() {
+                for instruction in function.layout.block_insts(block) {
+                    let arguments = function.dfg.inst_args(instruction);
+                    match function.dfg.insts[instruction] {
+                        ir::InstructionData::Load { offset, .. } if arguments == [receiver] => {
+                            assert_eq!(offset, 0.into());
+                            let [result] = function.dfg.inst_results(instruction) else {
+                                panic!("a refcount load must return one low word");
+                            };
+                            assert_eq!(function.dfg.value_type(*result), ir::types::I32);
+                            loads.push(*result);
+                        }
+                        ir::InstructionData::Store { offset, .. }
+                            if arguments.len() == 2 && arguments[1] == receiver =>
+                        {
+                            assert_eq!(offset, 0.into());
+                            assert_eq!(function.dfg.value_type(arguments[0]), ir::types::I32);
+                            stores += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(loads.len(), 2, "both refcount operations read the low u32");
+            assert_eq!(stores, 2, "no update may overwrite ob_overflow/ob_flags");
+            let mut increment_immortal = false;
+            let mut decrement_immortal = false;
+            for block in function.layout.blocks() {
+                for instruction in function.layout.block_insts(block) {
+                    if let ir::InstructionData::IntCompareImm { cond, imm, .. } =
+                        function.dfg.insts[instruction]
+                    {
+                        let [value] = function.dfg.inst_args(instruction) else {
+                            continue;
+                        };
+                        if loads.contains(value) {
+                            increment_immortal |= cond
+                                == ir::condcodes::IntCC::UnsignedGreaterThanOrEqual
+                                && imm.bits() == i64::from(3u32 << 30);
+                            decrement_immortal |=
+                                cond == ir::condcodes::IntCC::SignedLessThan && imm.bits() == 0;
+                        }
+                    }
+                }
+            }
+            assert!(
+                increment_immortal && decrement_immortal,
+                "immortality must depend on the low refcount, not high layout flags"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_refcount_lowering_uses_non_null_facts_to_remove_null_guards() {
         let (_compile_session, _jit_module, unknown_ctx, _wrapper_id, _helper_names) =
             unsafe { build_explicit_refcount_smoke_context(None) };
@@ -15651,6 +16567,122 @@ def f(x):
     }
 
     #[test]
+    fn jit_refcount_paths_preserve_actual_type_state_attachments() -> pyo3::PyResult<()> {
+        use pyo3::types::PyModuleMethods;
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        let runtime = unsafe { build_runtime_refcount_smoke_wrapper() };
+        let (_session, mut native, mut context, function_id, _) =
+            unsafe { build_explicit_refcount_smoke_context(None) };
+        define_prepared_function(
+            &mut native,
+            &SoacEnvConfig::default(),
+            function_id,
+            &mut context,
+            "type-state-explicit-refcounts",
+            "explicit refcount marker fixture should compile",
+        )
+        .unwrap();
+        native.clear_context(&mut context);
+        native.finalize_definitions().unwrap();
+        let explicit: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            unsafe { std::mem::transmute(native.get_finalized_function(function_id)) };
+
+        // The native fixture has no signed source authority. It uses the
+        // genuine pending constructor/default allocator to create a real
+        // stateful allocation, never a late bit on an ordinary object.
+        Python::attach(|py| {
+            let fixture = PyModule::from_code(
+                py,
+                cr#"
+import _testinternalcapi
+
+def namespace_function():
+    pass
+
+Kind = _testinternalcapi.dict_new_soac_type_state_type(
+    'RefcountState', (), {'__module__': __name__}, ('field',), namespace_function,
+)
+receiver = Kind()
+receiver.field = 17
+dictionary = vars(receiver)
+info = _testinternalcapi.get_soac_type_state_info
+"#,
+                c"type_state_refcounts.py",
+                c"type_state_refcounts",
+            )?;
+            let info = fixture.getattr("info")?;
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct RawPyRefcountHeader {
+                count: u32,
+                overflow: u16,
+                flags: u16,
+            }
+            for name in ["receiver", "dictionary"] {
+                let object = fixture.getattr(name)?;
+                let before_info = info.call1((&object,))?;
+                assert!(before_info.get_item("has_slot")?.extract::<bool>()?);
+                assert_eq!(
+                    before_info.get_item("storage_mode")?.extract::<String>()?,
+                    "direct"
+                );
+                let state = before_info.get_item("state_id")?.extract::<usize>()?;
+                assert_ne!(state, 0);
+                // Native support is audited LP64 little-endian GIL; this raw
+                // mirror deliberately exposes the exact header boundary.
+                assert!(cfg!(all(
+                    target_pointer_width = "64",
+                    target_endian = "little"
+                )));
+                let header = object.as_ptr().cast::<RawPyRefcountHeader>();
+                let before = unsafe { header.read() };
+                assert_ne!(
+                    before.flags & 0x10,
+                    0,
+                    "the real allocation marker must be present"
+                );
+                assert!(before.count > 0 && before.count < 1 << 31);
+                for _ in 0..64 {
+                    let pointer = object.as_ptr().cast();
+                    assert_eq!(unsafe { runtime.call(pointer) }, pointer);
+                    assert_eq!(
+                        unsafe { explicit(PyThreadState_GetUnchecked().cast(), pointer) },
+                        pointer
+                    );
+                    let after = unsafe { header.read() };
+                    assert_eq!(
+                        (after.count, after.overflow, after.flags),
+                        (before.count, before.overflow, before.flags)
+                    );
+                    assert!(unsafe { ffi::PyErr_Occurred() }.is_null());
+                }
+                let after_info = info.call1((&object,))?;
+                assert_eq!(after_info.get_item("state_id")?.extract::<usize>()?, state);
+            }
+            py.run(
+                cr#"
+for operation in (
+    lambda: setattr(receiver, 'field', 'wrong'),
+    lambda: dictionary.__setitem__('field', 'wrong'),
+):
+    try:
+        operation()
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('refcount updates lost the attached field policy')
+assert receiver.field == dictionary['field'] == 17
+"#,
+                Some(&fixture.dict()),
+                None,
+            )?;
+            Ok(())
+        })
+    }
+
+    #[test]
     fn jit_runtime_clif_decref_can_destroy_py_capsule() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
@@ -15777,16 +16809,14 @@ def f(x):
     fn vectorcall_native_recursion_guard_keeps_cpython_helper_only_on_cold_stack_edge() {
         use super::super::runtime_context::{
             PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET, PY_THREAD_STATE_BASE_FRAME_OFFSET,
+            assert_recursion_frame_abi_matches_native,
         };
 
-        assert_eq!(std::mem::size_of::<usize>(), 8);
-        assert_eq!(PY_THREAD_STATE_BASE_FRAME_OFFSET, 80);
-        assert_eq!(PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET, 104);
-        assert_eq!(
-            PY_BASE_FRAME_C_STACK_SOFT_LIMIT_OFFSET as usize - 2 * std::mem::size_of::<usize>(),
-            88,
-            "the pinned CPython embedded interpreter frame must occupy 88 bytes"
-        );
+        {
+            let _guard = crate::python_runtime_test_lock().lock().unwrap();
+            crate::initialize_test_python();
+            Python::attach(assert_recursion_frame_abi_matches_native).unwrap();
+        }
 
         let mut function = ir::Function::new();
         function
@@ -16054,7 +17084,7 @@ def immediate(owner, argument):
     }
 
     #[test]
-    fn jit_block_entry_counter_updates_shared_state() {
+    fn block_entry_counters_do_not_authorize_ordinary_runtime_compilation() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
             crate::initialize_test_python();
@@ -16100,7 +17130,6 @@ def f():
                     "",
                 )
                 .expect("shared state should build");
-                let runtime = build_test_module_runtime(py, shared_state.clone());
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
                 let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
                 let compile_session =
@@ -16109,7 +17138,7 @@ def f():
                             .with_specialization_mode(Some(SpecializationMode::Profile))
                             .with_profiled_cold_blocks_enabled(true),
                     ));
-                let compiled_handle = compile_cranelift_run_bb_specialized_cached(
+                let result = compile_cranelift_run_bb_specialized_cached(
                     &compile_session,
                     &blocks,
                     &shared_state.lowered_module,
@@ -16118,36 +17147,16 @@ def f():
                     &shared_state.lowered_module.counter_defs,
                     &module_constant_ptrs,
                     Some(shared_state.as_ref()),
-                )
-                .expect("direct counter test function should compile");
-                let (code_ptr, _default_code_ptr, param_count) = compiled_handle
-                    .handle
-                    .direct_runner_info()
-                    .expect("compiled direct runner should expose entrypoint");
-                assert_eq!(param_count, 0, "test function should not take direct args");
-                let entry: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
-                    std::mem::transmute(code_ptr);
-                let mut function_context =
-                    test_function_jit_context(&runtime, std::ptr::null_mut());
-                let thread_state = ffi::PyThreadState_Get().cast::<c_void>();
-
-                let result1 = entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
                 );
-                let result2 = entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
+                assert!(
+                    result.is_err(),
+                    "instrumentation must not authorize an ordinary source function"
                 );
-
                 assert_eq!(
                     shared_state.counter_value(entry_counter_id),
-                    2,
-                    "entry counter should reflect the number of completed direct JIT calls"
+                    0,
+                    "rejected code must never enter its instrumented body"
                 );
-
-                ffi::Py_DECREF(result1.cast());
-                ffi::Py_DECREF(result2.cast());
             });
         }
     }
@@ -16178,11 +17187,15 @@ def f():
         let mut constants = TestConstantPool::default();
         let mut function = test_function();
         set_stack_slots(&mut function, &["current", "acc"]);
+        let layout = function.storage_layout.as_mut().unwrap();
+        layout.record_block_parameter_role(NameLocation::local(0), BlockParamRole::AbruptKind);
+        layout.record_block_parameter_role(NameLocation::local(1), BlockParamRole::AbruptPayload);
         let mut source = test_source_block(&function, vec![], ret_term(constants.int_expr(7)));
         source.ensure_param("current", BlockParamRole::AbruptKind);
         source.ensure_param("acc", BlockParamRole::AbruptPayload);
         let function = with_test_blocks(function, vec![source]);
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function.clone()],
@@ -16484,6 +17497,95 @@ def f(x):
     }
 
     #[test]
+    fn handled_region_entry_failure_forwards_live_exception_locals() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def f(value, callback):
+    try:
+        callback()
+    except Exception as error:
+        callback(error)
+        return value
+    return value
+"#,
+        )
+        .expect("lowering the handled-region forwarding source should succeed")
+        .blockpy_module;
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "f")
+            .expect("missing lowered function f");
+        assert!(crate::handled_exception::HandledExceptionPlan::for_function(function).len() > 0);
+        let constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+        let built = build_test_specialized_function(&blocks, &lowered, function, &constants);
+        assert!(built.block_annotations.values().any(|annotation| {
+            annotation.semantic_name.starts_with("exc_dispatch::")
+                && annotation.param_names.iter().any(|name| name == "value")
+        }));
+        let helpers = import_user_names_for_symbols(&built, &["dp_jit_handled_state_select"]);
+        assert!(count_direct_calls_to_runtime_helpers(&built.ctx.func, &helpers) > 0);
+
+        let session = crate::session::CompileSession::new();
+        let jit_module = new_jit_module(&session).expect("test JIT module should construct");
+        cranelift_codegen::verify_function(&built.ctx.func, jit_module.isa())
+            .expect("handled-region entry failures must carry the planned live exception operands");
+    }
+
+    #[test]
+    fn handled_state_initialization_dominates_suspended_entry_failures() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+import sys
+
+def make_handled_coroutine():
+    async def coro():
+        try:
+            raise ValueError('coroutine')
+        except ValueError:
+            return sys.exception()
+    return coro()
+"#,
+        )
+        .expect("lowering the actual nested-coroutine regression should succeed")
+        .blockpy_module;
+        let function = lowered
+            .callable_defs
+            .iter()
+            .find(|function| function.names.bind_name == "coro")
+            .expect("missing lowered coroutine resume body");
+        assert_eq!(function.kind, FunctionKind::Coroutine);
+        assert!(
+            function
+                .storage_layout()
+                .as_ref()
+                .is_some_and(|layout| !layout.preserved_slots.is_empty())
+        );
+        let constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
+        let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+        let built = build_test_specialized_function(&blocks, &lowered, function, &constants);
+        for helper in [
+            "dp_jit_preserved_values_ptr",
+            "dp_jit_handled_state_init",
+            "dp_jit_handled_state_finish",
+        ] {
+            let imports = import_user_names_for_symbols(&built, &[helper]);
+            assert!(count_direct_calls_to_runtime_helpers(&built.ctx.func, &imports) > 0);
+        }
+        let session = crate::session::CompileSession::new();
+        let jit_module = new_jit_module(&session).expect("test JIT module should construct");
+        if let Err(error) = cranelift_codegen::verify_function(&built.ctx.func, jit_module.isa()) {
+            panic!(
+                "suspended prolog failures must have a defined activation to finish: {error:?}\n{}",
+                built.ctx.func.display(),
+            );
+        }
+    }
+
+    #[test]
     fn render_specialized_jit_operator_calls_use_python_capi() {
         let blocks = [1usize as ObjPtr];
         let mut function = with_single_test_block(
@@ -16525,6 +17627,303 @@ def f(x):
             rendered.contains("call PyObject_RichCompare"),
             "comparison lowering should use PyObject_RichCompare in rendered CLIF:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn native_nested_getattr_comparison_releases_lhs_when_rhs_raises() {
+        use pyo3::types::PyModuleMethods;
+
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "native_nested_getattr_comparison_releases_lhs_when_rhs_raises",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            // Exercise the native emitter's accepted nested expression, not a
+            // source rewrite that could first put both getters in local slots.
+            // Scalar-plan invalidation/reachability is covered independently.
+            let module_name_gen = ModuleNameGen::new(0);
+            let mut constants = TestConstantPool::default();
+            let mut function = test_function_in_module(&module_name_gen, "compare");
+            function.params = ParamSpec {
+                params: vec![
+                    test_param("left", ParamKind::Any, false),
+                    test_param("right", ParamKind::Any, false),
+                ],
+            };
+            set_stack_slots(&mut function, &["left", "right"]);
+            let entry_label = function.name_gen.next_block_name();
+            let then_label = function.name_gen.next_block_name();
+            let else_label = function.name_gen.next_block_name();
+            function.blocks = vec![
+                BlockPyBlock {
+                    label: entry_label,
+                    body: vec![],
+                    term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                        test: op_expr(BinOp::new(
+                            BinOpKind::Lt,
+                            op_expr(GetAttr::new(
+                                name_expr(test_local_name("left", 0)),
+                                constants.string_expr("value"),
+                            )),
+                            op_expr(GetAttr::new(
+                                name_expr(test_local_name("right", 1)),
+                                constants.string_expr("value"),
+                            )),
+                        )),
+                        then_label,
+                        else_label,
+                    }),
+                    params: vec![],
+                    exc_edge: None,
+                    extra: Default::default(),
+                },
+                BlockPyBlock {
+                    label: then_label,
+                    body: vec![],
+                    term: ret_term(constants.int_expr(1)),
+                    params: vec![],
+                    exc_edge: None,
+                    extra: Default::default(),
+                },
+                BlockPyBlock {
+                    label: else_label,
+                    body: vec![],
+                    term: ret_term(constants.int_expr(0)),
+                    params: vec![],
+                    exc_edge: None,
+                    extra: Default::default(),
+                },
+            ];
+            let mut module = test_module(module_name_gen, vec![function]);
+            module.module_constants = constants.module_constants;
+            let function = &module.callable_defs[0];
+            let typed = lower_blockpy_function_to_typed(function.clone());
+            let planned =
+                prepare_specialized_typed_function(&typed, None, &infer_jit_value_facts(&module))
+                    .expect("native preparation must accept the nested generic comparison")
+                    .typed_function;
+            assert!(planned.blocks.iter().all(|block| block.body.is_empty()));
+            let BlockTerm::IfTerm(branch) = &planned.blocks[0].term else {
+                panic!("the native test must retain the comparison branch");
+            };
+            let InstrTyped::BinOp(compare) = &branch.test else {
+                panic!("the native branch must retain its nested comparison");
+            };
+            assert_eq!(compare.kind, BinOpKind::Lt);
+            for input in [compare.left.as_ref(), compare.right.as_ref()] {
+                let InstrTyped::GetAttrTyped(getattr) = input else {
+                    panic!("both owned getter results must remain nested operands");
+                };
+                assert_eq!(getattr.access, TypedAttrAccessPlan::Generic);
+            }
+            assert!(
+                branch
+                    .test
+                    .typed_extra()
+                    .and_then(|extra| extra.exact_int_branch_plan())
+                    .is_none()
+            );
+
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module = new_jit_module(&compile_session).unwrap();
+            let module_constants = ModuleCodegenConstants::collect_from_module(&module);
+            let constant_owners = module_constants.build_python_constants(py).unwrap();
+            let constant_ptrs = constant_owners
+                .iter()
+                .map(|value| value.as_ptr())
+                .collect::<Vec<_>>();
+            let constant_data =
+                declare_module_constant_object_data(&mut jit_module, &module, &constant_ptrs)
+                    .unwrap();
+            let (counter_slots, scalar_data, top_value_data) =
+                define_test_counter_storage(&mut jit_module, &module, &module.counter_defs);
+            let built = build_test_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                &vec![ptr::null_mut(); function.blocks.len()],
+                &module,
+                function,
+                &module_constants,
+                &module.counter_defs,
+                &constant_data,
+                &counter_slots,
+                scalar_data,
+                top_value_data,
+                &compile_session,
+                None,
+                None,
+                None,
+                BuildSpecializedFunctionOptions {
+                    planned_typed_function: Some(planned),
+                    ..Default::default()
+                },
+            )
+            .expect("the retained nested expression must reach native emission");
+            for (symbol, expected) in [
+                ("dp_jit_pyobject_getattr", 2),
+                ("PyObject_RichCompare", 1),
+                ("dp_jit_deopt_resume", 0),
+            ] {
+                let imports = import_user_names_for_symbols(&built, &[symbol]);
+                assert_eq!(
+                    count_direct_calls_to_runtime_helpers(&built.ctx.func, &imports),
+                    expected,
+                    "the nested expression must use its actual native {symbol} path"
+                );
+            }
+            let mut ctx = built.ctx;
+            define_prepared_function(
+                &mut jit_module,
+                &SoacEnvConfig::default(),
+                built.main_id,
+                &mut ctx,
+                "native-nested-getattr-cleanup",
+                "native nested getter comparison should define",
+            )
+            .unwrap();
+            jit_module.clear_context(&mut ctx);
+            jit_module.finalize_definitions().unwrap();
+            let code = jit_module.get_finalized_function(built.main_id);
+
+            let callbacks = PyModule::from_code(
+                py,
+                cr#"
+import gc
+import weakref
+
+events = []
+drops = []
+saved = None
+fail = False
+error = LookupError('right getter failed')
+
+class Payload:
+    def __lt__(self, other):
+        events.append('compare')
+        return True
+    def __del__(self):
+        drops.append('payload')
+
+class Left:
+    @property
+    def value(self):
+        global saved
+        events.append('left')
+        value = Payload()
+        saved = weakref.ref(value)
+        return value
+
+class Right:
+    @property
+    def value(self):
+        events.append('right')
+        if fail:
+            raise error
+        return object()
+"#,
+                c"native_nested_getattr_cleanup.py",
+                c"native_nested_getattr_cleanup",
+            )
+            .unwrap();
+            let environment = crate::FunctionEnvAbiHeader {
+                direct_code_ptr: code,
+                default_direct_code_ptr: ptr::null(),
+                deopt_table_ptr: ptr::null_mut(),
+                globals_obj: callbacks.dict().as_ptr(),
+                builtins_obj: ffi::PyEval_GetBuiltins(),
+                late_bound_owner_cells: ptr::null(),
+                namespace_execution: ptr::null(),
+                strict_field_slots: ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: ptr::null(),
+            };
+            let invoke: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
+                std::mem::transmute(code);
+            for fail in [false, true] {
+                callbacks.setattr("fail", fail).unwrap();
+                callbacks
+                    .getattr("events")
+                    .unwrap()
+                    .call_method0("clear")
+                    .unwrap();
+                callbacks
+                    .getattr("drops")
+                    .unwrap()
+                    .call_method0("clear")
+                    .unwrap();
+                let left = callbacks.getattr("Left").unwrap().call0().unwrap();
+                let right = callbacks.getattr("Right").unwrap().call0().unwrap();
+                let result = invoke(
+                    ptr::from_ref(&environment).cast_mut().cast(),
+                    ffi::PyThreadState_Get().cast(),
+                    left.as_ptr().cast(),
+                    right.as_ptr().cast(),
+                );
+                // Take the pending error before Python assertions allocate.
+                let raised = pyo3::PyErr::take(py);
+                if fail {
+                    assert!(result.is_null(), "the right getter must abort comparison");
+                    let raised = raised.expect("the original getter error must survive cleanup");
+                    assert!(raised.value(py).is(&callbacks.getattr("error").unwrap()));
+                    drop(raised);
+                } else {
+                    assert!(raised.is_none(), "successful comparison raised {raised:?}");
+                    assert!(!result.is_null());
+                    let result =
+                        pyo3::Bound::<pyo3::types::PyAny>::from_owned_ptr(py, result.cast());
+                    assert_eq!(result.extract::<i64>().unwrap(), 1);
+                }
+                callbacks
+                    .getattr("error")
+                    .unwrap()
+                    .setattr("__traceback__", py.None())
+                    .unwrap();
+                drop(left);
+                drop(right);
+                callbacks
+                    .getattr("gc")
+                    .unwrap()
+                    .call_method0("collect")
+                    .unwrap();
+                let expected = if fail {
+                    vec!["left", "right"]
+                } else {
+                    vec!["left", "right", "compare"]
+                };
+                assert_eq!(
+                    callbacks
+                        .getattr("events")
+                        .unwrap()
+                        .extract::<Vec<String>>()
+                        .unwrap(),
+                    expected,
+                    "explicit getters/comparison must run once in source order"
+                );
+                assert!(
+                    callbacks
+                        .getattr("saved")
+                        .unwrap()
+                        .call0()
+                        .unwrap()
+                        .is_none(),
+                    "the completed native call must not retain the owned left getter result; fail={fail}"
+                );
+                assert_eq!(
+                    callbacks
+                        .getattr("drops")
+                        .unwrap()
+                        .extract::<Vec<String>>()
+                        .unwrap(),
+                    ["payload"],
+                    "quiescent cleanup must release the payload exactly once"
+                );
+            }
+        });
     }
 
     #[test]
@@ -20027,12 +21426,9 @@ def f(x, y):
                 Some(&reservation_typed_caller),
                 &module_plan.value_facts,
             );
-            let Err(stale_err) = stale_result else {
-                panic!("stale reservation-time function should not override module-plan body");
-            };
             assert!(
-                stale_err.contains("typed specialized JIT function block count mismatch"),
-                "{stale_err}"
+                stale_result.is_err(),
+                "stale reservation-time function should not override module-plan body"
             );
 
             let compile_session = crate::session::CompileSession::new();
@@ -20088,7 +21484,7 @@ def f(x, y):
                 &built,
                 &[
                     DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
-                    DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                    PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol,
                 ],
                 "inlined typed direct-call guard",
             );
@@ -20292,10 +21688,10 @@ def f(x, y):
     }
 
     #[test]
-    fn runtime_typed_v3_fuses_closed_map_filter_genexpr_across_runtime_module() {
+    fn runtime_typed_v3_retains_capsule_activations_in_closed_iterator_pipelines() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "runtime_typed_v3_fuses_closed_map_filter_genexpr_across_runtime_module",
+            "runtime_typed_v3_retains_capsule_activations_in_closed_iterator_pipelines",
         ) {
             return;
         }
@@ -20410,6 +21806,7 @@ def collect(count):
                 soac_core::pass_tracker::RecordingPassTracker::new(),
                 soac_lowering::LoweringOptions {
                     runtime_names_as_globals: true,
+                    ..Default::default()
                 },
             )
             .expect("closed-pipeline runtime source should lower")
@@ -20420,6 +21817,7 @@ def collect(count):
                 soac_core::pass_tracker::RecordingPassTracker::new(),
                 soac_lowering::LoweringOptions {
                     runtime_names_as_globals: false,
+                    ..Default::default()
                 },
             )
             .expect("closed-pipeline user source should lower")
@@ -20430,32 +21828,6 @@ def collect(count):
                 .find(|function| function.names.qualname == "collect")
                 .map(|function| function.function_id)
                 .expect("user source should define collect");
-            let forbidden_runtime_qualnames = HashSet::from([
-                "map_from_iter",
-                "filter_from_iter",
-                "__soac_map_iterator",
-                "__soac_filter_iterator",
-                "ClosureGenerator.__iter__",
-                "ClosureGenerator.__next__",
-                "ClosureGenerator.send",
-            ]);
-            let mut forbidden_direct_targets = runtime_lowered
-                .callable_defs
-                .iter()
-                .filter(|function| {
-                    forbidden_runtime_qualnames.contains(function.names.qualname.as_str())
-                })
-                .map(|function| function.function_id)
-                .collect::<HashSet<_>>();
-            forbidden_direct_targets.extend(
-                runtime_lowered
-                    .callable_defs
-                    .iter()
-                    .chain(user_lowered.callable_defs.iter())
-                    .filter(|function| function.lowered_kind() == &FunctionKind::Generator)
-                    .map(|function| function.function_id),
-            );
-
             let runtime_shared_state = crate::module_type::build_shared_state_for_testing(
                 py,
                 runtime_lowered,
@@ -20498,7 +21870,7 @@ def collect(count):
                 Some(&profile),
                 &env_config,
             )
-            .expect("closed map/filter/genexpr pipeline should fuse across the runtime module");
+            .expect("closed map/filter/genexpr pipeline should have a validated typed plan");
             let planned_collect = module_plan
                 .module
                 .callable_defs
@@ -20506,47 +21878,16 @@ def collect(count):
                 .find(|function| function.function_id == collect_id)
                 .expect("planned user module should include collect");
 
-            struct ClosedPipelineResiduals<'a> {
-                forbidden_direct_targets: &'a HashSet<RuntimeFunctionId>,
-                module_constants: &'a [ConstantExpr],
-                forbidden_calls: Vec<String>,
+            #[derive(Default)]
+            struct RetainedSuspendedActivations {
                 generator_instance_plans: usize,
                 generator_resume_plans: usize,
+                native_iterator_pipelines: usize,
                 generator_closures: usize,
                 preserved_references: usize,
-                final_tuple_calls: usize,
             }
 
-            impl ClosedPipelineResiduals<'_> {
-                fn record_callable(&mut self, callable: &InstrTyped) {
-                    let InstrTyped::Load(load) = callable else {
-                        return;
-                    };
-                    let runtime_name = load.name.runtime_name_id().or_else(|| {
-                        let index = load.name.location.as_constant()?;
-                        match self.module_constants.get(index as usize) {
-                            Some(ConstantExpr::RuntimeName(runtime_name)) => Some(*runtime_name),
-                            _ => None,
-                        }
-                    });
-                    let Some(runtime_name) = runtime_name else {
-                        return;
-                    };
-                    if matches!(
-                        runtime_name,
-                        RuntimeName::Map
-                            | RuntimeName::Filter
-                            | RuntimeName::SoacMapIterator
-                            | RuntimeName::SoacFilterIterator
-                            | RuntimeName::ResumeGenerator
-                    ) {
-                        self.forbidden_calls.push(runtime_name.name().to_string());
-                    }
-                    if runtime_name == RuntimeName::Tuple {
-                        self.final_tuple_calls += 1;
-                    }
-                }
-
+            impl RetainedSuspendedActivations {
                 fn record_name(&mut self, name: &ResolvedName) {
                     if name.preserved_location().is_some()
                         || name.cell_location().is_some_and(CellLocation::is_preserved)
@@ -20556,51 +21897,15 @@ def collect(count):
                 }
             }
 
-            impl Visit<InstrTyped> for ClosedPipelineResiduals<'_> {
+            impl Visit<InstrTyped> for RetainedSuspendedActivations {
                 fn visit_instr(&mut self, expr: &InstrTyped) {
                     self.generator_instance_plans +=
                         usize::from(expr.generator_instance_plan().is_some());
                     self.generator_resume_plans +=
                         usize::from(expr.generator_resume_plan().is_some());
-                    if expr.builtin_implementation_plan().is_some_and(|plan| {
-                        matches!(plan.source, RuntimeName::Map | RuntimeName::Filter)
-                    }) {
-                        self.forbidden_calls
-                            .push("map/filter builtin implementation sidecar".to_string());
-                    }
+                    self.native_iterator_pipelines +=
+                        usize::from(expr.native_iterator_pipeline_plan().is_some());
                     match expr {
-                        InstrTyped::CallTyped(call) => self.record_callable(call.func.as_ref()),
-                        InstrTyped::GuardedCallableCallTyped(call) => {
-                            self.record_callable(call.func.as_ref());
-                        }
-                        InstrTyped::DirectCallableCallTyped(call) => {
-                            self.record_callable(call.func.as_ref());
-                        }
-                        InstrTyped::CallDirect(call) => {
-                            self.record_callable(call.callable.as_ref());
-                            if self.forbidden_direct_targets.contains(&call.function_id) {
-                                self.forbidden_calls
-                                    .push(format!("direct target {:?}", call.function_id));
-                            }
-                        }
-                        InstrTyped::GuardedMethodCallTyped(call)
-                            if matches!(
-                                call.method_name.as_str(),
-                                "__iter__" | "__next__" | "send"
-                            ) =>
-                        {
-                            self.forbidden_calls
-                                .push(format!("guarded method {}", call.method_name));
-                        }
-                        InstrTyped::DirectMethodCallTyped(call)
-                            if matches!(
-                                call.method_name.as_str(),
-                                "__iter__" | "__next__" | "send"
-                            ) =>
-                        {
-                            self.forbidden_calls
-                                .push(format!("direct method {}", call.method_name));
-                        }
                         InstrTyped::MakeFunctionWithClosure(make_function)
                             if make_function.kind == FunctionKind::Generator =>
                         {
@@ -20618,38 +21923,27 @@ def collect(count):
                 }
             }
 
-            let mut residuals = ClosedPipelineResiduals {
-                forbidden_direct_targets: &forbidden_direct_targets,
-                module_constants: &module_plan.module.module_constants,
-                forbidden_calls: Vec::new(),
-                generator_instance_plans: 0,
-                generator_resume_plans: 0,
-                generator_closures: 0,
-                preserved_references: 0,
-                final_tuple_calls: 0,
-            };
+            let mut residuals = RetainedSuspendedActivations::default();
             residuals.visit_fn(planned_collect);
             assert!(
-                residuals.forbidden_calls.is_empty(),
-                "closed pipelines with {} blocks should not retain map/filter helpers, generator-worker, protocol-shell, or resume calls: {:?}",
-                planned_collect.blocks.len(),
-                residuals.forbidden_calls,
+                residuals.generator_instance_plans > 0,
+                "an immediately consumed generator still needs its own activation",
             );
             assert_eq!(
-                residuals.generator_instance_plans, 0,
-                "closed pipeline should not retain generator-instance sidecars",
+                residuals.native_iterator_pipelines, 2,
+                "both closed wrappers use the validated native-input template",
             );
             assert_eq!(
                 residuals.generator_resume_plans, 0,
-                "closed pipeline should not retain generator-resume sidecars",
+                "native tp_iternext keeps resume and handled state inside the original generator",
             );
-            assert_eq!(
-                residuals.generator_closures, 0,
-                "closed pipeline should not materialize generator function closures",
+            assert!(
+                residuals.generator_closures >= 2,
+                "both source genexprs retain factories for their distinct capsules",
             );
             assert_eq!(
                 residuals.preserved_references, 0,
-                "closed pipeline should lower all imported generator state to ordinary caller locals",
+                "retaining resume calls must not move capsule storage into an ordinary caller",
             );
             for layout in planned_collect
                 .storage_layout
@@ -20662,10 +21956,6 @@ def collect(count):
                     layout.preserved_slots,
                 );
             }
-            assert_eq!(
-                residuals.final_tuple_calls, 1,
-                "the two fused roots should retain only the tuple root's final materialization call",
-            );
         });
     }
 
@@ -20723,6 +22013,7 @@ def collect(count):
                 soac_core::pass_tracker::RecordingPassTracker::new(),
                 soac_lowering::LoweringOptions {
                     runtime_names_as_globals: true,
+                    ..Default::default()
                 },
             )
             .expect("runtime source should lower");
@@ -20857,6 +22148,7 @@ def collect(count):
                 soac_core::pass_tracker::RecordingPassTracker::new(),
                 soac_lowering::LoweringOptions {
                     runtime_names_as_globals: true,
+                    ..Default::default()
                 },
             )
             .expect("runtime source should lower");
@@ -21585,6 +22877,9 @@ class Point:
                 &["point", "value"],
             );
 
+            assert_indexed_field_reads_current_key_layout(&owned);
+            assert_indexed_field_reads_current_key_layout(&borrowed);
+
             assert_eq!(
                 count_refcount_family_instructions(
                     &owned.ctx.func,
@@ -21857,6 +23152,84 @@ class Point:
     }
 
     #[test]
+    fn guarded_scalar_setitem_replacement_requires_a_replayable_physical_read() {
+        use super::super::typed_setitem_replacement_can_replay_after_guard;
+        use soac_core::block_py::TakeOperand;
+
+        let module = test_module(ModuleNameGen::new(0), vec![]);
+        let constants = ModuleCodegenConstants::collect_from_runtime_module(&module);
+        let constant = constants
+            .runtime_name_constant_id(RuntimeName::None)
+            .expect("runtime prelude contains None");
+        let callback_function = with_single_test_block(
+            test_function(),
+            vec![op_expr(Call::new(
+                name_expr(test_global_name("callback")),
+                vec![],
+                vec![],
+            ))],
+            ret_term(none_expr()),
+        );
+        let callback = lower_blockpy_function_to_typed(callback_function).blocks[0].body[0].clone();
+        assert!(matches!(&callback, InstrTyped::CallTyped(_)));
+        let cases = [
+            (
+                "local",
+                InstrTyped::Load(Load::new(test_local_name("value", 0))),
+                true,
+            ),
+            (
+                "cell",
+                InstrTyped::Load(Load::new(test_closure_cell_name("value", 0))),
+                true,
+            ),
+            (
+                "preserved",
+                InstrTyped::Load(Load::new(ResolvedName {
+                    id: "value".into(),
+                    location: NameLocation::preserved(0),
+                })),
+                true,
+            ),
+            (
+                "constant",
+                InstrTyped::Load(Load::new(test_constant_name(
+                    u32::try_from(constant.0).unwrap(),
+                ))),
+                true,
+            ),
+            (
+                "bound runtime constant",
+                InstrTyped::Load(Load::new(test_runtime_name("NONE"))),
+                true,
+            ),
+            (
+                "consuming operand",
+                InstrTyped::TakeOperand(TakeOperand::new(test_local_name("value", 0))),
+                false,
+            ),
+            ("callback", callback, false),
+            (
+                "global lookup",
+                InstrTyped::Load(Load::new(test_global_name("value"))),
+                false,
+            ),
+            (
+                "runtime lookup",
+                InstrTyped::Load(Load::new(test_runtime_name(RuntimeName::Globals.name()))),
+                false,
+            ),
+        ];
+        for (kind, expression, expected) in cases {
+            assert_eq!(
+                typed_setitem_replacement_can_replay_after_guard(&expression, &constants),
+                expected,
+                "{kind}",
+            );
+        }
+    }
+
+    #[test]
     fn specialized_jit_exact_list_getitem_uses_scalar_local_index_without_hot_reboxing() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -21992,6 +23365,192 @@ class Point:
             1,
             "the scalar list index should stay unboxed on the hot exact-list path; only the generic fallback reboxes it"
         );
+    }
+
+    #[test]
+    fn source_setitem_scalar_guard_preserves_native_failure_projection() -> pyo3::PyResult<()> {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "source_setitem_scalar_guard_preserves_native_failure_projection",
+        ) {
+            return Ok(());
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let source = "from __future__ import strict\n\ndef f(items, a, b, make, after):\n    index = a + b\n    items[index] = make()\n    after()\n    return items\n";
+            crate::strict_class_state::tests::with_strict_callable_fixture_functions(
+                py,
+                source,
+                &[("f", &["items", "a", "b", "make", "after"], false)],
+                |_, shared| {
+                    #[derive(Default)]
+                    struct Sites {
+                        adds: Vec<InstrId>,
+                        sets: Vec<SetItem<InstrBlockPy>>,
+                    }
+                    impl Visit<InstrBlockPy> for Sites {
+                        fn visit_instr(&mut self, instr: &InstrBlockPy) {
+                            match instr {
+                                InstrBlockPy::BinOp(op) if op.kind == BinOpKind::Add => {
+                                    self.adds.push(op.semantic_instr_id());
+                                }
+                                InstrBlockPy::SetItem(op) => self.sets.push(op.clone()),
+                                _ => {}
+                            }
+                            instr.visit_children(self);
+                        }
+                    }
+
+                    let module = &shared.lowered_module;
+                    let function = module
+                        .callable_defs
+                        .iter()
+                        .find(|function| function.names.qualname == "f")
+                        .unwrap();
+                    let layout = function.storage_layout.as_ref().unwrap();
+                    let mut sites = Sites::default();
+                    sites.visit_fn(function);
+                    let [add_id] = sites.adds.as_slice() else {
+                        panic!("source has one index addition");
+                    };
+                    let [setitem] = sites.sets.as_slice() else {
+                        panic!("source has one target store");
+                    };
+                    let InstrBlockPy::TakeOperand(replacement) = setitem.replacement.as_ref()
+                    else {
+                        panic!("actual assignment lowering must move its captured RHS");
+                    };
+                    let replacement_location = replacement.validate_resolved(layout).unwrap();
+                    assert!(
+                        layout
+                            .expression_temporaries
+                            .contains(&replacement_location)
+                    );
+                    let setitem_id = setitem.semantic_instr_id();
+
+                    // Feed the real runtime module/source identity through the
+                    // production planner. Runtime module ids are not indices
+                    // into the serialized plan's independently interned table.
+                    let work_dir = fresh_test_work_dir("source-setitem-scalar-plan");
+                    let exact_int_shape = soac_opt::operator_specialization::pack_binary_shape(
+                        soac_opt::operator_specialization::ExactTypeTag::Int,
+                        soac_opt::operator_specialization::ExactTypeTag::Int,
+                    );
+                    write_test_counter_dump(
+                        &work_dir.join("profile.bin"),
+                        &CounterDumpRecord {
+                            source_hash: shared.source_hash,
+                            module_name: shared.module_name.clone(),
+                            package_name: None,
+                            rows: vec![CounterDumpRow {
+                                counter_id: 0,
+                                scope: "function".to_string(),
+                                kind: "operator_hot_shapes".to_string(),
+                                site_kind: "operator".to_string(),
+                                function_id: Some(function.function_id),
+                                current_function_id: Some(function.function_id),
+                                instr_id: Some(*add_id),
+                                function_qualname: Some(function.names.qualname.clone()),
+                                block_label: None,
+                                value: 16,
+                                branch_values: Vec::new(),
+                                observed_value: Some(exact_int_shape),
+                                max_overcount: Some(0),
+                            }],
+                            module_keys: Vec::new(),
+                            type_keys: Vec::new(),
+                            type_table: Vec::new(),
+                        },
+                    );
+                    let config = typed_v3_env_config()
+                        .with_specialization_mode(Some(SpecializationMode::Apply))
+                        .with_soac_work_dir(Some(work_dir));
+                    let session = crate::session::CompileSession::new_with_env_config(config);
+                    session
+                        .retain_shared_module_state_for_inspection(shared.clone())
+                        .unwrap();
+                    let mut profile = SpecializationProfile::from_runtime_state_with_session(
+                        Some(shared.as_ref()),
+                        Some(&session),
+                    )
+                    .expect("runtime evidence must resolve the actual module and source identity");
+                    assert!(
+                        profile
+                            .opt_v3_exact_int_branch_artifacts
+                            .contains_key(&function.function_id),
+                        "the original index addition selects the existing scalar plan",
+                    );
+                    profile.opt_v3_emitted_exact_list_items.insert(
+                        function.function_id,
+                        HashMap::from([(
+                            setitem_id,
+                            OptV3ExactListItemAccessPlan {
+                                source: setitem_id,
+                                access: PlanV3ExactListItemAccessKind::Set,
+                                shape: PlanV3ExactListItemShape::ExactListExactInt,
+                                guard:
+                                    PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+                                fallback: PlanV3ExactListItemFallbackKind::OriginalItemAccess,
+                            },
+                        )]),
+                    );
+                    let planned_module = optimize_blockpy_for_shared_state(
+                        shared.as_ref(),
+                        Some(&session),
+                        Some(&profile),
+                        session.env_config().unwrap(),
+                    )
+                    .unwrap();
+                    let planned = planned_module
+                        .module
+                        .callable_defs
+                        .iter()
+                        .find(|candidate| candidate.function_id == function.function_id)
+                        .unwrap();
+                    let selected = count_typed_instrs(planned, |instr| {
+                        let InstrTyped::SetItem(op) = instr else {
+                            return false;
+                        };
+                        if op.semantic_instr_id() != setitem_id {
+                            return false;
+                        }
+                        assert!(matches!(
+                            op.replacement.as_ref(),
+                            InstrTyped::TakeOperand(_)
+                        ));
+                        assert!(
+                            !super::super::typed_setitem_replacement_can_replay_after_guard(
+                                &op.replacement,
+                                &shared.codegen_constants,
+                            ),
+                            "the actual source RHS must use the once-evaluated boxed-index path",
+                        );
+                        let plan = op.extra().exact_list_item_access_plan().unwrap();
+                        assert_eq!(plan.instr_id, setitem_id);
+                        assert_eq!(plan.access, PlanV3ExactListItemAccessKind::Set);
+                        true
+                    });
+                    assert_eq!(selected, 1);
+
+                    let built = build_test_jit_function_with_constants_and_options(
+                        module,
+                        function,
+                        &[],
+                        &shared.codegen_constants,
+                        BuildSpecializedFunctionOptions {
+                            planned_typed_function: Some(planned.clone()),
+                            ..BuildSpecializedFunctionOptions::default()
+                        },
+                    );
+                    let target = new_jit_module(&session).expect("test target ISA");
+                    cranelift_codegen::verify_function(&built.ctx.func, target.isa()).expect(
+                        "native source failure projection must use dominating operand state",
+                    );
+                    Ok(())
+                },
+            )
+        })
     }
 
     #[test]
@@ -22407,10 +23966,11 @@ class Point:
     }
 
     #[test]
-    fn runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans_from_registered_types() {
+    fn runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans_from_live_owner_namespace()
+    {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans_from_registered_types",
+            "runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans_from_live_owner_namespace",
         ) {
             return;
         }
@@ -22436,16 +23996,9 @@ class Point:
             modules
                 .set_item("field_type_test", owner_module.as_any())
                 .expect("owner module should be registered");
-            let owner_type = owner_module
-                .getattr("Point")
-                .expect("Point should exist")
-                .as_ptr() as *mut ffi::PyTypeObject;
-            reloc_type_ref_for_type(owner_type)
-                .expect("owner type should register")
-                .expect("owner type should have a relocatable reference");
-            modules
-                .del_item("field_type_test")
-                .expect("owner module should be removed after type registration");
+            // Keep the real namespace alive through resolution. A raw registry
+            // address is not ownership; the separate namespace-decline test
+            // covers removal without weakening this positive remapping case.
 
             let module_name = "runtime_typed_v3_inline_indexed_field_plan_test";
             let module_name_gen = ModuleNameGen::new(0);
@@ -22593,6 +24146,9 @@ class Point:
             assert_eq!(field_plans.len(), 1);
             assert_ne!(field_plans[0].0, callee_getattr_instr_id);
             assert_eq!(field_plans[0].1, 1);
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed after the remapping check");
         });
     }
 
@@ -23021,6 +24577,158 @@ class Point:
                 .first()
                 .and_then(|exit| exit.source),
             Some(return_add_instr_id)
+        );
+    }
+
+    #[test]
+    fn runtime_typed_v3_exact_int_cell_inputs_compile_from_resolved_storage() {
+        let module_name = "exact_int_cell_storage";
+        let names = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&names, "captured_add");
+        function.params.params = vec![test_param("value", ParamKind::Any, false)];
+        let add_source = InstrId::new(2);
+        function = with_single_test_block(
+            function,
+            Vec::new(),
+            ret_term(with_instr_id(
+                op_expr(BinOp::new(
+                    BinOpKind::Add,
+                    with_instr_id(
+                        op_expr(
+                            Load::new(test_closure_cell_name("offset", 0)).with_cell_binding(Some(
+                                CellLoadBinding {
+                                    logical_name: "offset".into(),
+                                    kind: CellBindingKind::Capture,
+                                },
+                            )),
+                        ),
+                        InstrId::new(0),
+                    ),
+                    with_instr_id(name_expr(test_local_name("value", 0)), InstrId::new(1)),
+                )),
+                add_source,
+            )),
+        );
+        set_stack_slots(&mut function, &["value"]);
+        function.storage_layout.as_mut().unwrap().freevars = vec![ClosureSlot {
+            logical_name: "offset".into(),
+            storage_name: "_dp_cell_offset".into(),
+            init: ClosureInit::InheritedCapture,
+        }];
+        let function_id = function.function_id;
+        let module = test_module(names, vec![function.clone()]);
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence.operator_specializations.insert(
+            add_source,
+            vec![soac_opt::operator_specialization::pack_binary_shape(
+                soac_opt::operator_specialization::ExactTypeTag::Int,
+                soac_opt::operator_specialization::ExactTypeTag::Int,
+            )],
+        );
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: module_name.into(),
+                source_hash: 0,
+                cache_identity: "test".into(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            &module.module_constants,
+        )
+        .expect("a resolved closure load must remain eligible for exact-int arithmetic");
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::from([(
+                function_id,
+                std::sync::Arc::new(artifacts),
+            )]),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let module_plan =
+            optimize_blockpy(&module, Some(&profile), &typed_v3_env_config()).unwrap();
+        let planned = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|candidate| candidate.function_id == function_id)
+            .unwrap()
+            .clone();
+        struct CellInputs(usize);
+        impl Visit<InstrTyped> for CellInputs {
+            fn visit_instr(&mut self, instr: &InstrTyped) {
+                if let Some(plan) = instr
+                    .typed_extra()
+                    .and_then(|extra| extra.exact_int_return_plan())
+                {
+                    for region in [&plan.hot_plan, &plan.fallback_plan] {
+                        assert!(matches!(
+                            &region.inputs[0].source,
+                            RegionInputSource::CellValue { source, name, binding }
+                                if *source == InstrId::new(0)
+                                    && name.cell_location() == Some(CellLocation::Closure(0))
+                                    && binding.kind == CellBindingKind::Capture
+                        ));
+                        self.0 += 1;
+                    }
+                }
+                instr.visit_children(self);
+            }
+        }
+        let mut inputs = CellInputs(0);
+        inputs.visit_fn(&planned);
+        assert_eq!(
+            inputs.0, 2,
+            "both hot and generic regions must retain the cell binding"
+        );
+        let constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let session = crate::session::CompileSession::new_with_env_config(SoacEnvConfig::default());
+        let mut jit = new_jit_module(&session).unwrap();
+        let pointers = placeholder_module_constant_ptrs(constants.len());
+        let data = declare_module_constant_object_data(&mut jit, &module, &pointers).unwrap();
+        let (slots, scalar_data, top_data) =
+            define_test_counter_storage(&mut jit, &module, &module.counter_defs);
+        let built = build_test_cranelift_run_bb_specialized_function(
+            &mut jit,
+            &[1usize as ObjPtr],
+            &module,
+            &function,
+            &constants,
+            &module.counter_defs,
+            &data,
+            &slots,
+            scalar_data,
+            top_data,
+            &session,
+            None,
+            None,
+            None,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(planned),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        )
+        .expect("cell input lowering must load a cell value, not an unavailable local offset");
+        let loads = import_user_names_for_symbols(&built, &["dp_jit_load_cell"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &loads),
+            2
         );
     }
 
@@ -23938,6 +25646,8 @@ class Point:
             },
         );
         let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        let finish_helpers =
+            import_user_names_for_symbols(&built, &["dp_jit_handled_state_finish"]);
         let slow_global_helpers =
             import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
         assert_eq!(
@@ -23951,9 +25661,13 @@ class Point:
             "{case_name}: test deopt guard mode should isolate the deopt helper call in a cold block"
         );
         assert_eq!(
-            count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
+            count_deopt_returns_after_handled_state_finish(
+                &built.ctx.func,
+                &deopt_helpers,
+                &finish_helpers
+            ),
             1,
-            "{case_name}: test deopt guard mode should return a successful deopt continuation result"
+            "{case_name}: deopt must finish its original activation once and tail-return its result"
         );
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
@@ -24419,7 +26133,7 @@ class Point:
                 &built,
                 &[
                     DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
-                    DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                    PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol,
                 ],
             );
             assert_eq!(
@@ -24455,7 +26169,7 @@ class Point:
                 &built,
                 &[
                     DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
-                    DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                    PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol,
                 ],
             );
             assert_eq!(
@@ -24647,6 +26361,7 @@ class Point:
                 &caller_function,
                 function_plan,
                 &module_constant_ptrs,
+                &shared_state.codegen_constants,
             )
             .expect("runtime deopt table should build from plan");
 
@@ -24712,6 +26427,12 @@ class Point:
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
                 late_bound_owner_cells: std::ptr::null(),
+                namespace_execution: std::ptr::null(),
+                strict_field_slots: std::ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: std::ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -25032,9 +26753,13 @@ class Point:
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
+            let deopt_table = RuntimeJitDeoptTable::from_plan(
+                &function,
+                function_plan,
+                &module_constant_ptrs,
+                &shared_state.codegen_constants,
+            )
+            .expect("runtime deopt table should build from plan");
 
             let mut ctx = built.ctx;
             define_prepared_function(
@@ -25058,6 +26783,12 @@ class Point:
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
                 late_bound_owner_cells: std::ptr::null(),
+                namespace_execution: std::ptr::null(),
+                strict_field_slots: std::ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: std::ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -25164,9 +26895,13 @@ class Point:
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
+            let deopt_table = RuntimeJitDeoptTable::from_plan(
+                &function,
+                function_plan,
+                &module_constant_ptrs,
+                &shared_state.codegen_constants,
+            )
+            .expect("runtime deopt table should build from plan");
 
             let mut ctx = built.ctx;
             define_prepared_function(
@@ -25190,6 +26925,12 @@ class Point:
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
                 late_bound_owner_cells: std::ptr::null(),
+                namespace_execution: std::ptr::null(),
+                strict_field_slots: std::ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: std::ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -25233,6 +26974,7 @@ class Point:
         );
         set_stack_slots(&mut function, &["x"]);
         let mut module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function],
@@ -25266,11 +27008,7 @@ class Point:
                 deopt_call_args.len()
             );
         };
-        assert_eq!(
-            deopt_args.len(),
-            7,
-            "deopt helper call should pass table, globals, captured builtins, function data, record ordinal, live buffer, and live count"
-        );
+        assert_deopt_activation_operands(&built.ctx.func, deopt_args);
         assert!(
             value_is_iconst_imm(&built.ctx.func, deopt_args[6], 1),
             "guard-miss deopt should pass one live local value for x"
@@ -25281,6 +27019,483 @@ class Point:
             1,
             "guard-miss deopt should materialize scalar live local x exactly at the resume boundary"
         );
+    }
+
+    #[test]
+    fn indexed_global_guard_miss_deopt_boxes_live_bool_scalars() {
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![test_param("value", ParamKind::Any, false)],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let test_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let flag_name = test_local_name("_dp_bool_target", 1);
+        function.blocks = vec![
+            BlockPyBlock {
+                label: entry_label,
+                body: vec![op_expr(Store::new(
+                    flag_name.clone(),
+                    name_expr(test_local_name("value", 0)),
+                ))],
+                term: BlockTerm::Jump(BlockEdge::new(test_label)),
+                params: vec![],
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: test_label,
+                body: vec![name_expr(test_global_name("guarded"))],
+                term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                    test: name_expr(flag_name),
+                    then_label,
+                    else_label,
+                }),
+                params: vec![],
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: then_label,
+                body: vec![],
+                term: ret_term(none_expr()),
+                params: vec![],
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: else_label,
+                body: vec![],
+                term: ret_term(none_expr()),
+                params: vec![],
+                exc_edge: None,
+                extra: Default::default(),
+            },
+        ];
+        set_stack_slots(&mut function, &["value", "_dp_bool_target"]);
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        define_module_call_target_counters(&mut module);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let typed_function = typed_function_with_deopting_indexed_global_access_plan(
+            &function,
+            IndexedGlobalAccessKind::Load,
+            "guarded",
+        );
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &[1usize as ObjPtr; 4],
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(typed_function),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+        let clif = &built.ctx.func;
+        assert!(
+            clif.layout.blocks().any(|block| {
+                clif.dfg
+                    .block_params(block)
+                    .iter()
+                    .any(|&value| clif.dfg.value_type(value) == ir::types::I32)
+            }),
+            "the truthiness-only local must still use scalar Boolean block transport"
+        );
+        let helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        let calls = direct_call_args_to_runtime_helpers(clif, &helpers);
+        let [args] = calls.as_slice() else {
+            panic!(
+                "expected one actual guard-miss deopt call, got {}",
+                calls.len()
+            );
+        };
+        let ir::ValueDef::Result(buffer_inst, _) = clif.dfg.value_def(args[5]) else {
+            panic!("the live buffer must come from an explicit stack address");
+        };
+        let ir::InstructionData::StackLoad { stack_slot, .. } = clif.dfg.insts[buffer_inst] else {
+            panic!("the live buffer must use the deopt stack slot");
+        };
+        let stored_values: Vec<_> = clif
+            .layout
+            .blocks()
+            .flat_map(|block| clif.layout.block_insts(block))
+            .filter_map(|inst| match clif.dfg.insts[inst] {
+                ir::InstructionData::StackStore {
+                    stack_slot: stored_slot,
+                    arg,
+                    ..
+                } if stored_slot == stack_slot => Some(arg),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !stored_values.is_empty(),
+            "the deopt buffer must carry live locals"
+        );
+        for &value in &stored_values {
+            assert_eq!(
+                clif.dfg.value_type(value),
+                clif.dfg.value_type(args[0]),
+                "the interpreter consumes PyObject pointers, never raw Boolean 0/1 values"
+            );
+        }
+        assert!(
+            stored_values.iter().any(|&value| {
+                let ir::ValueDef::Result(inst, _) = clif.dfg.value_def(value) else {
+                    return false;
+                };
+                clif.dfg.insts[inst].opcode() == ir::Opcode::Select
+                    && clif.dfg.inst_args(inst)[1..].iter().all(|&input| {
+                        let ir::ValueDef::Result(input_inst, _) = clif.dfg.value_def(input) else {
+                            return false;
+                        };
+                        matches!(
+                            clif.dfg.insts[input_inst].opcode(),
+                            ir::Opcode::GlobalValue | ir::Opcode::Load
+                        )
+                    })
+            }),
+            "the scalar must select Python Boolean constants, not widen integer 0/1"
+        );
+    }
+
+    #[test]
+    fn profiled_deopt_inside_handler_preserves_borrowed_argument_ownership() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            for (setup, choices) in [
+                ("", &[(false, &[][..])][..]),
+                (
+                    "    observe = observe('replace')\n",
+                    &[(false, &["replace"][..])][..],
+                ),
+                (
+                    "    if observe('choose'):\n        observe = observe('replace')\n",
+                    &[(false, &["choose"][..]), (true, &["choose", "replace"][..])][..],
+                ),
+            ] {
+                let source = format!(
+                    "def deopt_handled_add(produce, observe):\n{setup}    try:\n        raise ValueError('deopt handler')\n    except ValueError:\n        observe('before')\n        value = produce()\n        result = value + 1\n        observe('after')\n        return result\n"
+                );
+                let module = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                    .expect("handled deopt fixture should lower")
+                    .blockpy_module;
+                let shared = crate::module_type::build_shared_state_for_testing(
+                    py,
+                    module,
+                    "deopt_borrowed_argument",
+                    &source,
+                )
+                .unwrap();
+                let function = shared
+                    .lowered_module
+                    .callable_defs
+                    .iter()
+                    .find(|function| function.names.qualname == "deopt_handled_add")
+                    .expect("source function");
+                let runtime = build_test_module_runtime(py, shared.clone());
+                struct AdditionFinder(Vec<InstrId>);
+                impl Visit<InstrBlockPy> for AdditionFinder {
+                    fn visit_instr(&mut self, instr: &InstrBlockPy) {
+                        if let InstrBlockPy::BinOp(op) = instr
+                            && op.kind == BinOpKind::Add
+                        {
+                            self.0.push(op.semantic_instr_id());
+                        }
+                        instr.visit_children(self);
+                    }
+                }
+                let mut addition = AdditionFinder(Vec::new());
+                addition.visit_fn(function);
+                let [addition_id] = addition.0.as_slice() else {
+                    panic!("the source fixture must contain exactly one addition");
+                };
+                let mut evidence = FunctionProfileEvidence::default();
+                evidence.operator_specializations.insert(
+                    *addition_id,
+                    vec![soac_opt::operator_specialization::pack_binary_shape(
+                        soac_opt::operator_specialization::ExactTypeTag::Int,
+                        soac_opt::operator_specialization::ExactTypeTag::Int,
+                    )],
+                );
+                let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+                    &AlternativeCatalog::default_v3(),
+                    ModulePlanIdentity {
+                        module_name: "deopt_borrowed_argument".to_string(),
+                        source_hash: 0,
+                        cache_identity: "test-cache".to_string(),
+                    },
+                    FunctionPlanIdentity {
+                        function: SerializedFunctionId::new(
+                            SerializedModuleId::new(0),
+                            function.function_id.local_function_id(),
+                        ),
+                        debug_name: Some(function.names.qualname.clone()),
+                    },
+                    function,
+                    &evidence,
+                    &shared.lowered_module.module_constants,
+                )
+                .expect("the observed exact-int addition should have a guarded plan");
+                let environment = typed_v3_env_config();
+                let session =
+                    crate::session::CompileSession::new_with_env_config(environment.clone());
+                // Use the production typed rewrite path, including its exception
+                // edges and linearized operands, not a codegen-only function override.
+                let mut profile =
+                    SpecializationProfile::from_runtime_state_with_session(None, Some(&session))
+                        .unwrap();
+                profile
+                    .opt_v3_exact_int_branch_artifacts
+                    .insert(function.function_id, std::sync::Arc::new(artifacts));
+                let planned =
+                    optimize_blockpy(&shared.lowered_module, Some(&profile), &environment)
+                        .expect("production profiled typed pipeline");
+                let typed = planned
+                    .module
+                    .callable_defs
+                    .iter()
+                    .find(|candidate| candidate.function_id == function.function_id)
+                    .unwrap();
+                assert!(
+                    collect_typed_guard_miss_deopt_instr_ids(typed).contains(addition_id),
+                    "the profiled addition must really select a cold interpreter exit"
+                );
+                let locals = planned.locals.function(function.function_id).unwrap();
+                let resume = planned.deopt_resume.function(function.function_id).unwrap();
+                let mut jit_module = new_jit_module(&session).unwrap();
+                let codegen_constants =
+                    crate::module_constants::ModuleCodegenConstants::collect_from_typed_module(
+                        planned.module.as_ref(),
+                    );
+                let constant_owners = codegen_constants.build_python_constants(py).unwrap();
+                let constants = constant_owners
+                    .iter()
+                    .map(|value| value.as_ptr())
+                    .collect::<Vec<_>>();
+                let data = declare_module_constant_object_data(
+                    &mut jit_module,
+                    planned.module.as_ref(),
+                    &constants,
+                )
+                .unwrap();
+                let (counters, scalar, top_value) = define_test_counter_storage(
+                    &mut jit_module,
+                    &shared.lowered_module,
+                    &planned.module.counter_defs,
+                );
+                let mut table = RuntimeJitDeoptTable::from_plan(
+                    function,
+                    resume,
+                    &constants,
+                    &codegen_constants,
+                )
+                .unwrap();
+                table.handled_plan.include_native_regions(typed);
+                let built = build_cranelift_run_bb_specialized_function(
+                    &mut jit_module,
+                    &vec![ptr::null_mut(); typed.blocks.len()],
+                    planned.module.as_ref(),
+                    typed,
+                    &planned.value_facts,
+                    locals,
+                    resume,
+                    &codegen_constants,
+                    &planned.module.counter_defs,
+                    &data,
+                    &counters,
+                    scalar,
+                    top_value,
+                    &session,
+                    Some(shared.as_ref()),
+                    None,
+                    None,
+                    BuildSpecializedFunctionOptions {
+                        handled_exception_plan: Some(table.handled_plan.clone()),
+                        runtime_supported_deopt_resume_points: Some(
+                            table.supported_resume_points(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+                assert!(count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers) > 0);
+                let mut ctx = built.ctx;
+                define_prepared_function(
+                    &mut jit_module,
+                    &environment,
+                    built.main_id,
+                    &mut ctx,
+                    "deopt-borrowed-argument",
+                    "borrowed argument deopt should define",
+                )
+                .unwrap();
+                jit_module.clear_context(&mut ctx);
+                jit_module.finalize_definitions().unwrap();
+                let code = jit_module.get_finalized_function(built.main_id);
+                let environment = crate::FunctionEnvAbiHeader {
+                    direct_code_ptr: code,
+                    default_direct_code_ptr: ptr::null(),
+                    deopt_table_ptr: ptr::from_ref(&table).cast_mut().cast(),
+                    globals_obj: runtime.mod_ctx.globals_obj.cast(),
+                    builtins_obj: ffi::PyEval_GetBuiltins(),
+                    late_bound_owner_cells: ptr::null(),
+                    namespace_execution: ptr::null(),
+                    strict_field_slots: ptr::null(),
+                    strict_field_slot_count: 0,
+                    strict_method_slots: ptr::null(),
+                    strict_method_slot_count: 0,
+                    active_strict_call: ptr::null(),
+                };
+                let invoke: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
+                    std::mem::transmute(code);
+                let callbacks = PyModule::from_code(
+                    py,
+                    cr#"
+import sys
+
+events = []
+handled = []
+choose = False
+fail = False
+caller = OSError('caller outside the native handler')
+
+def record_handled():
+    current = sys.exception()
+    assert type(current) is ValueError
+    assert current.__context__ is caller
+    if handled:
+        assert id(current) == handled[0]
+    # Do not retain the exception or its traceback solely for this observer.
+    handled.append(id(current))
+
+class Addition:
+    def __add__(self, other):
+        record_handled()
+        if fail:
+            raise LookupError('cold addition')
+        return 42
+
+def produce():
+    return Addition()
+
+def observe(label):
+    events.append(label)
+    if label in ('before', 'after'):
+        record_handled()
+    else:
+        assert sys.exception() is caller
+    return choose if label == 'choose' else observe
+"#,
+                    c"deopt_callbacks.py",
+                    c"deopt_callbacks",
+                )
+                .unwrap();
+                let produce = callbacks.getattr("produce").unwrap();
+                let observe = callbacks.getattr("observe").unwrap();
+                let caller = callbacks.getattr("caller").unwrap();
+                for (choose, prefix) in choices {
+                    for fail in [false, true] {
+                        callbacks.setattr("choose", *choose).unwrap();
+                        callbacks.setattr("fail", fail).unwrap();
+                        callbacks
+                            .getattr("events")
+                            .unwrap()
+                            .call_method0("clear")
+                            .unwrap();
+                        callbacks
+                            .getattr("handled")
+                            .unwrap()
+                            .call_method0("clear")
+                            .unwrap();
+                        let before = [
+                            ffi::Py_REFCNT(produce.as_ptr()),
+                            ffi::Py_REFCNT(observe.as_ptr()),
+                        ];
+                        let saved_handled = PyErr_GetHandledException();
+                        PyErr_SetHandledException(caller.as_ptr());
+                        let result = invoke(
+                            ptr::from_ref(&environment).cast_mut().cast(),
+                            ffi::PyThreadState_Get().cast(),
+                            produce.as_ptr().cast(),
+                            observe.as_ptr().cast(),
+                        );
+                        // Capture both error channels and restore the test caller
+                        // before assertions or any Python allocation can fail.
+                        let raised = ffi::PyErr_GetRaisedException();
+                        let active = PyErr_GetHandledException();
+                        let restored_caller = active == caller.as_ptr();
+                        PyErr_SetHandledException(saved_handled);
+                        ffi::Py_XDECREF(saved_handled);
+                        ffi::Py_XDECREF(active);
+                        ffi::PyErr_SetRaisedException(raised);
+                        let after = [
+                            ffi::Py_REFCNT(produce.as_ptr()),
+                            ffi::Py_REFCNT(observe.as_ptr()),
+                        ];
+                        // Keep a failing ownership assertion memory-safe: these extra test
+                        // owners let us observe and restore a deficit before RAII cleanup.
+                        for ((object, before), after) in [produce.as_ptr(), observe.as_ptr()]
+                            .into_iter()
+                            .zip(before)
+                            .zip(after)
+                        {
+                            for _ in after..before {
+                                ffi::Py_INCREF(object);
+                            }
+                        }
+                        let error = pyo3::PyErr::take(py);
+                        assert!(
+                            restored_caller,
+                            "deopt must restore the original caller handler"
+                        );
+                        let handled = callbacks
+                            .getattr("handled")
+                            .unwrap()
+                            .extract::<Vec<usize>>()
+                            .unwrap();
+                        assert_eq!(handled.len(), if fail { 2 } else { 3 });
+                        assert!(handled.iter().all(|identity| *identity == handled[0]));
+                        if fail {
+                            assert!(result.is_null());
+                            let error = error.unwrap();
+                            assert!(error.is_instance_of::<pyo3::exceptions::PyLookupError>(py));
+                            let context = error.value(py).getattr("__context__").unwrap();
+                            assert_eq!(context.as_ptr() as usize, handled[0]);
+                            assert!(context.getattr("__context__").unwrap().is(&caller));
+                        } else {
+                            assert!(!result.is_null(), "deopt failed: {error:?}");
+                            let value = ffi::PyLong_AsLong(result.cast());
+                            ffi::Py_DECREF(result.cast());
+                            assert_eq!(value, 42);
+                            assert!(error.is_none());
+                        }
+                        let mut expected_events = prefix.to_vec();
+                        expected_events.push("before");
+                        if !fail {
+                            expected_events.push("after");
+                        }
+                        assert_eq!(
+                            callbacks
+                                .getattr("events")
+                                .unwrap()
+                                .extract::<Vec<String>>()
+                                .unwrap(),
+                            expected_events
+                        );
+                        assert_eq!(
+                            after, before,
+                            "the resumed body must not steal either borrowed callback argument"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     #[test]
@@ -25421,9 +27636,13 @@ class Point:
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
+            let deopt_table = RuntimeJitDeoptTable::from_plan(
+                &function,
+                function_plan,
+                &module_constant_ptrs,
+                &shared_state.codegen_constants,
+            )
+            .expect("runtime deopt table should build from plan");
 
             let mut ctx = built.ctx;
             define_prepared_function(
@@ -25447,6 +27666,12 @@ class Point:
                 globals_obj: runtime.mod_ctx.globals_obj.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
                 late_bound_owner_cells: std::ptr::null(),
+                namespace_execution: std::ptr::null(),
+                strict_field_slots: std::ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: std::ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -25570,9 +27795,13 @@ class Point:
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
+            let deopt_table = RuntimeJitDeoptTable::from_plan(
+                &function,
+                function_plan,
+                &module_constant_ptrs,
+                &shared_state.codegen_constants,
+            )
+            .expect("runtime deopt table should build from plan");
 
             let mut ctx = built.ctx;
             define_prepared_function(
@@ -25613,6 +27842,12 @@ class Point:
                 globals_obj: globals.cast(),
                 builtins_obj: ffi::PyEval_GetBuiltins(),
                 late_bound_owner_cells: std::ptr::null(),
+                namespace_execution: std::ptr::null(),
+                strict_field_slots: std::ptr::null(),
+                strict_field_slot_count: 0,
+                strict_method_slots: std::ptr::null(),
+                strict_method_slot_count: 0,
+                active_strict_call: std::ptr::null(),
             };
             let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
                 std::mem::transmute(code_ptr);
@@ -25687,7 +27922,10 @@ class Point:
         let mut function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(name_expr(test_closure_cell_name("x", 2))),
+            ret_term(cell_value_expr(
+                test_closure_cell_name("x", 2),
+                CellBindingKind::Capture,
+            )),
         );
         set_stack_slots(&mut function, &["x"]);
         let rendered = render_test_jit_function(&function, &blocks);
@@ -25733,6 +27971,10 @@ class Point:
             ))),
         );
         function.storage_layout = Some(StorageLayout {
+            generator_resume_abi: None,
+            block_parameter_roles: Vec::new(),
+            class_bindings: None,
+            expression_temporaries: Vec::new(),
             freevars: vec![
                 ClosureSlot {
                     logical_name: "_dp_classcell".into(),
@@ -25898,10 +28140,11 @@ class Point:
     }
 
     #[test]
-    fn render_specialized_jit_constant_runtime_helper_calls_still_specialize() {
+    fn specialized_jit_constant_runtime_helper_calls_still_specialize() {
         let blocks = [1usize as ObjPtr];
+        let module_name_gen = ModuleNameGen::new(0);
         let function = with_single_test_block(
-            test_function(),
+            test_function_in_module(&module_name_gen, "call"),
             vec![],
             ret_term(op_expr(Call::new(
                 name_expr(test_constant_name(0)),
@@ -25909,17 +28152,25 @@ class Point:
                 vec![],
             ))),
         );
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            vec![runtime_name_constant("globals")],
+        let mut module = test_module(module_name_gen, vec![function.clone()]);
+        module.module_constants = vec![runtime_name_constant("globals")];
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+        let generic_helpers = import_user_names_for_symbols(
+            &built,
+            &[
+                "dp_jit_load_runtime_obj",
+                "dp_jit_py_call_object",
+                "PySoac_VectorcallWithContext",
+                "PySoac_ObjectCallWithContext",
+            ],
         );
-        assert!(
-            !rendered.contains("call dp_jit_load_runtime_obj")
-                && !rendered.contains("call dp_jit_py_vectorcall")
-                && !rendered.contains("call dp_jit_py_call_object")
-                && !rendered.contains("call dp_jit_py_call_with_kw"),
-            "constant-backed runtime helpers should still specialize instead of reloading or generic-calling:\n{rendered}"
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
+            0,
+            "constant-backed runtime helpers specialize without a reload or generic call"
         );
     }
 
@@ -25947,7 +28198,7 @@ class Point:
             &built,
             &[
                 DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
-                DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol,
             ],
         );
         assert_eq!(
@@ -25955,6 +28206,70 @@ class Point:
             1,
             "an actual mutable global named globals must call its loaded value; source spelling cannot authenticate the compiler intrinsic"
         );
+    }
+
+    #[test]
+    fn specialized_runtime_call_helpers_receive_actual_function_globals_and_builtins() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let function = with_single_test_block(
+            test_function_in_module(&module_name_gen, "call"),
+            vec![],
+            ret_term(op_expr(Call::new(
+                name_expr(test_global_name("target")),
+                vec![CallArgPositional::Starred(name_expr(test_global_name(
+                    "arguments",
+                )))],
+                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
+            ))),
+        );
+        let mut module = test_module(module_name_gen, vec![function.clone()]);
+        module.global_names = vec!["target".into(), "arguments".into()];
+        let constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_jit_function_with_constants(
+            &module,
+            &function,
+            &[1usize as ObjPtr],
+            &constants,
+        );
+        let emitted = &built.ctx.func;
+        let entry = emitted.layout.entry_block().unwrap();
+        let environment = emitted.dfg.block_params(entry)[0];
+        for (symbol, arity) in [
+            (DP_JIT_PY_CALL_OBJECT_IMPORT.symbol, 5),
+            (DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol, 7),
+            (PY_SOAC_OBJECT_CALL_CONTEXT_IMPORT.symbol, 6),
+        ] {
+            let names = import_user_names_for_symbols(&built, &[symbol]);
+            let calls = direct_call_args_to_runtime_helpers(emitted, &names);
+            assert!(
+                !calls.is_empty(),
+                "starred argument preparation exercises {symbol}"
+            );
+            for arguments in calls {
+                assert_eq!(arguments.len(), arity);
+                let globals = emitted.dfg.resolve_aliases(arguments[arity - 3]);
+                let ir::ValueDef::Result(load, _) = emitted.dfg.value_def(globals) else {
+                    panic!("call context must load actual globals from FunctionEnv");
+                };
+                assert!(matches!(
+                    emitted.dfg.insts[load],
+                    ir::InstructionData::Load { offset, .. }
+                        if offset == FUNCTION_ENV_GLOBALS_OBJ_OFFSET.into()
+                ));
+                assert_eq!(emitted.dfg.inst_args(load), &[environment]);
+                assert!(value_is_iconst_imm(emitted, arguments[arity - 2], 0));
+                assert_eq!(
+                    assert_function_env_load_base(
+                        emitted,
+                        arguments[arity - 1],
+                        FUNCTION_ENV_BUILTINS_OBJ_OFFSET,
+                    ),
+                    environment,
+                    "captured builtins must come from the same FunctionEnv as globals",
+                );
+            }
+        }
     }
 
     #[test]
@@ -26187,7 +28502,152 @@ class Point:
     }
 
     #[test]
-    fn render_specialized_jit_generic_positional_calls_use_vectorcall() {
+    fn specialized_raise_disposition_selects_normalization_or_exact_propagation() {
+        use soac_core::block_py::{RaiseDisposition, TermRaise};
+
+        for (disposition, source_calls, propagation_calls) in [
+            (RaiseDisposition::Source, 1, 0),
+            (RaiseDisposition::PropagateNormalized, 0, 1),
+            (RaiseDisposition::SourceNormalized, 0, 1),
+        ] {
+            let module_name_gen = ModuleNameGen::new(0);
+            let function = with_single_test_block(
+                test_function_in_module(&module_name_gen, "raise_error"),
+                vec![],
+                BlockTerm::Raise(TermRaise {
+                    disposition,
+                    exc: Some(name_expr(test_global_name("error"))),
+                }),
+            );
+            let mut module = test_module(module_name_gen, vec![function.clone()]);
+            module.global_names = vec!["error".into()];
+            let constants = ModuleCodegenConstants::collect_from_module(&module);
+
+            // The function emitter also builds a shared direct-error exit. A
+            // return of the same operand exposes those common helpers without
+            // adding a source raise or normalized propagation operation.
+            let baseline_function = with_single_test_block(
+                function.clone(),
+                vec![],
+                ret_term(name_expr(test_global_name("error"))),
+            );
+            let mut baseline_module = module.clone();
+            baseline_module.callable_defs = vec![baseline_function.clone()];
+            let baseline_constants = ModuleCodegenConstants::collect_from_module(&baseline_module);
+            let baseline = build_test_jit_function_with_constants(
+                &baseline_module,
+                &baseline_function,
+                &[1usize as ObjPtr],
+                &baseline_constants,
+            );
+            let common_raise_helpers =
+                import_user_names_for_symbols(&baseline, &["dp_jit_raise_from_exc"]);
+            let common_raise_calls =
+                direct_calls_to_runtime_helpers(&baseline.ctx.func, &common_raise_helpers).len();
+            let operation_helpers = import_user_names_for_symbols(
+                &baseline,
+                &[
+                    "dp_jit_restore_raised_exception",
+                    "dp_jit_py_call_positional_three",
+                ],
+            );
+            assert!(
+                direct_calls_to_runtime_helpers(&baseline.ctx.func, &operation_helpers).is_empty(),
+                "the return baseline must contain neither propagation nor normalization"
+            );
+            let built = build_test_jit_function_with_constants(
+                &module,
+                &function,
+                &[1usize as ObjPtr],
+                &constants,
+            );
+            let emitted = &built.ctx.func;
+            for (symbols, expected) in [
+                (
+                    &["dp_jit_raise_from_exc"][..],
+                    common_raise_calls + source_calls,
+                ),
+                (&["dp_jit_restore_raised_exception"][..], propagation_calls),
+                (&["dp_jit_py_call_positional_three"][..], source_calls),
+            ] {
+                let helpers = import_user_names_for_symbols(&built, symbols);
+                assert_eq!(
+                    direct_calls_to_runtime_helpers(emitted, &helpers).len(),
+                    expected,
+                    "{disposition:?} must select the matching raise operation: {symbols:?}"
+                );
+            }
+            let runtime_loads =
+                import_user_names_for_symbols(&built, &["dp_jit_load_runtime_obj_by_id"]);
+            let normalization_lookups =
+                direct_call_args_to_runtime_helpers(emitted, &runtime_loads)
+                    .into_iter()
+                    .filter(|arguments| {
+                        value_is_iconst_imm(
+                            emitted,
+                            arguments[0],
+                            i64::from(RuntimeName::RaiseFrom.id()),
+                        )
+                    })
+                    .count();
+            assert_eq!(
+                normalization_lookups, source_calls,
+                "normalized propagation must not even look up the source normalization helper"
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_raise_disposition_rejects_a_stale_typed_plan() {
+        use soac_core::block_py::{RaiseDisposition, TermRaise};
+
+        for (disposition, stale_disposition) in [
+            (
+                RaiseDisposition::Source,
+                RaiseDisposition::PropagateNormalized,
+            ),
+            (
+                RaiseDisposition::PropagateNormalized,
+                RaiseDisposition::Source,
+            ),
+            (
+                RaiseDisposition::PropagateNormalized,
+                RaiseDisposition::SourceNormalized,
+            ),
+            (
+                RaiseDisposition::SourceNormalized,
+                RaiseDisposition::PropagateNormalized,
+            ),
+        ] {
+            let function = with_single_test_block(
+                test_function(),
+                vec![],
+                BlockTerm::Raise(TermRaise {
+                    disposition,
+                    exc: Some(name_expr(test_global_name("error"))),
+                }),
+            );
+            let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+            module.global_names = vec!["error".into()];
+            let facts = infer_jit_value_facts(&module);
+            let typed = lower_blockpy_function_to_typed(function);
+            let mut planned = typed.clone();
+            prepare_specialized_typed_function(&typed, Some(&planned), &facts)
+                .expect("an unchanged raise plan must remain admissible");
+
+            let BlockTerm::Raise(raise) = &mut planned.blocks[0].term else {
+                panic!("fixture must retain its raise terminator");
+            };
+            raise.disposition = stale_disposition;
+            assert!(
+                prepare_specialized_typed_function(&typed, Some(&planned), &facts).is_err(),
+                "changing only the raise disposition must invalidate the prepared CFG"
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_jit_generic_positional_calls_use_explicit_context_vectorcall() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let function = with_single_test_block(
@@ -26202,20 +28662,244 @@ class Point:
                 vec![],
             ))),
         );
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
+        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+        let context_calls =
+            import_user_names_for_symbols(&built, &[PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &context_calls),
+            1,
+            "generic positional calls must use the native explicit-context boundary"
         );
-        assert!(
-            rendered.contains("call dp_jit_py_vectorcall"),
-            "generic positional calls should lower through the vectorcall helper:\n{rendered}"
+        let tuple_calls = import_user_names_for_symbols(
+            &built,
+            &[
+                DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
+                "dp_jit_py_call_object",
+                "PySoac_ObjectCallWithContext",
+            ],
         );
-        assert!(
-            !rendered.contains("call dp_jit_py_call_positional_three")
-                && !rendered.contains("call dp_jit_py_call_object")
-                && !rendered.contains("call dp_jit_py_call_with_kw"),
-            "generic positional calls should avoid the tuple/kwargs helper path:\n{rendered}"
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &tuple_calls),
+            0,
+            "ordinary positional calls need neither tuple packing nor a context-free helper"
+        );
+    }
+
+    #[test]
+    fn class_construction_passes_the_actual_active_function_environment() {
+        use soac_contracts::{DefinitionKind, ModuleContentId, SourceIdentity, SourceRange};
+        use soac_core::block_py::ConstructClass;
+
+        // The signed runtime fixtures exercise admission. This test checks the
+        // compiler ABI rather than treating a numeric site as a capability.
+        for decorated in [false, true] {
+            let blocks = [1usize as ObjPtr];
+            let function = test_function();
+            let site = function.function_id;
+            let operation = ConstructClass::new(
+                SourceIdentity {
+                    module: ModuleContentId::new("construction_codegen", 0),
+                    lexical_qualname: "Item".into(),
+                    source_range: SourceRange::new(0, 1),
+                    definition_kind: DefinitionKind::Class,
+                },
+                site,
+                name_expr(test_global_name("class_name")),
+                name_expr(test_global_name("namespace_function")),
+                name_expr(test_global_name("bases")),
+                name_expr(test_global_name("keywords")),
+                name_expr(test_global_name("needs_class_cell")),
+                name_expr(test_global_name("needs_dict_cell")),
+                name_expr(test_global_name("first_line")),
+                decorated.then(|| Box::new(name_expr(test_global_name("preparation")))),
+            );
+            let function = with_single_test_block(function, vec![], ret_term(op_expr(operation)));
+            let module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+            let constants =
+                crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+            let built =
+                build_test_jit_function_with_constants(&module, &function, &blocks, &constants);
+            let helpers = import_user_names_for_symbols(
+                &built,
+                &[crate::strict_class::CONSTRUCT_CLASS_SYMBOL],
+            );
+            let calls = direct_call_args_to_runtime_helpers(&built.ctx.func, &helpers);
+            let [arguments] = calls.as_slice() else {
+                panic!("construction must have exactly one runtime boundary");
+            };
+            assert_eq!(arguments.len(), 11);
+            assert!(value_is_iconst_imm(
+                &built.ctx.func,
+                arguments[0],
+                site.to_packed_runtime_u64() as i64,
+            ));
+            let entry = built.ctx.func.layout.entry_block().unwrap();
+            assert_eq!(arguments[1], built.ctx.func.dfg.block_params(entry)[0]);
+            if !decorated {
+                assert!(value_is_iconst_imm(&built.ctx.func, arguments[9], 0));
+            }
+        }
+    }
+
+    #[test]
+    fn class_decorator_preparation_receives_the_captured_callable_and_raw_arguments() {
+        use soac_contracts::{DefinitionKind, ModuleContentId, SourceIdentity, SourceRange};
+        use soac_core::block_py::PrepareClassDecorator;
+
+        // This is a code-generation boundary test, not executable admission.
+        // The real signed fixture exercises the same operation in both entries.
+        for (factory, unpack, named) in [
+            (false, false, false),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let blocks = [1usize as ObjPtr];
+            let mut constants = TestConstantPool::default();
+            let function = test_function();
+            let site = function.function_id;
+            let args = if !factory {
+                vec![]
+            } else if unpack {
+                vec![CallArgPositional::Starred(name_expr(test_global_name(
+                    "arguments",
+                )))]
+            } else {
+                vec![CallArgPositional::Positional(constants.int_expr(1))]
+            };
+            let keywords = if named {
+                vec![CallArgKeyword::Named {
+                    arg: "eq".into(),
+                    value: constants.int_expr(0),
+                }]
+            } else {
+                vec![]
+            };
+            let operation = PrepareClassDecorator::new(
+                SourceIdentity {
+                    module: ModuleContentId::new("decorator_codegen", 0),
+                    lexical_qualname: "Item".into(),
+                    source_range: SourceRange::new(0, 1),
+                    definition_kind: DefinitionKind::Class,
+                },
+                site,
+                name_expr(test_global_name("decorator")),
+                args,
+                keywords,
+                factory,
+                None,
+            );
+            let function = with_single_test_block(function, vec![], ret_term(op_expr(operation)));
+            let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+            module.module_constants = constants.module_constants;
+            let module_constants =
+                crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+            let built = build_test_jit_function_with_constants(
+                &module,
+                &function,
+                &blocks,
+                &module_constants,
+            );
+            let symbol = if unpack {
+                crate::strict_class_decorator::PREPARE_CLASS_DECORATOR_UNPACKED_SYMBOL
+            } else {
+                crate::strict_class_decorator::PREPARE_CLASS_DECORATOR_SYMBOL
+            };
+            let helper = import_user_names_for_symbols(&built, &[symbol]);
+            let calls = direct_call_args_to_runtime_helpers(&built.ctx.func, &helper);
+            assert_eq!(
+                calls.len(),
+                1,
+                "the preparation is the single invocation boundary"
+            );
+            let arguments = &calls[0];
+            assert_eq!(arguments.len(), if unpack { 7 } else { 8 });
+            assert!(value_is_iconst_imm(
+                &built.ctx.func,
+                arguments[0],
+                site.to_packed_runtime_u64() as i64,
+            ));
+            assert!(value_is_iconst_imm(
+                &built.ctx.func,
+                arguments[2],
+                i64::from(factory),
+            ));
+            if !unpack {
+                assert!(value_is_iconst_imm(
+                    &built.ctx.func,
+                    arguments[5],
+                    i64::from(factory),
+                ));
+                if !named {
+                    assert!(value_is_iconst_imm(&built.ctx.func, arguments[6], 0));
+                }
+                let ordinary = import_user_names_for_symbols(
+                    &built,
+                    &[PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol],
+                );
+                assert_eq!(
+                    count_direct_calls_to_runtime_helpers(&built.ctx.func, &ordinary),
+                    0,
+                    "the factory must not run before preparation can authenticate its invocation",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn function_descriptor_application_passes_original_operands_to_one_native_boundary() {
+        use soac_contracts::{DefinitionKind, ModuleContentId, SourceIdentity, SourceRange};
+        use soac_core::block_py::ApplyFunctionDescriptor;
+
+        let blocks = [1usize as ObjPtr];
+        let function = test_function();
+        let site = function.function_id;
+        let operation = ApplyFunctionDescriptor::new(
+            SourceIdentity {
+                module: ModuleContentId::new("descriptor_codegen", 0),
+                lexical_qualname: "Item.method".into(),
+                source_range: SourceRange::new(0, 1),
+                definition_kind: DefinitionKind::Function,
+            },
+            site,
+            name_expr(test_global_name("captured_factory")),
+            name_expr(test_global_name("original_function")),
+            None,
+        );
+        let function = with_single_test_block(function, vec![], ret_term(op_expr(operation)));
+        let module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        let constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_jit_function_with_constants(&module, &function, &blocks, &constants);
+        let helper = import_user_names_for_symbols(
+            &built,
+            &[crate::strict_descriptor::APPLY_FUNCTION_DESCRIPTOR_SYMBOL],
+        );
+        let calls = direct_call_args_to_runtime_helpers(&built.ctx.func, &helper);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 5);
+        assert!(value_is_iconst_imm(
+            &built.ctx.func,
+            calls[0][0],
+            site.to_packed_runtime_u64() as i64
+        ));
+        assert!(value_is_iconst_imm(&built.ctx.func, calls[0][4], 0));
+        let ordinary = import_user_names_for_symbols(
+            &built,
+            &[
+                PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol,
+                "dp_jit_py_call_object",
+            ],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &ordinary),
+            0
         );
     }
 
@@ -26294,7 +28978,7 @@ class Point:
         let public_tuple_set_item_helpers =
             import_user_names_for_symbols(&built, &["PyTuple_SetItem"]);
         let vectorcall_helpers =
-            import_user_names_for_symbols(&built, &[DP_JIT_PY_VECTORCALL_IMPORT.symbol]);
+            import_user_names_for_symbols(&built, &[PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol]);
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &tuple_new_helpers),
             1,
@@ -26346,6 +29030,719 @@ class Point:
     }
 
     #[test]
+    fn forward_preparation_tracks_clones_not_original_owner_transfers() {
+        use super::super::PreparedForwardValue;
+
+        let slots = StackSlots {
+            parameter_roles: Vec::new(),
+            names: Vec::new(),
+            storage_layout_indices: Vec::new(),
+            slots: Vec::new(),
+            cleanup_root_names: HashSet::new(),
+        };
+        let borrowed_value = ir::Value::from_u32(0);
+        let owned_value = ir::Value::from_u32(1);
+        let unknown_value = ir::Value::from_u32(2);
+        let borrowed = local_env_entry(
+            Some(LocalLocation(0)),
+            "borrowed",
+            borrowed_value,
+            LocalRefKind::Borrowed,
+            LocalEnvStorage::LocalOnly,
+        );
+        let owned = local_env_entry(
+            Some(LocalLocation(1)),
+            "owned",
+            owned_value,
+            LocalRefKind::Owned,
+            LocalEnvStorage::LocalOnly,
+        );
+        let unknown = local_env_entry(
+            Some(LocalLocation(2)),
+            "unknown",
+            unknown_value,
+            LocalRefKind::Unknown,
+            LocalEnvStorage::LocalOnly,
+        );
+        let prepared = [
+            PreparedForwardValue::from_local_env_reference(&borrowed, 0, &slots),
+            PreparedForwardValue::from_local_env_reference(&owned, 0, &slots),
+            PreparedForwardValue::from_local_env_reference(&borrowed, 1, &slots),
+            PreparedForwardValue::from_local_env_reference(&unknown, 0, &slots),
+            PreparedForwardValue::from_local_env_reference(&owned, 1, &slots),
+        ];
+        assert_eq!(
+            prepared.map(PreparedForwardValue::value),
+            [
+                borrowed_value,
+                owned_value,
+                borrowed_value,
+                unknown_value,
+                owned_value
+            ],
+            "successful forwarding must preserve every original argument"
+        );
+        assert_eq!(
+            prepared
+                .into_iter()
+                .rev()
+                .filter_map(PreparedForwardValue::acquired_owner)
+                .collect::<Vec<_>>(),
+            [owned_value, borrowed_value, borrowed_value],
+            "a failed later box releases each acquired reference, including duplicate aliases; original owned/unknown references still belong to base cleanup"
+        );
+    }
+
+    #[test]
+    fn forward_preparation_preserves_cleanup_root_and_unbound_ownership() {
+        use super::super::PreparedForwardValue;
+
+        let slots = StackSlots {
+            parameter_roles: vec![Vec::new()],
+            names: vec!["root".to_string()],
+            storage_layout_indices: vec![0],
+            slots: Vec::new(),
+            cleanup_root_names: HashSet::from(["root".to_string()]),
+        };
+        for (name, kind, storage) in [
+            ("root", LocalRefKind::Borrowed, LocalEnvStorage::StackMirror),
+            ("root", LocalRefKind::Owned, LocalEnvStorage::StackMirror),
+            (
+                "immortal",
+                LocalRefKind::Immortal,
+                LocalEnvStorage::LocalOnly,
+            ),
+            ("unbound", LocalRefKind::Unbound, LocalEnvStorage::LocalOnly),
+        ] {
+            let entry = local_env_entry(None, name, ir::Value::from_u32(0), kind, storage);
+            for previous_forwards in [0, 1] {
+                let prepared = PreparedForwardValue::from_local_env_reference(
+                    &entry,
+                    previous_forwards,
+                    &slots,
+                );
+                assert_eq!(prepared.acquired_owner(), None, "{name}: {kind:?}");
+                assert_eq!(prepared.value(), entry.value());
+            }
+        }
+    }
+
+    #[test]
+    fn exception_dispatch_clones_only_additional_owning_targets() {
+        use super::super::*;
+
+        for (demands, expected_clones) in [
+            (vec![LocalRefKind::Borrowed, LocalRefKind::Borrowed], 0),
+            (
+                vec![
+                    LocalRefKind::Borrowed,
+                    LocalRefKind::Owned,
+                    LocalRefKind::Borrowed,
+                ],
+                0,
+            ),
+            (
+                vec![
+                    LocalRefKind::Owned,
+                    LocalRefKind::Borrowed,
+                    LocalRefKind::Owned,
+                ],
+                1,
+            ),
+        ] {
+            let mut jit_module = new_jit_module(&crate::session::CompileSession::new()).unwrap();
+            let ptr_ty = jit_module.target_config().pointer_type();
+            let mut context = jit_module.make_context();
+            context.func.signature.params = vec![ir::AbiParam::new(ptr_ty); 3];
+            context.func.signature.returns = vec![ir::AbiParam::new(ptr_ty); demands.len()];
+            let mut builder = FunctionBuilderContext::new();
+            let mut module_imports = ModuleFuncImports::new();
+            let incref;
+            {
+                let mut fb = FunctionBuilder::new(&mut context.func, &mut builder);
+                let entry = fb.create_block();
+                fb.append_block_params_for_function_params(entry);
+                fb.switch_to_block(entry);
+                let inputs = fb.block_params(entry).to_vec();
+                let mut imports = FuncBuildImports::new(&mut module_imports);
+                incref = imports.get_or_panic(&mut jit_module, fb.func, &DP_JIT_INCREF_IMPORT);
+                let decref = imports.get_or_panic(&mut jit_module, fb.func, &DP_JIT_DECREF_IMPORT);
+                let module = test_module(ModuleNameGen::new(0), vec![test_function()]);
+                let constants = ModuleCodegenConstants::collect_from_module(&module);
+                let target_args = demands
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| RuntimeBlockArgPlan {
+                        target_name: format!("target_{index}"),
+                        source: BlockArg::Name("value".into()),
+                        repr: RuntimeBlockParamRepr::PyObject,
+                    })
+                    .collect::<Vec<_>>();
+                let result = emit_exception_dispatch_target_args(
+                    &mut fb,
+                    &target_args,
+                    &demands,
+                    &["value".into()],
+                    &[inputs[1]],
+                    inputs[2],
+                    &constants,
+                    &[],
+                    ptr_ty,
+                    &Default::default(),
+                    inputs[0],
+                    inputs[1],
+                    incref,
+                    decref,
+                )
+                .unwrap();
+                assert_eq!(result, vec![ir::BlockArg::Value(inputs[1]); demands.len()]);
+                fb.ins().return_(&vec![inputs[1]; demands.len()]);
+                fb.seal_all_blocks();
+                fb.finalize();
+            }
+            cranelift_codegen::verify_function(&context.func, jit_module.isa()).unwrap();
+            let clones = context
+                .func
+                .layout
+                .blocks()
+                .flat_map(|block| context.func.layout.block_insts(block))
+                .filter(|inst| {
+                    matches!(
+                        context.func.dfg.insts[*inst],
+                        ir::InstructionData::Call { func_ref, .. } if func_ref == incref
+                    )
+                })
+                .count();
+            assert_eq!(clones, expected_clones, "target demands: {demands:?}");
+        }
+    }
+
+    struct ForwardBoxProbe {
+        fail_at: Option<usize>,
+        calls: usize,
+        boxes: [*mut ffi::PyObject; 2],
+        error: *mut ffi::PyObject,
+        original_drops: usize,
+    }
+
+    impl Drop for ForwardBoxProbe {
+        fn drop(&mut self) {
+            unsafe {
+                let pending = ffi::PyErr_GetRaisedException();
+                for value in &mut self.boxes {
+                    ffi::Py_XDECREF(std::mem::replace(value, ptr::null_mut()));
+                }
+                ffi::PyErr_SetRaisedException(pending);
+            }
+        }
+    }
+
+    unsafe extern "C" fn forward_box_with_probe(
+        probe: *mut ForwardBoxProbe,
+        value: i64,
+    ) -> *mut ffi::PyObject {
+        let probe = unsafe { &mut *probe };
+        let index = probe.calls;
+        probe.calls += 1;
+        if probe.fail_at == Some(index) {
+            unsafe {
+                ffi::Py_INCREF(probe.error);
+                ffi::PyErr_SetRaisedException(probe.error);
+            }
+            return ptr::null_mut();
+        }
+        if index >= probe.boxes.len() {
+            unsafe {
+                ffi::PyErr_SetString(
+                    ffi::PyExc_SystemError,
+                    c"unexpected forwarding box".as_ptr(),
+                );
+            }
+            return ptr::null_mut();
+        }
+        let result = unsafe { ffi::PyLong_FromLongLong(value) };
+        if !result.is_null() {
+            // One explicit observer reference lets the test inspect the actual
+            // integer after the generated edge has consumed its own reference.
+            unsafe { ffi::Py_INCREF(result) };
+            probe.boxes[index] = result;
+        }
+        result
+    }
+
+    unsafe extern "C" fn forward_original_owner_drop(capsule: *mut ffi::PyObject) {
+        let probe =
+            unsafe { ffi::PyCapsule_GetPointer(capsule, c"test.forward-original-owner".as_ptr()) }
+                .cast::<ForwardBoxProbe>();
+        if !probe.is_null() {
+            unsafe {
+                (*probe).original_drops += 1;
+                // The error-preserving cleanup may temporarily clear PyErr;
+                // use the explicit failure mode to challenge only that path.
+                if (*probe).fail_at.is_some() {
+                    ffi::PyErr_SetString(
+                        ffi::PyExc_RuntimeError,
+                        c"original-owner destructor must not replace MemoryError".as_ptr(),
+                    );
+                }
+            }
+        }
+    }
+
+    struct ForwardPreparationKernel {
+        _jit_module: JITModule,
+        call: unsafe extern "C" fn(
+            *mut ffi::PyThreadState,
+            *mut ffi::PyObject,
+            *mut ffi::PyObject,
+            i64,
+            i64,
+        ) -> i32,
+    }
+
+    unsafe fn build_forward_preparation_kernel(
+        probe: *mut ForwardBoxProbe,
+        planned_target: bool,
+    ) -> ForwardPreparationKernel {
+        use super::super::*;
+
+        let session = crate::session::CompileSession::new();
+        let config = SoacEnvConfig::default();
+        let mut jit_module = new_jit_module(&session).unwrap();
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        // The standard one-argument boxing ABI delegates to a per-kernel state
+        // pointer. No global allocator hook, TLS, or source authority is needed.
+        let mut boxing_signature = jit_module.make_signature();
+        boxing_signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        boxing_signature.returns.push(ir::AbiParam::new(ptr_ty));
+        let boxing_id =
+            declare_local_fn(&mut jit_module, "forwarding_test_box", &boxing_signature).unwrap();
+        let mut boxing_ctx = jit_module.make_context();
+        boxing_ctx.func.signature = boxing_signature;
+        boxing_ctx.func.name = ir::UserFuncName::user(0, boxing_id.as_u32());
+        let mut boxing_builder = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut boxing_ctx.func, &mut boxing_builder);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            let value = fb.block_params(entry)[0];
+            let state = fb.ins().iconst(ptr_ty, probe as usize as i64);
+            let helper = fb
+                .ins()
+                .iconst(ptr_ty, forward_box_with_probe as *const () as usize as i64);
+            let mut signature = jit_module.make_signature();
+            signature
+                .params
+                .extend([ir::AbiParam::new(ptr_ty), ir::AbiParam::new(ir::types::I64)]);
+            signature.returns.push(ir::AbiParam::new(ptr_ty));
+            let signature = fb.import_signature(signature);
+            let call = fb.ins().call_indirect(signature, helper, &[state, value]);
+            let result = fb.inst_results(call)[0];
+            fb.ins().return_(&[result]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        define_prepared_function(
+            &mut jit_module,
+            &config,
+            boxing_id,
+            &mut boxing_ctx,
+            "forwarding-test-box",
+            "boxing stub should compile",
+        )
+        .unwrap();
+
+        let source = test_module(ModuleNameGen::new(0), vec![test_function()]);
+        let baseline = optimize_blockpy(&source, None, &config).unwrap();
+        let planned = planning::plan_jit_typed_module(
+            baseline.module.as_ref().clone(),
+            baseline.value_facts.clone(),
+        )
+        .unwrap();
+        let function = &planned.module.callable_defs[0];
+        let local_plan = planned.locals.function(function.function_id).unwrap();
+        let module_constants = ModuleCodegenConstants::collect_from_module(&source);
+        let runtime_layout = FunctionRuntimeDataLayout::from_typed_function(function);
+        let instr_locations = current_instr_locations(function);
+        let pending = RefCell::new(Vec::new());
+        let mut signature = jit_module.make_signature();
+        signature.params.extend([
+            ir::AbiParam::new(ptr_ty),
+            ir::AbiParam::new(ptr_ty),
+            ir::AbiParam::new(ptr_ty),
+            ir::AbiParam::new(ir::types::I64),
+            ir::AbiParam::new(ir::types::I64),
+        ]);
+        signature.returns.push(ir::AbiParam::new(ir::types::I32));
+        let kernel_id =
+            declare_local_fn(&mut jit_module, "forwarding_prefix_kernel", &signature).unwrap();
+        let mut context = jit_module.make_context();
+        context.func.name = ir::UserFuncName::user(0, kernel_id.as_u32());
+        context.func.signature = signature;
+        let mut builder = FunctionBuilderContext::new();
+        let mut module_imports = ModuleFuncImports::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut context.func, &mut builder);
+            let entry = fb.create_block();
+            let failure = fb.create_block();
+            fb.set_cold_block(failure);
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            let inputs = fb.block_params(entry).to_vec();
+            let null = fb.ins().iconst(ptr_ty, 0);
+            let mut imports = FuncBuildImports::new(&mut module_imports);
+            let incref_ref =
+                imports.get_or_panic(&mut jit_module, &mut fb.func, &DP_JIT_INCREF_IMPORT);
+            let decref_ref =
+                imports.get_or_panic(&mut jit_module, &mut fb.func, &DP_JIT_DECREF_IMPORT);
+            let boxing_ref = jit_module.declare_func_in_func(boxing_id, &mut fb.func);
+            let stack_slots = StackSlots::new(&mut fb, &[], &HashSet::new(), None);
+            let handled_exception_slots = HandledExceptionSlots::new(&mut fb, function, None);
+            let target_names = ["borrowed", "borrowed", "owned", "first", "second"];
+            let target_args = target_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| RuntimeBlockArgPlan {
+                    target_name: format!("target_{index}"),
+                    source: BlockArg::Name((*name).into()),
+                    repr: RuntimeBlockParamRepr::PyObject,
+                })
+                .collect::<Vec<_>>();
+            let entries = vec![
+                target_args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| {
+                        let mut materialization =
+                            planned_local_env_entry(PlannedLocalEnvEntrySource::BlockParam {
+                                param_index: index,
+                            });
+                        materialization.binding.name = arg.target_name.clone();
+                        materialization.binding.location = LocalLocation(index as u32);
+                        materialization
+                    })
+                    .collect::<Vec<_>>(),
+            ];
+            // Explicit raw-kernel inputs exercise both production preparation
+            // loops. This is not a fabricated strict-function admission.
+            let locals = LocalEnv {
+                entries: vec![
+                    local_env_entry(
+                        Some(LocalLocation(0)),
+                        "borrowed",
+                        inputs[1],
+                        LocalRefKind::Borrowed,
+                        LocalEnvStorage::LocalOnly,
+                    ),
+                    local_env_entry(
+                        Some(LocalLocation(1)),
+                        "owned",
+                        inputs[2],
+                        LocalRefKind::Owned,
+                        LocalEnvStorage::LocalOnly,
+                    ),
+                    local_env_i64_entry(
+                        Some(LocalLocation(2)),
+                        "first",
+                        inputs[3],
+                        IntFacts::i64_unknown(),
+                    ),
+                    local_env_i64_entry(
+                        Some(LocalLocation(3)),
+                        "second",
+                        inputs[4],
+                        IntFacts::i64_unknown(),
+                    ),
+                ],
+            };
+            let emit_ctx = JitEmitCtx {
+                module: &planned.module,
+                function_id: function.function_id,
+                function_kind: FunctionKind::Function,
+                indexed_field_guards_by_instr: &HashMap::new(),
+                indexed_field_counter_sources_by_instr: &HashMap::new(),
+                late_bound_owner_fields_by_instr: &HashMap::new(),
+                module_constants: &module_constants,
+                value_facts: &planned.value_facts,
+                deopt_resume_plan: planned.deopt_resume.function(function.function_id).unwrap(),
+                runtime_supported_deopt_resume_points: None,
+                refcount_plan: &local_plan.refcount_plan,
+                loop_backedges: &local_plan.loop_backedges,
+                entry_materializations: &entries,
+                cleanup_root_slot_states: &local_plan.cleanup_root_slot_states,
+                truthiness_only_local_locations: &HashSet::new(),
+                boxed_owner_local_locations: &HashSet::new(),
+                pending_exception_failures: &pending,
+                failure_local_cleanup_delegated: false,
+                return_cleanup_blocks_by_label: &HashMap::new(),
+                instr_locations: &instr_locations,
+                counter_slots_by_id: &[],
+                storage_layout: None,
+                function_runtime_data_layout: &runtime_layout,
+                incref_ref,
+                decref_ref,
+                refcount_lowering: RefcountLowering::HelperCalls {
+                    incref_ref,
+                    decref_ref,
+                },
+                py_call_positional_three_ref: incref_ref,
+                context_vectorcall_ref: incref_ref,
+                context_object_call_ref: incref_ref,
+                frame_namespace_value: None,
+                py_handle_pending_ref: None,
+                handle_pending_checks_enabled: false,
+                refcount_emission_enabled: true,
+                consts: JitEmitConsts {
+                    step_null_block: failure,
+                    step_null_args: Vec::new(),
+                    ptr_ty,
+                    i64_ty: ir::types::I64,
+                    i32_ty: ir::types::I32,
+                    function_env_value: null,
+                    function_data_value: null,
+                    module_constant_object_globals: Vec::new(),
+                    scalar_counter_base_value: None,
+                    top_value_counter_base_value: None,
+                    thread_state_value: inputs[0],
+                    preserved_state_value: null,
+                    preserved_values_base_value: None,
+                    none_constant_id: module_constants.require_runtime_name_constant_id("NONE"),
+                    true_constant_id: module_constants.require_runtime_name_constant_id("TRUE"),
+                    false_constant_id: module_constants.require_runtime_name_constant_id("FALSE"),
+                    empty_tuple_constant_id: module_constants
+                        .require_runtime_name_constant_id("EMPTY_TUPLE"),
+                    block_const: null,
+                    builtins_const: null,
+                    module_constant_accesses: Default::default(),
+                },
+                load_global_fast_ref: incref_ref,
+                probe_global_indexed_ref: incref_ref,
+                load_global_slow_ref: incref_ref,
+                guard_miss_deopt_stub_ref: None,
+                guard_miss_deopt_instr_ids: &HashSet::new(),
+                guard_miss_deopt_without_refcounts_instr_ids: &HashSet::new(),
+                guard_miss_resume_point: None,
+                load_runtime_obj_by_id_ref: incref_ref,
+                enter_recursive_ref: incref_ref,
+                direct_compile_function_env_ref: incref_ref,
+                pytype_generic_alloc_ref: incref_ref,
+                finish_constructor_init_ref: incref_ref,
+                pyobject_getattr_ref: incref_ref,
+                pyobject_setattr_ref: incref_ref,
+                pyobject_getitem_ref: incref_ref,
+                pyobject_setitem_ref: incref_ref,
+                del_preserved_ref: incref_ref,
+                del_preserved_quietly_ref: incref_ref,
+                pyobject_to_i64_ref: incref_ref,
+                py_long_from_i64_ref: boxing_ref,
+                raise_unbound_local_error_ref: incref_ref,
+                make_function_with_closure_ref: incref_ref,
+                make_cell_ref: incref_ref,
+                load_cell_ref: incref_ref,
+                store_cell_ref: incref_ref,
+                py_call_object_ref: incref_ref,
+                record_top_value_sample_ref: None,
+                tuple_new_ref: incref_ref,
+                tuple_set_item_ref: incref_ref,
+                stack_slots,
+                handled_exception_slots,
+                handled_state_value: null,
+                handled_state_select_ref: incref_ref,
+                handled_state_finish_ref: incref_ref,
+                handled_state_release_residual_ref: incref_ref,
+                retire_terminal_roots_ref: incref_ref,
+                set_raised_exception_ref: incref_ref,
+                reraise_current_ref: incref_ref,
+                direct_edge_stats: &DirectEdgeStats::default(),
+                direct_call_target_functions: &HashMap::new(),
+                direct_call_functions: &HashMap::new(),
+                call_target_counter_ids: &HashMap::new(),
+                call_direct_target_counter_ids: &HashMap::new(),
+                call_direct_hit_counter_ids: &HashMap::new(),
+                call_direct_fallback_counter_ids: &HashMap::new(),
+                operator_shape_counter_ids: &HashMap::new(),
+                getitem_shape_counter_ids: &HashMap::new(),
+                getitem_specialized_hit_counter_ids: &HashMap::new(),
+                getitem_specialized_fallback_counter_ids: &HashMap::new(),
+                getitem_specialized_hit_counter_ids_by_source: &HashMap::new(),
+                getitem_specialized_fallback_counter_ids_by_source: &HashMap::new(),
+                setitem_shape_counter_ids: &HashMap::new(),
+                setitem_specialized_hit_counter_ids: &HashMap::new(),
+                setitem_specialized_fallback_counter_ids: &HashMap::new(),
+                setitem_specialized_hit_counter_ids_by_source: &HashMap::new(),
+                setitem_specialized_fallback_counter_ids_by_source: &HashMap::new(),
+                branch_outcome_counter_ids: &HashMap::new(),
+                global_indexed_hit_counter_ids: &HashMap::new(),
+                global_indexed_fallback_counter_ids: &HashMap::new(),
+                field_indexed_hit_counter_ids: &HashMap::new(),
+                field_indexed_fallback_counter_ids: &HashMap::new(),
+                field_indexed_hit_counter_ids_by_source: &HashMap::new(),
+                field_indexed_fallback_counter_ids_by_source: &HashMap::new(),
+                field_generic_getattr_counter_ids: &HashMap::new(),
+                field_generic_setattr_counter_ids: &HashMap::new(),
+                method_dispatch_counter_ids: &Default::default(),
+                refcount_decref_location_counter_refs: &HashMap::new(),
+                allow_local_only_slot_backed_stores: true,
+                exception_dispatch_plan: None,
+                type_ptr_data_ids: RefCell::new(HashMap::new()),
+                callable_ptr_data_ids: RefCell::new(HashMap::new()),
+            };
+            let forwarded = if planned_target {
+                emit_planned_target_args_codegen_from_local_env(
+                    &mut fb,
+                    0,
+                    &target_args,
+                    &locals,
+                    &emit_ctx,
+                    &mut jit_module,
+                    &mut imports,
+                )
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|arg| match arg {
+                    ir::BlockArg::Value(value) => value,
+                    _ => panic!("forwarding kernel requires ordinary value operands"),
+                })
+                .collect::<Vec<_>>()
+            } else {
+                emit_forward_named_values_from_local_env_with_refcount(
+                    &mut fb,
+                    target_names,
+                    &HashSet::new(),
+                    &locals,
+                    ptr_ty,
+                    incref_ref,
+                    &emit_ctx,
+                )
+                .unwrap()
+                .0
+            };
+            assert_eq!(forwarded.len(), 5);
+            let success_owners = forwarded.into_iter().rev().collect::<Vec<_>>();
+            emit_release_owned_inputs(&mut fb, &emit_ctx, &success_owners);
+            let success = fb.ins().iconst(ir::types::I32, 1);
+            fb.ins().return_(&[success]);
+
+            fb.switch_to_block(failure);
+            // The original local has not crossed an edge when boxing fails.
+            // Prefix cleanup must not consume it in addition to this base sink.
+            emit_release_owned_inputs(&mut fb, &emit_ctx, &[inputs[2]]);
+            let failed = fb.ins().iconst(ir::types::I32, 0);
+            fb.ins().return_(&[failed]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        cranelift_codegen::verify_function(&context.func, jit_module.isa()).unwrap();
+        define_prepared_function(
+            &mut jit_module,
+            &config,
+            kernel_id,
+            &mut context,
+            "forwarding-prefix-kernel",
+            "forwarding kernel should compile",
+        )
+        .unwrap();
+        jit_module.finalize_definitions().unwrap();
+        let call = unsafe { std::mem::transmute(jit_module.get_finalized_function(kernel_id)) };
+        ForwardPreparationKernel {
+            _jit_module: jit_module,
+            call,
+        }
+    }
+
+    #[test]
+    fn forward_preparation_boxing_failure_releases_only_acquired_prefix() {
+        use pyo3::exceptions::PyMemoryError;
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| unsafe {
+            for planned_target in [false, true] {
+                let pending = PyMemoryError::new_err("later forwarded scalar box").into_value(py);
+                let mut probe = Box::new(ForwardBoxProbe {
+                    fail_at: None,
+                    calls: 0,
+                    boxes: [ptr::null_mut(); 2],
+                    error: pending.as_ptr(),
+                    original_drops: 0,
+                });
+                let probe_ptr = ptr::from_mut(probe.as_mut());
+                let kernel = build_forward_preparation_kernel(probe_ptr, planned_target);
+                for fail_at in [None, Some(0), Some(1)] {
+                    probe.fail_at = fail_at;
+                    probe.calls = 0;
+                    probe.original_drops = 0;
+                    let borrowed = py.eval(c"object()", None, None).unwrap();
+                    let before = ffi::Py_REFCNT(borrowed.as_ptr());
+                    let owned = ffi::PyCapsule_New(
+                        probe_ptr.cast(),
+                        c"test.forward-original-owner".as_ptr(),
+                        Some(forward_original_owner_drop),
+                    );
+                    assert!(!owned.is_null());
+                    let result = (kernel.call)(
+                        ffi::PyThreadState_Get(),
+                        borrowed.as_ptr(),
+                        owned,
+                        100_000_013,
+                        200_000_019,
+                    );
+                    let error = ffi::PyErr_GetRaisedException();
+                    let after = ffi::Py_REFCNT(borrowed.as_ptr());
+                    let observed_boxes = probe
+                        .boxes
+                        .iter()
+                        .map(|&value| (!value.is_null()).then(|| ffi::Py_REFCNT(value)))
+                        .collect::<Vec<_>>();
+                    // If old code leaks a prefix, release the test's leaked
+                    // references after recording the result, before asserting.
+                    for _ in before..after {
+                        ffi::Py_DECREF(borrowed.as_ptr());
+                    }
+                    for (value, count) in probe.boxes.iter_mut().zip(&observed_boxes) {
+                        if let Some(count) = count {
+                            for _ in 0..*count {
+                                ffi::Py_DECREF(*value);
+                            }
+                        }
+                        *value = ptr::null_mut();
+                    }
+                    let same_error = error == pending.as_ptr();
+                    let had_error = !error.is_null();
+                    ffi::Py_XDECREF(error);
+                    assert_eq!(result, i32::from(fail_at.is_none()));
+                    assert_eq!(probe.calls, fail_at.map_or(2, |index| index + 1));
+                    assert_eq!(probe.original_drops, 1, "original owner must have one sink");
+                    assert_eq!(
+                        after, before,
+                        "duplicate borrowed clones must balance; target={planned_target}, failure={fail_at:?}"
+                    );
+                    assert!(
+                        observed_boxes.iter().flatten().all(|&count| count == 1),
+                        "only each explicit observer may remain; target={planned_target}, failure={fail_at:?}, boxes={observed_boxes:?}"
+                    );
+                    assert_eq!(
+                        observed_boxes.iter().flatten().count(),
+                        fail_at.unwrap_or(2)
+                    );
+                    assert_eq!(had_error, fail_at.is_some());
+                    assert_eq!(
+                        same_error,
+                        fail_at.is_some(),
+                        "destructor must preserve the exact boxing error"
+                    );
+                    assert!(ffi::PyErr_Occurred().is_null());
+                }
+            }
+        });
+    }
+
+    #[test]
     fn specialized_jit_import_helpers_use_direct_external_refs() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
@@ -26370,7 +29767,7 @@ class Point:
             build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
 
         let vectorcall_helpers =
-            import_user_names_for_symbols(&built, &[DP_JIT_PY_VECTORCALL_IMPORT.symbol]);
+            import_user_names_for_symbols(&built, &[PY_SOAC_VECTORCALL_CONTEXT_IMPORT.symbol]);
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &vectorcall_helpers),
             1,
@@ -26381,5 +29778,215 @@ class Point:
             vec![false],
             "imported helpers should be direct external refs, not colocated local trampolines"
         );
+    }
+
+    #[test]
+    fn source_owned_operand_outgoing_call_selects_only_moved_prefix() -> pyo3::PyResult<()> {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "source_owned_operand_outgoing_call_selects_only_moved_prefix",
+        ) {
+            return Ok(());
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            for (source, expected) in [
+                (
+                    "from __future__ import strict\n\ndef f(callback, value):\n    local = value('local')\n    callback(value('operand'), (yield 'ready'), value('tail'))\n    return 73\n",
+                    1,
+                ),
+                (
+                    "from __future__ import strict\n\ndef f(callback, value):\n    callback(value, value)\n    yield value\n",
+                    0,
+                ),
+            ] {
+                crate::strict_class_state::tests::with_strict_callable_fixture(
+                    py,
+                    source,
+                    true,
+                    |_, shared| {
+                        let module = &shared.lowered_module;
+                        let function = module
+                            .callable_defs
+                            .iter()
+                            .find(|function| function.names.qualname == "f")
+                            .unwrap();
+                        let session = crate::session::CompileSession::new();
+                        let (built, target, _) = build_test_specialized_function_with_module_data(
+                            &[],
+                            module,
+                            function,
+                            &shared.codegen_constants,
+                            &session,
+                        );
+                        cranelift_codegen::verify_function(&built.ctx.func, target.isa()).unwrap();
+                        let transfers = direct_calls_to_runtime_helpers(
+                            &built.ctx.func,
+                            &import_user_names_for_symbols(&built, &["dp_jit_call_owned_operands"]),
+                        );
+                        assert_eq!(
+                            transfers.len(),
+                            expected,
+                            "only the explicit moved callable/argument prefix may select native consumption",
+                        );
+                        for call in transfers {
+                            let args = built.ctx.func.dfg.inst_args(call);
+                            assert_eq!(args.len(), 3);
+                            assert!(value_is_iconst_imm(&built.ctx.func, args[2], 4));
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn source_owned_operand_outgoing_call_survives_runtime_profile_linearization()
+    -> pyo3::PyResult<()> {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "source_owned_operand_outgoing_call_survives_runtime_profile_linearization",
+        ) {
+            return Ok(());
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            // Exact subject of the maintained suspended-expression lifetime
+            // regression, including its ordinary public factory. The public
+            // entry tier does not change the managed generator's resume body.
+            let source = "from __future__ import strict\ndef suspended_call(make, consume, later):\n    local = make('local')\n    consume(make('operand'), (yield 'ready'), later())\n    return 73\n\ndef make_suspended_call(make, consume, later):\n    return suspended_call(make, consume, later)\n";
+            crate::strict_class_state::tests::with_strict_callable_fixture_functions(
+                py,
+                source,
+                &[
+                    ("suspended_call", &["make", "consume", "later"], true),
+                    ("make_suspended_call", &["make", "consume", "later"], false),
+                ],
+                |_, shared| {
+                    #[derive(Default)]
+                    struct SourceCall {
+                        calls: Vec<Call<InstrBlockPy>>,
+                    }
+                    impl Visit<InstrBlockPy> for SourceCall {
+                        fn visit_instr(&mut self, instr: &InstrBlockPy) {
+                            if let InstrBlockPy::Call(call) = instr
+                                && call.args.len() == 3
+                                && matches!(call.func.as_ref(), InstrBlockPy::TakeOperand(_))
+                            {
+                                self.calls.push(call.clone());
+                            }
+                            instr.visit_children(self);
+                        }
+                    }
+
+                    let module = &shared.lowered_module;
+                    let function = module
+                        .callable_defs
+                        .iter()
+                        .find(|function| function.names.qualname == "suspended_call")
+                        .unwrap();
+                    assert_eq!(function.kind, FunctionKind::Generator);
+                    let layout = function.storage_layout.as_ref().unwrap();
+                    assert!(layout.generator_resume_abi.is_some());
+                    let mut source_call = SourceCall::default();
+                    source_call.visit_fn(function);
+                    let [outer] = source_call.calls.as_slice() else {
+                        panic!("expected the one actual suspended three-argument call");
+                    };
+                    let call_id = outer.try_semantic_instr_id().unwrap();
+                    let input_sites = std::iter::once(outer.func.as_ref())
+                        .chain(outer.args.iter().map(CallArgPositional::expr))
+                        .map(|input| (input.try_semantic_instr_id(), input.meta().range))
+                        .collect::<Vec<_>>();
+                    assert!(!outer.meta().range.is_empty());
+                    assert!(!input_sites.last().unwrap().1.is_empty());
+                    assert!(
+                        super::super::call_arguments_runtime::blockpy_owned_operand_call(
+                            outer, layout,
+                        )
+                        .unwrap(),
+                        "the lowered source already owns its consumed expression inputs",
+                    );
+
+                    let session =
+                        crate::session::CompileSession::new_with_env_config(typed_v3_env_config());
+                    session
+                        .retain_shared_module_state_for_inspection(shared.clone())
+                        .expect("the production planner must resolve this actual module");
+                    let profile = SpecializationProfile::from_runtime_state_with_session(
+                        Some(shared.as_ref()),
+                        Some(&session),
+                    )
+                    .expect("construct the normal runtime profile, even in mode none");
+                    let config = session.env_config().unwrap();
+                    let baseline = optimize_blockpy(module, None, config).unwrap();
+                    let runtime = optimize_blockpy_for_shared_state(
+                        shared.as_ref(),
+                        Some(&session),
+                        Some(&profile),
+                        config,
+                    )
+                    .unwrap();
+
+                    for (stage, plan) in [("baseline", baseline), ("runtime", runtime)] {
+                        let planned = plan
+                            .module
+                            .callable_defs
+                            .iter()
+                            .find(|candidate| candidate.function_id == function.function_id)
+                            .unwrap();
+                        let layout = planned.storage_layout.as_ref().unwrap();
+                        let mut selected = Vec::new();
+                        let calls = count_typed_instrs(planned, |instr| {
+                            let InstrTyped::CallTyped(call) = instr else {
+                                return false;
+                            };
+                            if call.try_semantic_instr_id() != Some(call_id) {
+                                return false;
+                            }
+                            let actual_sites = std::iter::once(call.func.as_ref())
+                                .chain(call.args.iter().map(CallArgPositional::expr))
+                                .map(|input| (input.try_semantic_instr_id(), input.meta().range))
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                actual_sites, input_sites,
+                                "{stage}: child order and source sites stay inside the consuming operation",
+                            );
+                            assert_eq!(call.meta().range, outer.meta().range);
+                            let shape = std::iter::once(call.func.as_ref())
+                                .chain(call.args.iter().map(|arg| match arg {
+                                    CallArgPositional::Positional(input)
+                                    | CallArgPositional::Starred(input) => input,
+                                }))
+                                .map(|input| match input {
+                                    InstrTyped::TakeOperand(_) => "TakeOperand",
+                                    InstrTyped::CallTyped(_) => "CallTyped",
+                                    InstrTyped::Load(_) => "Load",
+                                    _ => "Other",
+                                })
+                                .collect::<Vec<_>>();
+                            selected.push((
+                                super::super::call_arguments_runtime::typed_owned_operand_call(
+                                    call, layout,
+                                )
+                                .unwrap(),
+                                shape,
+                            ));
+                            true
+                        });
+                        assert_eq!(calls, 1, "{stage}: retain the exact original call identity");
+                        assert!(
+                            selected[0].0,
+                            "{stage}: native consumption lost for {call_id:?}: {selected:?}",
+                        );
+                    }
+                    Ok(())
+                },
+            )
+        })
     }
 }

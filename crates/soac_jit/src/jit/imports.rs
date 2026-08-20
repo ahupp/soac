@@ -5,9 +5,7 @@ use super::codegen_env::{
 use super::direct_abi;
 use super::intrinsics;
 use super::module_data::declare_type_ptr_import;
-use super::operation_specializations::{
-    field_index_specialization_from_primed_opt_v3, prime_opt_v3_field_index_layouts,
-};
+use super::operation_specializations::field_index_specialization_from_opt_v3;
 use super::symbols::RelocCallableRef;
 #[cfg(test)]
 use super::symbols::reloc_type_ref_from_typed_attr_owner_ref;
@@ -26,6 +24,14 @@ use super::symbols::{
     reloc_callable_ref_symbol_name, reloc_type_ref_for_type, reloc_type_ref_symbol_name,
 };
 use crate::function_instantiation::SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL;
+use crate::strict_annotation::{
+    CHECK_ANNOTATION_FORMAT_SYMBOL, CONSTRUCT_TYPE_PARAMETER_SCOPE_SYMBOL,
+    CREATE_TYPE_ALIAS_SYMBOL, CREATE_TYPE_PARAMETER_SYMBOL, NEW_ANNOTATION_SET_SYMBOL,
+    RECORD_ANNOTATION_SYMBOL, SET_FUNCTION_TYPE_PARAMETERS_SYMBOL,
+    SET_TYPE_PARAMETER_DEFAULT_SYMBOL, SETUP_ANNOTATIONS_SYMBOL, SUBSCRIPT_GENERIC_SYMBOL,
+};
+use crate::strict_class::CONSTRUCT_CLASS_SYMBOL;
+use crate::strict_function::COMPLETE_FUNCTION_DEFINITION_SYMBOL;
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage};
 #[cfg(test)]
@@ -36,10 +42,7 @@ use soac_ir_typed::{
     InstrTyped, TypedBlockPyModuleShape, TypedCallAccessPlan, TypedDirectCallableCallGuard,
     TypedDirectMethodCallGuard,
 };
-use soac_opt::access_emission_v3::{
-    indexed_field_layout_groups as opt_v3_indexed_field_layout_groups,
-    indexed_field_runtime_access_request as opt_v3_indexed_field_runtime_access_request,
-};
+use soac_opt::access_emission_v3::indexed_field_runtime_access_request as opt_v3_indexed_field_runtime_access_request;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -272,17 +275,38 @@ pub(super) static DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT: ImportSpec = ImportSpe
         SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
+        SigType::Pointer,
     ],
     &[SigType::Pointer],
 );
 pub(super) static DP_JIT_PY_CALL_OBJECT_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_object",
-    &[SigType::Pointer, SigType::Pointer],
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
     &[SigType::Pointer],
 );
-pub(super) static DP_JIT_PY_VECTORCALL_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_py_vectorcall",
+pub(super) static PY_SOAC_VECTORCALL_CONTEXT_IMPORT: ImportSpec = ImportSpec::new(
+    "PySoac_VectorcallWithContext",
     &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static PY_SOAC_OBJECT_CALL_CONTEXT_IMPORT: ImportSpec = ImportSpec::new(
+    "PySoac_ObjectCallWithContext",
+    &[
+        SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
@@ -311,11 +335,6 @@ pub(super) static PY_THREAD_STATE_GET_UNCHECKED_IMPORT: ImportSpec =
     ImportSpec::new("PyThreadState_GetUnchecked", &[], &[SigType::Pointer]);
 pub(super) static PY_HANDLE_PENDING_IMPORT: ImportSpec =
     ImportSpec::new("_Py_HandlePending", &[SigType::Pointer], &[SigType::I32]);
-pub(super) static DP_JIT_PY_CALL_WITH_KW_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_py_call_with_kw",
-    &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
-    &[SigType::Pointer],
-);
 static DP_JIT_LOAD_RUNTIME_OBJ_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_load_runtime_obj",
     &[SigType::Pointer],
@@ -339,6 +358,33 @@ pub(super) static PYOBJECT_GETMETHOD_IMPORT: ImportSpec = ImportSpec::new(
 pub(super) static DP_JIT_PYOBJECT_SETATTR_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_pyobject_setattr",
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+pub(super) static DP_JIT_MATCH_SEALED_FIELD_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_match_sealed_field_capability",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::I32],
+);
+pub(super) static DP_JIT_RESOLVE_SEALED_VIRTUAL_METHOD_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_resolve_sealed_virtual_method_capability",
+    &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
+    &[SigType::I32],
+);
+pub(super) static SOAC_RUNTIME_PROBE_SEALED_FIELD_IMPORT: ImportSpec = ImportSpec::local(
+    "soac_runtime_probe_stable_indexed_field",
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::I64,
+        SigType::I64,
+        SigType::I64,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_RUNTIME_LOAD_NATIVE_OBJECT_SLOT_IMPORT: ImportSpec = ImportSpec::local(
+    "soac_runtime_load_native_object_slot",
+    &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::Pointer],
 );
 pub(super) static DP_JIT_PYOBJECT_GETITEM_IMPORT: ImportSpec = ImportSpec::new(
@@ -433,6 +479,11 @@ pub(super) static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec
     &[SigType::Pointer, SigType::I64],
     &[],
 );
+pub(super) static DP_JIT_PROFILE_CALLABLE_FUNCTION_ID_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_profile_callable_function_id",
+    &[SigType::Pointer],
+    &[SigType::I64],
+);
 pub(super) static DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_protocol_next_function_id",
     &[SigType::Pointer],
@@ -451,8 +502,11 @@ pub(super) static DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_raise_super_arg_deleted", &[], &[]);
 pub(super) static DP_JIT_MAKE_CELL_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_make_cell", &[SigType::Pointer], &[SigType::Pointer]);
-pub(super) static DP_JIT_LOAD_CELL_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_load_cell", &[SigType::Pointer], &[SigType::Pointer]);
+pub(super) static DP_JIT_LOAD_CELL_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_load_cell",
+    &[SigType::Pointer, SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
 pub(super) static DP_JIT_STORE_CELL_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_store_cell",
     &[SigType::Pointer, SigType::Pointer],
@@ -475,13 +529,59 @@ pub(super) static DP_JIT_RAISE_FROM_EXC_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::I32],
 );
-pub(super) static DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_push_handled_exception",
+pub(super) static DP_JIT_RESTORE_RAISED_EXCEPTION_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_restore_raised_exception",
+    &[SigType::Pointer],
+    &[SigType::I32],
+);
+pub(super) static DP_JIT_GENERATOR_RETURN_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_generator_return",
     &[SigType::Pointer],
     &[SigType::Pointer],
 );
-pub(super) static DP_JIT_POP_HANDLED_EXCEPTION_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_pop_handled_exception", &[SigType::Pointer], &[]);
+pub(super) static DP_JIT_HANDLED_STATE_INIT_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_handled_state_init",
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::I64,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static DP_JIT_HANDLED_STATE_SELECT_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_handled_state_select",
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::I64,
+        SigType::I64,
+    ],
+    &[SigType::I32],
+);
+pub(super) static DP_JIT_HANDLED_STATE_RAISED_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_handled_state_raised",
+    &[SigType::Pointer, SigType::I64],
+    &[],
+);
+pub(super) static DP_JIT_HANDLED_STATE_FINISH_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_handled_state_finish",
+    &[SigType::Pointer, SigType::I64, SigType::Pointer],
+    &[],
+);
+pub(super) static DP_JIT_HANDLED_STATE_RELEASE_RESIDUAL_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_handled_state_release_residual",
+    &[SigType::Pointer],
+    &[],
+);
+pub(super) static DP_JIT_RETIRE_TERMINAL_ROOTS_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_retire_terminal_roots",
+    &[SigType::Pointer],
+    &[SigType::I32],
+);
+pub(super) static DP_JIT_RERAISE_CURRENT_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_reraise_current", &[], &[]);
 pub(super) static DP_JIT_DEOPT_RESUME_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_deopt_resume",
     &[
@@ -492,7 +592,14 @@ pub(super) static DP_JIT_DEOPT_RESUME_IMPORT: ImportSpec = ImportSpec::new(
         SigType::I64,
         SigType::Pointer,
         SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
     ],
+    &[SigType::Pointer],
+);
+pub(super) static DP_JIT_CHECKED_FUNCTION_METADATA_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_checked_function_metadata",
+    &[SigType::Pointer],
     &[SigType::Pointer],
 );
 pub(super) static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = ImportSpec::new(
@@ -505,13 +612,48 @@ pub(super) static DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT: ImportSpec = Import
         SigType::Pointer,
         SigType::Pointer,
         SigType::I64,
+        SigType::Pointer,
     ],
-    &[SigType::I32],
+    &[SigType::Pointer],
 );
 pub(super) static DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_compile_function_env",
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
+);
+pub(super) static DP_JIT_STRICT_FINISH_CALL_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_strict_finish_call",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+pub(super) static DP_JIT_PREPARE_STRICT_DIRECT_CALL_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_prepare_strict_direct_call",
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::I32],
+);
+pub(super) static DP_JIT_FINISH_STRICT_DIRECT_CALL_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_finish_strict_direct_call",
+    &[
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static DP_JIT_RETIRE_STRICT_CALL_ARGUMENTS_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_retire_strict_call_arguments",
+    &[SigType::Pointer],
+    &[],
 );
 pub(super) static DP_JIT_VECTORCALL_PREVIOUS_FOR_CHANGED_CODE_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_vectorcall_previous_for_changed_code",
@@ -538,7 +680,167 @@ pub(super) static SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT: ImportSpec = Impor
         SigType::Pointer,
         SigType::Pointer,
         SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
     ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_CONSTRUCT_CLASS_IMPORT: ImportSpec = ImportSpec::new(
+    CONSTRUCT_CLASS_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_PREPARE_CLASS_DECORATOR_IMPORT: ImportSpec = ImportSpec::new(
+    crate::strict_class_decorator::PREPARE_CLASS_DECORATOR_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::I32,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_PREPARE_CLASS_DECORATOR_UNPACKED_IMPORT: ImportSpec = ImportSpec::new(
+    crate::strict_class_decorator::PREPARE_CLASS_DECORATOR_UNPACKED_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::I32,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_APPLY_CLASS_DECORATOR_IMPORT: ImportSpec = ImportSpec::new(
+    crate::strict_class_decorator::APPLY_CLASS_DECORATOR_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_DISCARD_CLASS_DECORATOR_IMPORT: ImportSpec = ImportSpec::new(
+    crate::strict_class_decorator::DISCARD_CLASS_DECORATOR_SYMBOL,
+    &[SigType::Pointer],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_DISCARD_CLASS_CONSTRUCTION_CAPTURES_IMPORT: ImportSpec = ImportSpec::new(
+    crate::strict_function::DISCARD_CLASS_CONSTRUCTION_CAPTURES_SYMBOL,
+    &[SigType::Pointer],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_APPLY_FUNCTION_DESCRIPTOR_IMPORT: ImportSpec = ImportSpec::new(
+    crate::strict_descriptor::APPLY_FUNCTION_DESCRIPTOR_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_NEW_ANNOTATION_SET_IMPORT: ImportSpec =
+    ImportSpec::new(NEW_ANNOTATION_SET_SYMBOL, &[], &[SigType::Pointer]);
+pub(super) static SOAC_JIT_SETUP_ANNOTATIONS_IMPORT: ImportSpec = ImportSpec::new(
+    SETUP_ANNOTATIONS_SYMBOL,
+    &[SigType::Pointer],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_CREATE_TYPE_ALIAS_IMPORT: ImportSpec = ImportSpec::new(
+    CREATE_TYPE_ALIAS_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_CONSTRUCT_TYPE_PARAMETER_SCOPE_IMPORT: ImportSpec = ImportSpec::new(
+    CONSTRUCT_TYPE_PARAMETER_SCOPE_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_SUBSCRIPT_GENERIC_IMPORT: ImportSpec = ImportSpec::new(
+    SUBSCRIPT_GENERIC_SYMBOL,
+    &[SigType::Pointer],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_SET_FUNCTION_TYPE_PARAMETERS_IMPORT: ImportSpec = ImportSpec::new(
+    SET_FUNCTION_TYPE_PARAMETERS_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_CREATE_TYPE_PARAMETER_IMPORT: ImportSpec = ImportSpec::new(
+    CREATE_TYPE_PARAMETER_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::I32,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_SET_TYPE_PARAMETER_DEFAULT_IMPORT: ImportSpec = ImportSpec::new(
+    SET_TYPE_PARAMETER_DEFAULT_SYMBOL,
+    &[
+        SigType::I64,
+        SigType::Pointer,
+        SigType::Pointer,
+        SigType::Pointer,
+    ],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_COMPLETE_FUNCTION_DEFINITION_IMPORT: ImportSpec = ImportSpec::new(
+    COMPLETE_FUNCTION_DEFINITION_SYMBOL,
+    &[SigType::I64, SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_RECORD_ANNOTATION_IMPORT: ImportSpec = ImportSpec::new(
+    RECORD_ANNOTATION_SYMBOL,
+    &[SigType::Pointer, SigType::I32],
+    &[SigType::Pointer],
+);
+pub(super) static SOAC_JIT_CHECK_ANNOTATION_FORMAT_IMPORT: ImportSpec = ImportSpec::new(
+    CHECK_ANNOTATION_FORMAT_SYMBOL,
+    &[SigType::Pointer],
     &[SigType::Pointer],
 );
 pub(super) static SOAC_JIT_RESUME_GENERATOR_IMPORT: ImportSpec = ImportSpec::new(
@@ -579,15 +881,19 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
     &DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
     &DP_JIT_PY_CALL_OBJECT_IMPORT,
-    &DP_JIT_PY_VECTORCALL_IMPORT,
+    &PY_SOAC_VECTORCALL_CONTEXT_IMPORT,
+    &PY_SOAC_OBJECT_CALL_CONTEXT_IMPORT,
     &DP_JIT_MAKE_GENERATOR_INSTANCE_FROM_VECTORCALL_IMPORT,
     &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
     &PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
     &PY_HANDLE_PENDING_IMPORT,
-    &DP_JIT_PY_CALL_WITH_KW_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
     &DP_JIT_PYOBJECT_GETATTR_IMPORT,
+    &DP_JIT_MATCH_SEALED_FIELD_IMPORT,
+    &DP_JIT_RESOLVE_SEALED_VIRTUAL_METHOD_IMPORT,
+    &SOAC_RUNTIME_PROBE_SEALED_FIELD_IMPORT,
+    &SOAC_RUNTIME_LOAD_NATIVE_OBJECT_SLOT_IMPORT,
     &PYOBJECT_GETMETHOD_IMPORT,
     &DP_JIT_PYOBJECT_SETATTR_IMPORT,
     &DP_JIT_PYOBJECT_GETITEM_IMPORT,
@@ -609,6 +915,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYUNICODE_COMPARE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
+    &DP_JIT_PROFILE_CALLABLE_FUNCTION_ID_IMPORT,
     &DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT,
     &DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
     &DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
@@ -621,14 +928,44 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT,
     &DP_JIT_IS_TRUE_IMPORT,
     &DP_JIT_RAISE_FROM_EXC_IMPORT,
-    &DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
-    &DP_JIT_POP_HANDLED_EXCEPTION_IMPORT,
+    &DP_JIT_RESTORE_RAISED_EXCEPTION_IMPORT,
+    &DP_JIT_GENERATOR_RETURN_IMPORT,
+    &DP_JIT_HANDLED_STATE_INIT_IMPORT,
+    &DP_JIT_HANDLED_STATE_SELECT_IMPORT,
+    &DP_JIT_HANDLED_STATE_RAISED_IMPORT,
+    &DP_JIT_HANDLED_STATE_FINISH_IMPORT,
+    &DP_JIT_HANDLED_STATE_RELEASE_RESIDUAL_IMPORT,
+    &DP_JIT_RETIRE_TERMINAL_ROOTS_IMPORT,
+    &DP_JIT_RERAISE_CURRENT_IMPORT,
     &DP_JIT_DEOPT_RESUME_IMPORT,
+    &DP_JIT_CHECKED_FUNCTION_METADATA_IMPORT,
     &DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT,
     &DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
+    &DP_JIT_STRICT_FINISH_CALL_IMPORT,
+    &DP_JIT_PREPARE_STRICT_DIRECT_CALL_IMPORT,
+    &DP_JIT_FINISH_STRICT_DIRECT_CALL_IMPORT,
+    &DP_JIT_RETIRE_STRICT_CALL_ARGUMENTS_IMPORT,
     &DP_JIT_VECTORCALL_PREVIOUS_FOR_CHANGED_CODE_IMPORT,
     &DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
     &SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
+    &SOAC_JIT_CONSTRUCT_CLASS_IMPORT,
+    &SOAC_JIT_PREPARE_CLASS_DECORATOR_IMPORT,
+    &SOAC_JIT_PREPARE_CLASS_DECORATOR_UNPACKED_IMPORT,
+    &SOAC_JIT_APPLY_CLASS_DECORATOR_IMPORT,
+    &SOAC_JIT_DISCARD_CLASS_DECORATOR_IMPORT,
+    &SOAC_JIT_DISCARD_CLASS_CONSTRUCTION_CAPTURES_IMPORT,
+    &SOAC_JIT_COMPLETE_FUNCTION_DEFINITION_IMPORT,
+    &SOAC_JIT_APPLY_FUNCTION_DESCRIPTOR_IMPORT,
+    &SOAC_JIT_NEW_ANNOTATION_SET_IMPORT,
+    &SOAC_JIT_SETUP_ANNOTATIONS_IMPORT,
+    &SOAC_JIT_CREATE_TYPE_ALIAS_IMPORT,
+    &SOAC_JIT_CONSTRUCT_TYPE_PARAMETER_SCOPE_IMPORT,
+    &SOAC_JIT_SUBSCRIPT_GENERIC_IMPORT,
+    &SOAC_JIT_SET_FUNCTION_TYPE_PARAMETERS_IMPORT,
+    &SOAC_JIT_CREATE_TYPE_PARAMETER_IMPORT,
+    &SOAC_JIT_SET_TYPE_PARAMETER_DEFAULT_IMPORT,
+    &SOAC_JIT_RECORD_ANNOTATION_IMPORT,
+    &SOAC_JIT_CHECK_ANNOTATION_FORMAT_IMPORT,
     &SOAC_JIT_RESUME_GENERATOR_IMPORT,
 ];
 
@@ -696,6 +1033,16 @@ pub(super) fn predeclare_jit_runtime_imports(jit_module: &mut JITModule) -> Resu
     {
         imports.ensure_declared(jit_module, spec)?;
     }
+    for (spec, _) in super::native_iterator_runtime::primitive_bindings() {
+        imports.ensure_declared(jit_module, spec)?;
+    }
+    for (spec, _) in super::collection_runtime::primitive_bindings()
+        .into_iter()
+        .chain(super::call_arguments_runtime::primitive_bindings())
+        .chain(super::iteration_runtime::primitive_bindings())
+    {
+        imports.ensure_declared(jit_module, spec)?;
+    }
     for symbol in [
         CpythonTypeSymbol::Function,
         CpythonTypeSymbol::Method,
@@ -740,13 +1087,10 @@ pub(super) fn predeclare_specialization_type_imports(
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let opt_v3_planned_fields = profile.opt_v3_indexed_field_access_plans();
-    let opt_v3_layout_groups =
-        opt_v3_indexed_field_layout_groups(opt_v3_planned_fields.iter().copied());
-    prime_opt_v3_field_index_layouts(opt_v3_layout_groups.iter())?;
     let mut type_refs = HashSet::new();
     for planned in opt_v3_planned_fields {
         let request = opt_v3_indexed_field_runtime_access_request(planned);
-        if let Some(specialization) = field_index_specialization_from_primed_opt_v3(&request)? {
+        if let Some(specialization) = field_index_specialization_from_opt_v3(&request)? {
             type_refs.insert(specialization.owner_type_ref);
         }
     }

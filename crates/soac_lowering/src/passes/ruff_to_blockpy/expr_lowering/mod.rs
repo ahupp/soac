@@ -1,7 +1,7 @@
 use crate::block_py::{
     core_runtime_positional_call_expr_with_meta, literal_expr, BlockLabel, BlockTerm, Del,
-    FunctionKind, FunctionNameGen, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, Meta,
-    RuntimeFunctionId, Store, StringLiteral, TermIf, UnresolvedName, WithMeta,
+    FunctionNameGen, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, Meta, Store,
+    StringLiteral, TermIf, UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
@@ -14,6 +14,7 @@ use ruff_text_size::TextRange;
 use std::collections::HashSet;
 
 mod boolop_compare;
+pub(crate) mod call_arguments;
 mod if_expr;
 mod named_expr;
 mod recursive;
@@ -95,8 +96,7 @@ fn inplace_kind(op: ast::Operator) -> Option<crate::block_py::BinOpKind> {
 
 impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
     fn from_lowered_expr(expr: InstrRuff) -> Self {
-        lower_direct_core_helper_expr(&expr)
-            .unwrap_or_else(|| InstrWithAwaitAndYield::from_ruff_expr(expr))
+        InstrWithAwaitAndYield::from_ruff_expr(normalize_core_helper_expr(expr))
     }
 
     fn helper_call(
@@ -184,6 +184,20 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
 }
 
 pub(crate) trait BlockPySetupExprLowerer {
+    /// A registered operation may encode non-evaluated payload in its Call
+    /// children. None identifies an ordinary source call; Some(0) still keeps
+    /// a registered source-call boundary distinct from generic call assembly.
+    fn recorded_call_runtime_start(
+        &self,
+        _call: &crate::block_py::Call<InstrRuff>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn fresh_operand_binding(&self) -> String {
+        fresh_setup_name("operand")
+    }
+
     fn can_forward_name_value(&self, _name: &str) -> bool {
         false
     }
@@ -197,7 +211,7 @@ pub(crate) trait BlockPySetupExprLowerer {
     where
         E: RuffToBlockPyExpr,
     {
-        let expr = lower_string_templates_in_instr_ruff(expr);
+        let expr = normalize_core_helper_expr(lower_string_templates_in_instr_ruff(expr));
         recursive::lower_expr_ast_recursive(self, expr, out, loop_ctx)
     }
 
@@ -220,19 +234,55 @@ pub(crate) struct AstSetupExprLowerer;
 
 impl BlockPySetupExprLowerer for AstSetupExprLowerer {}
 
-pub(crate) struct ScopedSetupExprLowerer {
+pub(crate) struct ScopedSetupExprLowerer<'a> {
+    context: &'a Context,
     value_forwarding_locals: HashSet<String>,
 }
 
-impl ScopedSetupExprLowerer {
-    pub(crate) fn new(value_forwarding_locals: HashSet<String>) -> Self {
+impl<'a> ScopedSetupExprLowerer<'a> {
+    pub(crate) fn new(context: &'a Context) -> Self {
         Self {
-            value_forwarding_locals,
+            context,
+            value_forwarding_locals: context.current_value_forwarding_locals(),
         }
     }
 }
 
-impl BlockPySetupExprLowerer for ScopedSetupExprLowerer {
+impl BlockPySetupExprLowerer for ScopedSetupExprLowerer<'_> {
+    fn recorded_call_runtime_start(
+        &self,
+        call: &crate::block_py::Call<InstrRuff>,
+    ) -> Option<usize> {
+        let node = call.meta().node_index.load();
+        if self.context.function_construction(node).is_some() {
+            // Recorded callee/id/kind/empty closure are payload, not values.
+            return Some(4);
+        }
+        if let Some(operation) = self.context.class_decorator_operation(node) {
+            use crate::passes::ast_to_ast::context::ClassDecoratorOperation;
+            return Some(match operation {
+                ClassDecoratorOperation::Prepare { factory: true, .. } => 0,
+                // Cleanup identifies storage rather than evaluating its value.
+                ClassDecoratorOperation::DeleteBinding => 2,
+                _ => 1,
+            });
+        }
+        if self.context.annotation_operation(node).is_some()
+            || self.context.function_completion(node).is_some()
+            || self.context.is_class_capture_discard(node)
+        {
+            return Some(1);
+        }
+        if self.context.function_descriptor_application(node).is_some() {
+            // The descriptor is the real source callee.
+            return Some(0);
+        }
+        None
+    }
+
+    fn fresh_operand_binding(&self) -> String {
+        self.context.fresh_annotation_binding("operand")
+    }
     fn can_forward_name_value(&self, name: &str) -> bool {
         self.value_forwarding_locals.contains(name)
     }
@@ -620,7 +670,7 @@ pub(crate) fn try_lower_effect_only_expr_direct_with_context<E>(
 where
     E: RuffToBlockPyExpr,
 {
-    let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
+    let lowerer = ScopedSetupExprLowerer::new(context);
     try_lower_effect_only_expr_direct_with_lowerer(&lowerer, name_gen, expr, loop_ctx)
 }
 
@@ -649,35 +699,7 @@ pub(crate) fn lower_expr_into_with_context<E>(
 where
     E: RuffToBlockPyExpr,
 {
-    ScopedSetupExprLowerer::new(context.current_value_forwarding_locals())
-        .lower_expr_into(expr, out, loop_ctx)
-}
-
-fn make_function_kind_from_literal(expr: &InstrRuff) -> Option<FunctionKind> {
-    let InstrRuff::ExprStringLiteral(string) = expr else {
-        return None;
-    };
-    Some(match string.value.to_str() {
-        "function" => FunctionKind::Function,
-        "coroutine" => FunctionKind::Coroutine,
-        "generator" => FunctionKind::Generator,
-        "async_generator" => FunctionKind::AsyncGenerator,
-        _ => return None,
-    })
-}
-
-fn make_function_id_from_literal(expr: &InstrRuff) -> Option<RuntimeFunctionId> {
-    let InstrRuff::ExprNumberLiteral(number) = expr else {
-        return None;
-    };
-    let ast::Number::Int(value) = &number.value else {
-        return None;
-    };
-    value
-        .to_string()
-        .parse()
-        .ok()
-        .map(RuntimeFunctionId::from_packed_runtime_u64)
+    ScopedSetupExprLowerer::new(context).lower_expr_into(expr, out, loop_ctx)
 }
 
 fn string_literal_value(expr: &InstrRuff) -> Option<String> {
@@ -695,7 +717,14 @@ fn lowered_helper_call<'a>(
     let InstrRuff::Call(call) = expr else {
         return None;
     };
-    if !call.keywords.is_empty() || call.args.len() != arity {
+    if !call.keywords.is_empty()
+        || call.frame_namespace.is_some()
+        || call.args.len() != arity
+        || call
+            .args
+            .iter()
+            .any(|arg| matches!(arg, crate::block_py::CallArgPositional::Starred(_)))
+    {
         return None;
     }
     if !matches!(
@@ -709,68 +738,31 @@ fn lowered_helper_call<'a>(
     Some(call)
 }
 
-fn lower_direct_core_helper_expr(expr: &InstrRuff) -> Option<InstrWithAwaitAndYield> {
-    fn lowered(expr: InstrRuff) -> InstrWithAwaitAndYield {
-        <InstrWithAwaitAndYield as RuffToBlockPyExpr>::from_lowered_expr(expr)
-    }
-
-    if let Some(call) = lowered_helper_call(expr, "make_function", 5) {
-        let crate::block_py::CallArgPositional::Positional(function_id_expr) = &call.args[0] else {
-            return None;
-        };
-        let crate::block_py::CallArgPositional::Positional(kind_expr) = &call.args[1] else {
-            return None;
-        };
-        let crate::block_py::CallArgPositional::Positional(param_defaults_expr) = &call.args[3]
-        else {
-            return None;
-        };
-        let crate::block_py::CallArgPositional::Positional(annotate_fn_expr) = &call.args[4] else {
-            return None;
-        };
-        let function_id = make_function_id_from_literal(function_id_expr)?;
-        let kind = make_function_kind_from_literal(kind_expr)?;
-        return Some(
-            crate::block_py::MakeFunction::new(
-                function_id,
-                kind,
-                Box::new(lowered(param_defaults_expr.clone())),
-                Box::new(lowered(annotate_fn_expr.clone())),
-            )
-            .with_meta(call.meta())
-            .into(),
-        );
-    }
-
-    if let Some(call) = lowered_helper_call(expr, "store_global", 3) {
+fn normalize_core_helper_expr(expr: InstrRuff) -> InstrRuff {
+    if let Some(call) = lowered_helper_call(&expr, "store_global", 3) {
         let crate::block_py::CallArgPositional::Positional(name_expr) = &call.args[1] else {
-            return None;
+            unreachable!("helper operands were checked");
         };
         let crate::block_py::CallArgPositional::Positional(value_expr) = &call.args[2] else {
-            return None;
+            unreachable!("helper operands were checked");
         };
-        return Some(
-            crate::block_py::Store::new(
-                ast::name::Name::new(string_literal_value(name_expr)?),
-                Box::new(lowered(value_expr.clone())),
-            )
-            .with_meta(call.meta())
-            .into(),
-        );
-    }
-
-    if let Some(call) = lowered_helper_call(expr, "cell_ref", 1) {
-        let crate::block_py::CallArgPositional::Positional(name_expr) = &call.args[0] else {
-            return None;
-        };
-        return Some(
-            crate::block_py::CellRefForName::new(string_literal_value(name_expr)?)
+        if let Some(name) = string_literal_value(name_expr) {
+            return crate::block_py::Store::new(ast::name::Name::new(name), value_expr.clone())
                 .with_meta(call.meta())
-                .into(),
-        );
+                .into();
+        }
     }
-
-    None
+    if let Some(call) = lowered_helper_call(&expr, "cell_ref", 1) {
+        let crate::block_py::CallArgPositional::Positional(name_expr) = &call.args[0] else {
+            unreachable!("helper operands were checked");
+        };
+        if let Some(name) = string_literal_value(name_expr) {
+            return crate::block_py::CellRefForName::new(name, None)
+                .with_meta(call.meta())
+                .into();
+        }
+    }
+    expr
 }
 
 pub(crate) fn fresh_setup_name(prefix: &str) -> String {

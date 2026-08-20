@@ -9,4 +9,9 @@ except Exception as err:
     )
     raise
 
-__all__ = ["_soac_ext"]
+# The native exceptions use this module in their qualified names. Keep these
+# aliases identical to soac.strict's exports, including for pickle/import.
+StrictMutationError = _soac_ext.StrictMutationError
+StrictRuntimeUnavailableError = _soac_ext.StrictRuntimeUnavailableError
+
+__all__ = ["_soac_ext", "StrictMutationError", "StrictRuntimeUnavailableError"]

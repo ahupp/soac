@@ -41,7 +41,10 @@ def validate_module(module):
             f"{prior_enabled_modules},{entry}" if prior_enabled_modules else entry
         )
         try:
-            assert module.import_temp_module(tmp_path) is True
+            # An allow-list entry is not strict source opt-in, checker
+            # publication, or native startup authority. The temporary module
+            # must remain ordinary in both the stock and strict callers.
+            assert module.import_temp_module(tmp_path) is False
         finally:
             if prior_enabled_modules is None:
                 os.environ.pop("SOAC_MODULE_ENABLED", None)

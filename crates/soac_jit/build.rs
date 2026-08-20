@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let runtime_src = runtime_dir.join("src").join("lib.rs");
     emit_vendored_python_link(repo_root)?;
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    write_cpython_call_opcodes(repo_root, &out_dir)?;
     let clif_out_dir = out_dir.join("soac_jit_runtime-clif");
 
     emit_rerun_if_changed(&runtime_dir)?;
@@ -41,6 +42,53 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     write_runtime_clif_constant(&runtime_clif)?;
+    Ok(())
+}
+
+/// The adapter resolves a small explicit source-edge manifest, not arbitrary
+/// Python bytecode. The three call IDs are selected-build ABI data;
+/// runtime opcode/dis module attributes never supply admission authority.
+fn write_cpython_call_opcodes(repo_root: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-env-changed=CPYTHON_SOURCE_DIR");
+    let source = env::var_os("CPYTHON_SOURCE_DIR")
+        .map(|path| repo_root.join(path))
+        .unwrap_or_else(|| repo_root.join("vendor/cpython"));
+    let header = source.join("Include/opcode_ids.h");
+    println!("cargo:rerun-if-changed={}", header.display());
+    let contents = fs::read_to_string(&header)?;
+    let names = ["CALL", "CALL_KW", "CALL_FUNCTION_EX"];
+    let mut values = vec![None; names.len()];
+    for line in contents.lines() {
+        let mut words = line.split_ascii_whitespace();
+        if words.next() != Some("#define") {
+            continue;
+        }
+        let Some(name) = words.next() else { continue };
+        let Some(index) = names.iter().position(|expected| *expected == name) else {
+            continue;
+        };
+        if values[index].is_some() {
+            return Err(format!("duplicate {name} in {}", header.display()).into());
+        }
+        let value = words
+            .next()
+            .ok_or_else(|| format!("missing {name} value in {}", header.display()))?;
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) || words.next().is_some() {
+            return Err(format!("non-numeric {name} in {}", header.display()).into());
+        }
+        values[index] = Some(value.parse::<u8>()?);
+    }
+    let mut generated =
+        String::from("// Selected CPython opcode_ids.h; build-derived ABI constants.\n");
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, value) in names.into_iter().zip(values) {
+        let value = value.ok_or_else(|| format!("missing {name} in {}", header.display()))?;
+        if !seen.insert(value) {
+            return Err(format!("overlapping selected opcode IDs in {}", header.display()).into());
+        }
+        generated.push_str(&format!("pub(super) const {name}: u8 = {value};\n"));
+    }
+    fs::write(out_dir.join("cpython_call_opcodes.rs"), generated)?;
     Ok(())
 }
 

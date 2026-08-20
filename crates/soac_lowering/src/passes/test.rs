@@ -44,13 +44,18 @@ fn rewrite_ast_to_ast_for_testing(source: &str) -> (Context, Suite, SemanticAstS
         .expect("source should parse")
         .into_syntax();
     let mut body = module.body;
-    rewrite_future_annotations::rewrite(&mut body).expect("future annotation rewrite");
+    rewrite_future_annotations::rewrite(&mut body, None).expect("future annotation rewrite");
     let context = Context::new(source);
     rewrite_class_def::record_class_static_attributes(&context, &mut body);
     rewrite_class_def::private::rewrite_private_names(&context, &mut body);
+    let source_names = crate::passes::ast_to_ast::SourceNameCatalog::from_original(&mut body);
     rewrite_stmt::annotation::rewrite_ann_assign_to_dunder_annotate(&context, &mut body);
     rewrite_with_pass(&context, None, Some(&ScopedHelperExprPass), &mut body);
-    let mut semantic_state = SemanticAstState::from_ruff(&mut body);
+    let mut semantic_state = SemanticAstState::from_ruff_with_lambda_bodies(
+        &mut body,
+        &source_names,
+        context.take_lowered_lambda_bodies(),
+    );
     crate::driver::wrap_module_init(&mut semantic_state, &mut body);
     rewrite_class_def::class_body::rewrite_class_body_scopes(
         &context,
@@ -137,7 +142,7 @@ where
                     }
                     check(branch.default_label, "branch default");
                 }
-                BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+                BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
             }
             if let Some(edge) = &block.exc_edge {
                 check(edge.target, "exception");
@@ -358,7 +363,9 @@ where
                     .exc
                     .as_ref()
                     .is_some_and(|exc| instr_any(exc, &mut predicate)),
-                BlockTerm::Return(value) => instr_any(value, &mut predicate),
+                BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
+                    instr_any(value, &mut predicate)
+                }
                 BlockTerm::Jump(_) => false,
             }
     })
@@ -691,20 +698,20 @@ fn instr_ruff_from_ast_stmt_recursively_lowers_function_body_and_return() {
             node_index: ast::AtomicNodeIndex::default(),
             range: ruff_text_size::TextRange::default(),
             is_async: false,
-            decorator_list: Vec::new(),
+            decorator_list: Default::default(),
             name: ast::Identifier::new("f", ruff_text_size::TextRange::default()),
             type_params: None,
             parameters: Box::new(ast::Parameters {
                 range: ruff_text_size::TextRange::default(),
                 node_index: ast::AtomicNodeIndex::default(),
-                posonlyargs: Vec::new(),
-                args: Vec::new(),
+                posonlyargs: Default::default(),
+                args: Default::default(),
                 vararg: None,
-                kwonlyargs: Vec::new(),
+                kwonlyargs: Default::default(),
                 kwarg: None,
             }),
             returns: None,
-            body: vec![crate::template::py_stmt!("return g(x)")],
+            body: [crate::template::py_stmt!("return g(x)")].into(),
         }));
 
     let InstrRuff::StmtFunctionDef(func) = instr else {
@@ -735,8 +742,8 @@ fn instr_ruff_from_ast_stmt_recursively_lowers_loop_body_and_orelse() {
         node_index: ast::AtomicNodeIndex::default(),
         range: ruff_text_size::TextRange::default(),
         test: Box::new(crate::template::py_expr!("cond")),
-        body: vec![crate::template::py_stmt!("x = 1")],
-        orelse: vec![crate::template::py_stmt!("y = 2")],
+        body: [crate::template::py_stmt!("x = 1")].into(),
+        orelse: [crate::template::py_stmt!("y = 2")].into(),
     }));
 
     let InstrRuff::StmtWhile(while_stmt) = instr else {
@@ -1133,6 +1140,80 @@ def execute(value):
 }
 
 #[test]
+fn calls_carry_their_source_namespace_even_for_unknown_aliases() {
+    use soac_core::block_py::{CallableScopeKind, FrameNamespace};
+    use soac_ir_blockpy::InstrBlockPy;
+    let source = "from builtins import locals as query\nmodule_snapshot = query()\nclass Box:\n    value = 7\n    snapshot = query()\ndef read():\n    return query()\n";
+    let module = lower_python_to_blockpy_for_testing(source)
+        .unwrap()
+        .blockpy_module;
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct ContextCalls {
+        module: usize,
+        mapping: usize,
+        unmaterialized: usize,
+    }
+    impl crate::block_py::Visit<InstrBlockPy> for ContextCalls {
+        fn visit_instr(&mut self, expr: &InstrBlockPy) {
+            if let InstrBlockPy::Call(call) = expr {
+                match &call.frame_namespace {
+                    Some(FrameNamespace::ModuleGlobals) => self.module += 1,
+                    Some(FrameNamespace::Mapping(namespace)) => {
+                        assert!(matches!(namespace.as_ref(), InstrBlockPy::Load(load)
+                            if load.name.id.as_str() == "_dp_class_ns"
+                                && matches!(load.name.location, crate::block_py::NameLocation::Local(_))));
+                        self.mapping += 1;
+                    }
+                    None => self.unmaterialized += 1,
+                }
+            }
+            crate::block_py::walk_expr(self, expr);
+        }
+    }
+
+    let contexts =
+        |module: &crate::block_py::BlockPyModule<soac_ir_blockpy::BlockPyModuleShape>| {
+            module
+                .callable_defs
+                .iter()
+                .map(|function| {
+                    let mut calls = ContextCalls::default();
+                    crate::block_py::Visit::visit_fn(&mut calls, function);
+                    (function.scope.scope_kind, calls)
+                })
+                .collect::<Vec<_>>()
+        };
+    let calls = contexts(&module);
+    let (_, module_calls) = calls
+        .iter()
+        .find(|(scope, _)| *scope == CallableScopeKind::Module)
+        .unwrap();
+    assert!(module_calls.module > 0);
+    assert_eq!(module_calls.mapping, 0);
+    let (_, class_calls) = calls
+        .iter()
+        .find(|(scope, _)| *scope == CallableScopeKind::Class)
+        .unwrap();
+    assert!(class_calls.mapping > 0);
+    assert_eq!(class_calls.module, 0);
+    let mut function_calls = ContextCalls::default();
+    let read = module
+        .callable_defs
+        .iter()
+        .find(|function| function.names.display_name == "read")
+        .expect("ordinary function");
+    crate::block_py::Visit::visit_fn(&mut function_calls, read);
+    assert!(function_calls.unmaterialized > 0);
+    assert_eq!((function_calls.module, function_calls.mapping), (0, 0));
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&module).unwrap();
+    let restored: crate::block_py::BlockPyModule<soac_ir_blockpy::BlockPyModuleShape> =
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
+    assert_eq!(contexts(&restored), calls);
+}
+
+#[test]
 fn unsound_name_binding_keeps_assigned_or_declared_builtin_names_global() {
     let source = r#"
 len = lambda value: 42
@@ -1274,11 +1355,23 @@ def outer():
     ));
 
     let resolved_class_helper = lowered.bb_function("_dp_class_ns_Box");
-    assert!(!function_or_constants_use_text(
-        lowered.bb_module(),
-        resolved_class_helper,
-        "class_lookup_cell",
-    ));
+    let captured_x = resolved_class_helper
+        .public_storage_layout()
+        .unwrap()
+        .freevars
+        .iter()
+        .position(|slot| slot.logical_name == "x")
+        .unwrap() as u32;
+    assert!(
+        blockpy_function_instr_any(resolved_class_helper, |expr| {
+            runtime_call_by_name(lowered.bb_module(), expr, "class_lookup_cell")
+            .is_some_and(|call| {
+                matches!(call.args.as_slice(), [_, _, CallArgPositional::Positional(InstrResolved::CellRef(cell))]
+                    if cell.location == CellLocation::CapturedSource(captured_x))
+            })
+        }),
+        "the original class load must consult its namespace before the exact captured cell"
+    );
     assert!(resolved_function_has_setitem(resolved_class_helper));
     assert!(resolved_function_uses_captured_source(
         resolved_class_helper
@@ -1487,6 +1580,138 @@ fn method_super_uses_cell_ref_marker_for_classcell() {
         "{resolved_method:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
+}
+
+fn assert_super_uses_parameter_and_captured_class(
+    lowered: &TrackedLowering,
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+    parameter: &str,
+    expected_calls: usize,
+) {
+    assert_eq!(
+        function
+            .params
+            .iter()
+            .next()
+            .map(|param| param.name.as_str()),
+        Some(parameter),
+    );
+    let layout = function.storage_layout.as_ref().expect("callable storage");
+    let class_ordinal = layout
+        .freevars
+        .iter()
+        .position(|slot| slot.logical_name == "__class__")
+        .expect("super uses this callable's captured class cell") as u32;
+    let class_slot = &layout.freevars[class_ordinal as usize];
+    assert_eq!(class_slot.storage_name, "__class__");
+    assert_eq!(class_slot.init, ClosureInit::InheritedCapture);
+    let parameter_slot = layout
+        .stack_slots
+        .iter()
+        .position(|name| name == parameter)
+        .expect("the first parameter has its own local storage") as u32;
+    let mut calls = 0;
+    blockpy_function_instr_any(function, |instruction| {
+        let Some(call) = runtime_call_by_name(lowered.bb_module(), instruction, "call_super")
+        else {
+            return false;
+        };
+        calls += 1;
+        assert!(call.keywords.is_empty());
+        assert!(
+            matches!(
+                call.args.as_slice(),
+                [
+                    _,
+                    CallArgPositional::Positional(InstrResolved::CellRef(class)),
+                    CallArgPositional::Positional(InstrResolved::Load(receiver)),
+                ] if class.location == CellLocation::CapturedSource(class_ordinal)
+                    && receiver.name.id_str() == parameter
+                    && receiver.name.location.as_local()
+                        .is_some_and(|location| location.slot() == parameter_slot)
+            ),
+            "super must use the exact class freevar and first-parameter local",
+        );
+        false
+    });
+    assert_eq!(calls, expected_calls);
+}
+
+#[test]
+fn nested_definition_lambdas_normalize_super_with_their_own_receiver() {
+    for expression in ["super()", "(super(), [item for item in (1,)])"] {
+        for declaration in [
+            format!(
+                "        def nested(callback=lambda receiver: {expression}):\n            return callback\n        return nested()\n"
+            ),
+            format!(
+                "        @decorate(lambda receiver: {expression})\n        def nested():\n            return None\n        return nested\n"
+            ),
+        ] {
+            let source = format!(
+                "def decorate(callback):\n    def apply(function):\n        return function\n    return apply\nclass Base:\n    pass\nclass Derived(Base):\n    def build(self):\n{declaration}"
+            );
+            let lowered = TrackedLowering::new(&source);
+            let core = lowered.blockpy_module();
+            let build = blockpy_function_by_name(&core, "build");
+            let nested = blockpy_function_by_name(&core, "nested");
+            let lambda = blockpy_function_by_qualname(
+                &core, "Derived.build.<locals>.<lambda>",
+            );
+            assert!(blockpy_function_instr_any(build, |instruction| {
+                matches!(instruction, InstrWithAwaitAndYield::MakeFunction(created)
+                    if created.function_id == lambda.function_id)
+            }), "the default/decorator creates the lambda in build");
+            assert!(!blockpy_function_instr_any(nested, |instruction| {
+                matches!(instruction, InstrWithAwaitAndYield::MakeFunction(created)
+                    if created.function_id == lambda.function_id)
+            }), "the nested def body does not create its default/decorator lambda");
+
+            let resolved = function_by_name(lowered.bb_module(), &lambda.names.bind_name);
+            assert_super_uses_parameter_and_captured_class(&lowered, resolved, "receiver", 1);
+            let layout = resolved.storage_layout.as_ref().unwrap();
+            assert!(!layout.freevars.iter().any(|slot| slot.logical_name == "self"),
+                "the lambda must not capture build's receiver");
+            assert!(!resolved_function_uses_local(resolved, "self"));
+
+            let build_layout = lowered.bb_function("build").storage_layout.as_ref().unwrap();
+            assert_eq!(
+                slot_by_name(&build_layout.freevars, "__class__").init,
+                ClosureInit::InheritedCapture,
+                "build transports the actual class cell to its lambda",
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_definition_and_lambda_defaults_keep_the_containing_super_receiver() {
+    for expression in ["super()", "(super(), [item for item in (1,)])"] {
+        let source = format!(
+            "class Base:\n    pass\nclass Derived(Base):\n    def build(self):\n        def nested(prior=super(), callback=lambda receiver=super(): {expression}):\n            return prior, callback\n        return nested()\n"
+        );
+        let lowered = TrackedLowering::new(&source);
+        let core = lowered.blockpy_module();
+        let lambda = blockpy_function_by_qualname(&core, "Derived.build.<locals>.<lambda>");
+        assert_super_uses_parameter_and_captured_class(
+            &lowered,
+            lowered.bb_function("build"),
+            "self",
+            2,
+        );
+        assert_super_uses_parameter_and_captured_class(
+            &lowered,
+            function_by_name(lowered.bb_module(), &lambda.names.bind_name),
+            "receiver",
+            1,
+        );
+        assert!(
+            !blockpy_function_instr_any(lowered.bb_function("nested"), |instruction| {
+                runtime_call_by_name(lowered.bb_module(), instruction, "call_super").is_some()
+            }),
+            "definition-time super calls are not moved into nested"
+        );
+    }
 }
 
 #[test]
@@ -2375,6 +2600,227 @@ def gen():
 }
 
 #[test]
+fn nested_handled_regions_remain_distinct_across_generator_lowering() {
+    let lowered = TrackedLowering::new(
+        r#"
+def gen(mark):
+    try:
+        raise ValueError('outer')
+    except ValueError:
+        mark(1)
+        try:
+            raise LookupError('inner')
+        except LookupError:
+            mark(2)
+            yield 3
+        mark(4)
+"#,
+    );
+    let resume = lowered.bb_function("gen");
+    let nested = resume
+        .blocks
+        .iter()
+        .filter(|block| block.handled_exception_params().count() >= 2)
+        .collect::<Vec<_>>();
+    assert!(
+        !nested.is_empty(),
+        "an outer region must not erase an inner handler"
+    );
+    let layout = resume
+        .storage_layout
+        .as_ref()
+        .expect("suspended state layout");
+    for block in nested {
+        let scopes = block.handled_exception_params().collect::<Vec<_>>();
+        assert_eq!(scopes.last().unwrap().role, BlockParamRole::Exception);
+        assert!(scopes[..scopes.len() - 1]
+            .iter()
+            .all(|param| { param.role == BlockParamRole::EnclosingException }));
+        let names = scopes
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), scopes.len());
+        for name in names {
+            assert!(layout
+                .preserved_slots
+                .iter()
+                .any(|slot| slot.logical_name == name));
+        }
+    }
+    for block in &resume.blocks {
+        let Some(edge) = &block.exc_edge else {
+            continue;
+        };
+        let target = resume
+            .blocks
+            .iter()
+            .find(|target| target.label == edge.target)
+            .unwrap();
+        for (param, arg) in target.params.iter().zip(&edge.args) {
+            if param.role == BlockParamRole::EnclosingException {
+                assert!(
+                    !matches!(arg, BlockArg::CurrentException),
+                    "an inner raise cannot replace the surrounding handler operand"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_handled_regions_forward_every_enclosing_name_across_cleanup_branches() {
+    let lowered = TrackedLowering::new(
+        r#"
+def lookup(first, second, third, name):
+    try:
+        return first[name]
+    except KeyError:
+        try:
+            return second[name]
+        except KeyError:
+            try:
+                return third[name]
+            except KeyError as exc:
+                raise NameError(name) from exc
+"#,
+    );
+    let function = blockpy_function_by_name(&lowered.result.blockpy_module, "lookup");
+    let mut forwarded_nonfirst_region = 0;
+    let mut forwarded_identity = None;
+    for block in &function.blocks {
+        let enclosing = block
+            .params
+            .iter()
+            .filter(|param| param.role == BlockParamRole::EnclosingException)
+            .collect::<Vec<_>>();
+        if enclosing.len() < 2 {
+            continue;
+        }
+        let BlockTerm::BranchTable(branch) = &block.term else {
+            continue;
+        };
+        for label in branch
+            .targets
+            .iter()
+            .chain(std::iter::once(&branch.default_label))
+        {
+            let target = function
+                .blocks
+                .iter()
+                .find(|block| block.label == *label)
+                .unwrap();
+            for param in target
+                .params
+                .iter()
+                .filter(|param| param.role == BlockParamRole::EnclosingException)
+            {
+                assert!(block.params.iter().any(|source| source.name == param.name));
+                forwarded_nonfirst_region += usize::from(param.name != enclosing[0].name);
+                if param.name != enclosing[0].name {
+                    forwarded_identity = Some((block.label, param.name.clone()));
+                }
+            }
+        }
+    }
+    assert!(forwarded_nonfirst_region > 0, "cleanup must forward distinct nested handler operands, not just the first same-role parameter");
+    let (source_label, source_name) = forwarded_identity.unwrap();
+    let mut missing_identity = lowered.result.blockpy_module.clone();
+    let source = missing_identity
+        .callable_defs
+        .iter_mut()
+        .find(|function| function.names.bind_name == "lookup")
+        .unwrap()
+        .blocks
+        .iter_mut()
+        .find(|block| block.label == source_label)
+        .unwrap();
+    source
+        .params
+        .iter_mut()
+        .find(|param| param.name == source_name)
+        .unwrap()
+        .name = "different_enclosing_region".into();
+    assert!(
+        crate::block_py::validate_module(&missing_identity).is_err(),
+        "the same role cannot stand in for a missing enclosing-region identity"
+    );
+}
+
+#[test]
+fn suspended_terminal_cleanup_exits_handlers_without_erasing_raised_operands() {
+    use soac_core::block_py::HandledExceptionContext;
+    let lowered = TrackedLowering::new(
+        "def gen(probe):\n    try:\n        raise ValueError()\n    except ValueError:\n        yield probe\n        return probe\n",
+    );
+    let resume = lowered.bb_function("gen");
+    let exhausted_label = resume
+        .blocks
+        .iter()
+        .find_map(|block| match &block.term {
+            BlockTerm::BranchTable(branch) if branch.index.root_name_id() == Some("_dp_pc") => {
+                Some(branch.default_label)
+            }
+            _ => None,
+        })
+        .expect("resume dispatch has an already-exhausted target");
+    let terminal = resume
+        .blocks
+        .iter()
+        .filter(|block| block.extra.handled_exception == HandledExceptionContext::Terminal)
+        .collect::<Vec<_>>();
+    assert!(
+        terminal.len() >= 2,
+        "completion and exceptional cleanup must be explicit"
+    );
+    assert!(
+        terminal
+            .iter()
+            .any(|block| block.exception_param().is_some()),
+        "escaping exception remains an explicit transported operand"
+    );
+    let mut live_cleanup_blocks = 0;
+    let mut completed_values = Vec::new();
+    for block in terminal {
+        assert_eq!(block.handled_exception_params().count(), 0);
+        match &block.term {
+            BlockTerm::GeneratorReturn(value) => completed_values.push(value),
+            BlockTerm::Raise(_) => {}
+            other => panic!("terminal region must propagate an error or complete: {other:?}"),
+        }
+        assert!(block.exc_edge.is_none());
+        if block.label == exhausted_label {
+            assert!(block.params.is_empty());
+            assert!(
+                block.body.is_empty(),
+                "already-closed state has no locals to clear again"
+            );
+        } else {
+            assert!(
+                !block.body.is_empty(),
+                "live saved-local cleanup is inside the terminal region"
+            );
+            live_cleanup_blocks += 1;
+        }
+    }
+    assert!(
+        live_cleanup_blocks >= 2,
+        "live completion and exceptional cleanup are both represented"
+    );
+    assert_eq!(
+        completed_values.len(),
+        2,
+        "live and already-exhausted completion are explicit"
+    );
+    assert!(
+        completed_values
+            .iter()
+            .all(|value| matches!(value, InstrResolved::Load(_))),
+        "completion carries its pinned value without constructing a source raise"
+    );
+}
+
+#[test]
 fn coroutine_resume_dispatch_does_not_target_parameterized_exception_blocks() {
     let source = r#"
 import asyncio
@@ -2434,25 +2880,53 @@ async def parent():
                 continue;
             }
             assert_eq!(edge.args.len(), jump_target.params.len());
+            assert_eq!(
+                block.extra.handled_exception,
+                soac_core::block_py::HandledExceptionContext::Preserve
+            );
+            assert_eq!(
+                target_block.extra.handled_exception,
+                soac_core::block_py::HandledExceptionContext::Preserve
+            );
             for (param, arg) in jump_target.params.iter().zip(edge.args.iter()) {
-                match param.role {
-                    BlockParamRole::Exception => {
-                        assert!(
-                            matches!(arg, BlockArg::None),
-                            "resume dispatch wrapper should pass None for {}",
-                            param.name
-                        );
-                    }
-                    BlockParamRole::Value
-                    | BlockParamRole::AbruptKind
-                    | BlockParamRole::AbruptPayload => {
-                        assert!(
-                            matches!(arg, BlockArg::Name(name) if name == &param.name),
-                            "resume dispatch wrapper should preserve carried parameter {}",
-                            param.name
-                        );
-                    }
+                let BlockArg::Name(source_name) = arg else {
+                    panic!(
+                        "resume dispatch must restore carried parameter {}, got {arg:?}",
+                        param.name
+                    );
+                };
+                if source_name == &param.name {
+                    continue;
                 }
+                // A parameterless wrapper materializes a preserved operand in
+                // a fresh local before passing it through the explicit edge.
+                // Verify its actual saved slot, not the incidental local name.
+                let restored_slot = target_block
+                    .body
+                    .iter()
+                    .find_map(|instr| {
+                        let InstrResolved::Store(store) = instr else {
+                            return None;
+                        };
+                        if store.name.id_str() != source_name {
+                            return None;
+                        }
+                        let InstrResolved::Load(load) = store.value.as_ref() else {
+                            return None;
+                        };
+                        load.name.preserved_location()
+                    })
+                    .expect("dispatch alias must load an actual preserved value");
+                let slot = resume
+                    .storage_layout
+                    .as_ref()
+                    .unwrap()
+                    .preserved_slot(restored_slot.0)
+                    .expect("dispatch alias refers to a declared preserved slot");
+                assert_eq!(
+                    slot.logical_name, param.name,
+                    "dispatch must restore this parameter's exact saved value"
+                );
             }
         }
     }
@@ -2855,7 +3329,9 @@ def choose(y):
     let choose = blockpy_function_by_name(&blockpy_module, "choose");
     assert!(blockpy_function_has_store_name(choose, "x"));
     assert!(blockpy_function_has_root_name(choose, "f"));
-    assert!(blockpy_function_has_root_name(choose, "x"));
+    // The expression passes its saved original value, not a new source read
+    // of the assignment target (which may have observable lookup behavior).
+    assert!(!blockpy_function_has_root_name(choose, "x"));
 }
 
 #[test]
@@ -2901,6 +3377,224 @@ def choose(xs):
         expr,
         InstrWithAwaitAndYield::MakeFunction(_)
     )));
+}
+
+#[test]
+fn scoped_helper_expr_pass_keeps_lambda_body_helpers_in_the_lambda_scope() {
+    use crate::block_py::{BindingKind, CellBindingKind};
+
+    for (expression, display_name) in [
+        (
+            "[visit(target.value, item) for target.value in values for item in inner()]",
+            "<listcomp>",
+        ),
+        (
+            "{visit(target.value, item) for target.value in values for item in inner()}",
+            "<setcomp>",
+        ),
+        (
+            "{item: visit(target.value, item) for target.value in values for item in inner()}",
+            "<dictcomp>",
+        ),
+        (
+            "(visit(target.value, item) for target.value in values for item in inner())",
+            "<genexpr>",
+        ),
+    ] {
+        let source = format!(
+            "\ndef make():\n    return lambda target, values, inner, visit, item: (\n        {expression},\n        item,\n    )\n"
+        );
+        let module = tracked_core_blockpy_with_await_and_yield(&source);
+        let make = blockpy_function_by_name(&module, "make");
+        let lambda = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.display_name == "<lambda>")
+            .expect("the original lambda keeps its own callable scope");
+        let helper = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.display_name == display_name)
+            .expect("the comprehension keeps its ordinary helper scope");
+        let creates_helper = |instruction: &InstrWithAwaitAndYield| match instruction {
+            InstrWithAwaitAndYield::MakeFunction(created) => {
+                created.function_id == helper.function_id
+            }
+            _ => false,
+        };
+        assert!(
+            blockpy_function_instr_any(lambda, creates_helper),
+            "the lambda must create its helper when called: {expression}"
+        );
+        assert!(
+            !blockpy_function_instr_any(make, creates_helper),
+            "lambda-body helper creation must not escape into make: {expression}"
+        );
+        assert!(
+            blockpy_function_has_store_name(lambda, &helper.names.bind_name),
+            "the helper call must have a binding in its execution scope"
+        );
+        for name in ["target", "inner", "visit"] {
+            assert_eq!(
+                lambda.scope.binding_kind(name),
+                Some(BindingKind::Cell(CellBindingKind::Owner)),
+                "the lambda owns its captured parameter {name}: {expression}"
+            );
+            assert_eq!(
+                helper.scope.binding_kind(name),
+                Some(BindingKind::Cell(CellBindingKind::Capture)),
+                "the helper captures the actual lambda parameter {name}: {expression}"
+            );
+        }
+        assert_eq!(lambda.scope.binding_kind("item"), Some(BindingKind::Local));
+        assert_eq!(helper.scope.binding_kind("item"), Some(BindingKind::Local));
+        assert_eq!(
+            lambda.scope.binding_kind("values"),
+            Some(BindingKind::Local)
+        );
+        assert!(
+            blockpy_function_has_root_name(lambda, "values"),
+            "the initial iterable still evaluates in the lambda call"
+        );
+    }
+}
+
+#[test]
+fn lambda_body_helpers_keep_default_scope_and_nested_class_cells() {
+    use crate::block_py::{BindingKind, CellBindingKind};
+
+    let source = r#"
+def owner(enabled, default):
+    class Box:
+        callback = (lambda values=default(): [
+            lambda: (__class__, item) for item in values
+        ]) if enabled else None
+    return Box
+"#;
+    let module = tracked_core_blockpy_with_await_and_yield(source);
+    let namespace = module
+        .callable_defs
+        .iter()
+        .find(|function| function.scope.scope_kind == CallableScopeKind::Class)
+        .expect("class namespace keeps its own execution scope");
+    let callback = module
+        .callable_defs
+        .iter()
+        .find(|function| {
+            function.names.display_name == "<lambda>" && function.scope.has_local_def("values")
+        })
+        .expect("outer lambda");
+    let nested = module
+        .callable_defs
+        .iter()
+        .find(|function| {
+            function.names.display_name == "<lambda>"
+                && function.function_id != callback.function_id
+        })
+        .expect("delayed lambda in the comprehension body");
+    let helper = module
+        .callable_defs
+        .iter()
+        .find(|function| function.names.display_name == "<listcomp>")
+        .expect("ordinary comprehension helper");
+    assert!(blockpy_function_has_root_name(namespace, "default"));
+    assert!(!blockpy_function_has_root_name(callback, "default"));
+    assert!(namespace
+        .blocks
+        .iter()
+        .any(|block| matches!(&block.term, BlockTerm::IfTerm(_))));
+    assert!(
+        blockpy_function_instr_any(namespace, |instruction| {
+            matches!(instruction, InstrWithAwaitAndYield::MakeFunction(created)
+            if created.function_id == callback.function_id)
+        }),
+        "lambda creation and its defaults stay in the class expression"
+    );
+    assert!(blockpy_function_instr_any(callback, |instruction| {
+        matches!(instruction, InstrWithAwaitAndYield::MakeFunction(created)
+            if created.function_id == helper.function_id)
+    }));
+    assert!(blockpy_function_instr_any(helper, |instruction| {
+        matches!(instruction, InstrWithAwaitAndYield::MakeFunction(created)
+            if created.function_id == nested.function_id)
+    }));
+    for function in [callback, helper, nested] {
+        assert_eq!(
+            function.scope.binding_kind("__class__"),
+            Some(BindingKind::Cell(CellBindingKind::Capture)),
+            "the existing class cell must reach every actual lexical consumer"
+        );
+    }
+    assert_eq!(
+        helper.scope.binding_kind("item"),
+        Some(BindingKind::Cell(CellBindingKind::Owner))
+    );
+    assert_eq!(
+        nested.scope.binding_kind("item"),
+        Some(BindingKind::Cell(CellBindingKind::Capture))
+    );
+}
+
+#[test]
+fn lambda_body_class_cell_dependency_reaches_its_enclosing_method() {
+    use crate::block_py::{BindingKind, CellBindingKind};
+
+    let lowered = TrackedLowering::new(
+        "class Box:\n    def build(self, saved):\n        return lambda values: [(__class__, saved, item) for item in values]\n"
+    );
+    let module = lowered.blockpy_module();
+    let method = blockpy_function_by_name(&module, "build");
+    let lambda = module
+        .callable_defs
+        .iter()
+        .find(|function| function.names.display_name == "<lambda>")
+        .expect("source lambda");
+    let helper = module
+        .callable_defs
+        .iter()
+        .find(|function| function.names.display_name == "<listcomp>")
+        .expect("lambda-owned helper");
+    for function in [method, lambda, helper] {
+        assert_eq!(
+            function.scope.binding_kind("__class__"),
+            Some(BindingKind::Cell(CellBindingKind::Capture)),
+            "an enclosing callable must not lose a dependency inside a stored lambda body"
+        );
+    }
+    assert_eq!(
+        method.scope.cell_capture_source_name("__class__"),
+        "_dp_classcell"
+    );
+    for function in [method, lambda] {
+        assert!(
+            !function.scope.has_local_def("item"),
+            "the iteration target belongs only to the helper"
+        );
+    }
+    let method_layout = lowered
+        .bb_function("build")
+        .storage_layout
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        slot_by_name(&method_layout.cellvars, "saved").init,
+        ClosureInit::Parameter
+    );
+    for function in [lambda, helper] {
+        let resolved = function_by_name(lowered.bb_module(), &function.names.bind_name);
+        let layout = resolved.storage_layout.as_ref().unwrap();
+        assert_eq!(
+            slot_by_name(&layout.freevars, "saved").init,
+            ClosureInit::InheritedCapture
+        );
+        assert!(
+            !layout
+                .cellvars
+                .iter()
+                .any(|slot| slot.logical_name == "saved"),
+            "intermediate closure transport must not allocate another saved owner"
+        );
+    }
 }
 
 #[test]
@@ -3364,17 +4058,76 @@ def outer(scale):
     let pc = preserved_slot_by_name(&layout.preserved_slots, "_dp_pc");
     assert_eq!(pc.storage_name, "_dp_cell__dp_pc");
     assert_eq!(pc.init, ClosureInit::RuntimePcUnstarted);
-    let deleted_eval = layout
-        .preserved_slots
-        .iter()
-        .find(|slot| slot.logical_name.starts_with("_dp_eval_"))
-        .unwrap_or_else(|| panic!("missing preserved evaluation slot in {layout:?}"));
-    assert_eq!(
-        deleted_eval.storage_name,
-        format!("_dp_cell_{}", deleted_eval.logical_name)
+    // Ordered-suspension prefixes use Operand + Take. The surrounding
+    // augmented assignment also owns scratch values and releases them by Del.
+    // Both routes must retire the same explicit preserved owner they acquired.
+    #[derive(Default)]
+    struct Operands {
+        stored: HashSet<PreservedLocation>,
+        taken: HashSet<PreservedLocation>,
+        deleted: HashSet<PreservedLocation>,
+    }
+    impl crate::block_py::Visit<InstrResolved> for Operands {
+        fn visit_instr(&mut self, instr: &InstrResolved) {
+            match instr {
+                InstrResolved::Store(store)
+                    if matches!(
+                        store.lifetime,
+                        crate::block_py::StoreLifetime::Operand { .. }
+                    ) =>
+                {
+                    if let NameLocation::Preserved(location) = store.name.location {
+                        self.stored.insert(location);
+                    }
+                }
+                InstrResolved::TakeOperand(take) => {
+                    if let NameLocation::Preserved(location) = take.name.location {
+                        self.taken.insert(location);
+                    }
+                }
+                InstrResolved::Del(delete) => {
+                    if let NameLocation::Preserved(location) = delete.name.location {
+                        self.deleted.insert(location);
+                    }
+                }
+                _ => {}
+            }
+            instr.visit_children(self);
+        }
+    }
+    let mut operands = Operands::default();
+    crate::block_py::Visit::visit_fn(&mut operands, run);
+    assert!(
+        !operands.stored.is_empty(),
+        "the augmented-assignment prefix crosses await"
     );
-    assert_eq!(deleted_eval.init, ClosureInit::Deferred);
-    assert_eq!(deleted_eval.storage, PreservedSlotStorage::PyObjectOrNull);
+    assert!(
+        operands
+            .stored
+            .intersection(&operands.taken)
+            .next()
+            .is_some(),
+        "ordered await operands must still use the consuming handoff"
+    );
+    assert!(
+        operands
+            .stored
+            .intersection(&operands.deleted)
+            .next()
+            .is_some(),
+        "augmented-assignment scratch uses explicit deletion"
+    );
+    for location in operands.stored {
+        assert!(layout.is_expression_temporary(location));
+        let slot = &layout.preserved_slots[location.slot() as usize];
+        assert_eq!(slot.init, ClosureInit::Deferred);
+        assert_eq!(slot.storage, PreservedSlotStorage::PyObjectOrNull);
+        assert!(slot.generator_control.is_none());
+        assert!(
+            operands.taken.contains(&location) || operands.deleted.contains(&location),
+            "preserved operand {location:?} must have an explicit Take or Del retirement"
+        );
+    }
 }
 
 #[test]
@@ -3664,26 +4417,120 @@ def run(items):
         out.append(99)
     return out
 "#;
-    let bb_module = tracked_name_binding_module(source)
-        .expect("transform should succeed")
-        .expect("bb module should be available");
+    let result = lower_python_to_blockpy_for_testing(source).expect("transform should succeed");
+    let bb_module = result
+        .pass_tracker
+        .pass_name_binding()
+        .expect("name-bound CFG should be available");
     let run = function_by_name(&bb_module, "run");
+    let fetches = run
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.body.iter().any(|instr| {
+                instr_any(instr, |instr| {
+                    matches!(instr, InstrResolved::IteratorStep(_))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let [fetch] = fetches.as_slice() else {
+        panic!("one source loop has one native Step site")
+    };
+    let mut iterator = None;
+    for instruction in &fetch.body {
+        instr_any(instruction, |instr| {
+            if let InstrResolved::IteratorStep(step) = instr {
+                assert!(iterator.replace(step.name.location).is_none());
+            }
+            false
+        });
+    }
+    let iterator = iterator.unwrap();
+    let dispatch = run
+        .blocks
+        .iter()
+        .find(|block| {
+            block.label
+                == fetch
+                    .exc_edge
+                    .as_ref()
+                    .expect("fetch errors have a classifier")
+                    .target
+        })
+        .unwrap();
+    let BlockTerm::IfTerm(branch) = &dispatch.term else {
+        panic!("implicit exhaustion has an explicit conditional dispatch")
+    };
+    let classifier = runtime_call_by_name(&bb_module, &branch.test, "exception_matches")
+        .expect("the native iteration boundary classifies the caught exception");
+    let Some(CallArgPositional::Positional(InstrResolved::Load(stop))) = classifier.args.get(1)
+    else {
+        panic!("explicit exhaustion exception class")
+    };
+    assert!(stop.name.is_runtime_symbol("StopIteration") ||
+        stop.name.location.as_constant().is_some_and(|index| {
+            matches!(bb_module.module_constants.get(index as usize), Some(InstrResolved::Load(load))
+                if load.name.is_runtime_symbol("StopIteration"))
+        }));
+    let error_cleanup = run
+        .blocks
+        .iter()
+        .find(|block| block.label == branch.else_label)
+        .unwrap();
+    assert!(matches!(&error_cleanup.term, BlockTerm::Raise(raise)
+        if raise.disposition == crate::block_py::RaiseDisposition::PropagateNormalized));
     assert!(
-        function_or_constants_use_text(&bb_module, run, "StopIteration"),
-        "{run:?}"
+        error_cleanup
+            .body
+            .iter()
+            .any(|instr| instr_any(instr, |instr| {
+                matches!(instr, InstrResolved::TakeOperand(take)
+            if take.name.location == iterator)
+            })),
+        "a non-exhaustion error consumes the same iterator owner"
     );
+    // Local Operand roles are finalized after name binding. Validate the
+    // actual prepared Step against that final registry, not the early empty one.
+    let prepared = result
+        .blockpy_module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == run.function_id)
+        .unwrap();
+    let layout = prepared.storage_layout.as_ref().unwrap();
+    let mut prepared_iterator = None;
+    for block in &prepared.blocks {
+        for instruction in &block.body {
+            instr_any(instruction, |instr| {
+                if let crate::block_py::InstrBlockPy::IteratorStep(step) = instr {
+                    assert!(prepared_iterator
+                        .replace(step.validate_resolved(layout).unwrap())
+                        .is_none());
+                }
+                false
+            });
+        }
+    }
+    let prepared_iterator = prepared_iterator.expect("the prepared source retains its native Step");
     assert!(
-        function_or_constants_use_text(&bb_module, run, "next"),
-        "{run:?}"
+        prepared
+            .blocks
+            .iter()
+            .any(|block| block.body.iter().any(|instruction| {
+                instr_any(instruction, |instr| {
+                    matches!(instr, crate::block_py::InstrBlockPy::TakeOperand(take)
+            if take.validate_resolved(layout).unwrap() == prepared_iterator)
+                })
+            })),
+        "prepared cleanup consumes the validated compiler iterator owner"
     );
-    assert!(
-        function_or_constants_use_text(&bb_module, run, "iter"),
-        "{run:?}"
-    );
-    assert!(
-        !function_or_constants_use_text(&bb_module, run, "object"),
-        "{run:?}"
-    );
+    assert!(blockpy_function_instr_any(run, |expr| {
+        runtime_call_by_name(&bb_module, expr, "iter").is_some()
+    }));
+    assert!(!blockpy_function_instr_any(run, |expr| {
+        runtime_call_by_name(&bb_module, expr, "object").is_some()
+    }));
     assert!(
         run.blocks
             .iter()
@@ -3957,17 +4804,14 @@ def make_counter(delta):
         .map(|slot| slot.logical_name.as_str())
         .collect::<HashSet<_>>();
     assert!(
-        [
-            "sent",
-            "total",
-            "_dp_pc",
-            "_dp_is_closed",
-            "_dp_yieldfrom",
-            "_dp_throw_context"
-        ]
-        .into_iter()
-        .all(|name| preserved_names.contains(name)),
+        ["sent", "total", "_dp_pc", "_dp_is_closed", "_dp_yieldfrom",]
+            .into_iter()
+            .all(|name| preserved_names.contains(name)),
         "private generator state should remain distinct from lexical closure state: {layout:#?}"
+    );
+    assert!(
+        !preserved_names.contains("_dp_throw_context"),
+        "the actual handled-exception owner replaces the stale throw-context snapshot",
     );
     assert!(
         layout
@@ -3975,6 +4819,99 @@ def make_counter(delta):
             .iter()
             .all(|slot| !matches!(slot.logical_name.as_str(), "sent" | "total")),
         "private generator state should not be represented as lexical cellvars: {layout:#?}"
+    );
+}
+
+#[test]
+fn name_binding_marks_raw_preserved_parameter_copies_but_not_lexical_reads() {
+    use crate::block_py::{StorageLayout, StoreLifetime, StorePurpose, Visit};
+
+    let source = r#"
+def generate(error_factory, marker):
+    plain = marker
+    def capture():
+        return marker
+    try:
+        raise error_factory()
+    except ValueError:
+        yield (plain, capture)
+    return plain
+"#;
+    let module = tracked_name_binding_module(source)
+        .expect("name binding should succeed")
+        .expect("name-binding pass should be tracked");
+    let function = function_by_name(&module, "generate");
+    let layout = function.storage_layout.as_ref().expect("generator storage");
+    assert!(
+        layout
+            .preserved_slots
+            .iter()
+            .any(|slot| slot.storage == PreservedSlotStorage::PyCellObject),
+        "the fixture must include an actual lexical cell, not only raw transports",
+    );
+
+    struct Copies<'a> {
+        layout: &'a StorageLayout,
+        local_to_preserved: usize,
+        preserved_to_local: usize,
+        lexical_read_bindings: usize,
+    }
+    impl Visit<InstrResolved> for Copies<'_> {
+        fn visit_instr(&mut self, instr: &InstrResolved) {
+            if let InstrResolved::Store(store) = instr {
+                if store.purpose == StorePurpose::BlockParameterTransport {
+                    assert_eq!(store.lifetime, StoreLifetime::Frame);
+                    let InstrResolved::Load(source) = store.value.as_ref() else {
+                        panic!("a parameter transport must be an explicit raw load/store");
+                    };
+                    let preserved = match (store.name.location, source.name.location) {
+                        (NameLocation::Preserved(slot), NameLocation::Local(_)) => {
+                            self.local_to_preserved += 1;
+                            slot
+                        }
+                        (NameLocation::Local(_), NameLocation::Preserved(slot)) => {
+                            self.preserved_to_local += 1;
+                            slot
+                        }
+                        other => {
+                            panic!("transport purpose escaped its actual slot copy: {other:?}")
+                        }
+                    };
+                    assert_ne!(
+                        self.layout.preserved_slots[preserved.slot() as usize].storage,
+                        PreservedSlotStorage::PyCellObject,
+                        "lexical cells must not enter caught-value transport retirement",
+                    );
+                } else if matches!(
+                    store.value.as_ref(),
+                    InstrResolved::Load(source) if matches!(source.name.location, NameLocation::Cell(_))
+                ) {
+                    self.lexical_read_bindings += 1;
+                }
+            }
+            instr.visit_children(self);
+        }
+    }
+    let mut copies = Copies {
+        layout,
+        local_to_preserved: 0,
+        preserved_to_local: 0,
+        lexical_read_bindings: 0,
+    };
+    for block in &function.blocks {
+        crate::block_py::walk_block(&mut copies, block);
+    }
+    assert!(
+        copies.local_to_preserved > 0,
+        "incoming parameters must synchronize raw slots"
+    );
+    assert!(
+        copies.preserved_to_local > 0,
+        "resume arguments must materialize real local copies"
+    );
+    assert!(
+        copies.lexical_read_bindings > 0,
+        "ordinary source cell reads must remain bindings"
     );
 }
 

@@ -2,12 +2,13 @@ use super::ast_to_ast::string_templates::lower_string_templates_in_expr;
 use crate::block_py::{
     core_call_expr_with_meta, core_runtime_name_expr_with_meta,
     core_runtime_positional_call_expr_with_meta, literal_expr, Await, BytesLiteral, CallArgKeyword,
-    CallArgPositional, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, Meta, NumberLiteral,
-    NumberLiteralValue, StringLiteral, WithMeta, Yield, YieldFrom,
+    CallArgPositional, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, MapInstr, Mappable,
+    Meta, NumberLiteral, NumberLiteralValue, StringLiteral, WithMeta, Yield, YieldFrom,
 };
 use crate::passes::InstrRuff;
 use crate::template::py_expr;
 use ruff_python_ast::{self as ast, Expr};
+use ruff_text_size::Ranged;
 
 fn core_builtin_name(id: &str) -> InstrWithAwaitAndYield {
     core_runtime_name_expr_with_meta(id, Default::default(), Default::default())
@@ -57,29 +58,24 @@ fn complex_literal_expr_with_meta(
     )
 }
 
-fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYield {
+fn reduce_core_blockpy_dict(
+    items: Vec<crate::block_py::ExprDictItem<InstrWithAwaitAndYield>>,
+) -> InstrWithAwaitAndYield {
     let mut segments: Vec<InstrWithAwaitAndYield> = Vec::new();
-    let mut keyed_pairs = Vec::new();
+    let mut keyed_pairs: Vec<InstrWithAwaitAndYield> = Vec::new();
 
     for item in items {
         match item {
-            ast::DictItem {
+            crate::block_py::ExprDictItem {
                 key: Some(key),
                 value,
             } => {
-                keyed_pairs.push(py_expr!(
-                    "({key:expr}, {value:expr})",
-                    key = key,
-                    value = value,
-                ));
+                keyed_pairs.push(crate::block_py::Tuple::new(vec![key, value]).into());
             }
-            ast::DictItem { key: None, value } => {
+            crate::block_py::ExprDictItem { key: None, value } => {
                 if !keyed_pairs.is_empty() {
-                    let tuple = tuple_from_ast_exprs_with_meta(
-                        std::mem::take(&mut keyed_pairs),
-                        ast::AtomicNodeIndex::default(),
-                        Default::default(),
-                    );
+                    let tuple =
+                        crate::block_py::Tuple::new(std::mem::take(&mut keyed_pairs)).into();
                     segments.push(core_runtime_positional_call_expr_with_meta(
                         "dict",
                         ast::AtomicNodeIndex::default(),
@@ -87,20 +83,18 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYie
                         vec![tuple],
                     ));
                 }
-                segments.push(InstrWithAwaitAndYield::from_ast_expr(py_expr!(
-                    "__soac__.dict({mapping:expr})",
-                    mapping = value
-                )));
+                segments.push(core_runtime_positional_call_expr_with_meta(
+                    "dict",
+                    ast::AtomicNodeIndex::default(),
+                    Default::default(),
+                    vec![value],
+                ));
             }
         }
     }
 
     if !keyed_pairs.is_empty() {
-        let tuple = tuple_from_ast_exprs_with_meta(
-            keyed_pairs,
-            ast::AtomicNodeIndex::default(),
-            Default::default(),
-        );
+        let tuple = crate::block_py::Tuple::new(keyed_pairs).into();
         segments.push(core_runtime_positional_call_expr_with_meta(
             "dict",
             ast::AtomicNodeIndex::default(),
@@ -305,8 +299,8 @@ fn compare_expr_from_ast_with_meta(
             node_index,
             range,
             crate::block_py::BinOpKind::Contains,
-            right,
             left,
+            right,
         ),
         ast::CmpOp::NotIn => unary_op_expr_with_meta(
             node_index.clone(),
@@ -316,8 +310,8 @@ fn compare_expr_from_ast_with_meta(
                 node_index,
                 range,
                 crate::block_py::BinOpKind::Contains,
-                right,
                 left,
+                right,
             ),
         ),
     }
@@ -369,33 +363,6 @@ fn lower_core_call_keywords(
         .collect()
 }
 
-fn make_function_kind_from_literal(expr: &Expr) -> Option<crate::block_py::FunctionKind> {
-    let Expr::StringLiteral(node) = expr else {
-        return None;
-    };
-    match node.value.to_str() {
-        "function" => Some(crate::block_py::FunctionKind::Function),
-        "coroutine" => Some(crate::block_py::FunctionKind::Coroutine),
-        "generator" => Some(crate::block_py::FunctionKind::Generator),
-        "async_generator" => Some(crate::block_py::FunctionKind::AsyncGenerator),
-        _ => None,
-    }
-}
-
-fn make_function_id_from_literal(expr: &Expr) -> Option<crate::block_py::RuntimeFunctionId> {
-    let Expr::NumberLiteral(node) = expr else {
-        return None;
-    };
-    let ast::Number::Int(value) = &node.value else {
-        return None;
-    };
-    value
-        .to_string()
-        .parse()
-        .ok()
-        .map(crate::block_py::RuntimeFunctionId::from_packed_runtime_u64)
-}
-
 fn string_arg_from_core_expr(expr: InstrWithAwaitAndYield) -> Option<String> {
     let InstrWithAwaitAndYield::Literal(literal) = expr else {
         return None;
@@ -425,7 +392,7 @@ fn non_operator_operation_from_helper_call(
         .with_meta(meta)
         .into(),
         "cell_ref" => {
-            crate::block_py::CellRefForName::new(string_arg_from_core_expr(args.next()?)?)
+            crate::block_py::CellRefForName::new(string_arg_from_core_expr(args.next()?)?, None)
                 .with_meta(meta)
                 .into()
         }
@@ -445,27 +412,6 @@ fn lower_core_call_expr_with_meta(
     keywords: Vec<ast::Keyword>,
 ) -> InstrWithAwaitAndYield {
     if keywords.is_empty() {
-        if let Expr::Attribute(attr) = &func {
-            if matches!(attr.value.as_ref(), Expr::Name(base) if base.id.as_str() == "__soac__")
-                && attr.attr.id.as_str() == "make_function"
-                && args.len() == 5
-            {
-                if let (Some(function_id), Some(kind)) = (
-                    make_function_id_from_literal(&args[0]),
-                    make_function_kind_from_literal(&args[1]),
-                ) {
-                    return core_operation_expr(
-                        crate::block_py::MakeFunction::new(
-                            function_id,
-                            kind,
-                            Box::new(InstrWithAwaitAndYield::from_ast_expr(args[3].clone())),
-                            Box::new(InstrWithAwaitAndYield::from_ast_expr(args[4].clone())),
-                        )
-                        .with_meta(Meta::new(node_index, range)),
-                    );
-                }
-            }
-        }
         if let Expr::Attribute(attr) = &func {
             if matches!(attr.value.as_ref(), Expr::Name(base) if base.id.as_str() == "__soac__") {
                 let mut operation_args = Vec::with_capacity(args.len());
@@ -502,7 +448,9 @@ fn lower_core_call_expr_with_meta(
     )
 }
 
-fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
+fn reduce_core_tuple_segments(
+    elts: impl IntoIterator<Item = (InstrWithAwaitAndYield, Option<Meta>)>,
+) -> InstrWithAwaitAndYield {
     let mut segments: Vec<InstrWithAwaitAndYield> = Vec::new();
     let mut values: Vec<InstrWithAwaitAndYield> = Vec::new();
 
@@ -515,25 +463,23 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
             .into()
     }
 
-    for elt in elts {
-        match elt {
-            Expr::Starred(ast::ExprStarred {
-                value,
-                node_index,
-                range,
-                ..
-            }) => {
+    for (value, starred_meta) in elts {
+        match starred_meta {
+            Some(meta) => {
                 if !values.is_empty() {
                     segments.push(tuple_pack(std::mem::take(&mut values)));
                 }
-                segments.push(core_runtime_positional_call_expr_with_meta(
-                    "tuple_from_iter",
-                    node_index,
-                    range,
-                    vec![InstrWithAwaitAndYield::from_ast_expr(*value)],
-                ));
+                segments.push(
+                    core_runtime_positional_call_expr_with_meta(
+                        "tuple_from_iter",
+                        meta.node_index.clone(),
+                        meta.range,
+                        vec![value],
+                    )
+                    .with_meta(meta),
+                );
             }
-            other => values.push(InstrWithAwaitAndYield::from_ast_expr(other)),
+            None => values.push(value),
         }
     }
 
@@ -547,9 +493,119 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
         .unwrap_or_else(|| tuple_pack(Vec::new()))
 }
 
+fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
+    reduce_core_tuple_segments(elts.into_iter().map(|elt| match elt {
+        Expr::Starred(node) => (
+            InstrWithAwaitAndYield::from_ast_expr(*node.value),
+            Some(Meta::new(node.node_index, node.range)),
+        ),
+        other => (InstrWithAwaitAndYield::from_ast_expr(other), None),
+    }))
+}
+
+fn reduce_core_ruff_tuple(elts: Vec<InstrRuff>, meta: Meta) -> InstrWithAwaitAndYield {
+    if !elts
+        .iter()
+        .any(|elt| matches!(elt, InstrRuff::ExprStarred(_)))
+    {
+        return crate::block_py::Tuple::new(
+            elts.into_iter()
+                .map(InstrWithAwaitAndYield::from_ruff_expr)
+                .collect::<Vec<_>>(),
+        )
+        .with_meta(meta)
+        .into();
+    }
+    reduce_core_tuple_segments(elts.into_iter().map(|elt| match elt {
+        InstrRuff::ExprStarred(node) => {
+            let meta = node.meta();
+            (
+                InstrWithAwaitAndYield::from_ruff_expr(*node.value),
+                Some(meta),
+            )
+        }
+        other => (InstrWithAwaitAndYield::from_ruff_expr(other), None),
+    }))
+    .with_meta(meta)
+}
+
+struct LowerRuffChildren;
+
+impl MapInstr<InstrRuff, InstrWithAwaitAndYield> for LowerRuffChildren {
+    fn map_instr(&mut self, instr: InstrRuff) -> InstrWithAwaitAndYield {
+        InstrWithAwaitAndYield::from_ruff_expr(instr)
+    }
+
+    fn map_name(
+        &mut self,
+        name: crate::block_py::UnresolvedName,
+    ) -> crate::block_py::UnresolvedName {
+        name
+    }
+}
+
+fn lower_core_ruff_call(node: crate::block_py::Call<InstrRuff>) -> InstrWithAwaitAndYield {
+    let helper_name = match node.func.as_ref() {
+        InstrRuff::ExprAttribute(attr) if matches!(attr.value.as_ref(), InstrRuff::ExprName(base) if base.id.as_str() == "__soac__") => {
+            Some(attr.attr.id.as_str().to_owned())
+        }
+        _ => None,
+    };
+    // The shared mapper retains argument kinds, full source metadata, and the
+    // explicit namespace operand without making a lossy trip through raw AST.
+    let call = node.map_children(&mut LowerRuffChildren);
+    if call.keywords.is_empty() && call.frame_namespace.is_none() {
+        if let Some(helper_name) = helper_name {
+            let args = call
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    CallArgPositional::Positional(value) => Some(value.clone()),
+                    CallArgPositional::Starred(_) => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(args) = args {
+                let meta = call.meta();
+                if let Some(operation) = non_operator_operation_from_helper_call(
+                    &helper_name,
+                    meta.node_index.clone(),
+                    meta.range,
+                    args,
+                ) {
+                    return operation.with_meta(meta);
+                }
+            }
+        }
+    }
+    InstrWithAwaitAndYield::Call(call)
+}
+
 impl InstrWithAwaitAndYield {
     pub(crate) fn from_ruff_expr(value: InstrRuff) -> Self {
         match value {
+            InstrRuff::Call(node) => lower_core_ruff_call(node),
+            InstrRuff::Store(node) => Self::Store(node.map_children(&mut LowerRuffChildren)),
+            InstrRuff::Del(node) => Self::Del(node.map_children(&mut LowerRuffChildren)),
+            InstrRuff::MakeCell(node) => Self::MakeCell(node.map_children(&mut LowerRuffChildren)),
+            InstrRuff::ComprehensionInsert(node) => {
+                Self::ComprehensionInsert(node.map_children(&mut LowerRuffChildren))
+            }
+            InstrRuff::BuildCollection(node) => {
+                Self::BuildCollection(node.map_children(&mut LowerRuffChildren))
+            }
+            InstrRuff::CallArgumentOp(node) => {
+                Self::CallArgumentOp(node.map_children(&mut LowerRuffChildren))
+            }
+            InstrRuff::PreparedCall(node) => {
+                Self::PreparedCall(node.map_children(&mut LowerRuffChildren))
+            }
+            InstrRuff::IteratorStep(node) => {
+                Self::IteratorStep(node.map_children(&mut LowerRuffChildren))
+            }
+            InstrRuff::CellRefForName(node) => Self::CellRefForName(node),
+            InstrRuff::TakeOperand(node) => {
+                Self::TakeOperand(node.map_children(&mut LowerRuffChildren))
+            }
             InstrRuff::Await(node) => {
                 let meta = node.meta();
                 Self::Await(
@@ -662,7 +718,53 @@ impl InstrWithAwaitAndYield {
                 let op = node.ops.into_iter().next().expect("single compare op");
                 compare_expr_from_ast_with_meta(node_index, range, op, left, right)
             }
-            InstrRuff::ExprDict(node) => reduce_core_blockpy_dict(node.items.into()),
+            InstrRuff::ExprTuple(node) if matches!(node.ctx, ast::ExprContext::Load) => {
+                let meta = node.meta();
+                reduce_core_ruff_tuple(node.elts, meta)
+            }
+            InstrRuff::ExprList(node) if matches!(node.ctx, ast::ExprContext::Load) => {
+                let meta = node.meta();
+                let tuple = reduce_core_ruff_tuple(node.elts, meta.clone());
+                core_runtime_positional_call_expr_with_meta(
+                    "list",
+                    meta.node_index.clone(),
+                    meta.range,
+                    vec![tuple],
+                )
+                .with_meta(meta)
+            }
+            InstrRuff::ExprSet(node) => {
+                let meta = node.meta();
+                let tuple = reduce_core_ruff_tuple(node.elts, meta.clone());
+                core_runtime_positional_call_expr_with_meta(
+                    "set",
+                    meta.node_index.clone(),
+                    meta.range,
+                    vec![tuple],
+                )
+                .with_meta(meta)
+            }
+            InstrRuff::ExprSlice(node) => {
+                let meta = node.meta();
+                let node = node.map_children(&mut LowerRuffChildren);
+                let bound = |value: Option<Box<Self>>| {
+                    value
+                        .map(|value| *value)
+                        .unwrap_or_else(|| core_builtin_name("NONE"))
+                };
+                core_runtime_positional_call_expr_with_meta(
+                    "slice",
+                    meta.node_index.clone(),
+                    meta.range,
+                    vec![bound(node.lower), bound(node.upper), bound(node.step)],
+                )
+                .with_meta(meta)
+            }
+            InstrRuff::ExprDict(node) => {
+                let meta = node.meta();
+                let node = node.map_children(&mut LowerRuffChildren);
+                reduce_core_blockpy_dict(node.items).with_meta(meta)
+            }
             InstrRuff::ExprName(node) => {
                 let meta = node.meta();
                 InstrWithAwaitAndYield::Load(crate::block_py::Load::new(node.id).with_meta(meta))
@@ -678,13 +780,16 @@ impl InstrWithAwaitAndYield {
         let mut value = value;
         lower_string_templates_in_expr(&mut value);
         match value {
-            Expr::Call(node) => lower_core_call_expr_with_meta(
-                *node.func,
-                node.node_index,
-                node.range,
-                node.arguments.args.into_vec(),
-                node.arguments.keywords.into_vec(),
-            ),
+            Expr::Call(node) => {
+                let range = node.range();
+                lower_core_call_expr_with_meta(
+                    *node.func,
+                    node.node_index,
+                    range,
+                    node.arguments.args.into_vec(),
+                    node.arguments.keywords.into(),
+                )
+            }
             Expr::Await(node) => Self::Await(
                 Await::new(Self::from_ast_expr(*node.value))
                     .with_meta(Meta::new(node.node_index, node.range)),
@@ -845,7 +950,15 @@ impl InstrWithAwaitAndYield {
                     .map(|expr| *expr)
                     .unwrap_or_else(|| py_expr!("None")),
             )),
-            Expr::Dict(node) => reduce_core_blockpy_dict(node.items.into()),
+            Expr::Dict(node) => reduce_core_blockpy_dict(
+                node.items
+                    .into_iter()
+                    .map(|item| crate::block_py::ExprDictItem {
+                        key: item.key.map(Self::from_ast_expr),
+                        value: Self::from_ast_expr(item.value),
+                    })
+                    .collect(),
+            ),
             Expr::Name(node) => {
                 let meta = node.meta();
                 InstrWithAwaitAndYield::Load(crate::block_py::Load::new(node.id).with_meta(meta))

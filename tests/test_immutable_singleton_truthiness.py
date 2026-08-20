@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import subprocess
-import sys
 import textwrap
+
+from scripts.strict_pyperformance_sources import strict_opt_in
+from tests._strict_integration import (
+    StrictValidationCase,
+    _VALIDATION_PRELUDE,
+    create_strict_project,
+)
+
+_PROFILE_FUNCTIONS = ('branch', 'inverted', 'dynamic_branch', 'short_circuit', 'descriptor_branch', 'temporary_branch', 'hot')
 
 
 _MODULE_SOURCE = """
@@ -148,7 +154,7 @@ def hot(owner):
 
 
 def _run_truthiness_worker(
-    tmp_path: Path, module_name: str, work_dir: Path, mode: str
+    project, tmp_path: Path, module_name: str, work_dir: Path, mode: str
 ) -> dict:
     script = textwrap.dedent(
         """
@@ -163,11 +169,9 @@ def _run_truthiness_worker(
         source = open(root + "/" + name + ".py", encoding="utf-8").read()
         stock = {"__name__": name, "__builtins__": builtins.__dict__}
         exec(compile(source, "<stock-singleton-truthiness>", "exec"), stock)
+        assert all(function_id(stock[path]) == 0 and sealed_id(stock[path]) == 0
+            and native_owner(stock[path]) is None for path in ('branch', 'inverted', 'dynamic_branch', 'short_circuit', 'descriptor_branch', 'temporary_branch', 'hot'))
 
-        sys.path.insert(0, root)
-        from soac.import_hook import install
-
-        install()
         module = importlib.import_module(name)
 
         def error(callback):
@@ -256,6 +260,8 @@ def _run_truthiness_worker(
             return results
 
         expected = exercise(stock)
+        assert all(function_id(stock[path]) == 0 and sealed_id(stock[path]) == 0
+            and native_owner(stock[path]) is None for path in ('branch', 'inverted', 'dynamic_branch', 'short_circuit', 'descriptor_branch', 'temporary_branch', 'hot'))
         actual = exercise(module.__dict__)
         assert expected["singletons"] == ["true", "false", "false"], expected
         assert expected["inverted"] == [False, True, True], expected
@@ -282,21 +288,50 @@ def _run_truthiness_worker(
         .replace("__NAME__", repr(module_name))
         .replace("__MODE__", repr(mode))
     )
-    environment = {
-        **os.environ,
-        "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
-        "SOAC_WORK_DIR": str(work_dir),
-        "SOAC_OPT_MODE": mode,
-        "SOAC_COMPILE_MODE": "eager",
-        "SOAC_BACKGROUND_JIT": "0",
-    }
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-        timeout=90,
+    witnesses = f"""
+import ctypes
+from tests._strict_integration import _plain_function_witness
+function_id = ctypes.pythonapi.PyFunction_GetSoacFunctionId
+function_id.argtypes = [ctypes.py_object]
+function_id.restype = ctypes.c_uint64
+sealed_id = ctypes.pythonapi.PyFunction_GetSoacStrictId
+sealed_id.argtypes = [ctypes.py_object]
+sealed_id.restype = ctypes.c_uint64
+native_owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+native_owner.argtypes = [ctypes.py_object]
+native_owner.restype = ctypes.c_void_p
+def assert_profile_functions():
+    for path in {_PROFILE_FUNCTIONS!r}:
+        function = _plain_function_witness(module, path)
+        # The old ID grants unchecked dispatch, not source admission.
+        assert function_id(function) == 0, path
+        assert sealed_id(function) > 0, path
+        assert native_owner(function), path
+assert_profile_functions()
+"""
+    witnesses += """
+has_type_contract = ctypes.pythonapi.PyType_HasSoacContract
+has_type_contract.argtypes = [ctypes.py_object]
+has_type_contract.restype = ctypes.c_int
+# The real user-defined descriptor automatically declines type participation.
+# No manual class exception is provided; original allocation/mutation follows.
+assert has_type_contract(module.DescriptorBox) == 0
+"""
+    validation = "def validate_module(module):\n" + textwrap.indent(
+        witnesses + script + "\nassert_profile_functions()\nassert has_type_contract(module.DescriptorBox) == 0\n", "    "
+    )
+    program = _VALIDATION_PRELUDE + project._validation_program(
+        module_name,
+        StrictValidationCase(
+            validation, Path(__file__), required_functions=_PROFILE_FUNCTIONS,
+            
+        ),
+        entry_interpreter=False,
+    )
+
+    completed = project.run(
+        program, opt_mode=mode, extra_env={"SOAC_WORK_DIR": str(work_dir)},
+        timeout=90, check=False,
     )
     assert completed.returncode == 0, (
         f"{mode} transformed singleton-truthiness subprocess failed:\n"
@@ -310,9 +345,19 @@ def test_immutable_singleton_truthiness_preserves_cpython_behavior(
 ) -> None:
     module_name = "immutable_singleton_truthiness_case"
     (tmp_path / f"{module_name}.py").write_text(textwrap.dedent(_MODULE_SOURCE))
+    # Keep the original ordinary file for the stock control. Only the
+    # separately analyzed copy carries the strict future and startup authority.
+    relative = f"{module_name}.py"
+    original_source = (tmp_path / relative).read_bytes()
+    project = create_strict_project(
+        tmp_path / "strict-project",
+        {relative: strict_opt_in(original_source, relative)[0].decode()},
+        modules={module_name: relative},
+    )
+
     work_dir = tmp_path / "soac-work"
     results = {
-        mode: _run_truthiness_worker(tmp_path, module_name, work_dir, mode)
+        mode: _run_truthiness_worker(project, tmp_path, module_name, work_dir, mode)
         for mode in ("profile", "verify", "apply")
     }
     assert set(results) == {"profile", "verify", "apply"}

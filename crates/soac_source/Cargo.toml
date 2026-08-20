@@ -1,0 +1,11 @@
+[package]
+name = "soac_source"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
+
+[dev-dependencies]
+ruff_python_parser = { workspace = true }

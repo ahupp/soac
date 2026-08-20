@@ -1,6 +1,6 @@
 use super::super::{lower_instr_for_test, simplify_stmt_ast_once_for_blockpy, BlockPyStmtBuilder};
 use super::*;
-use crate::block_py::InstrWithAwaitAndYield;
+use crate::block_py::{InstrWithAwaitAndYield, NameLike, StoreLifetime};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::test_name_gen;
 
@@ -45,10 +45,18 @@ fn stmt_expr_to_blockpy_emits_setup_for_named_exprs() {
         .expect("expr lowering should succeed");
 
     let fragment = out.finish();
-    assert!(matches!(
-        fragment.entry.body.as_slice(),
-        [InstrWithAwaitAndYield::Store(_), _]
-    ));
+    let [InstrWithAwaitAndYield::Store(value), InstrWithAwaitAndYield::Store(target), InstrWithAwaitAndYield::TakeOperand(discarded)] =
+        fragment.entry.body.as_slice()
+    else {
+        panic!("save the value, assign the target, then discard the expression owner");
+    };
+    assert!(matches!(value.lifetime, StoreLifetime::Operand { .. }));
+    assert_eq!(target.name.id_str(), "x");
+    assert_eq!(discarded.name.id_str(), value.name.id_str());
+    assert_eq!(
+        discarded.name.runtime_name_id(),
+        value.name.runtime_name_id()
+    );
 }
 
 #[test]
@@ -80,7 +88,7 @@ fn stmt_raise_to_blockpy_sets_terminator_for_plain_exc() {
 
     assert!(matches!(
         fragment.entry.term,
-        BlockTerm::Raise(TermRaise { exc: Some(_) })
+        BlockTerm::Raise(TermRaise { exc: Some(_), .. })
     ));
 }
 

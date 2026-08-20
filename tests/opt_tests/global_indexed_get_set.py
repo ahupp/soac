@@ -24,10 +24,13 @@ for _ in range(80):
         "branch": "hit",
         "min": 2,
     },
+    # The native namespace prefix retains pre-existing module keys. Compiler
+    # catalogue indexes are not native slot authority; mismatches must take
+    # the checked name-lookup fallback without changing the program's result.
     {
         "function": "set_get_global",
         "kind": "global_indexed",
         "branch": "fallback",
-        "max": 0,
+        "min": 1,
     },
 ]

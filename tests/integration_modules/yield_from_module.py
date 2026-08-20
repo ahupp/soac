@@ -42,11 +42,11 @@ def validate_module(module):
     with pytest.raises(StopIteration) as exc:
         gen.send("stop")
 
-        result = exc.value.value
-        assert result[0] == "done"
-        assert result[1] == [
+    result = exc.value.value
+    assert result[0] == "done"
+    assert result[1] == [
         ("send", "first"),
         ("throw", "'boom'"),
         ("send", "stop"),
         ("finally", None),
-        ]
+    ]

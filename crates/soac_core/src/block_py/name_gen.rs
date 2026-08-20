@@ -214,32 +214,7 @@ impl fmt::Display for SerializedFunctionId {
     }
 }
 
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
-#[rkyv(derive(Hash, PartialEq, Eq, Debug))]
-pub struct ModuleContentId {
-    pub module_name: String,
-    pub source_hash: u64,
-}
-
-impl ModuleContentId {
-    pub fn new(module_name: impl Into<String>, source_hash: u64) -> Self {
-        Self {
-            module_name: module_name.into(),
-            source_hash,
-        }
-    }
-}
+use soac_contracts::ModuleContentId;
 
 #[derive(
     Debug,
@@ -427,6 +402,13 @@ impl FunctionNameGen {
             self.state.function_id.local_function_id(),
             current
         ))
+    }
+
+    /// A producer-owned sequence for expression operands. It shares the
+    /// function's unique allocation stream, but never depends on a spelling.
+    pub fn next_temporary_sequence(&self) -> u64 {
+        u64::try_from(self.state.next_tmp_id.fetch_add(1, Ordering::Relaxed))
+            .expect("temporary sequence fits u64")
     }
 }
 

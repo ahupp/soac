@@ -1,18 +1,21 @@
 mod suspend_order;
 
 use self::suspend_order::make_suspend_order_explicit_in_core_callable_def;
-use crate::block_py::cfg::RelabelBlockTargets;
+use crate::block_py::cfg::{validate_suspension_resumes, RelabelBlockTargets};
 use crate::block_py::{
     compute_storage_layout_from_scope, core_call_expr_with_meta, core_runtime_name_expr_with_meta,
     core_runtime_positional_call_expr_with_meta, literal_expr, map_module_functions, BindingKind,
-    BindingPurpose, BindingTarget, Block, BlockArg, BlockEdge, BlockLabel, BlockParam,
-    BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
-    CallableScopeInfo, CellBindingKind, ClosureInit, ClosureSlot, Del, FunctionKind,
-    FunctionNameGen, GetAttr, Instr, InstrUnresolved, InstrWithConstantNone, InstrWithYield, Load,
-    Mappable, ModuleNameGen, NameLike, NumberLiteral, NumberLiteralValue, PreservedSlot,
-    PreservedSlotStorage, ScopeExprNode, StorageLayout, Store, StringLiteral, TermBranchTable,
-    TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp, UnaryOpKind,
-    UnresolvedName,
+    BindingPurpose, BindingTarget, Block, BlockArg, BlockContext, BlockEdge, BlockLabel,
+    BlockParam, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
+    CallArgPositional, CallableScopeInfo, CellBindingKind, ChildVisitable, ClosureInit,
+    ClosureSlot, Del, FunctionKind, FunctionNameGen, GeneratorControlRole, GeneratorResumeAbi,
+    GeneratorResumeDelivery, GeneratorResumeParamBinding, GeneratorResumeParamRole, GetAttr,
+    HandledExceptionContext, HasMeta, Instr, InstrUnresolved, InstrWithConstantNone,
+    InstrWithYield, Load, Mappable, Meta, ModuleNameGen, NameLike, NumberLiteral,
+    NumberLiteralValue, PreservedSlot, PreservedSlotStorage, RaiseDisposition, RuntimeName,
+    ScopeExprNode, StorageLayout, Store, StoreLifetime, StorePurpose, StringLiteral,
+    TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm, UnaryOp,
+    UnaryOpKind, UnresolvedName, WithMeta,
 };
 use crate::block_py::{Param, ParamKind, ParamSpec};
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
@@ -23,41 +26,156 @@ use soac_macros::match_default;
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ResumeAbiParam {
-    SelfValue,
-    StateValue,
-    SendValue,
-    ResumeExc,
-    TransportSent,
+/// Names allocated by this producer; only the explicit roles carry meaning.
+#[derive(Clone)]
+struct GeneratorBindingNames {
+    controls: Vec<(GeneratorControlRole, String)>,
+    abi: GeneratorResumeAbi,
+    reserved: HashSet<String>,
 }
 
-impl ResumeAbiParam {
-    fn name(self) -> &'static str {
-        match self {
-            Self::SelfValue => "_dp_self",
-            Self::StateValue => "_dp_state",
-            Self::SendValue => "_dp_send_value",
-            Self::ResumeExc => "_dp_resume_exc",
-            Self::TransportSent => "_dp_transport_sent",
+/// The original callable catalogue is shared by suspension operands and ABI
+/// controls. Allocating one kind must not instantiate the other's bindings.
+pub(super) fn reserved_callable_names(
+    callable: &BlockPyFunction<CoreModuleShapeWithYield>,
+) -> HashSet<String> {
+    #[derive(Default)]
+    struct Names(HashSet<String>);
+    impl crate::block_py::Visit<InstrWithYield> for Names {
+        fn visit_instr(&mut self, expr: &InstrWithYield) {
+            expr.walk_root_loaded_names(&mut |name| {
+                self.0.insert(name.to_owned());
+            });
+            expr.walk_root_defined_names(&mut |name| {
+                self.0.insert(name.to_owned());
+            });
+            expr.walk_root_deleted_names(&mut |name| {
+                self.0.insert(name.to_owned());
+            });
+            expr.walk_root_cell_ref_logical_names(&mut |name| {
+                self.0.insert(name.to_owned());
+            });
+            expr.visit_children(self);
+        }
+    }
+    let mut names = Names::default();
+    for block in &callable.blocks {
+        names.0.extend(block.param_names().map(str::to_owned));
+        for instr in &block.body {
+            crate::block_py::Visit::visit_instr(&mut names, instr);
+        }
+        crate::block_py::Visit::visit_term(&mut names, &block.term);
+    }
+    names.0.extend(callable.params.names());
+    names.0.extend(callable.scope.bindings.keys().cloned());
+    names.0.extend(callable.scope.local_defs.iter().cloned());
+    names
+        .0
+        .extend(callable.scope.scope_internal_names.iter().cloned());
+    names
+        .0
+        .extend(callable.scope.cell_storage_names.keys().cloned());
+    names
+        .0
+        .extend(callable.scope.cell_storage_names.values().cloned());
+    names
+        .0
+        .extend(callable.scope.cell_capture_source_names.keys().cloned());
+    names
+        .0
+        .extend(callable.scope.cell_capture_source_names.values().cloned());
+    names
+        .0
+        .extend(callable.scope.cell_value_aliases.keys().cloned());
+    names
+        .0
+        .extend(callable.scope.cell_value_aliases.values().cloned());
+    names
+        .0
+        .extend(callable.scope.owned_cell_source_names.iter().cloned());
+    names.0
+}
+
+impl GeneratorBindingNames {
+    fn for_callable(callable: &BlockPyFunction<CoreModuleShapeWithYield>) -> Self {
+        let mut reserved = reserved_callable_names(callable);
+        let mut allocate = |preferred: &str, prefix: &str| {
+            let mut candidate = preferred.to_owned();
+            loop {
+                let storage = callable.scope.cell_storage_name(&candidate);
+                if !reserved.contains(&candidate) && !reserved.contains(&storage) {
+                    reserved.insert(candidate.clone());
+                    reserved.insert(storage);
+                    break candidate;
+                }
+                candidate = callable.name_gen.next_tmp_name(prefix).to_string();
+            }
+        };
+        let controls = [
+            (GeneratorControlRole::ProgramCounter, "_dp_pc", "resume_pc"),
+            (
+                GeneratorControlRole::IsClosed,
+                "_dp_is_closed",
+                "resume_closed",
+            ),
+            (
+                GeneratorControlRole::Delegate,
+                "_dp_yieldfrom",
+                "resume_delegate",
+            ),
+        ]
+        .into_iter()
+        .map(|(role, preferred, prefix)| (role, allocate(preferred, prefix)))
+        .collect();
+        let params = GeneratorResumeParamRole::for_kind(callable.kind)
+            .iter()
+            .copied()
+            .map(|role| {
+                let (preferred, prefix) = match role {
+                    GeneratorResumeParamRole::SelfValue => ("_dp_self", "resume_self"),
+                    GeneratorResumeParamRole::StateValue => ("_dp_state", "resume_state"),
+                    GeneratorResumeParamRole::SendValue => ("_dp_send_value", "resume_send"),
+                    GeneratorResumeParamRole::ResumeExc => ("_dp_resume_exc", "resume_exception"),
+                    GeneratorResumeParamRole::TransportSent => {
+                        ("_dp_transport_sent", "resume_transport")
+                    }
+                };
+                GeneratorResumeParamBinding {
+                    role,
+                    name: allocate(preferred, prefix),
+                }
+            })
+            .collect();
+        Self {
+            controls,
+            abi: GeneratorResumeAbi { params },
+            reserved,
+        }
+    }
+
+    fn control(&self, role: GeneratorControlRole) -> &str {
+        self.controls
+            .iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, name)| name.as_str())
+            .expect("producer allocated every generator control")
+    }
+
+    fn parameter(&self, role: GeneratorResumeParamRole) -> &str {
+        self.abi
+            .parameter(role)
+            .expect("producer allocated the required resume parameter")
+    }
+
+    fn fresh_temp(&mut self, name_gen: &FunctionNameGen, prefix: &str) -> String {
+        loop {
+            let candidate = name_gen.next_tmp_name(prefix).to_string();
+            if self.reserved.insert(candidate.clone()) {
+                return candidate;
+            }
         }
     }
 }
-
-const GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 4] = [
-    ResumeAbiParam::SelfValue,
-    ResumeAbiParam::StateValue,
-    ResumeAbiParam::SendValue,
-    ResumeAbiParam::ResumeExc,
-];
-
-const ASYNC_GENERATOR_RESUME_ABI_PARAMS: [ResumeAbiParam; 5] = [
-    ResumeAbiParam::SelfValue,
-    ResumeAbiParam::StateValue,
-    ResumeAbiParam::SendValue,
-    ResumeAbiParam::ResumeExc,
-    ResumeAbiParam::TransportSent,
-];
 
 type LinearYieldStmt = InstrWithYield;
 type LinearCoreStmt = InstrUnresolved;
@@ -91,14 +209,6 @@ impl TryMapInstr<InstrWithYield, InstrUnresolved, InstrWithYield> for ErrOnYield
     }
 }
 
-fn resume_abi_params(kind: FunctionKind) -> &'static [ResumeAbiParam] {
-    match kind {
-        FunctionKind::Function => &[],
-        FunctionKind::Coroutine | FunctionKind::Generator => &GENERATOR_RESUME_ABI_PARAMS,
-        FunctionKind::AsyncGenerator => &ASYNC_GENERATOR_RESUME_ABI_PARAMS,
-    }
-}
-
 fn generator_state_logical_name(scope: &CallableScopeInfo, name: &str) -> String {
     scope
         .logical_name_for_cell_storage(name)
@@ -108,19 +218,6 @@ fn generator_state_logical_name(scope: &CallableScopeInfo, name: &str) -> String
 fn generator_state_storage_name(scope: &CallableScopeInfo, name: &str) -> String {
     let logical_name = generator_state_logical_name(scope, name);
     scope.cell_storage_name(logical_name.as_str())
-}
-
-fn runtime_init(name: &str) -> Option<ClosureInit> {
-    match name {
-        "_dp_pc" => Some(ClosureInit::RuntimePcUnstarted),
-        name if name.starts_with("_dp_try_abrupt_kind_") => {
-            Some(ClosureInit::RuntimeAbruptKindFallthrough)
-        }
-        "_dp_is_closed" => Some(ClosureInit::RuntimeZero),
-        "_dp_yieldfrom" => Some(ClosureInit::RuntimeNone),
-        "_dp_throw_context" => Some(ClosureInit::RuntimeNone),
-        _ => None,
-    }
 }
 
 fn preserved_slot_storage(init: &ClosureInit) -> PreservedSlotStorage {
@@ -147,6 +244,8 @@ pub(crate) fn build_blockpy_storage_layout(
     capture_names: &[String],
     semantic_cell_storage_names: &HashSet<String>,
     injected_exception_names: &HashSet<String>,
+    control_names: &[(GeneratorControlRole, String)],
+    abrupt_kind_names: &HashSet<String>,
 ) -> StorageLayout {
     let capture_names = capture_names.iter().cloned().collect::<HashSet<_>>();
     let mut seen_storage_names = HashSet::new();
@@ -161,8 +260,19 @@ pub(crate) fn build_blockpy_storage_layout(
         if !seen_storage_names.insert(storage_name.clone()) {
             continue;
         }
-        if let Some(init) = runtime_init(logical_name.as_str()) {
+        let generator_control = control_names
+            .iter()
+            .find_map(|(role, binding)| (binding == name).then_some(*role));
+        let runtime_init = generator_control
+            .map(GeneratorControlRole::initial_value)
+            .or_else(|| {
+                abrupt_kind_names
+                    .contains(name)
+                    .then_some(ClosureInit::RuntimeAbruptKindFallthrough)
+            });
+        if let Some(init) = runtime_init {
             preserved_slots.push(PreservedSlot {
+                generator_control,
                 logical_name,
                 storage_name,
                 storage: preserved_slot_storage(&init),
@@ -190,6 +300,7 @@ pub(crate) fn build_blockpy_storage_layout(
         };
         if semantic_cell_storage_names.contains(storage_name.as_str()) {
             preserved_slots.push(PreservedSlot {
+                generator_control: None,
                 logical_name,
                 storage_name,
                 storage: preserved_cell_slot_storage(),
@@ -201,6 +312,7 @@ pub(crate) fn build_blockpy_storage_layout(
             });
         } else {
             preserved_slots.push(PreservedSlot {
+                generator_control: None,
                 logical_name,
                 storage_name,
                 storage: preserved_slot_storage(&init),
@@ -209,11 +321,21 @@ pub(crate) fn build_blockpy_storage_layout(
         }
     }
 
+    // Assignment discovery orders preserved frame state, not public closure
+    // slots. A walrus can encounter written b before read-only a; resume name
+    // binding uses logical capture order, so creation must use that same order.
+    // Do not reorder preserved_slots: those indices are the physical state ABI.
+    freevars.sort_by(|left, right| left.logical_name.cmp(&right.logical_name));
+
     StorageLayout {
+        class_bindings: None,
+        block_parameter_roles: Vec::new(),
+        generator_resume_abi: None,
         freevars,
         cellvars,
         preserved_slots,
         stack_slots: Vec::new(),
+        expression_temporaries: Vec::new(),
     }
 }
 
@@ -423,18 +545,76 @@ fn is_generator_like(kind: FunctionKind) -> bool {
 fn injected_exception_names<I: Instr>(blocks: &[Block<I>]) -> HashSet<String> {
     let mut names = HashSet::new();
     for block in blocks {
-        if let Some(exc_param) = block.exception_param() {
-            names.insert(exc_param.to_string());
+        for param in block.handled_exception_params() {
+            names.insert(param.name.clone());
         }
     }
     names
 }
 
+fn mark_preserved_expression_operands(
+    callable: &BlockPyFunction<CoreModuleShapeWithYield>,
+    layout: &mut StorageLayout,
+) {
+    struct Producers(HashMap<String, u64>);
+    impl crate::block_py::Visit<InstrWithYield> for Producers {
+        fn visit_instr(&mut self, instr: &InstrWithYield) {
+            if let InstrWithYield::Store(store) = instr {
+                if let StoreLifetime::Operand { unwind_order } = store.lifetime {
+                    let name = store.name.id_str().to_owned();
+                    if let Some(previous) = self.0.insert(name, unwind_order) {
+                        assert_eq!(
+                            previous, unwind_order,
+                            "one operand has one acquisition rank"
+                        );
+                    }
+                }
+            }
+            instr.visit_children(self);
+        }
+    }
+    let mut producers = Producers(HashMap::new());
+    for block in &callable.blocks {
+        for instr in &block.body {
+            crate::block_py::Visit::visit_instr(&mut producers, instr);
+        }
+        crate::block_py::walk_term(&mut producers, &block.term);
+    }
+    let mut producers = producers.0.into_iter().collect::<Vec<_>>();
+    producers.sort_by(|left, right| (left.1, &left.0).cmp(&(right.1, &right.0)));
+    for (name, _) in producers {
+        let storage_name = generator_state_storage_name(&callable.scope, &name);
+        let mut slots = layout
+            .preserved_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.storage_name == storage_name);
+        let (index, slot) = slots
+            .next()
+            .expect("suspended operand has private preserved storage");
+        assert!(
+            slots.next().is_none(),
+            "suspended operand has one physical slot"
+        );
+        assert_eq!(slot.storage, PreservedSlotStorage::PyObjectOrNull);
+        assert_eq!(slot.init, ClosureInit::Deferred);
+        assert!(slot.generator_control.is_none());
+        layout.mark_expression_temporary(crate::block_py::PreservedLocation(
+            u32::try_from(index).expect("preserved operand index fits u32"),
+        ));
+    }
+}
+
 fn build_generator_storage_layout(
     callable: &BlockPyFunction<CoreModuleShapeWithYield>,
+    bindings: &GeneratorBindingNames,
 ) -> StorageLayout {
     let param_names = callable.params.names();
     let semantic_layout = compute_storage_layout_from_scope(callable).unwrap_or(StorageLayout {
+        class_bindings: None,
+        block_parameter_roles: Vec::new(),
+        generator_resume_abi: None,
+        expression_temporaries: Vec::new(),
         freevars: Vec::new(),
         cellvars: Vec::new(),
         preserved_slots: Vec::new(),
@@ -459,9 +639,9 @@ fn build_generator_storage_layout(
         }
     }
     for block in &callable.blocks {
-        if let Some(exc_param) = block.exception_param() {
-            if !state_vars.iter().any(|existing| existing == exc_param) {
-                state_vars.push(exc_param.to_string());
+        for param in block.handled_exception_params() {
+            if !state_vars.iter().any(|existing| existing == &param.name) {
+                state_vars.push(param.name.clone());
             }
         }
     }
@@ -474,25 +654,33 @@ fn build_generator_storage_layout(
             state_vars.push(logical_name);
         }
     }
-    for runtime_name in [
-        "_dp_pc",
-        "_dp_is_closed",
-        "_dp_yieldfrom",
-        "_dp_throw_context",
-    ] {
-        if !state_vars.iter().any(|existing| existing == runtime_name) {
-            state_vars.push(runtime_name.to_string());
-        }
+    for (_, name) in &bindings.controls {
+        assert!(
+            !state_vars.contains(name),
+            "private generator control aliases source state"
+        );
+        state_vars.push(name.clone());
     }
+    let abrupt_kind_names = callable
+        .blocks
+        .iter()
+        .flat_map(|block| block.params.iter())
+        .filter(|param| param.role == BlockParamRole::AbruptKind)
+        .map(|param| param.name.clone())
+        .collect::<HashSet<_>>();
 
-    build_blockpy_storage_layout(
+    let mut layout = build_blockpy_storage_layout(
         &callable.scope,
         &param_names,
         &state_vars,
         &capture_names,
         &semantic_cell_storage_names,
         &injected_exception_names(&callable.blocks),
-    )
+        &bindings.controls,
+        &abrupt_kind_names,
+    );
+    mark_preserved_expression_operands(callable, &mut layout);
+    layout
 }
 
 fn resume_closure_state_order(layout: &StorageLayout) -> Vec<String> {
@@ -563,29 +751,29 @@ fn generator_resume_declared_param_indices(
     kind: FunctionKind,
     params: &[BlockParam],
 ) -> Vec<usize> {
-    let resume_abi_names = resume_abi_params(kind)
-        .iter()
-        .map(|param| param.name())
-        .collect::<HashSet<_>>();
     params
         .iter()
         .enumerate()
         .filter(|(_, param)| {
             param.role == BlockParamRole::Exception
+                || param.role == BlockParamRole::EnclosingException
                 || param.role == BlockParamRole::AbruptKind
                 || param.role == BlockParamRole::AbruptPayload
-                || resume_abi_names.contains(param.name.as_str())
+                || param.role == BlockParamRole::EnclosingAbruptPayload
+                || matches!(param.role, BlockParamRole::GeneratorResume(role)
+                    if GeneratorResumeParamRole::for_kind(kind).contains(&role))
         })
         .map(|(index, _)| index)
         .collect()
 }
 
-fn resume_param_spec(kind: FunctionKind) -> ParamSpec {
+fn resume_param_spec(abi: &GeneratorResumeAbi) -> ParamSpec {
     ParamSpec {
-        params: resume_abi_params(kind)
+        params: abi
+            .params
             .iter()
             .map(|param| Param {
-                name: param.name().to_string(),
+                name: param.name.clone(),
                 kind: ParamKind::PosOnly,
                 has_default: false,
             })
@@ -595,36 +783,62 @@ fn resume_param_spec(kind: FunctionKind) -> ParamSpec {
 
 #[derive(Clone)]
 enum YieldSite {
-    ExprYield(InstrWithYield),
+    ExprYield {
+        value: InstrWithYield,
+        meta: Meta,
+    },
     AssignYield {
         target: UnresolvedName,
         value: InstrWithYield,
+        meta: Meta,
+        lifetime: StoreLifetime,
+        purpose: StorePurpose,
     },
-    ReturnYield(InstrWithYield),
-    ExprYieldFrom(InstrWithYield),
+    ReturnYield {
+        value: InstrWithYield,
+        meta: Meta,
+    },
+    ExprYieldFrom {
+        value: InstrWithYield,
+        meta: Meta,
+    },
     AssignYieldFrom {
         target: UnresolvedName,
         value: InstrWithYield,
+        meta: Meta,
+        lifetime: StoreLifetime,
+        purpose: StorePurpose,
     },
-    ReturnYieldFrom(InstrWithYield),
+    ReturnYieldFrom {
+        value: InstrWithYield,
+        meta: Meta,
+    },
 }
 
 fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
     match stmt {
-        InstrWithYield::Yield(yield_expr) => {
-            Some(YieldSite::ExprYield(yield_expr.value.as_ref().clone()))
-        }
-        InstrWithYield::YieldFrom(yield_from) => {
-            Some(YieldSite::ExprYieldFrom((*yield_from.value).clone()))
-        }
+        InstrWithYield::Yield(yield_expr) => Some(YieldSite::ExprYield {
+            value: yield_expr.value.as_ref().clone(),
+            meta: yield_expr.meta(),
+        }),
+        InstrWithYield::YieldFrom(yield_from) => Some(YieldSite::ExprYieldFrom {
+            value: (*yield_from.value).clone(),
+            meta: yield_from.meta(),
+        }),
         InstrWithYield::Store(store) => match store.value.as_ref() {
             InstrWithYield::Yield(yield_expr) => Some(YieldSite::AssignYield {
                 target: store.name.clone(),
                 value: yield_expr.value.as_ref().clone(),
+                meta: yield_expr.meta(),
+                lifetime: store.lifetime,
+                purpose: store.purpose,
             }),
             InstrWithYield::YieldFrom(yield_from) => Some(YieldSite::AssignYieldFrom {
                 target: store.name.clone(),
                 value: (*yield_from.value).clone(),
+                meta: yield_from.meta(),
+                lifetime: store.lifetime,
+                purpose: store.purpose,
             }),
             _ => None,
         },
@@ -634,11 +848,15 @@ fn stmt_yield_site(stmt: &LinearYieldStmt) -> Option<YieldSite> {
 
 fn term_yield_site(term: &BlockTerm<InstrWithYield>) -> Option<YieldSite> {
     match term {
-        BlockTerm::Return(InstrWithYield::Yield(yield_expr)) => {
-            Some(YieldSite::ReturnYield(yield_expr.value.as_ref().clone()))
-        }
+        BlockTerm::Return(InstrWithYield::Yield(yield_expr)) => Some(YieldSite::ReturnYield {
+            value: yield_expr.value.as_ref().clone(),
+            meta: yield_expr.meta(),
+        }),
         BlockTerm::Return(InstrWithYield::YieldFrom(yield_from)) => {
-            Some(YieldSite::ReturnYieldFrom((*yield_from.value).clone()))
+            Some(YieldSite::ReturnYieldFrom {
+                value: (*yield_from.value).clone(),
+                meta: yield_from.meta(),
+            })
         }
         _ => None,
     }
@@ -668,22 +886,15 @@ fn yield_value_expr(value: InstrWithYield) -> InstrUnresolved {
         .unwrap_or_else(|_| panic!("yield payload unexpectedly contained nested yield"))
 }
 
-fn completion_raise(
+fn completion_term(
     kind: FunctionKind,
     value: Option<InstrUnresolved>,
 ) -> BlockTerm<InstrUnresolved> {
     match kind {
         FunctionKind::Generator | FunctionKind::Coroutine => {
-            let exc = if let Some(value) = value {
-                core_call("StopIteration", vec![value])
-            } else {
-                core_call("StopIteration", Vec::new())
-            };
-            BlockTerm::Raise(TermRaise { exc: Some(exc) })
+            BlockTerm::GeneratorReturn(value.unwrap_or_else(core_none))
         }
-        FunctionKind::AsyncGenerator => BlockTerm::Raise(TermRaise {
-            exc: Some(core_call("AsyncGenComplete", Vec::new())),
-        }),
+        FunctionKind::AsyncGenerator => BlockTerm::GeneratorReturn(core_none()),
         FunctionKind::Function => unreachable!(),
     }
 }
@@ -709,7 +920,13 @@ fn push_terminal_exception_blocks(state: &mut ResumeLoweringState) {
                 core_name(terminal_exception_name.as_str()),
             ],
         ),
-        FunctionKind::AsyncGenerator => core_name(terminal_exception_name.as_str()),
+        FunctionKind::AsyncGenerator => core_call(
+            "pep_479_exception",
+            vec![
+                core_literal_int(2),
+                core_name(terminal_exception_name.as_str()),
+            ],
+        ),
         FunctionKind::Function => unreachable!(),
     };
     state.push_terminal_block(LinearCoreBlock {
@@ -717,6 +934,7 @@ fn push_terminal_exception_blocks(state: &mut ResumeLoweringState) {
         body: state.terminal_cleanup_stmts(),
         term: BlockTerm::Raise(TermRaise {
             exc: Some(terminal_exception),
+            disposition: RaiseDisposition::PropagateNormalized,
         }),
         params: terminal_params,
         exc_edge: None,
@@ -724,7 +942,7 @@ fn push_terminal_exception_blocks(state: &mut ResumeLoweringState) {
     });
 }
 
-fn push_completion_raise_block(
+fn push_completion_block(
     state: &mut ResumeLoweringState,
     label: BlockLabel,
     mut body: Vec<LinearCoreStmt>,
@@ -752,7 +970,7 @@ fn push_completion_raise_block(
     state.push_terminal_block(BlockPyBlock {
         label: completion_label,
         body: state.terminal_cleanup_stmts(),
-        term: completion_raise(state.kind, value),
+        term: completion_term(state.kind, value),
         params,
         exc_edge: None,
         extra: Default::default(),
@@ -769,22 +987,21 @@ fn explicit_jump_args_for_params(params: &[BlockParam]) -> Vec<BlockArg> {
 fn resume_dispatch_jump_args_for_params(params: &[BlockParam]) -> Vec<BlockArg> {
     params
         .iter()
-        .map(|param| match param.role {
-            BlockParamRole::Exception => BlockArg::None,
-            BlockParamRole::Value | BlockParamRole::AbruptKind | BlockParamRole::AbruptPayload => {
-                BlockArg::Name(param.name.clone())
-            }
-        })
+        .map(|param| BlockArg::Name(param.name.clone()))
         .collect()
 }
 
-fn is_resume_exc_test() -> InstrUnresolved {
+fn is_resume_exc_test(state: &ResumeLoweringState) -> InstrUnresolved {
     crate::block_py::UnaryOp::new(
         crate::block_py::UnaryOpKind::Not,
         Box::new(
             crate::block_py::BinOp::new(
                 crate::block_py::BinOpKind::Is,
-                Box::new(core_name("_dp_resume_exc")),
+                Box::new(core_name(
+                    state
+                        .bindings
+                        .parameter(GeneratorResumeParamRole::ResumeExc),
+                )),
                 Box::new(core_runtime_name_expr_with_meta(
                     "NO_DEFAULT",
                     ast::AtomicNodeIndex::default(),
@@ -797,10 +1014,14 @@ fn is_resume_exc_test() -> InstrUnresolved {
     .into()
 }
 
-fn is_send_none_test() -> InstrUnresolved {
+fn is_send_none_test(state: &ResumeLoweringState) -> InstrUnresolved {
     crate::block_py::BinOp::new(
         crate::block_py::BinOpKind::Is,
-        Box::new(core_name("_dp_send_value")),
+        Box::new(core_name(
+            state
+                .bindings
+                .parameter(GeneratorResumeParamRole::SendValue),
+        )),
         Box::new(core_none()),
     )
     .into()
@@ -819,19 +1040,30 @@ fn is_name_not_none_test(name: &str) -> InstrUnresolved {
     UnaryOp::new(UnaryOpKind::Not, Box::new(is_name_none_test(name))).into()
 }
 
-fn is_resume_generator_exit_test() -> InstrUnresolved {
+fn is_resume_generator_exit_test(state: &ResumeLoweringState) -> InstrUnresolved {
     core_call(
         "isinstance",
         vec![
-            core_name("_dp_resume_exc"),
+            core_name(
+                state
+                    .bindings
+                    .parameter(GeneratorResumeParamRole::ResumeExc),
+            ),
             core_runtime_attr("GeneratorExit"),
         ],
     )
 }
 
-fn resume_exc_raise_term() -> BlockTerm<InstrUnresolved> {
+fn resume_exc_raise_term(state: &ResumeLoweringState) -> BlockTerm<InstrUnresolved> {
     BlockTerm::Raise(TermRaise {
-        exc: Some(core_name("_dp_resume_exc")),
+        exc: Some(core_name(
+            state
+                .bindings
+                .parameter(GeneratorResumeParamRole::ResumeExc),
+        )),
+        // Retained unmanaged helpers keep the ordinary source-raise boundary.
+        // Managed owners inject through their owned native handled item instead.
+        disposition: RaiseDisposition::Source,
     })
 }
 
@@ -847,23 +1079,35 @@ fn current_exception_value_expr(exc_name: &str) -> InstrUnresolved {
     core_get_attr(core_name(exc_name), "value")
 }
 
-fn yield_from_next_expr() -> InstrUnresolved {
-    core_call("next", vec![core_name("_dp_yieldfrom")])
+fn yield_from_next_expr(state: &ResumeLoweringState) -> InstrUnresolved {
+    core_call(
+        "next",
+        vec![core_name(
+            state.bindings.control(GeneratorControlRole::Delegate),
+        )],
+    )
 }
 
-fn yield_from_send_expr() -> InstrUnresolved {
+fn yield_from_send_expr(state: &ResumeLoweringState) -> InstrUnresolved {
     core_call_expr(
-        core_get_attr(core_name("_dp_yieldfrom"), "send"),
-        vec![core_name("_dp_send_value")],
+        core_get_attr(
+            core_name(state.bindings.control(GeneratorControlRole::Delegate)),
+            "send",
+        ),
+        vec![core_name(
+            state
+                .bindings
+                .parameter(GeneratorResumeParamRole::SendValue),
+        )],
         Vec::new(),
     )
 }
 
-fn yield_from_method_lookup_expr(method: &str) -> InstrUnresolved {
+fn yield_from_method_lookup_expr(state: &ResumeLoweringState, method: &str) -> InstrUnresolved {
     core_call(
         "getattr",
         vec![
-            core_name("_dp_yieldfrom"),
+            core_name(state.bindings.control(GeneratorControlRole::Delegate)),
             core_string_literal(method),
             core_none(),
         ],
@@ -880,6 +1124,7 @@ fn single_arg_name_call_expr(name: &str, arg: InstrUnresolved) -> InstrUnresolve
 
 struct ResumeLoweringState {
     kind: FunctionKind,
+    bindings: GeneratorBindingNames,
     name_gen: FunctionNameGen,
     next_resume_pc: usize,
     blocks: Vec<LinearCoreBlock>,
@@ -897,11 +1142,13 @@ impl ResumeLoweringState {
         kind: FunctionKind,
         target_arg_indices: HashMap<BlockLabel, Vec<usize>>,
         terminal_object_slots: Vec<String>,
+        bindings: GeneratorBindingNames,
     ) -> Self {
         let exhausted_label = name_gen.next_block_name();
         let terminal_exception_label = name_gen.next_block_name();
         Self {
             kind,
+            bindings,
             name_gen,
             next_resume_pc: 2,
             blocks: Vec::new(),
@@ -928,15 +1175,23 @@ impl ResumeLoweringState {
     }
 
     fn fresh_temp(&mut self, base: &str) -> String {
-        self.name_gen.next_tmp_name(base).to_string()
+        self.bindings.fresh_temp(&self.name_gen, base)
     }
 
     fn terminal_cleanup_stmts(&self) -> Vec<LinearCoreStmt> {
         let mut cleanup = vec![
-            internal_store_stmt("_dp_is_closed", core_literal_int(1)),
-            internal_store_stmt("_dp_pc", core_literal_int(0)),
-            internal_store_stmt("_dp_yieldfrom", core_none()),
-            internal_store_stmt("_dp_throw_context", core_none()),
+            internal_store_stmt(
+                self.bindings.control(GeneratorControlRole::IsClosed),
+                core_literal_int(1),
+            ),
+            internal_store_stmt(
+                self.bindings.control(GeneratorControlRole::ProgramCounter),
+                core_literal_int(0),
+            ),
+            internal_store_stmt(
+                self.bindings.control(GeneratorControlRole::Delegate),
+                core_none(),
+            ),
         ];
         cleanup.extend(
             self.terminal_object_slots
@@ -946,17 +1201,7 @@ impl ResumeLoweringState {
         cleanup
     }
 
-    fn push_block(&mut self, mut block: LinearCoreBlock, exc_target: Option<BlockLabel>) {
-        let active_exception = block
-            .params
-            .iter()
-            .find(|param| param.role == BlockParamRole::Exception)
-            .map(|param| core_name(param.name.as_str()))
-            .unwrap_or_else(core_none);
-        block.body.insert(
-            0,
-            internal_store_stmt("_dp_throw_context", active_exception),
-        );
+    fn push_block(&mut self, block: LinearCoreBlock, exc_target: Option<BlockLabel>) {
         self.exception_edges.insert(
             block.label.clone(),
             Some(exc_target.unwrap_or_else(|| self.terminal_exception_label.clone())),
@@ -964,7 +1209,8 @@ impl ResumeLoweringState {
         self.blocks.push(block);
     }
 
-    fn push_terminal_block(&mut self, block: LinearCoreBlock) {
+    fn push_terminal_block(&mut self, mut block: LinearCoreBlock) {
+        block.extra.handled_exception = soac_core::block_py::HandledExceptionContext::Terminal;
         self.exception_edges.insert(block.label.clone(), None);
         self.blocks.push(block);
     }
@@ -1038,7 +1284,7 @@ fn lower_resume_fragment(
         .collect::<Vec<_>>();
     match term {
         BlockTerm::Return(value) => {
-            push_completion_raise_block(
+            push_completion_block(
                 state,
                 label,
                 lowered_body,
@@ -1067,6 +1313,193 @@ fn lower_resume_fragment(
     }
 }
 
+/// Allocate the native async-value token before publishing any suspension
+/// state. This operation keeps the source yield's range and exception edge:
+/// wrapping after the body returns would make allocation failure uncatchable.
+fn prepare_direct_yield_value(
+    state: &mut ResumeLoweringState,
+    prefix: &mut Vec<LinearCoreStmt>,
+    value: InstrWithYield,
+    meta: Meta,
+) -> InstrUnresolved {
+    let value = yield_value_expr(value);
+    if state.kind != FunctionKind::AsyncGenerator {
+        return value;
+    }
+    let wrapped_name = state.fresh_temp("async_yield");
+    let unwind_order = state.name_gen.next_temporary_sequence();
+    prefix.push(
+        Store::new(
+            unresolved_name(wrapped_name.as_str()),
+            core_runtime_positional_call_expr_with_meta(
+                RuntimeName::AsyncGenWrapYield.name(),
+                meta.node_index.clone(),
+                meta.range,
+                vec![value],
+            ),
+        )
+        .with_lifetime(StoreLifetime::Operand { unwind_order })
+        .with_meta(meta)
+        .into(),
+    );
+    core_name(wrapped_name.as_str())
+}
+
+/// The native binding owns the pending injected error. Keep one explicit
+/// operand owner while clearing the borrowed resume argument and retiring a
+/// direct-yield delegate, then take the binding's owner at the raising helper.
+/// Shared resolved operand cleanup releases this temporary before the handler.
+fn emit_managed_resume_exception(
+    state: &mut ResumeLoweringState,
+    label: BlockLabel,
+    params: Vec<BlockParam>,
+    exc_target: Option<BlockLabel>,
+    clear_delegate: bool,
+    source_meta: Option<Meta>,
+) {
+    let error_name = state.fresh_temp("resume_error");
+    let unwind_order = state.name_gen.next_temporary_sequence();
+    let mut body = vec![
+        Store::new(
+            unresolved_name(error_name.as_str()),
+            core_name(
+                state
+                    .bindings
+                    .parameter(GeneratorResumeParamRole::ResumeExc),
+            ),
+        )
+        .with_lifetime(StoreLifetime::Operand { unwind_order })
+        .into(),
+        internal_store_stmt(
+            state
+                .bindings
+                .parameter(GeneratorResumeParamRole::ResumeExc),
+            core_none(),
+        ),
+    ];
+    if clear_delegate {
+        body.push(internal_store_stmt(
+            state.bindings.control(GeneratorControlRole::Delegate),
+            core_none(),
+        ));
+    }
+    let injection = core_call(
+        RuntimeName::InjectGeneratorResumeException.name(),
+        vec![
+            core_name(
+                state
+                    .bindings
+                    .parameter(GeneratorResumeParamRole::StateValue),
+            ),
+            core_name(error_name.as_str()),
+        ],
+    );
+    let (raised, disposition) = if let Some(meta) = source_meta {
+        // This source operation receives an already-normalized injected error.
+        // Preserve its original metadata for diagnostics and handler semantics.
+        let disposition = RaiseDisposition::SourceNormalized;
+        (injection.with_meta(meta), disposition)
+    } else {
+        // Delegated StopIteration is classified before forwarding; delegation
+        // may consume it as a successful return instead of propagating it.
+        (injection, RaiseDisposition::PropagateNormalized)
+    };
+    state.push_block(
+        BlockPyBlock {
+            label,
+            body,
+            // The helper always raises. If it ever returned an exception,
+            // preserve it rather than normalizing/chaining it a second time.
+            term: BlockTerm::Raise(TermRaise {
+                exc: Some(raised),
+                disposition,
+            }),
+            params,
+            exc_edge: None,
+            extra: Default::default(),
+        },
+        exc_target,
+    );
+}
+
+/// This dispatch is reached only after the resume-exception sentinel test.
+/// The ordinary send path does not call a delivery helper or gain ABI args.
+fn emit_resume_exception_dispatch(
+    state: &mut ResumeLoweringState,
+    label: BlockLabel,
+    ordinary_label: BlockLabel,
+    delegate_exception_target: Option<BlockLabel>,
+    params: Vec<BlockParam>,
+    source_exception_target: Option<BlockLabel>,
+    source_meta: Meta,
+) {
+    let direct_label = state.fresh_label("managed_resume_direct");
+    let invalid_label = state.fresh_label("managed_resume_invalid");
+    let delegate_label = delegate_exception_target
+        .as_ref()
+        .map(|_| state.fresh_label("managed_resume_delegate"));
+    let mut targets = vec![invalid_label; GeneratorResumeDelivery::YieldFromException as usize + 1];
+    targets[GeneratorResumeDelivery::Ordinary as usize] = ordinary_label;
+    targets[GeneratorResumeDelivery::DirectRaise as usize] = direct_label;
+    if let Some(delegate_label) = delegate_label {
+        targets[GeneratorResumeDelivery::YieldFromException as usize] = delegate_label;
+    }
+    state.push_block(
+        BlockPyBlock {
+            label,
+            body: Vec::new(),
+            term: BlockTerm::BranchTable(TermBranchTable {
+                index: core_call(
+                    RuntimeName::GeneratorResumeDelivery.name(),
+                    vec![core_name(
+                        state
+                            .bindings
+                            .parameter(GeneratorResumeParamRole::StateValue),
+                    )],
+                ),
+                targets,
+                default_label: invalid_label,
+            }),
+            params: params.clone(),
+            exc_edge: None,
+            extra: Default::default(),
+        },
+        source_exception_target.clone(),
+    );
+    emit_managed_resume_exception(
+        state,
+        direct_label,
+        params.clone(),
+        source_exception_target,
+        true,
+        Some(source_meta),
+    );
+    if let (Some(label), Some(target)) = (delegate_label, delegate_exception_target) {
+        // Native already performed delegation. Its normalized error belongs
+        // to the existing StopIteration handler, never another delegate call.
+        emit_managed_resume_exception(state, label, params.clone(), Some(target), false, None);
+    }
+    state.push_block(
+        BlockPyBlock {
+            label: invalid_label,
+            body: Vec::new(),
+            term: BlockTerm::Raise(TermRaise {
+                exc: Some(core_call(
+                    "RuntimeError",
+                    vec![core_string_literal(
+                        "invalid managed generator resume delivery",
+                    )],
+                )),
+                disposition: RaiseDisposition::Source,
+            }),
+            params,
+            exc_edge: None,
+            extra: Default::default(),
+        },
+        None,
+    );
+}
+
 fn emit_yield_site(
     state: &mut ResumeLoweringState,
     label: BlockLabel,
@@ -1078,18 +1511,28 @@ fn emit_yield_site(
     exc_target: Option<BlockLabel>,
 ) {
     match site {
-        YieldSite::ExprYield(value) => {
+        YieldSite::ExprYield { value, meta } => {
+            let value = prepare_direct_yield_value(state, prefix, value, meta.clone());
             let (resume_pc, resume_label) = state.fresh_resume_target("yield_resume");
-            prefix.push(internal_store_stmt("_dp_pc", core_literal_int(resume_pc)));
-            prefix.push(internal_store_stmt("_dp_yieldfrom", core_none()));
+            prefix.push(internal_store_stmt(
+                state.bindings.control(GeneratorControlRole::ProgramCounter),
+                core_literal_int(resume_pc),
+            ));
+            prefix.push(internal_store_stmt(
+                state.bindings.control(GeneratorControlRole::Delegate),
+                core_none(),
+            ));
             state.push_block(
                 BlockPyBlock {
                     label,
                     body: std::mem::take(prefix),
-                    term: BlockTerm::Return(yield_value_expr(value)),
+                    term: BlockTerm::Return(value),
                     params: params.clone(),
                     exc_edge: None,
-                    extra: Default::default(),
+                    extra: BlockContext {
+                        suspension_resume: Some(resume_label),
+                        ..Default::default()
+                    },
                 },
                 exc_target.clone(),
             );
@@ -1101,45 +1544,73 @@ fn emit_yield_site(
                 tail_term,
                 params,
                 exc_target,
+                meta,
             );
         }
-        YieldSite::AssignYield { target, value } => {
+        YieldSite::AssignYield {
+            target,
+            value,
+            meta,
+            lifetime,
+            purpose,
+        } => {
+            let value = prepare_direct_yield_value(state, prefix, value, meta.clone());
             let (resume_pc, resume_label) = state.fresh_resume_target("yield_resume");
-            prefix.push(internal_store_stmt("_dp_pc", core_literal_int(resume_pc)));
-            prefix.push(internal_store_stmt("_dp_yieldfrom", core_none()));
+            prefix.push(internal_store_stmt(
+                state.bindings.control(GeneratorControlRole::ProgramCounter),
+                core_literal_int(resume_pc),
+            ));
+            prefix.push(internal_store_stmt(
+                state.bindings.control(GeneratorControlRole::Delegate),
+                core_none(),
+            ));
             state.push_block(
                 BlockPyBlock {
                     label,
                     body: std::mem::take(prefix),
-                    term: BlockTerm::Return(yield_value_expr(value)),
+                    term: BlockTerm::Return(value),
                     params: params.clone(),
                     exc_edge: None,
-                    extra: Default::default(),
+                    extra: BlockContext {
+                        suspension_resume: Some(resume_label),
+                        ..Default::default()
+                    },
                 },
                 exc_target.clone(),
             );
             emit_resume_after_yield(
                 state,
                 resume_label,
-                Some(target),
+                Some((target, lifetime, purpose)),
                 tail_body,
                 tail_term,
                 params,
                 exc_target,
+                meta,
             );
         }
-        YieldSite::ReturnYield(value) => {
+        YieldSite::ReturnYield { value, meta } => {
+            let value = prepare_direct_yield_value(state, prefix, value, meta.clone());
             let (resume_pc, resume_label) = state.fresh_resume_target("yield_return_resume");
-            prefix.push(internal_store_stmt("_dp_pc", core_literal_int(resume_pc)));
-            prefix.push(internal_store_stmt("_dp_yieldfrom", core_none()));
+            prefix.push(internal_store_stmt(
+                state.bindings.control(GeneratorControlRole::ProgramCounter),
+                core_literal_int(resume_pc),
+            ));
+            prefix.push(internal_store_stmt(
+                state.bindings.control(GeneratorControlRole::Delegate),
+                core_none(),
+            ));
             state.push_block(
                 BlockPyBlock {
                     label,
                     body: std::mem::take(prefix),
-                    term: BlockTerm::Return(yield_value_expr(value)),
+                    term: BlockTerm::Return(value),
                     params: params.clone(),
                     exc_edge: None,
-                    extra: Default::default(),
+                    extra: BlockContext {
+                        suspension_resume: Some(resume_label),
+                        ..Default::default()
+                    },
                 },
                 exc_target.clone(),
             );
@@ -1148,30 +1619,43 @@ fn emit_yield_site(
                 resume_label,
                 None,
                 Vec::new(),
-                BlockTerm::Return(unresolved_load_expr(unresolved_name("_dp_send_value"))),
+                BlockTerm::Return(unresolved_load_expr(unresolved_name(
+                    state
+                        .bindings
+                        .parameter(GeneratorResumeParamRole::SendValue),
+                ))),
                 params,
                 exc_target,
+                meta,
             );
         }
-        YieldSite::ExprYieldFrom(value) => emit_yield_from_site(
-            state, label, prefix, value, None, tail_body, tail_term, params, exc_target,
+        YieldSite::ExprYieldFrom { value, meta } => emit_yield_from_site(
+            state, label, prefix, value, meta, None, tail_body, tail_term, params, exc_target,
         ),
-        YieldSite::AssignYieldFrom { target, value } => emit_yield_from_site(
+        YieldSite::AssignYieldFrom {
+            target,
+            value,
+            meta,
+            lifetime,
+            purpose,
+        } => emit_yield_from_site(
             state,
             label,
             prefix,
             value,
-            Some(target),
+            meta,
+            Some((target, lifetime, purpose)),
             tail_body,
             tail_term,
             params,
             exc_target,
         ),
-        YieldSite::ReturnYieldFrom(value) => emit_yield_from_site(
+        YieldSite::ReturnYieldFrom { value, meta } => emit_yield_from_site(
             state,
             label,
             prefix,
             value,
+            meta,
             None,
             Vec::new(),
             BlockTerm::Return(unresolved_load_expr(unresolved_name(
@@ -1186,20 +1670,22 @@ fn emit_yield_site(
 fn emit_resume_after_yield(
     state: &mut ResumeLoweringState,
     resume_label: BlockLabel,
-    assign_target: Option<UnresolvedName>,
+    assign_target: Option<(UnresolvedName, StoreLifetime, StorePurpose)>,
     mut tail_body: Vec<LinearYieldStmt>,
     tail_term: BlockTerm<InstrWithYield>,
     params: Vec<BlockParam>,
     exc_target: Option<BlockLabel>,
+    source_meta: Meta,
 ) {
     let raise_label = state.fresh_label("yield_throw");
+    let ordinary_raise_label = state.fresh_label("yield_throw_ordinary");
     let continue_label = state.fresh_label("yield_continue");
     state.push_block(
         BlockPyBlock {
             label: resume_label,
             body: Vec::new(),
             term: BlockTerm::IfTerm(TermIf {
-                test: is_resume_exc_test(),
+                test: is_resume_exc_test(state),
                 then_label: raise_label.clone(),
                 else_label: continue_label.clone(),
             }),
@@ -1209,24 +1695,40 @@ fn emit_resume_after_yield(
         },
         exc_target.clone(),
     );
+    emit_resume_exception_dispatch(
+        state,
+        raise_label,
+        ordinary_raise_label,
+        None,
+        params.clone(),
+        exc_target.clone(),
+        source_meta,
+    );
     state.push_block(
         BlockPyBlock {
-            label: raise_label,
+            label: ordinary_raise_label,
             body: Vec::new(),
-            term: resume_exc_raise_term(),
+            term: resume_exc_raise_term(state),
             params: params.clone(),
             exc_edge: None,
             extra: Default::default(),
         },
         exc_target.clone(),
     );
-    if let Some(target) = assign_target {
+    if let Some((target, lifetime, purpose)) = assign_target {
         tail_body.insert(
             0,
-            unresolved_store_stmt(
+            Store::new(
                 target,
-                unresolved_load_expr(unresolved_name("_dp_send_value")),
-            ),
+                unresolved_load_expr::<InstrWithYield>(unresolved_name(
+                    state
+                        .bindings
+                        .parameter(GeneratorResumeParamRole::SendValue),
+                )),
+            )
+            .with_lifetime(lifetime)
+            .with_purpose(purpose)
+            .into(),
         );
     }
     lower_resume_fragment(
@@ -1245,7 +1747,8 @@ fn emit_yield_from_site(
     label: BlockLabel,
     prefix: &mut Vec<LinearCoreStmt>,
     value: InstrWithYield,
-    assign_target: Option<UnresolvedName>,
+    source_meta: Meta,
+    assign_target: Option<(UnresolvedName, StoreLifetime, StorePurpose)>,
     mut tail_body: Vec<LinearYieldStmt>,
     tail_term: BlockTerm<InstrWithYield>,
     params: Vec<BlockParam>,
@@ -1254,6 +1757,7 @@ fn emit_yield_from_site(
     let (delegate_pc, delegate_label) = state.fresh_resume_target("yield_from");
     let send_dispatch_label = state.fresh_label("yield_from_send_dispatch");
     let exc_dispatch_label = state.fresh_label("yield_from_exc_dispatch");
+    let delivery_dispatch_label = state.fresh_label("yield_from_delivery");
     let next_call_label = state.fresh_label("yield_from_next");
     let send_call_label = state.fresh_label("yield_from_send");
     let throw_lookup_label = state.fresh_label("yield_from_throw_lookup");
@@ -1262,8 +1766,10 @@ fn emit_yield_from_site(
     let close_call_label = state.fresh_label("yield_from_close");
     let raise_resume_exc_label = state.fresh_label("yield_from_reraise");
     let call_except_label = state.fresh_label("yield_from_except");
+    let managed_call_except_label = state.fresh_label("yield_from_managed_except");
     let stopiter_label = state.fresh_label("yield_from_stopiter");
     let non_stopiter_label = state.fresh_label("yield_from_non_stopiter");
+    let managed_non_stopiter_label = state.fresh_label("yield_from_managed_non_stopiter");
     let value_expr = ErrOnYield
         .try_map_instr(value)
         .unwrap_or_else(|_| panic!("yield from payload unexpectedly contained nested yield"));
@@ -1272,15 +1778,20 @@ fn emit_yield_from_site(
     let close_name = state.fresh_temp("yield_from_close");
     let caught_exc_name = state.fresh_temp("yield_from_exc");
     prefix.push(internal_store_stmt(
-        "_dp_yieldfrom",
+        state.bindings.control(GeneratorControlRole::Delegate),
         core_call("iter", vec![value_expr]),
     ));
-    prefix.push(internal_store_stmt("_dp_pc", core_literal_int(delegate_pc)));
+    prefix.push(internal_store_stmt(
+        state.bindings.control(GeneratorControlRole::ProgramCounter),
+        core_literal_int(delegate_pc),
+    ));
     state.push_block(
         BlockPyBlock {
             label,
             body: std::mem::take(prefix),
-            term: BlockTerm::Jump(BlockEdge::new(delegate_label.clone())),
+            // Initial source entry advances a fresh iterator with next().
+            // Only a later suspension consumes send/throw resume operands.
+            term: BlockTerm::Jump(BlockEdge::new(next_call_label.clone())),
             params: params.clone(),
             exc_edge: None,
             extra: Default::default(),
@@ -1295,8 +1806,8 @@ fn emit_yield_from_site(
             label: delegate_label.clone(),
             body: Vec::new(),
             term: BlockTerm::IfTerm(TermIf {
-                test: is_resume_exc_test(),
-                then_label: exc_dispatch_label.clone(),
+                test: is_resume_exc_test(state),
+                then_label: delivery_dispatch_label,
                 else_label: send_dispatch_label.clone(),
             }),
             params: params.clone(),
@@ -1310,7 +1821,7 @@ fn emit_yield_from_site(
             label: send_dispatch_label,
             body: Vec::new(),
             term: BlockTerm::IfTerm(TermIf {
-                test: is_send_none_test(),
+                test: is_send_none_test(state),
                 then_label: next_call_label.clone(),
                 else_label: send_call_label.clone(),
             }),
@@ -1325,7 +1836,7 @@ fn emit_yield_from_site(
             label: next_call_label,
             body: vec![internal_store_stmt(
                 yielded_value_name.as_str(),
-                yield_from_next_expr(),
+                yield_from_next_expr(state),
             )],
             term: BlockTerm::Jump(BlockEdge::new(yielded_label.clone())),
             params: params.clone(),
@@ -1339,7 +1850,7 @@ fn emit_yield_from_site(
             label: send_call_label,
             body: vec![internal_store_stmt(
                 yielded_value_name.as_str(),
-                yield_from_send_expr(),
+                yield_from_send_expr(state),
             )],
             term: BlockTerm::Jump(BlockEdge::new(yielded_label.clone())),
             params: params.clone(),
@@ -1348,12 +1859,21 @@ fn emit_yield_from_site(
         },
         Some(call_except_label.clone()),
     );
+    emit_resume_exception_dispatch(
+        state,
+        delivery_dispatch_label,
+        exc_dispatch_label,
+        Some(managed_call_except_label),
+        params.clone(),
+        exc_target.clone(),
+        source_meta,
+    );
     state.push_block(
         BlockPyBlock {
             label: exc_dispatch_label,
             body: Vec::new(),
             term: BlockTerm::IfTerm(TermIf {
-                test: is_resume_generator_exit_test(),
+                test: is_resume_generator_exit_test(state),
                 then_label: close_lookup_label.clone(),
                 else_label: throw_lookup_label.clone(),
             }),
@@ -1368,7 +1888,7 @@ fn emit_yield_from_site(
             label: close_lookup_label,
             body: vec![internal_store_stmt(
                 close_name.as_str(),
-                yield_from_method_lookup_expr("close"),
+                yield_from_method_lookup_expr(state, "close"),
             )],
             term: BlockTerm::IfTerm(TermIf {
                 test: is_name_not_none_test(close_name.as_str()),
@@ -1397,7 +1917,7 @@ fn emit_yield_from_site(
             label: throw_lookup_label,
             body: vec![internal_store_stmt(
                 throw_name.as_str(),
-                yield_from_method_lookup_expr("throw"),
+                yield_from_method_lookup_expr(state, "throw"),
             )],
             term: BlockTerm::IfTerm(TermIf {
                 test: is_name_none_test(throw_name.as_str()),
@@ -1415,7 +1935,14 @@ fn emit_yield_from_site(
             label: throw_call_label,
             body: vec![internal_store_stmt(
                 yielded_value_name.as_str(),
-                single_arg_name_call_expr(throw_name.as_str(), core_name("_dp_resume_exc")),
+                single_arg_name_call_expr(
+                    throw_name.as_str(),
+                    core_name(
+                        state
+                            .bindings
+                            .parameter(GeneratorResumeParamRole::ResumeExc),
+                    ),
+                ),
             )],
             term: BlockTerm::Jump(BlockEdge::new(yielded_label.clone())),
             params: params.clone(),
@@ -1425,8 +1952,21 @@ fn emit_yield_from_site(
         Some(call_except_label.clone()),
     );
     let mut except_params = params.clone();
-    except_params
-        .retain(|param| param.role != BlockParamRole::Exception || param.name == caught_exc_name);
+    // Delegation transports a raised value without entering a Python except
+    // suite. Keep the surrounding source handler's restoration edge separate
+    // from this compiler-only caught operand.
+    if let Some(index) = except_params
+        .iter()
+        .position(|param| param.role == BlockParamRole::Exception && param.name != caught_exc_name)
+    {
+        let mut surrounding = except_params.remove(index);
+        surrounding.role = BlockParamRole::EnclosingException;
+        let outer_index = except_params
+            .iter()
+            .position(|param| param.role == BlockParamRole::EnclosingException)
+            .unwrap_or(except_params.len());
+        except_params.insert(outer_index, surrounding);
+    }
     if let Some(existing) = except_params
         .iter_mut()
         .find(|param| param.name == caught_exc_name)
@@ -1438,21 +1978,61 @@ fn emit_yield_from_site(
             role: BlockParamRole::Exception,
         });
     }
-    state.push_block(
-        BlockPyBlock {
-            label: call_except_label.clone(),
-            body: Vec::new(),
-            term: BlockTerm::IfTerm(TermIf {
-                test: stop_iteration_match_test(caught_exc_name.as_str()),
-                then_label: stopiter_label.clone(),
-                else_label: non_stopiter_label.clone(),
-            }),
-            params: except_params.clone(),
-            exc_edge: None,
-            extra: Default::default(),
-        },
-        exc_target.clone(),
-    );
+    // Preserve ordinary callback propagation versus injected-error delivery
+    // after deciding whether delegation consumes StopIteration.
+    // Classification, value extraction, and forwarding must not publish the
+    // internal caught value as sys.exception(), including during finalizers.
+    for (handler, escaped, disposition) in [
+        (
+            call_except_label,
+            non_stopiter_label,
+            RaiseDisposition::PropagateNormalized,
+        ),
+        (
+            managed_call_except_label,
+            managed_non_stopiter_label,
+            RaiseDisposition::SourceNormalized,
+        ),
+    ] {
+        state.push_block(
+            BlockPyBlock {
+                label: handler,
+                body: Vec::new(),
+                term: BlockTerm::IfTerm(TermIf {
+                    test: stop_iteration_match_test(caught_exc_name.as_str()),
+                    then_label: stopiter_label.clone(),
+                    else_label: escaped.clone(),
+                }),
+                params: except_params.clone(),
+                exc_edge: None,
+                extra: BlockContext {
+                    handled_exception: HandledExceptionContext::Preserve,
+                    ..Default::default()
+                },
+            },
+            exc_target.clone(),
+        );
+        state.push_block(
+            BlockPyBlock {
+                label: escaped,
+                body: vec![internal_store_stmt(
+                    state.bindings.control(GeneratorControlRole::Delegate),
+                    InstrUnresolved::constant_none(),
+                )],
+                term: BlockTerm::Raise(TermRaise {
+                    exc: Some(core_name(caught_exc_name.as_str())),
+                    disposition,
+                }),
+                params: except_params.clone(),
+                exc_edge: None,
+                extra: BlockContext {
+                    handled_exception: HandledExceptionContext::Preserve,
+                    ..Default::default()
+                },
+            },
+            exc_target.clone(),
+        );
+    }
     state.push_block(
         BlockPyBlock {
             label: stopiter_label,
@@ -1466,34 +2046,27 @@ fn emit_yield_from_site(
             )),
             params: except_params.clone(),
             exc_edge: None,
-            extra: Default::default(),
-        },
-        exc_target.clone(),
-    );
-    state.push_block(
-        BlockPyBlock {
-            label: non_stopiter_label,
-            body: vec![internal_store_stmt(
-                "_dp_yieldfrom",
-                InstrUnresolved::constant_none(),
-            )],
-            term: BlockTerm::Raise(TermRaise {
-                exc: Some(core_name(caught_exc_name.as_str())),
-            }),
-            params: except_params,
-            exc_edge: None,
-            extra: Default::default(),
+            extra: BlockContext {
+                handled_exception: HandledExceptionContext::Preserve,
+                ..Default::default()
+            },
         },
         exc_target.clone(),
     );
     state.push_block(
         BlockPyBlock {
             label: yielded_label,
-            body: vec![internal_store_stmt("_dp_pc", core_literal_int(delegate_pc))],
+            body: vec![internal_store_stmt(
+                state.bindings.control(GeneratorControlRole::ProgramCounter),
+                core_literal_int(delegate_pc),
+            )],
             term: BlockTerm::Return(core_name(yielded_value_name.as_str())),
             params: params.clone(),
             exc_edge: None,
-            extra: Default::default(),
+            extra: BlockContext {
+                suspension_resume: Some(delegate_label),
+                ..Default::default()
+            },
         },
         exc_target.clone(),
     );
@@ -1501,7 +2074,7 @@ fn emit_yield_from_site(
         BlockPyBlock {
             label: raise_resume_exc_label,
             body: Vec::new(),
-            term: resume_exc_raise_term(),
+            term: resume_exc_raise_term(state),
             params: params.clone(),
             exc_edge: None,
             extra: Default::default(),
@@ -1511,15 +2084,23 @@ fn emit_yield_from_site(
 
     tail_body.insert(
         0,
-        internal_store_stmt("_dp_yieldfrom", InstrWithYield::constant_none()),
+        internal_store_stmt(
+            state.bindings.control(GeneratorControlRole::Delegate),
+            InstrWithYield::constant_none(),
+        ),
     );
-    if let Some(target) = assign_target {
+    if let Some((target, lifetime, purpose)) = assign_target {
         tail_body.insert(
             1,
-            unresolved_store_stmt(
+            Store::new(
                 target,
-                unresolved_load_expr(unresolved_name(yielded_value_name.as_str())),
-            ),
+                unresolved_load_expr::<InstrWithYield>(unresolved_name(
+                    yielded_value_name.as_str(),
+                )),
+            )
+            .with_lifetime(lifetime)
+            .with_purpose(purpose)
+            .into(),
         );
     } else if matches!(tail_term, BlockTerm::Return(InstrWithYield::Load(ref op)) if op.name.id_str() == "_dp_yield_from_value")
     {
@@ -1538,6 +2119,7 @@ fn lower_resume_blocks(
     callable: &BlockPyFunction<CoreModuleShapeWithYield>,
     resume_name_gen: FunctionNameGen,
     public_storage_layout: &StorageLayout,
+    bindings: &GeneratorBindingNames,
 ) -> (
     Vec<LinearCoreBlock>,
     HashMap<BlockLabel, Option<BlockLabel>>,
@@ -1571,7 +2153,7 @@ fn lower_resume_blocks(
                 }
                 check(branch.default_label, "branch default");
             }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
         }
         if let Some(edge) = &block.exc_edge {
             check(edge.target, "exception");
@@ -1643,10 +2225,7 @@ fn lower_resume_blocks(
         .iter()
         .filter(|slot| {
             slot.storage != PreservedSlotStorage::I64
-                && !matches!(
-                    slot.logical_name.as_str(),
-                    "_dp_yieldfrom" | "_dp_throw_context"
-                )
+                && slot.generator_control != Some(GeneratorControlRole::Delegate)
         })
         .map(|slot| slot.storage_name.clone())
         .collect();
@@ -1655,6 +2234,7 @@ fn lower_resume_blocks(
         callable.kind,
         declared_param_indices_by_label,
         terminal_object_slots,
+        bindings.clone(),
     );
     state.resume_targets.push((1, resume_entry_target));
 
@@ -1687,6 +2267,7 @@ fn lower_resume_blocks(
         + 1;
     let mut targets = vec![state.exhausted_label.clone(); targets_len];
     let mut dispatch_wrappers = Vec::new();
+    let mut dispatch_target_by_resume = HashMap::new();
     let params_by_label = state
         .blocks
         .iter()
@@ -1695,23 +2276,38 @@ fn lower_resume_blocks(
     let resume_targets = state.resume_targets.clone();
     for (pc, label) in resume_targets {
         let declared_params = params_by_label.get(&label).cloned().unwrap_or_default();
-        if declared_params.is_empty() {
-            targets[pc] = label.clone();
-        } else {
-            let wrapper_label = state.fresh_label("resume_dispatch_target");
-            targets[pc] = wrapper_label.clone();
-            dispatch_wrappers.push(LinearCoreBlock {
-                label: wrapper_label.clone(),
-                body: Vec::new(),
-                term: BlockTerm::Jump(BlockEdge::with_args(
-                    label.clone(),
-                    resume_dispatch_jump_args_for_params(&declared_params),
-                )),
-                params: Vec::new(),
-                exc_edge: None,
-                extra: Default::default(),
-            });
-            state.exception_edges.insert(wrapper_label, None);
+        // Every activation entry gets a distinct wrapper, including a
+        // zero-parameter continuation. A source's first Jump into yield-from
+        // must not be mistaken for the later native dispatch into its resume.
+        let wrapper_label = state.fresh_label("resume_dispatch_target");
+        targets[pc] = wrapper_label;
+        dispatch_wrappers.push(LinearCoreBlock {
+            label: wrapper_label,
+            body: Vec::new(),
+            term: BlockTerm::Jump(BlockEdge::with_args(
+                label,
+                resume_dispatch_jump_args_for_params(&declared_params),
+            )),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: BlockContext {
+                handled_exception: soac_core::block_py::HandledExceptionContext::Preserve,
+                ..Default::default()
+            },
+        });
+        state.exception_edges.insert(wrapper_label, None);
+        dispatch_target_by_resume.insert(label, wrapper_label);
+    }
+    // Ownership must start at the same entry as the next runtime activation:
+    // name binding materializes the wrapper's preserved-to-local reloads.
+    // Keep this projection explicit rather than recovering a target from _dp_pc.
+    for block in &mut state.blocks {
+        if let Some(resume) = block.extra.suspension_resume {
+            block.extra.suspension_resume = Some(
+                *dispatch_target_by_resume
+                    .get(&resume)
+                    .expect("yield continuation must have a final resume entry"),
+            );
         }
     }
 
@@ -1719,20 +2315,23 @@ fn lower_resume_blocks(
         label: dispatch_label.clone(),
         body: Vec::new(),
         term: BlockTerm::BranchTable(TermBranchTable {
-            index: core_name("_dp_pc"),
+            index: core_name(state.bindings.control(GeneratorControlRole::ProgramCounter)),
             targets,
             default_label: state.exhausted_label.clone(),
         }),
         params: Vec::new(),
         exc_edge: None,
-        extra: Default::default(),
+        extra: soac_core::block_py::BlockContext {
+            handled_exception: soac_core::block_py::HandledExceptionContext::Preserve,
+            ..Default::default()
+        },
     }];
     blocks.append(&mut dispatch_wrappers);
     push_terminal_exception_blocks(&mut state);
     state.push_terminal_block(LinearCoreBlock {
         label: state.exhausted_label.clone(),
         body: Vec::new(),
-        term: completion_raise(state.kind, None),
+        term: completion_term(state.kind, None),
         params: Vec::new(),
         exc_edge: None,
         extra: Default::default(),
@@ -1766,12 +2365,17 @@ pub(crate) fn lower_generator_like_function(
         is_generator_like(callable.kind),
         "generator lowering only applies to generator-like callables"
     );
-    let mut storage_layout = build_generator_storage_layout(&callable);
+    let bindings = GeneratorBindingNames::for_callable(&callable);
+    let mut storage_layout = build_generator_storage_layout(&callable, &bindings);
     let resume_closure_state_order = resume_closure_state_order(&storage_layout);
     let resume_binding_logical_names =
         ordered_resume_binding_logical_names(&callable, &resume_closure_state_order);
-    let (resume_blocks, _resume_exception_edges, _resume_entry_label) =
-        lower_resume_blocks(&callable, callable.name_gen.share(), &storage_layout);
+    let (resume_blocks, _resume_exception_edges, _resume_entry_label) = lower_resume_blocks(
+        &callable,
+        callable.name_gen.share(),
+        &storage_layout,
+        &bindings,
+    );
     let closure_bindings = resume_closure_bindings(&callable.scope, &resume_binding_logical_names);
 
     let BlockPyFunction {
@@ -1783,6 +2387,7 @@ pub(crate) fn lower_generator_like_function(
         params,
         doc,
         scope,
+        public_scope,
         ..
     } = callable;
     storage_layout.set_stack_slots(params.names());
@@ -1790,7 +2395,7 @@ pub(crate) fn lower_generator_like_function(
     let mut resume_semantic = scope.clone();
     augment_resume_semantic_for_standard_name_binding(&mut resume_semantic, &closure_bindings);
 
-    let resume_params = resume_param_spec(kind);
+    let resume_params = resume_param_spec(&bindings.abi);
     let mut lowered_function = BlockPyFunction {
         function_id,
         name_gen,
@@ -1799,7 +2404,9 @@ pub(crate) fn lower_generator_like_function(
         execution_mode,
         params,
         body_params: Some(resume_params),
-        public_scope: Some(scope.clone()),
+        // Private construction cells belong to the complete physical body
+        // layout, not the source function's public closure projection.
+        public_scope: Some(public_scope.unwrap_or_else(|| scope.clone())),
         blocks: resume_blocks.clone(),
         doc,
         public_storage_layout: Some(storage_layout),
@@ -1824,7 +2431,29 @@ pub(crate) fn lower_generator_like_function(
         .expect("generator public layout should exist")
         .preserved_slots
         .clone();
+    for block in &mut lowered_function.blocks {
+        for parameter in &mut block.params {
+            if let Some(role) = bindings.abi.role_for_name(&parameter.name) {
+                assert!(
+                    matches!(
+                        parameter.role,
+                        BlockParamRole::Value | BlockParamRole::GeneratorResume(_)
+                    ),
+                    "private resume parameter collided with a semantic block parameter"
+                );
+                parameter.role = BlockParamRole::GeneratorResume(role);
+            }
+        }
+    }
+    resume_storage_layout.expression_temporaries = lowered_function
+        .public_storage_layout()
+        .expect("generator public layout should exist")
+        .expression_temporaries
+        .clone();
+    resume_storage_layout.generator_resume_abi = Some(bindings.abi);
     lowered_function.storage_layout = Some(resume_storage_layout);
+    validate_suspension_resumes(&lowered_function)
+        .unwrap_or_else(|error| panic!("invalid lowered generator suspension: {error}"));
 
     vec![lowered_function]
 }
@@ -1854,6 +2483,7 @@ pub(crate) fn lower_yield_in_lowered_core_blockpy_module_bundle(
     }
     BlockPyModule {
         module_name_gen,
+        strict_source: module.strict_source,
         global_names: Vec::new(),
         callable_defs,
         module_constants: Vec::new(),

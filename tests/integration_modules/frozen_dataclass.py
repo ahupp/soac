@@ -1,9 +1,14 @@
 import dataclasses
 import importlib
+import os
 from pathlib import Path
 import sys
 
-stdlib_path = Path(__file__).resolve().parents[2] / "vendor" / "cpython" / "Lib"
+stdlib_path = (
+    Path(__file__).resolve().parents[2]
+    / os.environ.get("CPYTHON_SOURCE_DIR", "vendor/cpython")
+    / "Lib"
+)
 sys.path.insert(0, str(stdlib_path))
 try:
     dataclasses = importlib.reload(dataclasses)

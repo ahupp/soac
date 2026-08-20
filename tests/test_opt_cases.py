@@ -4,11 +4,12 @@ import ast
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tests._strict_integration import _VALIDATION_PRELUDE, create_strict_project
 
 OPT_TESTS_DIR = Path(__file__).resolve().parent / "opt_tests"
 VERIFY_DELIMITER = "# soac: verify"
@@ -50,44 +51,84 @@ def _split_opt_case(case_path: Path) -> tuple[str, list[dict[str, Any]]]:
     return module_source.rstrip() + "\n", expectations
 
 
-def _soac_subprocess_env(module_root: Path, *, work_dir: Path) -> dict[str, str]:
-    env = dict(os.environ)
-    env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
-    env["SOAC_WORK_DIR"] = str(work_dir)
-    env.pop("SOAC_LOG", None)
-    env.pop("SOAC_COMPILE_MODE", None)
-    return env
+# Each source is reviewed explicitly. Counter rows alone cannot prove native
+# admission; these witnesses name the actual functions used by the old cases.
+_REQUIRED_FUNCTIONS = {
+    "direct_call_v3": ("target", "caller", "exercise_direct_call"),
+    "exact_list_item_get_set_v3": ("list_get_set", "exercise_exact_list_items"),
+    "exact_tuple_item_get_v3": (
+        "OverrideTuple.__getitem__", "CustomIndex.__index__", "tuple_get",
+        "tuple_set", "exercise_exact_tuple_items",
+    ),
+    "global_indexed_get_set": ("set_get_global", "exercise_global_indexed"),
+    "indexed_field_branch_compare": ("Record.__init__", "branch_fields", "exercise_branch_fields"),
+    "indexed_field_get_set": ("Record.__init__", "read_fields", "write_fields", "exercise_indexed_fields"),
+    "indexed_field_get_set_v3": ("Record.__init__", "read_fields", "write_fields", "exercise_indexed_fields"),
+}
 
 
-def _run_soac_subprocess(script: str, *, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        env=env,
-        text=True,
-    )
+def _opt_environment(work_dir: Path) -> dict[str, str]:
+    # The original helper removed SOAC_COMPILE_MODE (Lazy). Preserve that
+    # choice instead of accepting StrictProject.run's eager test default.
+    return {
+        "SOAC_WORK_DIR": str(work_dir),
+        "SOAC_COMPILE_MODE": "lazy",
+        "SOAC_BACKGROUND_JIT": os.environ.get("SOAC_BACKGROUND_JIT", "1"),
+    }
+
+
+def _opt_project(root: Path, module_name: str, source: str, environment):
+    with pytest.MonkeyPatch.context() as patch:
+        for name in (
+            "SOAC_MODULE_ENABLED", "SOAC_LOG", "SOAC_WORK_DIR",
+            "SOAC_COMPILE_MODE", "SOAC_BACKGROUND_JIT", "SOAC_OPT_MODE",
+        ):
+            patch.delenv(name, raising=False)
+        for name, value in environment.items():
+            patch.setenv(name, value)
+        patch.setenv("SOAC_OPT_MODE", "profile")
+        return create_strict_project(
+            root / "strict-publication",
+            {f"{module_name}.py": "from __future__ import strict\n" + source},
+            modules={module_name: f"{module_name}.py"},
+            backend="soac",
+        )
 
 
 def _assert_subprocess_ok(result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _run_script(module_root: Path, module_name: str) -> str:
-    return "\n".join(
-        [
-            "import sys",
-            "import importlib",
-            f"sys.path.insert(0, {str(module_root)!r})",
-            "from soac.import_hook import install",
-            "install()",
-            f"module = importlib.import_module({module_name!r})",
-            "verify = getattr(module, '_soac_opt_verify', None)",
-            "if callable(verify):",
-            "    verify()",
-            "",
-        ]
-    )
+def _run_script(project, module_name: str) -> str:
+    return _VALIDATION_PRELUDE + f"""
+import ctypes
+import importlib
+from soac import _soac_ext
+
+module = importlib.import_module({module_name!r})
+diagnostic = _soac_ext.strict_module_diagnostics(module)
+assert diagnostic is not None, 'opt case ran without strict ownership'
+assert diagnostic['sealed'] is True
+assert diagnostic['module_name'] == {module_name!r}
+assert diagnostic['source_path'] == {str(project.project / (module_name + '.py'))!r}
+assert diagnostic['artifact_generation'] == {project.publication['generation']!r}
+assert diagnostic['initializer_entry_kind'] == 'entry_interpreter'
+owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+owner.argtypes = (ctypes.py_object,)
+owner.restype = ctypes.c_void_p
+metadata = ctypes.pythonapi.PyFunction_GetSoacMetadata
+metadata.argtypes = (ctypes.py_object,)
+metadata.restype = ctypes.c_void_p
+for name in {_REQUIRED_FUNCTIONS[module_name]!r}:
+    function = _plain_function_witness(module, name)
+    assert owner(function), name
+    assert metadata(function), name
+del function
+verify = getattr(module, '_soac_opt_verify', None)
+if callable(verify):
+    verify()
+assert _soac_ext.strict_module_diagnostics(module) == diagnostic
+"""
 
 
 def _inspect_counter_dump_json(path: Path) -> dict[str, Any]:
@@ -162,24 +203,20 @@ def _assert_counter_expectation(
 def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
     source, expectations = _split_opt_case(case_path)
     module_name = case_path.stem
-    module_root = tmp_path / "modules"
-    module_root.mkdir()
-    (module_root / f"{module_name}.py").write_text(source, encoding="utf-8")
-
+    assert module_name in _REQUIRED_FUNCTIONS, "opt case needs explicit admission review"
     work_dir = tmp_path / "soac-work"
-    base_env = _soac_subprocess_env(module_root, work_dir=work_dir)
-    script = _run_script(module_root, module_name)
+    environment = _opt_environment(work_dir)
+    project = _opt_project(tmp_path, module_name, source, environment)
+    script = _run_script(project, module_name)
 
-    profile_result = _run_soac_subprocess(
-        script,
-        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    profile_result = project.run(
+        script, opt_mode="profile", extra_env=environment, check=False,
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
 
-    verify_result = _run_soac_subprocess(
-        script,
-        env={**base_env, "SOAC_OPT_MODE": "verify"},
+    verify_result = project.run(
+        script, opt_mode="verify", extra_env=environment, check=False,
     )
     _assert_subprocess_ok(verify_result)
     verify_path = work_dir / "verify.bin"
@@ -190,3 +227,42 @@ def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
         _assert_counter_expectation(
             verify, expectation, case_path, module_name=module_name
         )
+
+
+@pytest.mark.integration
+def test_opt_case_driver_uses_canonical_witnesses_under_isolation(
+    tmp_path: Path,
+) -> None:
+    # Keep this focused on the real isolated driver, before counter inspection.
+    # These are the existing direct_call_v3 witness names and callable shapes.
+    source = """
+def target(left, right):
+    return left + right
+
+
+def caller(fn, left, right):
+    return fn(left, right)
+
+
+def exercise_direct_call():
+    assert caller(target, 20, 22) == 42
+"""
+    module_name = "direct_call_v3"
+    environment = _opt_environment(tmp_path / "soac-work")
+    project = _opt_project(tmp_path, module_name, source, environment)
+    helper_path = Path(__file__).with_name("_strict_integration.py").resolve()
+    script = (
+        "assert sys.flags.isolated == 1\n"
+        f"assert {str(OPT_TESTS_DIR.parents[1])!r} not in sys.path\n"
+        + _run_script(project, module_name)
+        + f"""
+from pathlib import Path
+assert Path(_plain_function_witness.__code__.co_filename).resolve() == Path({str(helper_path)!r})
+assert _plain_function_witness(module, 'caller') is module.caller
+assert module.exercise_direct_call() is None
+"""
+    )
+    result = project.run(
+        script, opt_mode="profile", extra_env=environment, check=False,
+    )
+    _assert_subprocess_ok(result)

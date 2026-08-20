@@ -10,5 +10,6 @@ doctest = false
 derive_more = { version = "2", features = ["from"] }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
 soac_core = { path = "../soac_core" }
+soac_contracts = { path = "../soac_contracts" }
 soac_ir_blockpy = { path = "../soac_ir_blockpy" }
 soac_macros = { path = "../soac_macros" }

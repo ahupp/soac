@@ -1,0 +1,63 @@
+{
+  "ord_chr_roundtrip_uses_runtime_builtin_primitives": {
+    "original_test": "test_ord_chr_roundtrip_uses_runtime_builtin_primitives",
+    "source": "\ndef codepoint(value):\n    return ord(value)\n\ndef bytes_codepoint(value):\n    return ord(value)\n\ndef roundtrip(value):\n    return chr(ord(value))\n\ndef item_count(value):\n    return len(value)\n\ndef chr_count(value):\n    return chr(len(value))\n\ndef from_literal():\n    return chr(65)\n\ndef from_local():\n    value = 65\n    return chr(value)\n\ndef local_overflow():\n    value = 1267650600228229401496703205376\n    return chr(value)\n",
+    "source_sha256": "3013f7cae38cd256770acda547bd895dfe7a1e591c5a1709b2bf62925b267189",
+    "validation": "assert module.codepoint('A') == 65\nassert module.bytes_codepoint(b'A') == 65\nassert module.bytes_codepoint(bytearray(b'B')) == 66\nassert module.roundtrip('Z') == 'Z'\nassert module.item_count('abc') == 3\nassert module.item_count([1, 2, 3]) == 3\nassert module.chr_count('x' * 65) == 'A'\nassert module.from_literal() == 'A'\nassert module.from_local() == 'A'\nwith pytest.raises(ValueError):\n    module.local_overflow()\n",
+    "required_functions": [
+      "codepoint",
+      "bytes_codepoint",
+      "roundtrip",
+      "item_count",
+      "chr_count",
+      "from_literal",
+      "from_local",
+      "local_overflow"
+    ]
+  },
+  "ord_chr_runtime_builtin_primitive_errors": {
+    "original_test": "test_ord_chr_runtime_builtin_primitive_errors",
+    "source": "\ndef bad_ord(value):\n    return ord(value)\n\ndef bad_chr(value):\n    return chr(ord(value))\n\ndef bad_len(value):\n    return len(value)\n",
+    "source_sha256": "b03e766ed3618fb57b7da486b6f91780bbd64c834b459c276ee28cc8a5c30dc2",
+    "validation": "with pytest.raises(TypeError):\n    module.bad_ord('AB')\nwith pytest.raises(TypeError):\n    module.bad_ord(b'AB')\nwith pytest.raises(TypeError):\n    module.bad_ord(bytearray(b'AB'))\nwith pytest.raises(TypeError):\n    module.bad_chr('AB')\nwith pytest.raises(TypeError):\n    module.bad_len(5)\n",
+    "required_functions": [
+      "bad_ord",
+      "bad_chr",
+      "bad_len"
+    ]
+  },
+  "runtime_range_is_reusable_iterable": {
+    "original_test": "test_runtime_range_is_reusable_iterable",
+    "source": "\ndef collect_stop(stop):\n    return list(range(stop))\n\ndef collect_start_stop(start, stop):\n    return list(range(start, stop))\n\ndef collect_step(start, stop, step):\n    return list(range(start, stop, step))\n\ndef reuse_range(stop):\n    values = range(stop)\n    return list(values), list(values)\n\ndef reuse_iterator(stop):\n    iterator = iter(range(stop))\n    return list(iterator), list(iterator)\n\ndef collect_reversed_stop(stop):\n    return list(reversed(range(stop)))\n\ndef collect_reversed_step(start, stop, step):\n    return list(reversed(range(start, stop, step)))\n\ndef make_range(stop):\n    return range(stop)\n\ndef iterator_type_name(stop):\n    return type(iter(range(stop))).__name__\n\ndef range_type_name(stop):\n    value = range(stop)\n    return type(value).__module__, type(value).__name__\n\ndef zero_step():\n    return list(range(1, 3, 0))\n\ndef no_args():\n    return range()\n\nclass Indexable:\n    def __init__(self, value):\n        self.value = value\n\n    def __index__(self):\n        return self.value\n\nclass BadIndex:\n    def __index__(self):\n        return \"not-int\"\n\ndef collect_indexable():\n    return list(range(Indexable(1), Indexable(5), Indexable(2)))\n\ndef bad_index():\n    return list(range(BadIndex()))\n\ndef no_index():\n    return list(range(object()))\n",
+    "source_sha256": "5aef7e9263bf7efdfe37221e4bdf96005b92ffb66296466367cbd8d566470b25",
+    "validation": "assert module.collect_stop(4) == [0, 1, 2, 3]\nassert module.collect_start_stop(2, 5) == [2, 3, 4]\nassert module.collect_step(5, 1, -2) == [5, 3]\nassert module.reuse_range(3) == ([0, 1, 2], [0, 1, 2])\nassert module.reuse_iterator(3) == ([0, 1, 2], [])\nassert module.collect_reversed_stop(4) == [3, 2, 1, 0]\nassert module.collect_reversed_step(1, 8, 2) == [7, 5, 3, 1]\nassert module.collect_reversed_step(8, 1, -3) == [2, 5, 8]\nactual_range = module.make_range(3)\nassert type(actual_range) is range\nassert actual_range == range(3)\nassert actual_range[1:] == range(1, 3)\nassert module.iterator_type_name(3) == type(iter(range(3))).__name__\nassert module.range_type_name(3) == (range.__module__, range.__name__)\nassert module.collect_indexable() == [1, 3]\nwith pytest.raises(ValueError):\n    module.zero_step()\nwith pytest.raises(TypeError):\n    module.no_args()\nwith pytest.raises(TypeError):\n    module.bad_index()\nwith pytest.raises(TypeError):\n    module.no_index()\n",
+    "required_functions": [
+      "collect_stop",
+      "collect_start_stop",
+      "collect_step",
+      "reuse_range",
+      "reuse_iterator",
+      "collect_reversed_stop",
+      "collect_reversed_step",
+      "make_range",
+      "iterator_type_name",
+      "range_type_name",
+      "zero_step",
+      "no_args",
+      "collect_indexable",
+      "bad_index",
+      "no_index"
+    ]
+  },
+  "for_range_stop_iteration_match_preserves_loop_semantics": {
+    "original_test": "test_for_range_stop_iteration_match_preserves_loop_semantics",
+    "source": "\ndef total(n):\n    result = 0\n    for value in range(n):\n        result += value\n    return result\n\ndef loop_else_complete(n):\n    result = []\n    for value in range(n):\n        result.append(value)\n    else:\n        result.append(\"done\")\n    return result\n\ndef loop_else_break(n):\n    result = []\n    for value in range(n):\n        if value == 2:\n            break\n        result.append(value)\n    else:\n        result.append(\"done\")\n    return result\n",
+    "source_sha256": "f1898e75968547f1924882ec1c724598aa4e673895467b5b0e70f630319d51a2",
+    "validation": "assert module.total(6) == 15\nassert module.loop_else_complete(3) == [0, 1, 2, 'done']\nassert module.loop_else_break(5) == [0, 1]\n",
+    "required_functions": [
+      "total",
+      "loop_else_complete",
+      "loop_else_break"
+    ]
+  }
+}

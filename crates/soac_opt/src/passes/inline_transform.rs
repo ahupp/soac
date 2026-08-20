@@ -1,10 +1,98 @@
 use crate::passes::{BlockPyModuleShape, InstrBlockPy, try_allocate_codegen_stack_temp};
 use soac_core::block_py::{
-    Block, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockPyFunction, BlockTerm,
-    CallArgPositional, CallDirect, ConstantExpr, HasMeta, LocalLocation, MapInstr, Mappable,
-    NameLocation, ParamKind, ResolvedName, RuntimeName, Store, TryMapInstr, TryMapTerm, WithMeta,
+    Block, BlockArg, BlockContext, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
+    BlockPyFunction, BlockTerm, CallArgPositional, CallDirect, ConstantExpr,
+    HandledExceptionContext, HasBlockContext, HasMeta, Instr, LocalLocation, MapInstr, Mappable,
+    ModuleShape, NameLocation, ParamKind, ResolvedName, RuntimeName, Store, TryMapInstr,
+    TryMapTerm, WithMeta,
 };
 use std::collections::HashMap;
+
+/// A necessary activation-safety precondition for copying a callee's body.
+///
+/// A terminal handled-state operation belongs to the callee's own activation.
+/// Copying it into an ordinary caller would retire the wrong exception item.
+/// This predicate does not establish caller-region compatibility,
+/// authentication, supported operation shapes, or an inline size budget.
+pub fn inline_callee_preserves_activation(callee: &BlockPyFunction<impl ModuleShape>) -> bool {
+    !callee.blocks.iter().any(|block| {
+        block.extra.block_context().handled_exception == HandledExceptionContext::Terminal
+    })
+}
+
+/// The call site's active handler prefix, not a new Python activation.
+///
+/// Ordinary callees share the current native handled item. A suspended resume
+/// has a different capsule-owned item and cannot be represented by appending
+/// lexical regions to this one activation.
+#[derive(Debug, Clone)]
+pub(crate) struct InlineHandledContext {
+    context: BlockContext,
+    regions: Vec<BlockParam>,
+    pending_payloads: Vec<BlockParam>,
+}
+
+impl InlineHandledContext {
+    pub(crate) fn for_call_site<I: Instr, E: HasBlockContext>(block: &Block<I, E>) -> Self {
+        Self {
+            context: block.extra.block_context(),
+            regions: block.handled_exception_params().cloned().collect(),
+            pending_payloads: block.pending_abrupt_payload_params().cloned().collect(),
+        }
+    }
+
+    pub(crate) fn can_inline(&self, callee: &BlockPyFunction<impl ModuleShape>) -> bool {
+        if !inline_callee_preserves_activation(callee) {
+            return false;
+        }
+        self.context.handled_exception == HandledExceptionContext::Regions
+            || callee
+                .blocks
+                .iter()
+                .all(|block| block.handled_exception_params().next().is_none())
+    }
+
+    pub(crate) fn preserve_caller<I: Instr, E: HasBlockContext>(&self, block: &mut Block<I, E>) {
+        block.extra.set_block_context(self.context);
+        // These new blocks are in the original caller's lexical region. Keep
+        // its roles, not a second copy of that region nested inside itself.
+        block.params.extend(self.regions.iter().rev().cloned());
+        block
+            .params
+            .extend(self.pending_payloads.iter().rev().map(|param| BlockParam {
+                name: param.name.clone(),
+                role: BlockParamRole::EnclosingAbruptPayload,
+            }));
+    }
+
+    pub(crate) fn compose_callee<I: Instr, E: HasBlockContext>(&self, block: &mut Block<I, E>) {
+        if self.context.handled_exception != HandledExceptionContext::Regions {
+            // A no-handler ordinary callee inherits the current dynamic item.
+            // Terminal applies to the original caller's cleanup/raise, never
+            // to a source raise inside its inlined ordinary callee.
+            block.extra.set_block_context(BlockContext {
+                handled_exception: HandledExceptionContext::Preserve,
+                ..Default::default()
+            });
+        }
+        // Existing explicit edge arguments address the callee parameter
+        // prefix. Appended caller regions use same-name edge transport. The
+        // region iterator reverses EnclosingException parameters, so append
+        // the caller's inner-to-outer prefix after the callee's own regions.
+        block
+            .params
+            .extend(self.regions.iter().rev().map(|param| BlockParam {
+                name: param.name.clone(),
+                role: BlockParamRole::EnclosingException,
+            }));
+        block
+            .params
+            .extend(self.pending_payloads.iter().rev().map(|param| BlockParam {
+                name: param.name.clone(),
+                role: BlockParamRole::EnclosingAbruptPayload,
+            }));
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct InlineFragment {
@@ -46,6 +134,8 @@ pub enum InlineUnsupportedReason {
     MissingCalleeConstant(u32),
     TooManyCallerConstants,
     CrossModuleGlobalName(String),
+    ClassConstructionExecutionContext,
+    FunctionDefinitionExecutionContext,
     UnknownBlockName(String),
 }
 
@@ -328,6 +418,7 @@ fn build_multi_block_inline_fragment_to_target_impl(
         let fresh = allocate_inline_local(caller)?;
         locals.insert(location, fresh);
     }
+    record_inline_block_parameter_roles(caller, callee_layout, &locals);
 
     let label_map = callee
         .blocks
@@ -418,7 +509,9 @@ fn remap_inline_term_labels(
             BlockTerm::BranchTable(term)
         }
         BlockTerm::Raise(term) => BlockTerm::Raise(term),
-        BlockTerm::Return(_) => return Err(InlineUnsupportedReason::NonReturnTerm),
+        BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {
+            return Err(InlineUnsupportedReason::NonReturnTerm);
+        }
     })
 }
 
@@ -480,6 +573,7 @@ fn build_single_block_inline_fragment_with_constant_scope(
         let fresh = allocate_inline_local(caller)?;
         locals.insert(location, fresh);
     }
+    record_inline_block_parameter_roles(caller, callee_layout, &locals);
     let (return_target, return_local, continuation_args) = match return_placement {
         InlineReturnPlacement::FreshContinuationArg => {
             let return_local = allocate_inline_local(caller)?;
@@ -531,6 +625,27 @@ fn build_single_block_inline_fragment_with_constant_scope(
 enum InlineReturnPlacement {
     FreshContinuationArg,
     StoreTo(ResolvedName),
+}
+
+fn record_inline_block_parameter_roles(
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee_layout: &soac_core::block_py::StorageLayout,
+    locals: &HashMap<LocalLocation, InlineLocal>,
+) {
+    let layout = caller
+        .storage_layout
+        .as_mut()
+        .expect("inline local allocation requires a caller layout");
+    for binding in &callee_layout.block_parameter_roles {
+        if let NameLocation::Local(source) = binding.location {
+            if let Some(target) = locals.get(&source) {
+                layout.record_block_parameter_role(
+                    NameLocation::Local(target.location),
+                    binding.role,
+                );
+            }
+        }
+    }
 }
 
 fn allocate_inline_local(
@@ -735,7 +850,12 @@ impl TryMapInstr<InstrBlockPy, InstrBlockPy, InlineUnsupportedReason>
             InstrBlockPy::BinOp(op) => InstrBlockPy::BinOp(op.try_map_children(self)?),
             InstrBlockPy::UnaryOp(op) => InstrBlockPy::UnaryOp(op.try_map_children(self)?),
             InstrBlockPy::Tuple(op) => InstrBlockPy::Tuple(op.try_map_children(self)?),
-            InstrBlockPy::Call(op) => InstrBlockPy::Call(op.try_map_children(self)?),
+            InstrBlockPy::Call(op) => {
+                if op.frame_namespace.is_some() {
+                    return Err(InlineUnsupportedReason::ClassConstructionExecutionContext);
+                }
+                InstrBlockPy::Call(op.try_map_children(self)?)
+            }
             InstrBlockPy::GetAttr(op) => InstrBlockPy::GetAttr(op.try_map_children(self)?),
             InstrBlockPy::SetAttr(op) => InstrBlockPy::SetAttr(op.try_map_children(self)?),
             InstrBlockPy::GetItem(op) => InstrBlockPy::GetItem(op.try_map_children(self)?),
@@ -766,10 +886,67 @@ impl TryMapInstr<InstrBlockPy, InstrBlockPy, InlineUnsupportedReason>
                 InstrBlockPy::Del(op.try_map_children(self)?)
             }
             InstrBlockPy::MakeCell(op) => InstrBlockPy::MakeCell(op.try_map_children(self)?),
+            InstrBlockPy::NewAnnotationSet(op) => {
+                InstrBlockPy::NewAnnotationSet(op.try_map_children(self)?)
+            }
+            InstrBlockPy::SetupAnnotations(op) => {
+                InstrBlockPy::SetupAnnotations(op.try_map_children(self)?)
+            }
+            InstrBlockPy::ConstructTypeParameterScope(op) => {
+                InstrBlockPy::ConstructTypeParameterScope(op.try_map_children(self)?)
+            }
+            InstrBlockPy::SubscriptGeneric(op) => {
+                InstrBlockPy::SubscriptGeneric(op.try_map_children(self)?)
+            }
+            InstrBlockPy::SetFunctionTypeParameters(op) => {
+                InstrBlockPy::SetFunctionTypeParameters(op.try_map_children(self)?)
+            }
+            InstrBlockPy::CreateTypeAlias(op) => {
+                InstrBlockPy::CreateTypeAlias(op.try_map_children(self)?)
+            }
+            InstrBlockPy::CreateTypeParameter(op) => {
+                InstrBlockPy::CreateTypeParameter(op.try_map_children(self)?)
+            }
+            InstrBlockPy::SetTypeParameterDefault(op) => {
+                InstrBlockPy::SetTypeParameterDefault(op.try_map_children(self)?)
+            }
+            InstrBlockPy::CheckAnnotationFormat(op) => {
+                InstrBlockPy::CheckAnnotationFormat(op.try_map_children(self)?)
+            }
+            InstrBlockPy::RecordAnnotation(op) => {
+                InstrBlockPy::RecordAnnotation(op.try_map_children(self)?)
+            }
             InstrBlockPy::IncrementCounter(op) => InstrBlockPy::IncrementCounter(op),
             InstrBlockPy::CellRef(op) => InstrBlockPy::CellRef(op),
             InstrBlockPy::MakeFunctionWithClosure(op) => {
                 InstrBlockPy::MakeFunctionWithClosure(op.try_map_children(self)?)
+            }
+            InstrBlockPy::TakeOperand(op) => InstrBlockPy::TakeOperand(op.try_map_children(self)?),
+            InstrBlockPy::ComprehensionInsert(op) => {
+                InstrBlockPy::ComprehensionInsert(op.try_map_children(self)?)
+            }
+            InstrBlockPy::BuildCollection(op) => {
+                InstrBlockPy::BuildCollection(op.try_map_children(self)?)
+            }
+            InstrBlockPy::CallArgumentOp(op) => {
+                InstrBlockPy::CallArgumentOp(op.try_map_children(self)?)
+            }
+            InstrBlockPy::PreparedCall(op) => {
+                InstrBlockPy::PreparedCall(op.try_map_children(self)?)
+            }
+            InstrBlockPy::IteratorStep(op) => {
+                InstrBlockPy::IteratorStep(op.try_map_children(self)?)
+            }
+            InstrBlockPy::ConstructClass(_)
+            | InstrBlockPy::PrepareClassDecorator(_)
+            | InstrBlockPy::DiscardClassDecorator(_)
+            | InstrBlockPy::DiscardClassConstructionCaptures(_)
+            | InstrBlockPy::ApplyClassDecorator(_) => {
+                return Err(InlineUnsupportedReason::ClassConstructionExecutionContext);
+            }
+            InstrBlockPy::CompleteFunctionDefinition(_)
+            | InstrBlockPy::ApplyFunctionDescriptor(_) => {
+                return Err(InlineUnsupportedReason::FunctionDefinitionExecutionContext);
             }
         };
         Ok(clear_blockpy_instr_id(mapped))
@@ -833,10 +1010,69 @@ impl MapInstr<InstrBlockPy, InstrBlockPy> for InstrIdScrubber {
             InstrBlockPy::Store(op) => InstrBlockPy::Store(op.map_children(self)),
             InstrBlockPy::Del(op) => InstrBlockPy::Del(op.map_children(self)),
             InstrBlockPy::MakeCell(op) => InstrBlockPy::MakeCell(op.map_children(self)),
+            InstrBlockPy::NewAnnotationSet(op) => {
+                InstrBlockPy::NewAnnotationSet(op.map_children(self))
+            }
+            InstrBlockPy::SetupAnnotations(op) => {
+                InstrBlockPy::SetupAnnotations(op.map_children(self))
+            }
+            InstrBlockPy::ConstructTypeParameterScope(op) => {
+                InstrBlockPy::ConstructTypeParameterScope(op.map_children(self))
+            }
+            InstrBlockPy::SubscriptGeneric(op) => {
+                InstrBlockPy::SubscriptGeneric(op.map_children(self))
+            }
+            InstrBlockPy::SetFunctionTypeParameters(op) => {
+                InstrBlockPy::SetFunctionTypeParameters(op.map_children(self))
+            }
+            InstrBlockPy::CreateTypeAlias(op) => {
+                InstrBlockPy::CreateTypeAlias(op.map_children(self))
+            }
+            InstrBlockPy::CreateTypeParameter(op) => {
+                InstrBlockPy::CreateTypeParameter(op.map_children(self))
+            }
+            InstrBlockPy::SetTypeParameterDefault(op) => {
+                InstrBlockPy::SetTypeParameterDefault(op.map_children(self))
+            }
+            InstrBlockPy::CheckAnnotationFormat(op) => {
+                InstrBlockPy::CheckAnnotationFormat(op.map_children(self))
+            }
+            InstrBlockPy::RecordAnnotation(op) => {
+                InstrBlockPy::RecordAnnotation(op.map_children(self))
+            }
             InstrBlockPy::IncrementCounter(op) => InstrBlockPy::IncrementCounter(op),
             InstrBlockPy::CellRef(op) => InstrBlockPy::CellRef(op),
             InstrBlockPy::MakeFunctionWithClosure(op) => {
                 InstrBlockPy::MakeFunctionWithClosure(op.map_children(self))
+            }
+            InstrBlockPy::ConstructClass(op) => InstrBlockPy::ConstructClass(op.map_children(self)),
+            InstrBlockPy::PrepareClassDecorator(op) => {
+                InstrBlockPy::PrepareClassDecorator(op.map_children(self))
+            }
+            InstrBlockPy::ApplyClassDecorator(op) => {
+                InstrBlockPy::ApplyClassDecorator(op.map_children(self))
+            }
+            InstrBlockPy::DiscardClassDecorator(op) => {
+                InstrBlockPy::DiscardClassDecorator(op.map_children(self))
+            }
+            InstrBlockPy::TakeOperand(op) => InstrBlockPy::TakeOperand(op.map_children(self)),
+            InstrBlockPy::ComprehensionInsert(op) => {
+                InstrBlockPy::ComprehensionInsert(op.map_children(self))
+            }
+            InstrBlockPy::BuildCollection(op) => {
+                InstrBlockPy::BuildCollection(op.map_children(self))
+            }
+            InstrBlockPy::CallArgumentOp(op) => InstrBlockPy::CallArgumentOp(op.map_children(self)),
+            InstrBlockPy::PreparedCall(op) => InstrBlockPy::PreparedCall(op.map_children(self)),
+            InstrBlockPy::IteratorStep(op) => InstrBlockPy::IteratorStep(op.map_children(self)),
+            InstrBlockPy::DiscardClassConstructionCaptures(op) => {
+                InstrBlockPy::DiscardClassConstructionCaptures(op.map_children(self))
+            }
+            InstrBlockPy::CompleteFunctionDefinition(op) => {
+                InstrBlockPy::CompleteFunctionDefinition(op.map_children(self))
+            }
+            InstrBlockPy::ApplyFunctionDescriptor(op) => {
+                InstrBlockPy::ApplyFunctionDescriptor(op.map_children(self))
             }
         };
         clear_blockpy_instr_id(mapped)
@@ -844,5 +1080,53 @@ impl MapInstr<InstrBlockPy, InstrBlockPy> for InstrIdScrubber {
 
     fn map_name(&mut self, name: ResolvedName) -> ResolvedName {
         name
+    }
+}
+
+#[cfg(test)]
+mod inline_context_tests {
+    use super::*;
+
+    #[test]
+    fn resolved_block_parameter_roles_follow_legacy_inline_locals() {
+        let module = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def callee():\n    try:\n        work()\n    except:\n        pass\n    return 1\n\ndef caller():\n    return callee()\n",
+        ).expect("actual bounded handler callee").blockpy_module;
+        let callee = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.display_name == "callee")
+            .unwrap();
+        let mut caller = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.display_name == "caller")
+            .unwrap()
+            .clone();
+        let continuation = caller.name_gen.next_block_name();
+        let return_target = allocate_inline_local(&mut caller).unwrap().resolved_name();
+        let fragment = build_multi_block_inline_fragment_to_target(
+            &mut caller,
+            callee,
+            continuation,
+            &InlineValueBindings::new(),
+            return_target,
+        )
+        .expect("ordinary compiler inlining should carry control slots");
+        let source = callee.storage_layout.as_ref().unwrap();
+        assert!(!source.block_parameter_roles.is_empty());
+        let target = caller.storage_layout.as_ref().unwrap();
+        target.validate_block_parameter_roles().unwrap();
+        for binding in &source.block_parameter_roles {
+            let Some(location) = binding.location.as_local() else {
+                continue;
+            };
+            let mapped = &fragment.locals[&location];
+            assert!(
+                target
+                    .block_parameter_roles_at(NameLocation::Local(mapped.location))
+                    .any(|role| role == binding.role)
+            );
+        }
     }
 }

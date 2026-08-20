@@ -719,17 +719,8 @@ fn late_bound_split_owner_nonself_field_plans(
 fn function_uses_generator_resume_state(function: &BlockPyFunction<BlockPyModuleShape>) -> bool {
     function.storage_layout.as_ref().is_some_and(|layout| {
         layout
-            .freevars
-            .iter()
-            .any(|slot| slot.logical_name == "_dp_pc")
-            || layout
-                .cellvars
-                .iter()
-                .any(|slot| slot.logical_name == "_dp_pc")
-            || layout
-                .preserved_slots
-                .iter()
-                .any(|slot| slot.logical_name == "_dp_pc")
+            .generator_control_slot(soac_core::block_py::GeneratorControlRole::ProgramCounter)
+            .is_some()
     })
 }
 
@@ -833,6 +824,7 @@ pub fn late_bound_owner_field_site_catalog(
     struct ClassCollector<'a> {
         module: &'a BlockPyModule<BlockPyModuleShape>,
         namespace_name: &'a str,
+        storage_layout: Option<&'a soac_core::block_py::StorageLayout>,
         constant_locals: HashMap<LocalLocation, String>,
         methods: HashMap<String, RuntimeFunctionId>,
         declared_slots: Option<Option<HashSet<String>>>,
@@ -844,11 +836,19 @@ pub fn late_bound_owner_field_site_catalog(
             if let Some(value) = codegen_constant_string_value_v3(self.module, expr) {
                 return Some(value);
             }
-            let InstrBlockPy::Load(load) = expr else {
-                return None;
-            };
-            let NameLocation::Local(location) = load.name.location else {
-                return None;
+            let location = match expr {
+                InstrBlockPy::Load(load) => load.name.local_location()?,
+                InstrBlockPy::TakeOperand(take) => {
+                    // Read the same literal evidence without changing the consuming
+                    // operation or treating a source local as an operand owner.
+                    let soac_core::block_py::OperandLocation::Local(location) =
+                        take.validate_resolved(self.storage_layout?).ok()?
+                    else {
+                        return None;
+                    };
+                    location
+                }
+                _ => return None,
             };
             self.constant_locals.get(&location).map(String::as_str)
         }
@@ -952,6 +952,7 @@ pub fn late_bound_owner_field_site_catalog(
         let mut collector = ClassCollector {
             module,
             namespace_name: class_function.params.params[namespace_index].name.as_str(),
+            storage_layout: class_function.storage_layout.as_ref(),
             constant_locals: constants
                 .values
                 .into_iter()
@@ -2586,12 +2587,16 @@ fn direct_call_inline_candidate_v3(
     callee: &DirectCallCallee,
     arg_plan: &DirectCallArgPlan,
 ) -> bool {
-    let Some((return_target, call)) =
+    let Some((source_block, return_target, call)) =
         inline_call_and_return_target_for_instr_id_v3(function, source)
     else {
         return false;
     };
     let target_function = &target.function;
+    if !crate::passes::InlineHandledContext::for_call_site(source_block).can_inline(target_function)
+    {
+        return false;
+    }
     if target_function.names.fn_name == "__init__" {
         return false;
     }
@@ -2642,7 +2647,11 @@ enum InlineCallReturnTargetV3 {
 fn inline_call_and_return_target_for_instr_id_v3(
     function: &BlockPyFunction<BlockPyModuleShape>,
     source: InstrId,
-) -> Option<(InlineCallReturnTargetV3, &Call<InstrBlockPy>)> {
+) -> Option<(
+    &soac_core::block_py::Block<InstrBlockPy>,
+    InlineCallReturnTargetV3,
+    &Call<InstrBlockPy>,
+)> {
     for block in &function.blocks {
         for instr in &block.body {
             match instr {
@@ -2651,11 +2660,15 @@ fn inline_call_and_return_target_for_instr_id_v3(
                         continue;
                     };
                     if call.try_semantic_instr_id() == Some(source) {
-                        return Some((InlineCallReturnTargetV3::StoreTo(store.name.clone()), call));
+                        return Some((
+                            block,
+                            InlineCallReturnTargetV3::StoreTo(store.name.clone()),
+                            call,
+                        ));
                     }
                 }
                 InstrBlockPy::Call(call) if call.try_semantic_instr_id() == Some(source) => {
-                    return Some((InlineCallReturnTargetV3::Discard, call));
+                    return Some((block, InlineCallReturnTargetV3::Discard, call));
                 }
                 _ => {}
             }
@@ -2663,7 +2676,7 @@ fn inline_call_and_return_target_for_instr_id_v3(
         if let BlockTerm::Return(InstrBlockPy::Call(call)) = &block.term
             && call.try_semantic_instr_id() == Some(source)
         {
-            return Some((InlineCallReturnTargetV3::Discard, call));
+            return Some((block, InlineCallReturnTargetV3::Discard, call));
         }
     }
     None
@@ -3151,6 +3164,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generator_resume_state_requires_a_producer_control_role() {
+        let module = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def owner(_dp_pc):\n    def read():\n        return _dp_pc\n    return read\n\ndef suspended(_dp_pc):\n    yield _dp_pc\n",
+        )
+        .expect("source control spellings should lower")
+        .blockpy_module;
+        for name in ["owner", "read"] {
+            let function = module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.display_name == name)
+                .unwrap();
+            assert!(
+                !function_uses_generator_resume_state(function),
+                "ordinary source locals/captures are not a suspended activation"
+            );
+        }
+        let suspended = module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.display_name == "suspended")
+            .unwrap();
+        assert!(function_uses_generator_resume_state(suspended));
+        let layout = suspended.storage_layout.as_ref().unwrap();
+        let location = layout
+            .generator_control_slot(soac_core::block_py::GeneratorControlRole::ProgramCounter)
+            .unwrap();
+        assert_ne!(
+            layout.preserved_slot(location.slot()).unwrap().logical_name,
+            "_dp_pc",
+            "the real control was allocated away from the source parameter"
+        );
+    }
+
+    #[test]
     fn late_bound_owner_field_catalog_finds_static_slot_and_split_methods() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
@@ -3240,6 +3288,187 @@ def make_dynamic():
                 !matches!(*owner, "Decorated" | "Inherited") && !owner.contains("<locals>")
             }),
             "decorated, inherited, and dynamic owner bindings must not be selected: {actual:?}",
+        );
+    }
+
+    #[test]
+    fn late_bound_owner_field_catalog_requires_validated_constant_operand_transport() {
+        use soac_contracts::{DefinitionKind, SourceIdentity};
+        use soac_core::block_py::{CompleteFunctionDefinition, OperandLocation, StoreLifetime};
+
+        let source = "class Point:\n    __slots__ = ('value',)\n    def read(self):\n        return self.value\n";
+        let module = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("original slotted class should lower")
+            .blockpy_module;
+        let class_index = module
+            .callable_defs
+            .iter()
+            .position(|function| function.scope.scope_kind == CallableScopeKind::Class)
+            .expect("source class must retain its namespace body");
+        let class = &module.callable_defs[class_index];
+        let stores = class
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(block_index, block)| {
+                block.body.iter().filter_map(move |instr| {
+                    let InstrBlockPy::Store(store) = instr else {
+                        return None;
+                    };
+                    Some((block_index, store))
+                })
+            })
+            .filter(|(_, store)| {
+                codegen_constant_string_value_v3(&module, &store.value) == Some("Point")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1, "qualname must have one literal producer");
+        let (producer_block, producer) = stores[0];
+        assert!(matches!(producer.lifetime, StoreLifetime::Operand { .. }));
+        let operand = producer.name.local_location().unwrap();
+        let layout = class.storage_layout.as_ref().unwrap();
+
+        struct ConstantTake<'a> {
+            operand: LocalLocation,
+            layout: &'a StorageLayout,
+            count: usize,
+        }
+        impl Visit<InstrBlockPy> for ConstantTake<'_> {
+            fn visit_instr(&mut self, expr: &InstrBlockPy) {
+                if let InstrBlockPy::TakeOperand(take) = expr
+                    && take.name.local_location() == Some(self.operand)
+                {
+                    assert_eq!(
+                        take.validate_resolved(self.layout).unwrap(),
+                        OperandLocation::Local(self.operand),
+                    );
+                    self.count += 1;
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut takes = ConstantTake {
+            operand,
+            layout,
+            count: 0,
+        };
+        takes.visit_fn(class);
+        assert_eq!(takes.count, 1, "qualname must consume its actual operand");
+        let catalog = late_bound_owner_field_site_catalog(&module, "pkg.mod");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].1.owner_type.qualname, "Point");
+        assert_eq!(catalog[0].1.storage, LateBoundOwnerFieldStorage::ObjectSlot);
+
+        // Model only the new IR shape, not authenticated runtime authority.
+        // Completing a source definition is an adoption boundary; the old
+        // optional catalog must not infer a bare method binding through it.
+        let method = module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == catalog[0].0)
+            .unwrap();
+        let method_source = "def read(self):\n        return self.value";
+        let method_start = source
+            .find(method_source)
+            .expect("the original method source");
+        let definition = SourceIdentity {
+            module: ModuleContentId::new("pkg.mod", 0),
+            lexical_qualname: method.names.qualname.clone(),
+            source_range: soac_contracts::SourceRange::new(
+                u32::try_from(method_start).unwrap(),
+                u32::try_from(method_start + method_source.len()).unwrap(),
+            ),
+            definition_kind: DefinitionKind::Function,
+        };
+        let mut completed = module.clone();
+        let binding = completed.callable_defs[class_index]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.body)
+            .find_map(|instr| {
+                let InstrBlockPy::SetItem(store) = instr else {
+                    return None;
+                };
+                matches!(store.replacement.as_ref(),
+                    InstrBlockPy::MakeFunctionWithClosure(function)
+                    if function.function_id() == method.function_id)
+                .then_some(store)
+            })
+            .expect("the positive control has one original bare method binding");
+        binding.replacement = Box::new(
+            CompleteFunctionDefinition::new(
+                definition,
+                method.function_id,
+                binding.replacement.clone(),
+            )
+            .into(),
+        );
+        assert!(
+            late_bound_owner_field_site_catalog(&completed, "pkg.mod").is_empty(),
+            "source definition completion alone does not select an optional late-owner plan",
+        );
+
+        let mut missing_layout = module.clone();
+        missing_layout.callable_defs[class_index].storage_layout = None;
+        assert!(
+            late_bound_owner_field_site_catalog(&missing_layout, "pkg.mod").is_empty(),
+            "a consuming read without a physical owner proof is not a constant binding",
+        );
+
+        let mut unmarked_operand = module.clone();
+        unmarked_operand.callable_defs[class_index]
+            .storage_layout
+            .as_mut()
+            .unwrap()
+            .expression_temporaries
+            .retain(|location| *location != OperandLocation::Local(operand));
+        assert!(
+            late_bound_owner_field_site_catalog(&unmarked_operand, "pkg.mod").is_empty(),
+            "the same literal producer and spelling do not make an ordinary local an Operand",
+        );
+
+        let namespace_name = &class.params.params[class.params.positional_param_indices()[0]].name;
+        let namespace = LocalLocation(
+            u32::try_from(
+                layout
+                    .stack_slots
+                    .iter()
+                    .position(|name| name == namespace_name)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(!layout.is_expression_temporary(namespace));
+        struct RedirectTake {
+            operand: LocalLocation,
+            namespace: LocalLocation,
+        }
+        impl VisitMut<InstrBlockPy> for RedirectTake {
+            fn visit_instr_mut(&mut self, expr: &mut InstrBlockPy) {
+                if let InstrBlockPy::TakeOperand(take) = expr
+                    && take.name.local_location() == Some(self.operand)
+                {
+                    // Leave its displayed name unchanged: only physical ownership counts.
+                    take.name.location = NameLocation::Local(self.namespace);
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+        let mut wrong_owner = module.clone();
+        RedirectTake { operand, namespace }
+            .visit_fn_mut(&mut wrong_owner.callable_defs[class_index]);
+        assert!(
+            late_bound_owner_field_site_catalog(&wrong_owner, "pkg.mod").is_empty(),
+            "a source namespace local cannot acquire Operand authority through its spelling",
+        );
+
+        let mut ambiguous = module.clone();
+        ambiguous.callable_defs[class_index].blocks[producer_block]
+            .body
+            .push(InstrBlockPy::Store(producer.clone()));
+        assert!(
+            late_bound_owner_field_site_catalog(&ambiguous, "pkg.mod").is_empty(),
+            "even equal literals from repeated stores must retain the existing ambiguity refusal",
         );
     }
 
@@ -4495,6 +4724,7 @@ class Handler:
         module_constants: Vec<ConstantExpr>,
     ) -> BlockPyModule<BlockPyModuleShape> {
         BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: Vec::new(),
@@ -4966,6 +5196,7 @@ class Handler:
         let caller_id = caller.function_id;
         let target_id = target.function_id;
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen,
             global_names: Vec::new(),
             callable_defs: vec![caller.clone(), target],
@@ -5231,6 +5462,7 @@ def caller(offset, values):
         let caller_id = caller.function_id;
         let init_id = init.function_id;
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen,
             global_names: Vec::new(),
             callable_defs: vec![caller.clone(), init],
@@ -5308,6 +5540,7 @@ def caller(offset, values):
         let caller_id = caller.function_id;
         let coroutine_id = coroutine.function_id;
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen,
             global_names: Vec::new(),
             callable_defs: vec![caller.clone(), coroutine],
@@ -5401,6 +5634,7 @@ def caller(offset, values):
         let caller_id = caller.function_id;
         let method_id = method.function_id;
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen,
             global_names: Vec::new(),
             callable_defs: vec![caller.clone(), method],
@@ -5509,6 +5743,7 @@ def caller(offset, values):
         let caller_id = caller.function_id;
         let next_id = next_method.function_id;
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen,
             global_names: Vec::new(),
             callable_defs: vec![caller.clone(), next_method],
@@ -5810,32 +6045,118 @@ def caller(offset, values):
             }
         }
 
+        let expected_operations = plan.operations.clone();
         Annotator { plan }.visit_fn_mut(&mut selected);
-        let selected_stats = crate::passes::linearize_typed_function_expressions(&mut selected)
+        crate::passes::linearize_typed_function_expressions(&mut selected)
             .expect("selected arithmetic should linearize as one opaque expression");
-        let ordinary_stats = crate::passes::linearize_typed_function_expressions(&mut ordinary)
+        crate::passes::linearize_typed_function_expressions(&mut ordinary)
             .expect("unselected arithmetic should retain ordinary linearization");
-        assert_eq!(selected_stats.lifted_nested_exprs, 1);
-        assert_eq!(ordinary_stats.lifted_nested_exprs, 5);
 
-        struct SelectedTreeCollector {
-            operation_counts: Vec<usize>,
+        // The callable must be resolved before arithmetic, including the
+        // selected tree's generic fallback. An unbound sink must fail before
+        // an operand overload can run; rebinding sink in that overload must
+        // not replace the callable already captured by this call.
+        for function in [&selected, &ordinary] {
+            let block = &function.blocks[0];
+            let Some(InstrTyped::Store(callable)) = block.body.first() else {
+                panic!("the callable should be captured before arithmetic");
+            };
+            assert!(matches!(
+                callable.value.as_ref(),
+                InstrTyped::Load(load) if load.name == local_name("sink", 3)
+            ));
+            let (call_result, call) = block
+                .body
+                .iter()
+                .find_map(|instr| {
+                    let InstrTyped::Store(store) = instr else {
+                        return None;
+                    };
+                    let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+                        return None;
+                    };
+                    Some((store, call))
+                })
+                .expect("the captured sink call should produce the return value");
+            assert!(matches!(
+                call.func.as_ref(),
+                InstrTyped::Load(load) if load.name == callable.name
+            ));
+            let [CallArgPositional::Positional(InstrTyped::Load(argument))] = call.args.as_slice()
+            else {
+                panic!("the argument should be a captured arithmetic result")
+            };
+            assert!(block.body.iter().any(|instr| matches!(
+                instr, InstrTyped::Store(store)
+                    if store.name == argument.name && matches!(store.value.as_ref(), InstrTyped::BinOp(_))
+            )));
+            assert!(
+                matches!(&block.term, BlockTerm::Return(InstrTyped::Load(load))
+                if load.name == call_result.name)
+            );
         }
 
-        impl Visit<InstrTyped> for SelectedTreeCollector {
+        let selected_arithmetic = selected.blocks[0]
+            .body
+            .iter()
+            .filter_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                matches!(store.value.as_ref(), InstrTyped::BinOp(_)).then_some(store)
+            })
+            .collect::<Vec<_>>();
+        let [expression] = selected_arithmetic.as_slice() else {
+            panic!("the selected tree should remain one arithmetic expression");
+        };
+        let selected_plan = expression
+            .value
+            .exact_float_expression_plan()
+            .expect("the complete arithmetic tree should retain its selected plan");
+        assert_eq!(selected_plan.operations, expected_operations);
+
+        struct ArithmeticCollector {
+            operations: Vec<ExactFloatExpressionOperationPlan>,
+        }
+
+        impl Visit<InstrTyped> for ArithmeticCollector {
             fn visit_instr(&mut self, expr: &InstrTyped) {
-                if let Some(plan) = expr.exact_float_expression_plan() {
-                    self.operation_counts.push(plan.operations.len());
-                }
                 expr.visit_children(self);
+                if let InstrTyped::BinOp(op) = expr {
+                    self.operations.push(ExactFloatExpressionOperationPlan {
+                        source: op.semantic_instr_id(),
+                        kind: op.kind,
+                    });
+                }
             }
         }
 
-        let mut collector = SelectedTreeCollector {
-            operation_counts: Vec::new(),
+        let mut collector = ArithmeticCollector {
+            operations: Vec::new(),
         };
-        collector.visit_fn(&selected);
-        assert_eq!(collector.operation_counts, vec![5]);
+        collector.visit_instr(&expression.value);
+        assert_eq!(collector.operations, expected_operations);
+
+        let ordinary_operations = ordinary.blocks[0]
+            .body
+            .iter()
+            .filter_map(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return None;
+                };
+                let InstrTyped::BinOp(op) = store.value.as_ref() else {
+                    return None;
+                };
+                assert!(op.extra().exact_float_expression_plan().is_none());
+                assert!(matches!(op.left.as_ref(), InstrTyped::Load(_)));
+                assert!(matches!(op.right.as_ref(), InstrTyped::Load(_)));
+                Some(ExactFloatExpressionOperationPlan {
+                    source: op.semantic_instr_id(),
+                    kind: op.kind,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary_operations, expected_operations);
     }
 
     #[test]
@@ -5933,6 +6254,7 @@ def caller(offset, values):
         );
         let function = function_with_blocks(vec![block]);
         let module = BlockPyModule {
+            strict_source: None,
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function],

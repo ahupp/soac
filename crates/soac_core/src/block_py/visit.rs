@@ -111,6 +111,13 @@ pub trait Visit<I: Instr> {
         self.visit_instr(value);
     }
 
+    fn visit_generator_return_term(&mut self, value: &I)
+    where
+        I: ChildVisitable<I>,
+    {
+        self.visit_instr(value);
+    }
+
     fn visit_block<E>(&mut self, block: &Block<I, E>)
     where
         I: ChildVisitable<I>,
@@ -199,6 +206,13 @@ pub trait VisitMut<I: Instr> {
     }
 
     fn visit_return_term_mut(&mut self, value: &mut I)
+    where
+        I: ChildVisitable<I>,
+    {
+        self.visit_instr_mut(value);
+    }
+
+    fn visit_generator_return_term_mut(&mut self, value: &mut I)
     where
         I: ChildVisitable<I>,
     {
@@ -371,6 +385,7 @@ where
         BlockTerm::BranchTable(branch) => visitor.visit_branch_table_term(branch),
         BlockTerm::Raise(raise_term) => visitor.visit_raise_term(raise_term),
         BlockTerm::Return(value) => visitor.visit_return_term(value),
+        BlockTerm::GeneratorReturn(value) => visitor.visit_generator_return_term(value),
     }
 }
 
@@ -385,6 +400,7 @@ where
         BlockTerm::BranchTable(branch) => visitor.visit_branch_table_term_mut(branch),
         BlockTerm::Raise(raise_term) => visitor.visit_raise_term_mut(raise_term),
         BlockTerm::Return(value) => visitor.visit_return_term_mut(value),
+        BlockTerm::GeneratorReturn(value) => visitor.visit_generator_return_term_mut(value),
     }
 }
 

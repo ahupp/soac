@@ -17,4 +17,5 @@ soac_macros = { path = "../soac_macros" }
 tracing = "0.1"
 
 [dev-dependencies]
+soac_contracts = { path = "../soac_contracts" }
 soac_lowering = { path = "../soac_lowering" }

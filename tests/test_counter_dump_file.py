@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import gc
+import ast
 import importlib.util
 import json
 import os
@@ -10,7 +10,8 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from tests._integration import integration_module
+from tests._integration import stock_module
+from tests._strict_integration import assert_strict_source_rejected, create_strict_project
 
 
 def _inspect_counter_dump_json(path):
@@ -27,10 +28,112 @@ def _read_jsonl(path):
     ]
 
 
-def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
+def _strict_counter_source(source):
+    """Add only the explicit opt-in, preserving the original module docstring/body."""
+    source = textwrap.dedent(source).lstrip("\n")
+    tree = ast.parse(source)
+    assert not any(
+        isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        and any(alias.name == "strict" for alias in node.names)
+        for node in tree.body
+    ), "counter fixture source already opted in"
+    position = 0
+    if (
+        tree.body
+        and isinstance(tree.body[0], ast.Expr)
+        and isinstance(tree.body[0].value, ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+    ):
+        position = tree.body[0].end_lineno
+    lines = source.splitlines(keepends=True)
+    prefix = "".join(lines[:position])
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + "from __future__ import strict\n" + "".join(lines[position:])
+
+
+def _counter_project(root, modules, *, env, ordinary_sources=None, backend="soac"):
+    """Publish explicit source selections with the real checker/startup protocol."""
+    sources = {
+        path.name: _strict_counter_source(path.read_text(encoding="utf-8"))
+        for path in modules.values()
+    }
+    assert len(sources) == len(modules), "counter module filenames must be unique"
+    if ordinary_sources:
+        assert not sources.keys() & ordinary_sources.keys(), "ordinary and selected sources overlap"
+        sources.update(ordinary_sources)
+    # These are existing execution/logging settings, not contract authority.
+    # Capture the same requested lazy/eager/background setup before publication.
+    with pytest.MonkeyPatch.context() as patch:
+        for name in (
+            "SOAC_MODULE_ENABLED", "SOAC_WORK_DIR", "SOAC_LOG",
+            "SOAC_COMPILE_MODE", "SOAC_BACKGROUND_JIT", "SOAC_OPT_MODE",
+        ):
+            patch.delenv(name, raising=False)
+        for name, value in env.items():
+            patch.setenv(name, value)
+        patch.setenv("SOAC_OPT_MODE", env.get("SOAC_OPT_MODE", "none"))
+        return create_strict_project(
+            root / "strict-publication", sources,
+            modules={name: path.name for name, path in modules.items()},
+            backend=backend,
+        )
+
+
+def _counter_env(*, work_dir=None, extra_env=None):
+    # The old subprocess helper removed SOAC_COMPILE_MODE, selecting Lazy.
+    # StrictProject.run defaults to Eager, so make the original choice explicit.
+    env = {
+        "SOAC_COMPILE_MODE": "lazy",
+        "SOAC_BACKGROUND_JIT": os.environ.get("SOAC_BACKGROUND_JIT", "1"),
+    }
+    if work_dir is not None:
+        env["SOAC_WORK_DIR"] = str(work_dir)
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
+def _counter_script(import_stmt, body):
+    # The project is supplied explicitly at execution, after mode setup and
+    # publication; this tuple carries no runtime authority.
+    return import_stmt, textwrap.dedent(body).strip()
+
+
+def _run_counter_project(project, script, *, env, timeout=None):
+    options = dict(env)
+    opt_mode = options.pop("SOAC_OPT_MODE", "none")
+    assert options["SOAC_COMPILE_MODE"] == project.environment["SOAC_COMPILE_MODE"]
+    assert options["SOAC_BACKGROUND_JIT"] == project.environment["SOAC_BACKGROUND_JIT"]
+    import_stmt, body = script
+    expected_modules = [
+        (name, str(project.project / source), project.publication["generation"])
+        for name, source in project.modules.items()
+    ]
+    witness = f"""
+for _counter_name, _counter_path, _counter_generation in {expected_modules!r}:
+    _counter_diagnostic = _soac_ext.strict_module_diagnostics(sys.modules[_counter_name])
+    assert _counter_diagnostic is not None, 'counter subject ran without strict ownership'
+    assert _counter_diagnostic['sealed'] is True
+    assert _counter_diagnostic['module_name'] == _counter_name
+    assert _counter_diagnostic['source_path'] == _counter_path
+    assert _counter_diagnostic['artifact_generation'] == _counter_generation
+    assert _counter_diagnostic['initializer_entry_kind'] == 'entry_interpreter'
+"""
+    return project.run(
+        import_stmt + "\n" + textwrap.dedent(witness) + "\n" + body + "\n",
+        opt_mode=opt_mode, extra_env=options, timeout=timeout, check=False,
+        backend="soac",
+    )
+
+
+def _ordinary_subprocess_env(module_root, *, work_dir=None, extra_env=None):
+    """Only unmarked-source controls use this ordinary CPython launcher."""
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
     env.pop("SOAC_COMPILE_MODE", None)
+    env.pop("SOAC_OPT_MODE", None)
+    env.pop("DIET_PYTHON_MODE", None)
     if work_dir is not None:
         env["SOAC_WORK_DIR"] = str(work_dir)
     else:
@@ -41,14 +144,17 @@ def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
     return env
 
 
-def _run_soac_subprocess(script, *, env, timeout=None):
+def _run_ordinary_subprocess(script, *, env, timeout=None):
     return subprocess.run(
         [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        env=env,
-        text=True,
-        timeout=timeout,
+        check=False, capture_output=True, env=env, text=True, timeout=timeout,
+    )
+
+
+def _ordinary_script(module_root, import_stmt, body):
+    return "\n".join(
+        ["import sys", f"sys.path.insert(0, {str(module_root)!r})",
+         import_stmt, textwrap.dedent(body).strip(), ""]
     )
 
 
@@ -60,27 +166,17 @@ def _counter_branch(row, branch):
     return row.get("branches", {}).get(branch, 0)
 
 
-def _import_and_run_script(module_root, import_stmt, body):
-    body_lines = textwrap.dedent(body).strip().splitlines()
-    return "\n".join(
-        [
-            "import sys",
-            f"sys.path.insert(0, {str(module_root)!r})",
-            "from soac.import_hook import install",
-            "install()",
-            import_stmt,
-            *body_lines,
-            "",
-        ]
-    )
+_BOX_GENERIC_COUNTER_ORIGINAL = """
+class Box:
+    pass
 
+def write_and_read(value):
+    box = Box()
+    box.x = value
+    return box.x
+"""
 
-@pytest.fixture(scope="module")
-def profiled_specialization_runtime_case(tmp_path_factory):
-    base_dir = tmp_path_factory.mktemp("counter-dump-specialization-runtime")
-    module_name = "specialization_runtime_case"
-    (base_dir / f"{module_name}.py").write_text(
-        """
+_SPECIALIZATION_RUNTIME_ORIGINAL = """
 VALUE = 9
 
 class Point:
@@ -90,23 +186,116 @@ def run():
     point = Point()
     point.x = 33
     return point.x + VALUE
+"""
+
+# Driver-only observations. A source/profile identity is not permission to
+# enter an unchecked body, and lazy execution need not already be native.
+_COUNTER_FUNCTION_WITNESSES = """
+import ctypes
+_counter_apis = []
+for _counter_api_name, _counter_result_type in (
+    ("PyFunction_GetSoacFunctionId", ctypes.c_uint64),
+    ("PyFunction_GetSoacStrictId", ctypes.c_uint64),
+    ("PyFunction_GetSoacStrictOwner", ctypes.c_void_p),
+    ("PyFunction_GetSoacMetadata", ctypes.c_void_p),
+):
+    _counter_api = getattr(ctypes.pythonapi, _counter_api_name)
+    _counter_api.argtypes = [ctypes.py_object]
+    _counter_api.restype = _counter_result_type
+    _counter_apis.append(_counter_api)
+
+def _counter_function_snapshot(function):
+    return tuple(api(function) for api in _counter_apis) + (
+        _soac_ext.strict_function_entry_kind(function),
+    )
+
+def _counter_source_id(function, entry_kind=None):
+    actual = _counter_function_snapshot(function)
+    assert actual[0] == 0 and actual[1] > 0, (function.__qualname__, actual)
+    assert actual[2] and actual[3], (function.__qualname__, actual)
+    if entry_kind is None:
+        assert actual[4] in {"entry_interpreter", "checked_native"}, actual
+    else:
+        assert actual[4] == entry_kind, (function.__qualname__, actual)
+    return actual[1]
+
+def _counter_assert_ordinary(function):
+    actual = _counter_function_snapshot(function)
+    assert actual == (0, 0, None, None, None), (function.__qualname__, actual)
+"""
+
+
+@pytest.mark.parametrize("case", ["box", "point"])
+def test_external_field_counter_originals_are_ordinary_and_strict_rejected(tmp_path, case):
+    from soac import _soac_ext
+
+    if case == "box":
+        module_name, source = "field_generic_counter_case", _BOX_GENERIC_COUNTER_ORIGINAL
+        function_name = "write_and_read"
+    else:
+        module_name, source = "specialization_runtime_case", _SPECIALIZATION_RUNTIME_ORIGINAL
+        function_name = "run"
+    with stock_module(tmp_path / "ordinary", module_name, source) as module:
+        assert _soac_ext.strict_module_diagnostics(module) is None
+        assert _soac_ext.strict_function_entry_kind(getattr(module, function_name)) is None
+        if case == "box":
+            for index in range(5):
+                assert module.write_and_read(index) == index
+        else:
+            assert module.run() == 42
+    # A plain candidate class's absent field is a blocking ty diagnostic, not
+    # the automatic fallback reserved for unsupported framework receivers.
+    assert_strict_source_rejected(
+        tmp_path / "strict-original",
+        _strict_counter_source(source),
+        module_name=module_name,
+        diagnostic="unresolved-attribute",
+    )
+
+
+@pytest.fixture(scope="module")
+def profiled_specialization_runtime_case(tmp_path_factory):
+    base_dir = tmp_path_factory.mktemp("counter-dump-specialization-runtime")
+    module_name = "specialization_runtime_case"
+    ordinary_name = "specialization_runtime_original"
+    (base_dir / f"{module_name}.py").write_text(
+        """
+VALUE = 9
+
+def run(point):
+    point.x = 33
+    return point.x + VALUE
 """,
         encoding="utf-8",
     )
     work_dir = base_dir / "soac-work"
-    script = _import_and_run_script(
-        base_dir,
-        f"import {module_name} as module",
-        "assert module.run() == 42",
+    script = _counter_script(
+        f"import {module_name} as module\nimport {ordinary_name} as ordinary",
+        _COUNTER_FUNCTION_WITNESSES + """
+assert _soac_ext.strict_module_diagnostics(ordinary) is None
+_counter_assert_ordinary(ordinary.run)
+assert ordinary.run() == 42
+point = ordinary.Point()
+assert module.run(point) == 42
+assert point.x == 33
+_counter_source_id(module.run)
+""",
     )
-    base_env = _soac_subprocess_env(base_dir, work_dir=work_dir)
-    profile_result = _run_soac_subprocess(
+    base_env = _counter_env(work_dir=work_dir)
+    project = _counter_project(
+        base_dir, {module_name: base_dir / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+        ordinary_sources={f"{ordinary_name}.py": _SPECIALIZATION_RUNTIME_ORIGINAL},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
     return {
+        "project": project,
         "base_dir": base_dir,
         "module_name": module_name,
         "script": script,
@@ -115,11 +304,9 @@ def run():
     }
 
 
-def test_counter_dump_file_is_written_on_module_exit(tmp_path, monkeypatch):
+def test_counter_dump_file_is_written_on_module_exit(tmp_path):
     work_dir = tmp_path / "soac-work"
     dump_path = work_dir / "profile.bin"
-    monkeypatch.setenv("SOAC_WORK_DIR", str(work_dir))
-    monkeypatch.setenv("SOAC_OPT_MODE", "profile")
 
     source = """
 VALUE = 7
@@ -127,12 +314,31 @@ VALUE = 7
 def read():
     return VALUE
 """
-
-    with integration_module(tmp_path, "counter_dump_file_case", source, mode="soac") as module:
-        assert module.read() == 7
-        assert module.read() == 7
-
-    gc.collect()
+    module_path = tmp_path / "counter_dump_file_case.py"
+    module_path.write_text(source, encoding="utf-8")
+    env = _counter_env(
+        work_dir=work_dir,
+        extra_env={
+            "SOAC_OPT_MODE": "profile",
+            "SOAC_COMPILE_MODE": os.environ.get("SOAC_COMPILE_MODE", "lazy"),
+        },
+    )
+    project = _counter_project(tmp_path, {"counter_dump_file_case": module_path}, env=env)
+    script = _counter_script(
+        "import counter_dump_file_case as module",
+        f"""
+import gc
+from pathlib import Path
+assert module.read() == 7
+assert module.read() == 7
+# Observe module retirement before process exit; shutdown alone is not this test.
+sys.modules.pop("counter_dump_file_case")
+del module
+gc.collect()
+assert Path({str(dump_path)!r}).is_file()
+""",
+    )
+    _assert_subprocess_ok(_run_counter_project(project, script, env=env))
 
     data = dump_path.read_bytes()
     assert data.startswith(b"SOACRKV1")
@@ -162,20 +368,28 @@ def run():
         encoding="utf-8",
     )
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         f"import {module_name} as module",
         "assert module.run() is True",
     )
-    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
-    profile_result = _run_soac_subprocess(
+    base_env = _counter_env(work_dir=work_dir)
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
     _assert_subprocess_ok(profile_result)
+    assert (work_dir / "profile.bin").is_file()
+    profile = _inspect_counter_dump_json(work_dir / "profile.bin")
+    assert any(record["module_name"] == module_name for record in profile["records"])
 
     for opt_mode in ("verify", "apply"):
-        result = _run_soac_subprocess(
+        result = _run_counter_project(
+            project,
             script,
             env={**base_env, "SOAC_OPT_MODE": opt_mode},
         )
@@ -197,23 +411,27 @@ def run():
         encoding="utf-8",
     )
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         f"import {module_name} as module",
         "module.run()",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
     _assert_subprocess_ok(profile_result)
 
-    verify_result = _run_soac_subprocess(
+    verify_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "verify"},
     )
@@ -261,33 +479,36 @@ def run():
         encoding="utf-8",
     )
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         f"import {module_name} as module",
         "module.run()",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
     _assert_subprocess_ok(profile_result)
 
-    verify_result = _run_soac_subprocess(
+    verify_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "verify"},
     )
     _assert_subprocess_ok(verify_result)
 
 
-def test_counter_dump_file_is_not_written_in_none_mode(tmp_path, monkeypatch):
+def test_counter_dump_file_is_not_written_in_none_mode(tmp_path):
     work_dir = tmp_path / "soac-work"
-    monkeypatch.setenv("SOAC_WORK_DIR", str(work_dir))
-    monkeypatch.setenv("SOAC_OPT_MODE", "none")
+    dump_path = work_dir / "profile.bin"
 
     source = """
 VALUE = 7
@@ -295,14 +516,32 @@ VALUE = 7
 def read():
     return VALUE
 """
-
-    with integration_module(
-        tmp_path, "counter_dump_none_mode_case", source, mode="soac"
-    ) as module:
-        assert module.read() == 7
-        assert module.read() == 7
-
-    gc.collect()
+    module_path = tmp_path / "counter_dump_none_mode_case.py"
+    module_path.write_text(source, encoding="utf-8")
+    env = _counter_env(
+        work_dir=work_dir,
+        extra_env={
+            "SOAC_OPT_MODE": "none",
+            "SOAC_COMPILE_MODE": os.environ.get("SOAC_COMPILE_MODE", "lazy"),
+        },
+    )
+    project = _counter_project(tmp_path, {"counter_dump_none_mode_case": module_path}, env=env)
+    script = _counter_script(
+        "import counter_dump_none_mode_case as module",
+        f"""
+import gc
+from pathlib import Path
+assert module.read() == 7
+assert module.read() == 7
+# Observe module retirement before process exit; shutdown alone is not this test.
+sys.modules.pop("counter_dump_none_mode_case")
+del module
+gc.collect()
+assert not (Path({str(work_dir)!r}) / "profile.bin").exists()
+assert not (Path({str(work_dir)!r}) / "verify.bin").exists()
+""",
+    )
+    _assert_subprocess_ok(_run_counter_project(project, script, env=env))
 
     assert not (work_dir / "profile.bin").exists()
     assert not (work_dir / "verify.bin").exists()
@@ -310,34 +549,41 @@ def read():
 
 def test_unplanned_field_access_records_generic_counters_not_indexed_fallback(tmp_path):
     module_name = "field_generic_counter_case"
+    ordinary_name = "field_generic_counter_original"
     (tmp_path / f"{module_name}.py").write_text(
         """
-class Box:
-    pass
-
-def write_and_read(value):
-    box = Box()
+def write_and_read(box, value):
     box.x = value
     return box.x
 """,
         encoding="utf-8",
     )
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        tmp_path,
-        f"import {module_name} as module",
-        """
-        for index in range(5):
-            assert module.write_and_read(index) == index
-        """,
+    script = _counter_script(
+        f"import {module_name} as module\nimport {ordinary_name} as ordinary",
+        _COUNTER_FUNCTION_WITNESSES + """
+assert _soac_ext.strict_module_diagnostics(ordinary) is None
+_counter_assert_ordinary(ordinary.write_and_read)
+for index in range(5):
+    assert ordinary.write_and_read(index) == index
+    box = ordinary.Box()
+    assert module.write_and_read(box, index) == index
+    assert box.x == index
+_counter_source_id(module.write_and_read, "checked_native")
+""",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
 
-    result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+        ordinary_sources={f"{ordinary_name}.py": _BOX_GENERIC_COUNTER_ORIGINAL},
+    )
+    result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
@@ -393,28 +639,33 @@ def run(stop):
         encoding="utf-8",
     )
     work_dir = tmp_path / "soac-work"
-    ids_path = tmp_path / "function-ids.json"
-    script = _import_and_run_script(
-        tmp_path,
+    ids_path = tmp_path / "source-function-ids.json"
+    script = _counter_script(
         f"import {module_name} as module",
-        f"""
-        import ctypes
-        import json
-        from pathlib import Path
-        assert module.run(4) == 6
-        get_function_id = ctypes.pythonapi.PyFunction_GetSoacFunctionId
-        get_function_id.argtypes = [ctypes.py_object]
-        get_function_id.restype = ctypes.c_uint64
-        Path({str(ids_path)!r}).write_text(json.dumps({{
-            "iter": get_function_id(module.SelfIter.__dict__["__iter__"]),
-            "run": get_function_id(module.run),
-        }}), encoding="utf-8")
-        """,
+        _COUNTER_FUNCTION_WITNESSES + f"""
+import json
+from pathlib import Path
+assert module.run(4) == 6
+Path({str(ids_path)!r}).write_text(json.dumps({{
+    "iter": _counter_source_id(module.SelfIter.__dict__["__iter__"], "checked_native"),
+    "run": _counter_source_id(module.run, "checked_native"),
+}}), encoding="utf-8")
+""",
     )
-    result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env=_counter_env(
+            work_dir=work_dir,
+            extra_env={
+                "SOAC_COMPILE_MODE": "eager",
+                "SOAC_OPT_MODE": "profile",
+            },
+        ),
+    )
+    result = _run_counter_project(
+        project,
         script,
-        env=_soac_subprocess_env(
-            tmp_path,
+        env=_counter_env(
             work_dir=work_dir,
             extra_env={
                 "SOAC_COMPILE_MODE": "eager",
@@ -425,13 +676,15 @@ def run(stop):
     _assert_subprocess_ok(result)
 
     profile = _inspect_counter_dump_json(work_dir / "profile.bin")
-    function_ids = json.loads(ids_path.read_text(encoding="utf-8"))
-    iter_id = function_ids["iter"]
-    run_id = function_ids["run"]
+    source_function_ids = json.loads(ids_path.read_text(encoding="utf-8"))
+    iter_id = source_function_ids["iter"]
+    run_id = source_function_ids["run"]
+    assert iter_id != run_id, source_function_ids
     assert any(
         row["kind"] == "call_hot_targets"
         and row["function_id"] == run_id
         and row.get("observed_value") == iter_id
+        and row["value"] > 0
         for record in profile["records"]
         if record["module_name"] == module_name
         for row in record["rows"]
@@ -448,14 +701,21 @@ def read():
     return VALUE
 """
     module_path.write_text(source, encoding="utf-8")
-    result = _run_soac_subprocess(
-        _import_and_run_script(
-            tmp_path,
+    project = _counter_project(
+        tmp_path, {"module_load_log_case": module_path},
+        env=_counter_env(
+            extra_env={
+                "SOAC_LOG": f"soac_module_load=info,soac_jit_codegen=info;json={log_path}",
+            },
+        ),
+    )
+    result = _run_counter_project(
+        project,
+        _counter_script(
             "import module_load_log_case",
             "assert module_load_log_case.read() == 5",
         ),
-        env=_soac_subprocess_env(
-            tmp_path,
+        env=_counter_env(
             extra_env={
                 "SOAC_LOG": f"soac_module_load=info,soac_jit_codegen=info;json={log_path}",
             },
@@ -534,7 +794,7 @@ def read():
     assert jit_row["jit_machine_code_block_count"] > 0
 
 
-def test_eager_compile_keeps_named_generators_on_source_vectorcall(tmp_path):
+def test_eager_compile_prewarms_named_resume_without_replacing_generator_factory(tmp_path):
     module_name = "eager_generator_compile_case"
     (tmp_path / f"{module_name}.py").write_text(
         """
@@ -555,14 +815,53 @@ def run(repeats):
         encoding="utf-8",
     )
 
-    result = _run_soac_subprocess(
-        _import_and_run_script(
-            tmp_path,
-            f"import {module_name} as module",
-            "assert callable(module.explicit_items)",
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env=_counter_env(
+            work_dir=tmp_path / "soac-work",
+            extra_env={
+                "SOAC_COMPILE_MODE": "eager",
+            },
         ),
-        env=_soac_subprocess_env(
-            tmp_path,
+    )
+    result = _run_counter_project(
+        project,
+        _counter_script(
+            f"import {module_name} as module",
+            """
+import gc
+import types
+import weakref
+from soac import _soac_ext
+
+assert callable(module.explicit_items)
+named_items = module.explicit_items
+assert _soac_ext.strict_function_entry_kind(named_items) == "generator_factory"
+source_code = named_items.__code__
+
+class Limit:
+    def __index__(self):
+        raise AssertionError("a created-and-closed generator entered its body")
+
+limit = Limit()
+limit_ref = weakref.ref(limit)
+generator = named_items(limit)
+assert type(generator) is types.GeneratorType
+assert generator.gi_code is source_code
+assert generator.__name__ == named_items.__name__
+assert generator.__qualname__ == named_items.__qualname__
+del limit
+gc.collect()
+assert limit_ref() is not None
+generator.close()
+assert tuple(generator) == ()
+assert generator.gi_code is source_code
+gc.collect()
+assert limit_ref() is None
+assert _soac_ext.strict_function_entry_kind(named_items) == "generator_factory"
+""",
+        ),
+        env=_counter_env(
             work_dir=tmp_path / "soac-work",
             extra_env={
                 "SOAC_COMPILE_MODE": "eager",
@@ -579,10 +878,13 @@ def run(repeats):
         and row.get("function_qualname", "").endswith("explicit_items")
     ]
 
-    assert not explicit_codegen_rows
+    # The machine-code record is the resume body, not the public factory
+    # entry. Creation and close above never resume it, so this is eager work.
+    assert len(explicit_codegen_rows) == 1, explicit_codegen_rows
+    assert explicit_codegen_rows[0]["code_size"] > 0
 
 
-def test_apply_eager_compile_preserves_named_generators_and_prewarms_genexpr(tmp_path):
+def test_apply_eager_compile_prewarms_native_generator_resumes_and_genexpr(tmp_path):
     module_name = "apply_eager_source_named_generator_case"
     work_dir = tmp_path / "soac-work"
     (tmp_path / f"{module_name}.py").write_text(
@@ -599,17 +901,24 @@ def run():
 """,
         encoding="utf-8",
     )
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         f"import {module_name} as module",
-        "assert module.run() == 72",
+        """
+from soac import _soac_ext
+assert module.run() == 72
+assert _soac_ext.strict_function_entry_kind(module.explicit_items) == "generator_factory"
+""",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
@@ -624,12 +933,9 @@ def run():
         for row in profile_codegen_rows
     ), profile_codegen_rows
 
-    apply_script = _import_and_run_script(
-        tmp_path,
+    ordinary_apply_script = _ordinary_script(tmp_path,
         f"import {module_name} as module",
         """
-        import dis
-
         assert module.run() == 72
         named_items = module.explicit_items
         expected = tuple(range(1, 9))
@@ -640,28 +946,61 @@ def run():
         for _ in range(128):
             assert tuple(call_named(8)) == expected
 
-        call_opnames = {
-            instruction.opname
-            for instruction in dis.get_instructions(call_named, adaptive=True)
-            if instruction.opname.startswith("CALL")
-        }
-        assert "CALL_PY_EXACT_ARGS" in call_opnames, call_opnames
-
         named_items.__defaults__ = (8,)
         for _ in range(128):
             assert tuple(call_named(8)) == expected
 
-        call_opnames = {
-            instruction.opname
-            for instruction in dis.get_instructions(call_named, adaptive=True)
-            if instruction.opname.startswith("CALL")
-        }
-        assert not any(
-            opname.startswith("CALL_PY_") for opname in call_opnames
-        ), call_opnames
         """,
     )
-    apply_result = _run_soac_subprocess(
+    # Keep ordinary defaults semantics. The former CALL_PY_* assertions
+    # described SOAC dispatch after a now-forbidden owned-defaults mutation,
+    # not a CPython behavior guarantee; their exact text is archived in the
+    # migration evidence. Other profile/apply observers below remain intact.
+    _assert_subprocess_ok(_run_ordinary_subprocess(
+        ordinary_apply_script, env=_ordinary_subprocess_env(tmp_path),
+    ))
+    apply_script = _counter_script(
+        f"import {module_name} as module",
+        """
+import types
+from soac import StrictMutationError, _soac_ext
+assert module.run() == 72
+named_items = module.explicit_items
+expected = tuple(range(1, 9))
+source_code = named_items.__code__
+assert _soac_ext.strict_function_entry_kind(named_items) == "generator_factory"
+assert named_items.__globals__ is module.__dict__
+
+def call_named(value):
+    return named_items(value)
+
+generator = call_named(8)
+assert type(generator) is types.GeneratorType
+assert generator.gi_code is source_code
+assert tuple(generator) == expected
+assert generator.gi_code is source_code
+
+for _ in range(128):
+    assert tuple(call_named(8)) == expected
+before_code = named_items.__code__
+before_defaults = named_items.__defaults__
+before_kwdefaults = named_items.__kwdefaults__
+try:
+    named_items.__defaults__ = (8,)
+except StrictMutationError:
+    pass
+else:
+    raise AssertionError("a sealed generator accepted defaults replacement")
+assert named_items.__code__ is before_code
+assert named_items.__defaults__ is before_defaults
+assert named_items.__kwdefaults__ is before_kwdefaults
+for _ in range(128):
+    assert tuple(call_named(8)) == expected
+assert _soac_ext.strict_function_entry_kind(named_items) == "generator_factory"
+""",
+    )
+    apply_result = _run_counter_project(
+        project,
         apply_script,
         env={**base_env, "SOAC_OPT_MODE": "apply"},
     )
@@ -669,11 +1008,16 @@ def run():
     apply_codegen_rows = _read_jsonl(summary_path)[len(profile_codegen_rows) :]
 
     assert apply_codegen_rows
-    assert not any(
-        row.get("entry_kind") == "direct_function_body"
-        and row.get("function_qualname", "").endswith("explicit_items")
+    # Strict named generators keep their checked native factory while their
+    # authenticated resume body is compiled, including outside counter modes.
+    explicit_codegen_rows = [
+        row
         for row in apply_codegen_rows
-    ), apply_codegen_rows
+        if row.get("entry_kind") == "direct_function_body"
+        and row.get("function_qualname", "").endswith("explicit_items")
+    ]
+    assert len(explicit_codegen_rows) == 1, explicit_codegen_rows
+    assert explicit_codegen_rows[0]["code_size"] > 0
     assert any(
         row.get("entry_kind") == "direct_function_body"
         and row.get("function_qualname", "").endswith("<genexpr>")
@@ -722,8 +1066,7 @@ def run():
 """,
         encoding="utf-8",
     )
-    profile_script = _import_and_run_script(
-        tmp_path,
+    profile_script = _counter_script(
         f"import {module_name} as module",
         """
         assert module.named_items.__globals__ is module.__dict__
@@ -738,8 +1081,7 @@ def run():
         assert "len" not in module.__dict__
         """,
     )
-    apply_script = _import_and_run_script(
-        tmp_path,
+    apply_script = _counter_script(
         f"import {module_name} as module",
         """
         assert module.named_items.__globals__ is module.__dict__
@@ -754,12 +1096,16 @@ def run():
         )
         """,
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         profile_script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
         timeout=30,
@@ -767,7 +1113,8 @@ def run():
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
 
-    apply_result = _run_soac_subprocess(
+    apply_result = _run_counter_project(
+        project,
         apply_script,
         env={**base_env, "SOAC_OPT_MODE": "apply"},
         timeout=30,
@@ -788,17 +1135,20 @@ def run():
 """,
         encoding="utf-8",
     )
-    profile_script = _import_and_run_script(
-        tmp_path,
+    profile_script = _counter_script(
         f"import {module_name} as module",
         "assert module.run() == 36",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         profile_script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
@@ -807,12 +1157,12 @@ def run():
     if summary_path.exists():
         summary_path.unlink()
 
-    apply_script = _import_and_run_script(
-        tmp_path,
+    apply_script = _counter_script(
         f"import {module_name} as module",
         "assert module.run() == 36",
     )
-    apply_result = _run_soac_subprocess(
+    apply_result = _run_counter_project(
+        project,
         apply_script,
         env={
             **base_env,
@@ -850,24 +1200,28 @@ def run():
 """,
         encoding="utf-8",
     )
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         f"import {module_name} as module",
         "assert module.run() == 5",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
 
-    apply_result = _run_soac_subprocess(
+    apply_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "apply"},
     )
@@ -877,20 +1231,25 @@ def run():
 def test_apply_mode_lazy_diagonal_slice_runner_preserves_expected_result_binding(tmp_path):
     bench_dir = Path(__file__).resolve().parents[1] / "bench"
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        bench_dir,
+    script = _counter_script(
         "import nqueens_slice_diagonal_set_consumers as module",
         'assert module.main(["nqueens_slice_diagonal_set_consumers.py", "4", "1"]) == 0',
     )
-    base_env = _soac_subprocess_env(bench_dir, work_dir=work_dir)
-    profile_result = _run_soac_subprocess(
+    base_env = _counter_env(work_dir=work_dir)
+    project = _counter_project(
+        tmp_path, {"nqueens_slice_diagonal_set_consumers": bench_dir / "nqueens_slice_diagonal_set_consumers.py", "nqueens_slice_support": bench_dir / "nqueens_slice_support.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
 
-    apply_result = _run_soac_subprocess(
+    apply_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "apply"},
     )
@@ -950,18 +1309,21 @@ def run():
 """,
         encoding="utf-8",
     )
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         f"import {module_name} as module",
         "assert module.run() == ((3, 4, 5), (True, 3, 4, 5), 12, (3, 9, 4, 10), 15)",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
 
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
         timeout=60,
@@ -970,7 +1332,8 @@ def run():
     assert (work_dir / "profile.bin").exists()
 
     for opt_mode in ("verify", "apply"):
-        specialized_result = _run_soac_subprocess(
+        specialized_result = _run_counter_project(
+            project,
             script,
             env={**base_env, "SOAC_OPT_MODE": opt_mode},
             timeout=60,
@@ -978,21 +1341,28 @@ def run():
         _assert_subprocess_ok(specialized_result)
 
 
-def test_profiled_full_nqueens_slice_preserves_results_tracing_and_mutations(tmp_path):
+def test_profiled_full_nqueens_slice_preserves_results_mutations_and_ordinary_tracing(tmp_path):
     bench_dir = Path(__file__).resolve().parents[1] / "bench"
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        bench_dir,
+    module_paths = {
+        "nqueens_slice_full_nqueens_list_consumer": bench_dir / "nqueens_slice_full_nqueens_list_consumer.py",
+        "nqueens_slice_support": bench_dir / "nqueens_slice_support.py",
+    }
+    script = _counter_script(
         "import nqueens_slice_full_nqueens_list_consumer as module",
         'assert module.main(["nqueens_slice_full_nqueens_list_consumer.py", "4", "1"]) == 0',
     )
-    base_env = _soac_subprocess_env(
-        bench_dir,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "eager"},
     )
 
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, module_paths,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
         timeout=60,
@@ -1021,7 +1391,8 @@ def test_profiled_full_nqueens_slice_preserves_results_tracing_and_mutations(tmp
     ), profile
 
     for opt_mode in ("verify", "apply"):
-        specialized_result = _run_soac_subprocess(
+        specialized_result = _run_counter_project(
+            project,
             script,
             env={**base_env, "SOAC_OPT_MODE": opt_mode},
             timeout=60,
@@ -1157,21 +1528,113 @@ def test_profiled_full_nqueens_slice_preserves_results_tracing_and_mutations(tmp
         assert module.full_nqueens_list_consumer(4) == 2
         """,
     ]
+    # All seven original observers still run against the unmarked source.
+    # NULL via the public PyFunction_SetVectorcall setter changes semantics and
+    # is outside the supported strict contract (STRICT_MODULES.md); it is not
+    # a supported setter that promises strict mutation rejection.
     for body in apply_bodies:
-        apply_script = _import_and_run_script(
-            bench_dir,
+        ordinary_result = _run_ordinary_subprocess(
+            _ordinary_script(
+                bench_dir,
+                "import nqueens_slice_full_nqueens_list_consumer as module",
+                body,
+            ),
+            env=_ordinary_subprocess_env(bench_dir),
+            timeout=60,
+        )
+        _assert_subprocess_ok(ordinary_result)
+
+    # The authenticated interpreter backend retains ordinary native trace
+    # events. Run the original positive observer unchanged, not on a lookalike
+    # unselected module; run_case proves original-code ownership and zero JIT.
+    cpython_project = _counter_project(
+        tmp_path / "cpython-tracing", module_paths, env={}, backend="cpython",
+    )
+    cpython_project.run_case(
+        "nqueens_slice_full_nqueens_list_consumer",
+        "def validate_module(module):\n" + textwrap.indent(
+            textwrap.dedent(apply_bodies[1]).strip() + "\n", "    "
+        ),
+        Path(__file__),
+        required_functions=("permutations", "n_queens", "full_nqueens_list_consumer"),
+        backend="cpython",
+    )
+
+    strict_semantics_body = """
+assert list(module.n_queens(1)) == [(0,)]
+assert module.full_nqueens_list_consumer(4) == 2
+"""
+    strict_mutation_body = """
+from soac import StrictMutationError
+
+def function_state(function):
+    return (
+        function.__code__, function.__defaults__, function.__kwdefaults__,
+        function.__closure__, function.__globals__,
+    )
+
+def assert_function_unchanged(function, before):
+    assert all(left is right for left, right in zip(function_state(function), before))
+
+def reject_global(name, replacement):
+    original = getattr(module, name)
+    before = function_state(original)
+    try:
+        setattr(module, name, replacement)
+    except StrictMutationError:
+        pass
+    else:
+        raise AssertionError("a sealed final function binding accepted replacement")
+    assert getattr(module, name) is original
+    assert vars(module)[name] is original
+    assert_function_unchanged(original, before)
+    assert module.full_nqueens_list_consumer(4) == 2
+
+def rebound_n_queens(_queen_count):
+    yield "first"
+    yield "second"
+    yield "third"
+
+def rebound_permutations(_iterable, r=None):
+    yield (1, 3, 0, 2)
+
+assert module.full_nqueens_list_consumer(4) == 2
+reject_global("n_queens", rebound_n_queens)
+reject_global("permutations", rebound_permutations)
+
+original = module.permutations
+for replacement_defaults in ((1,), (None, 1)):
+    before = function_state(original)
+    try:
+        original.__defaults__ = replacement_defaults
+    except StrictMutationError:
+        pass
+    else:
+        raise AssertionError("a sealed generator accepted defaults replacement")
+    assert module.permutations is original
+    assert_function_unchanged(original, before)
+    assert module.full_nqueens_list_consumer(4) == 2
+"""
+    # Values and sealed-binding/default mutation barriers remain in scope for
+    # untraced SOAC execution. Positive ordinary/native tracing is checked above;
+    # neither SOAC observer events nor observer refusal are required.
+    for body in [apply_bodies[0], strict_semantics_body + strict_mutation_body]:
+        apply_script = _counter_script(
             "import nqueens_slice_full_nqueens_list_consumer as module",
             body,
         )
-        apply_result = _run_soac_subprocess(
+        apply_result = _run_counter_project(
+            project,
             apply_script,
             env={**base_env, "SOAC_OPT_MODE": "apply"},
-            timeout=60,
+            # The unchanged width-9 result/subclass workload completes in about
+            # 98 seconds on the bounded validation VM; 60 seconds cut it off.
+            timeout=180,
         )
         _assert_subprocess_ok(apply_result)
 
 
-def test_profiled_pyperformance_nqueens_preserves_generator_tracing_and_rebinding(
+def test_profiled_pyperformance_nqueens_preserves_rebinding_and_ordinary_tracing(
     tmp_path,
 ):
     spec = importlib.util.find_spec("benchmarks.bm_nqueens.run_benchmark")
@@ -1181,12 +1644,11 @@ def test_profiled_pyperformance_nqueens_preserves_generator_tracing_and_rebindin
     benchmark_root.mkdir(parents=True)
     benchmark_path = benchmark_root / "run_benchmark.py"
     benchmark_path.write_bytes(benchmark_source.read_bytes())
-    profile_script = _import_and_run_script(
-        benchmark_root,
+    profile_script = _counter_script(
         "import run_benchmark as module",
         "assert module.bench_n_queens(8) is None",
     )
-    apply_script = _import_and_run_script(
+    ordinary_apply_script = _ordinary_script(
         benchmark_root,
         "import run_benchmark as module",
         """
@@ -1230,16 +1692,91 @@ def test_profiled_pyperformance_nqueens_preserves_generator_tracing_and_rebindin
         assert fallback_calls == [8]
         """,
     )
+    _assert_subprocess_ok(_run_ordinary_subprocess(
+        ordinary_apply_script,
+        env=_ordinary_subprocess_env(benchmark_root),
+        timeout=60,
+    ))
+    tracing_body = """
+        frame_events = []
+
+        def trace(frame, event, _arg):
+            if event in ("call", "line") and frame.f_code.co_name in {
+                "n_queens",
+                "permutations",
+            }:
+                frame_events.append((frame.f_code.co_name, event))
+            return trace
+
+        sys.settrace(trace)
+        try:
+            assert list(module.n_queens(1)) == [(0,)]
+            assert frame_events, "direct generator consumption must exercise the tracer"
+            frame_events.clear()
+            assert module.bench_n_queens(4) is None
+        finally:
+            sys.settrace(None)
+        assert {"n_queens", "permutations"}.issubset(
+            {function_name for function_name, _event in frame_events}
+        ), frame_events
+        assert {"call", "line"}.issubset(
+            {event for _function_name, event in frame_events}
+        ), frame_events
+        """
+
+    strict_semantics_body = """
+        assert list(module.n_queens(1)) == [(0,)]
+        assert module.bench_n_queens(4) is None
+        """
+    strict_mutation_body = """
+        from soac import StrictMutationError
+
+        original_n_queens = module.n_queens
+        original_code = original_n_queens.__code__
+        original_defaults = original_n_queens.__defaults__
+        original_kwdefaults = original_n_queens.__kwdefaults__
+        fallback_calls = []
+
+        def rebound_n_queens(width):
+            fallback_calls.append(width)
+            yield (0, 1, 2, 3)
+
+        try:
+            module.n_queens = rebound_n_queens
+        except StrictMutationError:
+            pass
+        else:
+            raise AssertionError("a sealed final generator binding accepted replacement")
+        assert module.n_queens is original_n_queens
+        assert vars(module)["n_queens"] is original_n_queens
+        assert original_n_queens.__code__ is original_code
+        assert original_n_queens.__defaults__ is original_defaults
+        assert original_n_queens.__kwdefaults__ is original_kwdefaults
+        assert fallback_calls == []
+        assert module.bench_n_queens(8) is None
+        assert fallback_calls == []
+        """
+    apply_script = _counter_script(
+        "import run_benchmark as module",
+        strict_semantics_body + strict_mutation_body,
+    )
     work_dir = tmp_path / "soac-work"
-    base_env = _soac_subprocess_env(
-        benchmark_root,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={
             "SOAC_COMPILE_MODE": "eager",
             "SOAC_BACKGROUND_JIT": "0",
         },
     )
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {"run_benchmark": benchmark_path},
+        env={
+            **base_env,
+            "SOAC_OPT_MODE": "profile",
+        },
+    )
+    profile_result = _run_counter_project(
+        project,
         profile_script,
         env={
             **base_env,
@@ -1250,7 +1787,24 @@ def test_profiled_pyperformance_nqueens_preserves_generator_tracing_and_rebindin
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
 
-    apply_result = _run_soac_subprocess(
+    # Preserve the complete original positive trace observer under its native
+    # interpreter contract, with a separate authenticated publication.
+    cpython_project = _counter_project(
+        tmp_path / "cpython-tracing", {"run_benchmark": benchmark_path},
+        env={}, backend="cpython",
+    )
+    cpython_project.run_case(
+        "run_benchmark",
+        "def validate_module(module):\n    import sys\n" + textwrap.indent(
+            textwrap.dedent(tracing_body).strip() + "\n", "    "
+        ),
+        Path(__file__),
+        required_functions=("permutations", "n_queens", "bench_n_queens"),
+        backend="cpython",
+    )
+
+    apply_result = _run_counter_project(
+        project,
         apply_script,
         env={
             **base_env,
@@ -1311,20 +1865,25 @@ def main(argv):
 """,
         encoding="utf-8",
     )
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         f"import {module_name} as module",
         'assert module.main(["callback_pair_inline_genexpr_binding_case.py", "4", "1"]) == 0',
     )
-    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
-    profile_result = _run_soac_subprocess(
+    base_env = _counter_env(work_dir=work_dir)
+    project = _counter_project(
+        tmp_path, {support_module_name: tmp_path / f"{support_module_name}.py", module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
 
-    apply_result = _run_soac_subprocess(
+    apply_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "apply"},
     )
@@ -1333,7 +1892,7 @@ def main(argv):
 
 def test_profile_eager_runtime_import_does_not_compile_runtime_entries(tmp_path):
     log_path = tmp_path / "runtime-import-events.jsonl"
-    result = _run_soac_subprocess(
+    result = _run_ordinary_subprocess(
         "\n".join(
             [
                 "import builtins",
@@ -1344,7 +1903,7 @@ def test_profile_eager_runtime_import_does_not_compile_runtime_entries(tmp_path)
                 "",
             ]
         ),
-        env=_soac_subprocess_env(
+        env=_ordinary_subprocess_env(
             tmp_path,
             work_dir=tmp_path / "soac-work",
             extra_env={
@@ -1366,7 +1925,7 @@ def test_profile_eager_runtime_import_does_not_compile_runtime_entries(tmp_path)
     assert not runtime_codegen_rows
 
 
-def test_pre_optimization_blockpy_module_cache_is_reused(tmp_path):
+def test_strict_import_ignores_unsigned_pre_optimization_blockpy_cache(tmp_path):
     work_dir = tmp_path / "soac-work"
     cache_dir = work_dir / "modules"
     log_path = tmp_path / "cache-events.jsonl"
@@ -1378,52 +1937,71 @@ def value():
 """,
         encoding="utf-8",
     )
-    env = _soac_subprocess_env(
-        tmp_path,
+    env = _counter_env(
         work_dir=work_dir,
         extra_env={
             "SOAC_LOG": f"soac_blockpy_module_cache=info;json={log_path}",
         },
     )
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         "import module_cache_case",
         "assert module_cache_case.value() == 42",
     )
 
-    first = _run_soac_subprocess(script, env=env)
+    project = _counter_project(
+        tmp_path, {"module_cache_case": module_path},
+        env=env,
+    )
+    # Neither cache subtree is strict authority. Keep poisoned cache bytes in
+    # both locations so this also covers fixtures outside the repository root.
+    cache_files = [
+        cache_dir / subtree / "module_cache_case" / "mod.blockpy"
+        for subtree in ("project", "python-stdlib")
+    ]
+    unsigned_cache = b"unsigned executable cache must never be read or repaired"
+    for cache_path in cache_files:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(unsigned_cache)
+    first = _run_counter_project(project, script, env=env)
     _assert_subprocess_ok(first)
-    second = _run_soac_subprocess(script, env=env)
+    second = _run_counter_project(project, script, env=env)
     _assert_subprocess_ok(second)
 
-    cache_files = list(cache_dir.rglob("mod.blockpy"))
-    assert cache_files
-    rows = _read_jsonl(log_path)
-    assert any(
-        row.get("event") == "soac.blockpy_module_cache" and row.get("cache_hit") is True
+    assert set(cache_dir.rglob("mod.blockpy")) == set(cache_files)
+    assert all(path.read_bytes() == unsigned_cache for path in cache_files)
+    rows = _read_jsonl(log_path) if log_path.exists() else []
+    assert not any(
+        row.get("event") in {"soac.blockpy_module_cache", "soac.blockpy_module_cache_store"}
         for row in rows
     )
 
 
-def test_soac_work_dir_is_default_module_artifact_root(tmp_path):
+def test_strict_import_does_not_publish_unsigned_module_artifacts(tmp_path):
     work_dir = tmp_path / "soac-work"
     module_path = tmp_path / "work_dir_cache_case.py"
     module_path.write_text("def read():\n    return 17\n", encoding="utf-8")
 
-    result = _run_soac_subprocess(
-        _import_and_run_script(
-            tmp_path,
+    project = _counter_project(
+        tmp_path, {"work_dir_cache_case": module_path},
+        env=_counter_env(
+            work_dir=work_dir,
+        ),
+    )
+    result = _run_counter_project(
+        project,
+        _counter_script(
             "import work_dir_cache_case",
             "assert work_dir_cache_case.read() == 17",
         ),
-        env=_soac_subprocess_env(
-            tmp_path,
+        env=_counter_env(
             work_dir=work_dir,
         ),
     )
     _assert_subprocess_ok(result)
 
-    assert list((work_dir / "modules").rglob("mod.blockpy"))
+    # Ordinary compiler cache routing/reuse is covered in soac_driver. An
+    # authenticated import lowers verified source, not writable serialized IR.
+    assert not list((work_dir / "modules").rglob("mod.blockpy"))
 
 
 def test_soac_work_dir_is_default_event_log_dir(tmp_path):
@@ -1431,13 +2009,17 @@ def test_soac_work_dir_is_default_event_log_dir(tmp_path):
     log_path = work_dir / "events.jsonl"
     module_path = tmp_path / "work_dir_log_case.py"
     module_path.write_text("def read():\n    return 11\n", encoding="utf-8")
-    result = _run_soac_subprocess(
-        _import_and_run_script(
-            tmp_path,
+    project = _counter_project(
+        tmp_path, {"work_dir_log_case": module_path},
+        env=_counter_env(work_dir=work_dir),
+    )
+    result = _run_counter_project(
+        project,
+        _counter_script(
             "import work_dir_log_case",
             "assert work_dir_log_case.read() == 11",
         ),
-        env=_soac_subprocess_env(tmp_path, work_dir=work_dir),
+        env=_counter_env(work_dir=work_dir),
     )
     _assert_subprocess_ok(result)
 
@@ -1454,7 +2036,8 @@ def test_apply_mode_does_not_emit_specialization_runtime_counter_logs(
 ):
     log_path = profiled_specialization_runtime_case["base_dir"] / "apply-events.jsonl"
 
-    result = _run_soac_subprocess(
+    result = _run_counter_project(
+        profiled_specialization_runtime_case["project"],
         profiled_specialization_runtime_case["script"],
         env={
             **profiled_specialization_runtime_case["base_env"],
@@ -1479,7 +2062,8 @@ def test_apply_mode_default_event_log_omits_specialization_runtime_counters(
 ):
     log_path = profiled_specialization_runtime_case["work_dir"] / "events.jsonl"
 
-    result = _run_soac_subprocess(
+    result = _run_counter_project(
+        profiled_specialization_runtime_case["project"],
         profiled_specialization_runtime_case["script"],
         env={
             **profiled_specialization_runtime_case["base_env"],
@@ -1521,14 +2105,18 @@ def run_case():
         encoding="utf-8",
     )
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         "import getitem_specialization_case",
         "assert getitem_specialization_case.run_case() == 182",
     )
-    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+    base_env = _counter_env(work_dir=work_dir)
 
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {"getitem_specialization_case": module_path},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
@@ -1546,7 +2134,8 @@ def run_case():
     ]
     assert profiled_shapes, profile
 
-    verify_result = _run_soac_subprocess(
+    verify_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "verify"},
     )
@@ -1597,14 +2186,18 @@ def run_case():
         encoding="utf-8",
     )
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         "import setitem_specialization_case",
         "assert setitem_specialization_case.run_case() == 281",
     )
-    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+    base_env = _counter_env(work_dir=work_dir)
 
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {"setitem_specialization_case": module_path},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
@@ -1622,7 +2215,8 @@ def run_case():
     ]
     assert profiled_shapes, profile
 
-    verify_result = _run_soac_subprocess(
+    verify_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "verify"},
     )
@@ -1695,20 +2289,28 @@ def write_field():
     )
     work_dir = tmp_path / "soac-work"
 
-    script = _import_and_run_script(
-        tmp_path,
+    script = _counter_script(
         "import field_user_case",
         textwrap.dedent(
             """
             for _ in range(50):
                 assert field_user_case.read_fields() == 84
                 assert field_user_case.write_field() == 84
+            import _testinternalcapi
+            # The indexed_hit counter can describe a guarded ordinary split-dict path.
+            assert not _testinternalcapi.dict_has_indexed_keys(vars(field_user_case.point))
+            assert not _testinternalcapi.dict_has_indexed_keys(vars(field_user_case.vector))
             """
         ).strip(),
     )
-    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+    base_env = _counter_env(work_dir=work_dir)
 
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {"field_owner_case": owner_path, "field_user_case": user_path},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
@@ -1742,7 +2344,8 @@ def write_field():
     }
     assert keys_by_owner == {"Point": {"x", "y"}, "Vector": {"x", "y"}}
 
-    verify_result = _run_soac_subprocess(
+    verify_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "verify"},
     )
@@ -1797,18 +2400,25 @@ def run():
         encoding="utf-8",
     )
     work_dir = tmp_path / "soac-work"
-    script = _import_and_run_script(
-        tmp_path,
+    # Preserve the positive guarded-path counters below; their label does not
+    # assert indexed-key storage on this admitted source class.
+    script = _counter_script(
         f"import {module_name} as module",
-        "for _ in range(50):\n    assert module.run() == 8",
+        "for _ in range(50):\n    assert module.run() == 8"
+        "\nimport _testinternalcapi"
+        "\nassert not _testinternalcapi.dict_has_indexed_keys(vars(module.Record(1, 2)))",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path,
+    base_env = _counter_env(
         work_dir=work_dir,
         extra_env={"SOAC_COMPILE_MODE": "lazy", "SOAC_BACKGROUND_JIT": "0"},
     )
 
-    profile_result = _run_soac_subprocess(
+    project = _counter_project(
+        tmp_path, {module_name: tmp_path / f"{module_name}.py"},
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    profile_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
@@ -1830,7 +2440,8 @@ def run():
     }
     assert profiled_keys == {"x", "y"}, profile
 
-    verify_result = _run_soac_subprocess(
+    verify_result = _run_counter_project(
+        project,
         script,
         env={**base_env, "SOAC_OPT_MODE": "verify"},
     )

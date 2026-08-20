@@ -108,6 +108,7 @@ pub(super) fn callable_scope_info(
     let local_cell_bindings = function_scope.local_cell_bindings();
     let local_defs = function_scope.local_def_names();
     let type_param_names = function_scope.type_param_names();
+    let source_names = function_scope.source_names();
     let mut bindings = function_scope
         .bindings()
         .into_iter()
@@ -150,7 +151,7 @@ pub(super) fn callable_scope_info(
                     scope_kind,
                     &type_param_names,
                     BindingPurpose::Load,
-                    false,
+                    source_names.contains(name),
                 ),
             )
         })
@@ -166,7 +167,7 @@ pub(super) fn callable_scope_info(
                     scope_kind,
                     &type_param_names,
                     BindingPurpose::Store,
-                    false,
+                    source_names.contains(name),
                 ),
             )
         })
@@ -204,14 +205,24 @@ pub(super) fn callable_scope_info(
     };
     let raw_cell_storage_names = function_scope.cell_storage_names();
     let mut info = CallableScopeInfo {
+        class_bindings: None,
+        source_origin: None,
+        generator_expression_code: None,
+        annotation_provider: None,
+        type_parameter_scope: None,
+        class_construction: None,
+        private_lexical: None,
+        creation_defaults: Default::default(),
         names,
         scope_kind,
         bindings,
         local_defs,
         cell_storage_names: raw_cell_storage_names.clone(),
         cell_capture_source_names: raw_cell_storage_names,
+        cell_capture_projections: HashMap::new(),
+        cell_value_aliases: HashMap::new(),
         owned_cell_source_names: HashSet::new(),
-        scope_internal_names: HashSet::new(),
+        scope_internal_names: source_names,
         type_param_names,
         effective_load_bindings,
         effective_store_bindings,

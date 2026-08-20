@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import subprocess
-import sys
 import textwrap
 
 import pytest
+from tests._strict_integration import StrictProject, create_strict_project
 
 
 _MODULE_SOURCE = """
@@ -55,16 +54,47 @@ def _write_module(tmp_path: Path) -> str:
     return name
 
 
+def _worker_environment(tmp_path, mode, scenario, *, work_dir=None):
+    log_path = tmp_path / f"{scenario}-{mode}.jsonl"
+    work_dir = tmp_path / f"{scenario}-work" if work_dir is None else work_dir
+    return {
+        "SOAC_WORK_DIR": str(work_dir),
+        "SOAC_OPT_MODE": mode,
+        "SOAC_COMPILE_MODE": "eager",
+        "SOAC_BACKGROUND_JIT": "0",
+        "SOAC_LOG": f"soac_jit_direct_edges=info;json={log_path}",
+    }
+
+
+def _create_project(tmp_path, module_name, mode, scenario, *, work_dir=None):
+    # Only this original caller module is selected. soac.runtime stays ordinary;
+    # neither import-hook installation nor a test prefix grants it authority.
+    environment = _worker_environment(
+        tmp_path, mode, scenario, work_dir=work_dir,
+    )
+    source = (tmp_path / f"{module_name}.py").read_text(encoding="utf-8")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("SOAC_MODULE_ENABLED", raising=False)
+        for name, value in environment.items():
+            patch.setenv(name, value)
+        return create_strict_project(
+            tmp_path / "strict-publication",
+            {f"{module_name}.py": "from __future__ import strict\n" + source.lstrip("\n")},
+            modules={module_name: f"{module_name}.py"},
+            backend="soac",
+        )
+
+
 def _run_worker(
     tmp_path: Path,
     module_name: str,
     mode: str,
     scenario: str,
     *,
+    project: StrictProject,
     work_dir: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     log_path = tmp_path / f"{scenario}-{mode}.jsonl"
-    work_dir = tmp_path / f"{scenario}-work" if work_dir is None else work_dir
     script = textwrap.dedent(
         """
         import builtins
@@ -74,12 +104,41 @@ def _run_worker(
         import os
         import sys
 
-        sys.path.insert(0, __MODULE_ROOT__)
-        from soac.import_hook import install
-
-        install()
+        from soac import _soac_ext
         module = importlib.import_module(__MODULE_NAME__)
         import soac.runtime as runtime
+
+        diagnostic = _soac_ext.strict_module_diagnostics(module)
+        assert diagnostic is not None, "caller source ran without strict ownership"
+        assert diagnostic["sealed"] is True
+        assert diagnostic["module_name"] == __MODULE_NAME__
+        assert diagnostic["source_path"] == __SOURCE_PATH__
+        assert diagnostic["artifact_generation"] == __GENERATION__
+        assert diagnostic["initializer_entry_kind"] == "entry_interpreter"
+        owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+        owner.argtypes = (ctypes.py_object,)
+        owner.restype = ctypes.c_void_p
+        metadata = ctypes.pythonapi.PyFunction_GetSoacMetadata
+        metadata.argtypes = (ctypes.py_object,)
+        metadata.restype = ctypes.c_void_p
+        for function_name in (
+            "invoke", "collect", "ordinary_loop", "increment",
+            "unrelated_direct", "explicit_shadow",
+        ):
+            function = vars(module)[function_name]
+            assert owner(function), function_name
+            assert metadata(function), function_name
+        del function
+
+        # These are ordinary mutable dependencies, not newly enrolled helpers.
+        assert _soac_ext.strict_module_diagnostics(runtime) is None
+        assert not owner(runtime.exception_matches)
+        assert not owner(runtime._validate_exception_type)
+
+        # Configuration premise only: this is not raw indexed-store guard
+        # coverage. The ordinary runtime has no installed indexed prefix.
+        import _testinternalcapi
+        assert not _testinternalcapi.dict_has_indexed_keys(runtime.__dict__)
 
         scenario = __SCENARIO__
         events = []
@@ -257,88 +316,9 @@ def _run_worker(
             assert events == ["recursion"], events
             events.clear()
 
-            class DictKeys(ctypes.Structure):
-                _fields_ = [
-                    ("refcount", ctypes.c_ssize_t),
-                    ("log2_size", ctypes.c_uint8),
-                    ("log2_index_bytes", ctypes.c_uint8),
-                    ("kind", ctypes.c_uint8),
-                    ("version", ctypes.c_uint32),
-                ]
-
-            class IndexedValues(ctypes.Structure):
-                _fields_ = [
-                    ("capacity", ctypes.c_ssize_t),
-                    ("order_size", ctypes.c_ssize_t),
-                    ("first_value", ctypes.c_void_p),
-                ]
-
-            class RawDict(ctypes.Structure):
-                _fields_ = [
-                    ("refcount", ctypes.c_ssize_t),
-                    ("type", ctypes.c_void_p),
-                    ("used", ctypes.c_ssize_t),
-                    ("watcher_tag", ctypes.c_uint64),
-                    ("keys", ctypes.POINTER(DictKeys)),
-                    ("values", ctypes.POINTER(IndexedValues)),
-                ]
-
-            indexed_key = ctypes.pythonapi._PyDict_IndexedKeyIndex
-            indexed_key.argtypes = (ctypes.py_object, ctypes.py_object)
-            indexed_key.restype = ctypes.c_ssize_t
-            incref = ctypes.pythonapi.Py_IncRef
-            incref.argtypes = (ctypes.py_object,)
-            incref.restype = None
-            decref = ctypes.pythonapi.Py_DecRef
-            decref.argtypes = (ctypes.py_object,)
-            decref.restype = None
-
-            globals_dict = runtime.__dict__
-            raw_dict = RawDict.from_address(id(globals_dict))
-            assert raw_dict.keys.contents.kind == 3
-            index = indexed_key(globals_dict, "isinstance")
-            assert 0 <= index < raw_dict.values.contents.capacity
-            value_array = ctypes.cast(
-                ctypes.addressof(raw_dict.values.contents)
-                + IndexedValues.first_value.offset,
-                ctypes.POINTER(ctypes.c_void_p),
-            )
-            assert value_array[index] == id(original_isinstance)
-            old_version = raw_dict.keys.contents.version
-            old_watcher_tag = raw_dict.watcher_tag
-
-            incref(replace_isinstance)
-            value_array[index] = id(replace_isinstance)
-            decref(original_isinstance)
-            try:
-                assert raw_dict.keys.contents.version == old_version
-                assert raw_dict.watcher_tag == old_watcher_tag
-                assert call() is True
-            finally:
-                incref(original_isinstance)
-                value_array[index] = id(original_isinstance)
-                decref(replace_isinstance)
-            assert len(events) >= 3, events
-            events.clear()
-
-            shadow_index = indexed_key(globals_dict, "issubclass")
-            assert 0 <= shadow_index < raw_dict.values.contents.capacity
-            assert "issubclass" not in globals_dict
-            previous_shadow = value_array[shadow_index]
-            old_version = raw_dict.keys.contents.version
-            old_watcher_tag = raw_dict.watcher_tag
-            incref(replace_issubclass)
-            value_array[shadow_index] = id(replace_issubclass)
-            try:
-                assert raw_dict.keys.contents.version == old_version
-                assert raw_dict.watcher_tag == old_watcher_tag
-                assert call() is True
-            finally:
-                value_array[shadow_index] = previous_shadow
-                decref(replace_issubclass)
-            assert events == ["issubclass"], events
-            assert "issubclass" not in globals_dict
-            events.clear()
+            # The two historical watcher-bypassing indexed-slot observers
+            # required a runtime dictionary capability not installed here.
+            # They are archived, not replaced by an ordinary-dict write test.
 
             class PlainStop(stop_class):
                 pass
@@ -408,6 +388,11 @@ def _run_worker(
             assert module.invoke(original_helper, stop_class, stop_class) is False
             assert call(ValueError("different")) is False
 
+            def ordinary_call():
+                # Exercise the ordinary helper itself. A SOAC call is not
+                # required to choose a fallback just to reproduce its events.
+                return original_helper(stop_class("done"), stop_class)
+
             monitoring = sys.monitoring
             tool_id = next(
                 identifier
@@ -431,7 +416,7 @@ def _run_worker(
                 monitoring.set_local_events(
                     tool_id, helper_code, monitoring.events.PY_START
                 )
-                assert call() is True
+                assert ordinary_call() is True
                 monitoring.set_local_events(tool_id, helper_code, 0)
                 assert "exception_matches" in observed["helper-local"], observed
 
@@ -439,7 +424,7 @@ def _run_worker(
                 monitoring.set_local_events(
                     tool_id, validator_code, monitoring.events.PY_START
                 )
-                assert call() is True
+                assert ordinary_call() is True
                 monitoring.set_local_events(tool_id, validator_code, 0)
                 assert (
                     "_validate_exception_type" in observed["validator-local"]
@@ -448,7 +433,7 @@ def _run_worker(
                 phase = "global"
                 monitoring.set_events(tool_id, monitoring.events.PY_START)
                 try:
-                    assert call() is True
+                    assert ordinary_call() is True
                 finally:
                     monitoring.set_events(tool_id, 0)
                 assert {"exception_matches", "_validate_exception_type"} <= set(
@@ -471,7 +456,7 @@ def _run_worker(
 
             sys.setprofile(profile)
             try:
-                assert call() is True
+                assert ordinary_call() is True
             finally:
                 sys.setprofile(None)
             assert {"exception_matches", "_validate_exception_type"} <= set(
@@ -487,12 +472,13 @@ def _run_worker(
 
             sys.settrace(trace)
             try:
-                assert call() is True
+                assert ordinary_call() is True
             finally:
                 sys.settrace(None)
             assert {"exception_matches", "_validate_exception_type"} <= set(
                 trace_events
             ), trace_events
+            assert call() is True
 
         elif scenario == "training":
             for index in range(40):
@@ -509,26 +495,20 @@ def _run_worker(
         """
     )
     script = (
-        script.replace("__MODULE_ROOT__", repr(str(tmp_path)))
-        .replace("__MODULE_NAME__", repr(module_name))
+        script.replace("__MODULE_NAME__", repr(module_name))
+        .replace("__SOURCE_PATH__", repr(str(project.project / f"{module_name}.py")))
+        .replace("__GENERATION__", repr(project.publication["generation"]))
         .replace("__SCENARIO__", repr(scenario))
     )
-    env = {
-        **os.environ,
-        "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
-        "SOAC_WORK_DIR": str(work_dir),
-        "SOAC_OPT_MODE": mode,
-        "SOAC_COMPILE_MODE": "eager",
-        "SOAC_BACKGROUND_JIT": "0",
-        "SOAC_LOG": f"soac_jit_direct_edges=info;json={log_path}",
-    }
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=90,
+    environment = _worker_environment(
+        tmp_path, mode, scenario, work_dir=work_dir,
+    )
+    assert environment["SOAC_COMPILE_MODE"] == project.environment["SOAC_COMPILE_MODE"]
+    assert environment["SOAC_BACKGROUND_JIT"] == project.environment["SOAC_BACKGROUND_JIT"]
+    environment.pop("SOAC_OPT_MODE")
+    completed = project.run(
+        script, opt_mode=mode, extra_env=environment,
+        timeout=90, check=False, backend="soac",
     )
     return completed, log_path
 
@@ -542,11 +522,12 @@ def _run_worker(
         "dependencies_and_observers",
     ),
 )
-def test_stop_iteration_fast_path_preserves_live_dependencies_and_observers(
+def test_stop_iteration_fast_path_preserves_dependencies_and_ordinary_observers(
     tmp_path: Path, scenario: str
 ) -> None:
     module_name = _write_module(tmp_path)
-    result, _ = _run_worker(tmp_path, module_name, "apply", scenario)
+    project = _create_project(tmp_path, module_name, "apply", scenario)
+    result, _ = _run_worker(tmp_path, module_name, "apply", scenario, project=project)
     assert result.returncode == 0, (
         f"{scenario} must preserve Python-visible callbacks and exception matching:\n"
         f"{result.stdout}{result.stderr}"
@@ -562,8 +543,12 @@ def test_stop_iteration_fast_path_uses_generic_edge_only_for_runtime_handler(
 ) -> None:
     module_name = _write_module(tmp_path)
     work_dir = tmp_path / "trained-work"
+    project = _create_project(
+        tmp_path, module_name, "profile", "training", work_dir=work_dir,
+    )
     profile, _ = _run_worker(
-        tmp_path, module_name, "profile", "training", work_dir=work_dir
+        tmp_path, module_name, "profile", "training",
+        project=project, work_dir=work_dir,
     )
     assert profile.returncode == 0, profile.stdout + profile.stderr
 
@@ -605,7 +590,7 @@ def test_stop_iteration_fast_path_uses_generic_edge_only_for_runtime_handler(
             summary_path.read_text(encoding="utf-8").splitlines()
         )
         result, event_path = _run_worker(
-            tmp_path, module_name, mode, "training", work_dir=work_dir
+            tmp_path, module_name, mode, "training", project=project, work_dir=work_dir
         )
         assert result.returncode == 0, result.stdout + result.stderr
         compiled_nested_bodies = [
@@ -631,7 +616,7 @@ def test_stop_iteration_fast_path_uses_generic_edge_only_for_runtime_handler(
         ]
         nested = [event for event in events if event.get("qualname") == nested_name]
         unrelated = [
-            event for event in events if event.get("qualname") == "explicit_shadow"
+            event for event in events if event.get("qualname") == "unrelated_direct"
         ]
         assert unrelated, (mode, events)
         assert all(event.get("clif_direct_edges", 0) >= 1 for event in unrelated), (

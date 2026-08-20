@@ -221,6 +221,7 @@ struct RawPyDictUnicodeEntry {
 struct RawPyDictIndexedValues {
     capacity: isize,
     order_size: isize,
+    prefix_keys: *mut RawPyDictKeysObject,
     values: [*mut RawPyObject; 1],
 }
 
@@ -727,21 +728,36 @@ pub unsafe extern "C" fn soac_runtime_pylong_as_i64_saturating(
     value
 }
 
-#[inline(always)]
-unsafe fn dict_guarded_index(dict: *mut RawPyDictObject, index: isize) -> i64 {
-    const DICT_KEYS_INDEXED_UNICODE: u8 = 3;
+// These checks must be part of the exported helper's CLIF, not a private Rust
+// call. `inline(always)` is not a guarantee in the rustc-codegen-cranelift
+// emission path; only explicit runtime symbols and C externs can be linked.
+macro_rules! dict_guarded_index {
+    ($dict:expr, $index:expr) => {{
+        const DICT_KEYS_INDEXED_UNICODE: u8 = 3;
+        const DICT_KEYS_INDEXED_GENERAL: u8 = 4;
+        const DICT_LOOKUP_ALIASES: u64 = 1 << 13;
 
-    let keys = unsafe { (*dict).ma_keys };
-    let values = unsafe { (*dict).ma_values.cast::<RawPyDictIndexedValues>() };
-    if !keys.is_null()
-        && !values.is_null()
-        && unsafe { (*keys).dk_kind } == DICT_KEYS_INDEXED_UNICODE
-        && index >= 0
-        && unsafe { index < (*values).capacity }
-    {
-        return index as i64;
-    }
-    -1
+        let dict = $dict;
+        let index = $index;
+        let keys = unsafe { (*dict).ma_keys };
+        let values = unsafe { (*dict).ma_values.cast::<RawPyDictIndexedValues>() };
+        if !keys.is_null()
+            && !values.is_null()
+            && matches!(
+                unsafe { (*keys).dk_kind },
+                DICT_KEYS_INDEXED_UNICODE | DICT_KEYS_INDEXED_GENERAL
+            )
+            && unsafe { (*dict).ma_watcher_tag } & DICT_LOOKUP_ALIASES == 0
+            && index >= 0
+            && unsafe { index < (*values).capacity }
+            && !unsafe { (*values).prefix_keys }.is_null()
+            && unsafe { index < (*(*values).prefix_keys).dk_nentries }
+        {
+            index as i64
+        } else {
+            -1
+        }
+    }};
 }
 
 #[inline(always)]
@@ -750,14 +766,17 @@ unsafe fn indexed_value(values: *mut RawPyDictIndexedValues, index: isize) -> *m
     unsafe { *values_ptr.offset(index) }
 }
 
-#[inline(always)]
-unsafe fn set_indexed_value(
-    values: *mut RawPyDictIndexedValues,
-    index: isize,
-    value: *mut RawPyObject,
-) {
-    let values_ptr = unsafe { (&raw mut (*values).values).cast::<*mut RawPyObject>() };
-    unsafe { *values_ptr.offset(index) = value };
+macro_rules! indexed_name_matches {
+    ($values:expr, $index:expr, $key:expr) => {{
+        let values: *mut RawPyDictIndexedValues = $values;
+        let index = $index;
+        let key: *mut RawPyObject = $key;
+        let actual = unsafe { indexed_key((*values).prefix_keys, index) };
+        actual == key
+            || (!key.is_null()
+                && unsafe { (*key).ob_type } == (&raw mut PyUnicode_Type).cast()
+                && unsafe { dict_key_matches(actual, key) })
+    }};
 }
 
 #[inline(always)]
@@ -799,19 +818,27 @@ unsafe fn add_split_value_to_insertion_order(
 }
 
 macro_rules! probe_indexed_dict_value {
-    ($dict:expr, $index:expr) => {{
+    ($dict:expr, $key:expr, $index:expr) => {{
         let dict = $dict;
+        let key = $key;
         let index = $index;
-        if unsafe { dict_guarded_index(dict, index) } < 0 {
+        if dict_guarded_index!(dict, index) < 0 {
             core::ptr::null_mut()
         } else {
             let values = unsafe { (*dict).ma_values.cast::<RawPyDictIndexedValues>() };
-            let value = unsafe { indexed_value(values, index) };
-            if value.is_null() || value.cast::<c_void>() == (&raw mut _PyDict_IndexedValueTombstone)
-            {
+            if !indexed_name_matches!(values, index, key) {
                 core::ptr::null_mut()
             } else {
-                value
+                // The name comparison only compares exact strings. No Python
+                // effect can intervene between the alias guard and this load.
+                let value = unsafe { indexed_value(values, index) };
+                if value.is_null()
+                    || value.cast::<c_void>() == (&raw mut _PyDict_IndexedValueTombstone)
+                {
+                    core::ptr::null_mut()
+                } else {
+                    value
+                }
             }
         }
     }};
@@ -862,8 +889,7 @@ pub unsafe extern "C" fn soac_runtime_probe_global_indexed(
     debug_assert!(!key.is_null());
     debug_assert!(index >= 0);
 
-    let _ = key;
-    probe_indexed_dict_value!(dict, index).cast::<c_void>()
+    probe_indexed_dict_value!(dict, key, index).cast::<c_void>()
 }
 
 #[unsafe(no_mangle)]
@@ -879,7 +905,7 @@ pub unsafe extern "C" fn soac_runtime_load_global(
     debug_assert!(!key.is_null());
     debug_assert!(index >= 0);
 
-    let value = probe_indexed_dict_value!(dict, index);
+    let value = probe_indexed_dict_value!(dict, key, index);
     if !value.is_null() {
         unsafe { incref_impl(value) };
         return value.cast::<c_void>();
@@ -899,26 +925,26 @@ macro_rules! store_global_indexed_body {
         debug_assert!(!$value.is_null());
         debug_assert!($index >= 0);
 
-        if unsafe { dict_guarded_index(dict_obj, $index) } < 0 {
-            return core::ptr::null_mut();
-        }
-        let values = unsafe { (*dict_obj).ma_values.cast::<RawPyDictIndexedValues>() };
-        let old_value = unsafe { indexed_value(values, $index) };
-
-        // BEHAVIOR_CHANGE: this is a raw slot store for verify/apply JIT code.
-        // First insert, insertion order, ma_used, watchers, and versions are skipped.
         let value = $value.cast::<RawPyObject>();
-        if !$value_is_stolen {
-            unsafe { incref_impl(value) };
+        let guarded = dict_guarded_index!(dict_obj, $index) >= 0
+            && indexed_name_matches!(unsafe { (*dict_obj).ma_values.cast() }, $index, key);
+        // Index/profile facts are not write capabilities. Always use the
+        // authoritative native kernel, preserving owner checks, first-insert
+        // bookkeeping, watchers, and post-commit finalizer behavior.
+        let result = if guarded {
+            if unsafe { _PyDict_SetIndexedItem(dict_obj.cast(), $index, value.cast()) } < 0 {
+                core::ptr::null_mut()
+            } else {
+                unsafe { incref_impl(value) };
+                value.cast::<c_void>()
+            }
+        } else {
+            unsafe { dp_jit_store_global(dict_obj.cast(), key.cast(), -1, value.cast()) }
+        };
+        if $value_is_stolen {
+            decref_raw_with_tstate!($tstate.cast::<RawPyThreadState>(), value);
         }
-        unsafe { set_indexed_value(values, $index, value) };
-        if !old_value.is_null()
-            && old_value.cast::<c_void>() != (&raw mut _PyDict_IndexedValueTombstone)
-        {
-            decref_raw_with_tstate!($tstate.cast::<RawPyThreadState>(), old_value);
-        }
-        unsafe { incref_impl(value) };
-        value.cast::<c_void>()
+        result
     }};
 }
 
@@ -958,7 +984,13 @@ pub unsafe extern "C" fn soac_runtime_store_global(
     debug_assert!(!value.is_null());
     debug_assert!(index >= 0);
 
-    let guarded_index = unsafe { dict_guarded_index(dict, index) };
+    let guarded_index = if dict_guarded_index!(dict, index) >= 0
+        && indexed_name_matches!(unsafe { (*dict).ma_values.cast() }, index, key)
+    {
+        index as i64
+    } else {
+        -1
+    };
     unsafe {
         dp_jit_store_global(
             dict.cast::<c_void>(),
@@ -999,6 +1031,167 @@ macro_rules! object_dict {
             dict.cast::<RawPyDictObject>()
         }
     }};
+}
+
+// The private sealed-capability match is a separate, dominating runtime guard.
+// These macros remain explicit in the exported probe's CLIF; they do not
+// manufacture authority from a type pointer, a profile index, or a dict shape.
+macro_rules! stable_indexed_receiver_type {
+    ($obj:expr, $expected_type:expr) => {{
+        let obj: *mut RawPyObject = $obj;
+        let expected_type: *mut RawPyTypeObject = $expected_type;
+        if obj.is_null()
+            || expected_type.is_null()
+            || unsafe { (*obj).ob_type.cast::<RawPyTypeObject>() } != expected_type
+        {
+            core::ptr::null_mut::<RawPyTypeObject>()
+        } else {
+            let flags = unsafe { (*expected_type).tp_flags };
+            if flags & PY_TPFLAGS_INLINE_VALUES != 0
+                || (flags & PY_TPFLAGS_MANAGED_DICT == 0
+                    && unsafe { (*expected_type).tp_dictoffset <= 0 })
+            {
+                core::ptr::null_mut::<RawPyTypeObject>()
+            } else {
+                expected_type
+            }
+        }
+    }};
+}
+
+macro_rules! indexed_class_default_dictionary {
+    ($owner_type:expr, $mro_index:expr, $namespace_index:expr) => {{
+        let owner_type: *mut RawPyTypeObject = $owner_type;
+        let mro_index: isize = $mro_index;
+        let namespace_index: isize = $namespace_index;
+        let mro = unsafe { (*owner_type).tp_mro.cast::<RawPyTupleObject>() };
+        if mro.is_null()
+            || mro_index < 0
+            || namespace_index < 0
+            || unsafe { mro_index >= (*mro).ob_base.ob_size }
+        {
+            core::ptr::null_mut::<RawPyDictObject>()
+        } else {
+            let classes = unsafe { (&raw const (*mro).ob_item).cast::<*mut RawPyTypeObject>() };
+            let declaring_type = unsafe { *classes.offset(mro_index) };
+            let dictionary = if declaring_type.is_null() {
+                core::ptr::null_mut::<RawPyDictObject>()
+            } else {
+                // The published locator excludes static builtin namespaces:
+                // their dictionaries are per-interpreter, not in tp_dict.
+                unsafe { (*declaring_type).tp_dict.cast::<RawPyDictObject>() }
+            };
+            if dictionary.is_null() || dict_guarded_index!(dictionary, namespace_index) < 0 {
+                core::ptr::null_mut::<RawPyDictObject>()
+            } else {
+                dictionary
+            }
+        }
+    }};
+}
+
+macro_rules! plain_class_default_value {
+    ($value:expr) => {{
+        let value: *mut RawPyObject = $value;
+        if value.is_null() {
+            false
+        } else {
+            let value_type = unsafe { (*value).ob_type.cast::<RawPyTypeObject>() };
+            !value_type.is_null()
+                && unsafe {
+                    (*value_type).tp_descr_get.is_null() && (*value_type).tp_descr_set.is_null()
+                }
+        }
+    }};
+}
+
+/// Probe one initialized stable prefix slot, returning a borrowed reference or
+/// NULL for the original getattr path. This function never raises, allocates,
+/// hashes a key, invokes a Python callback, or changes reference ownership.
+///
+/// # Safety
+/// A successful private sealed-field capability match must dominate this call
+/// with no intervening Python effect. All locator operands must come from that
+/// same live capability; a source/profile offset is not sufficient. The caller
+/// keeps the receiver and name alive and INCREFs a hit before releasing either
+/// input or allowing a Python effect. The expected-type address alone is not a
+/// construction identity and is not safe against address reuse without that
+/// dominating match. Both default indices are -1 for NoClassBinding.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_probe_stable_indexed_field(
+    receiver: *mut c_void,
+    expected_type: *mut c_void,
+    name: *mut c_void,
+    index: isize,
+    default_mro_index: isize,
+    default_namespace_index: isize,
+) -> *mut c_void {
+    let receiver = receiver.cast::<RawPyObject>();
+    let owner_type = stable_indexed_receiver_type!(receiver, expected_type.cast());
+    if owner_type.is_null() || name.is_null() {
+        return core::ptr::null_mut();
+    }
+    let dictionary = object_dict!(receiver);
+    if dictionary.is_null() {
+        return core::ptr::null_mut();
+    }
+    // This checks the positive NoLookupAliases condition and actual name, and
+    // reloads the current values base. Prefix indices survive overflow growth;
+    // the values allocation itself does not. UNSET must use generic getattr.
+    let value = probe_indexed_dict_value!(dictionary, name.cast(), index);
+    if value.is_null() {
+        return core::ptr::null_mut();
+    }
+    if default_mro_index == -1 && default_namespace_index == -1 {
+        return value.cast();
+    }
+    let default_dictionary =
+        indexed_class_default_dictionary!(owner_type, default_mro_index, default_namespace_index);
+    if default_dictionary.is_null() {
+        return core::ptr::null_mut();
+    }
+    let default =
+        probe_indexed_dict_value!(default_dictionary, name.cast(), default_namespace_index);
+    // Even a frozen binding can hold an object whose type gains descriptor
+    // slots or whose __class__ changes. Recheck its CURRENT type before using
+    // the instance value; a new data descriptor could otherwise take priority.
+    if !plain_class_default_value!(default) {
+        return core::ptr::null_mut();
+    }
+    value.cast()
+}
+
+/// Read one actual native T_OBJECT_EX member, returning a borrowed reference
+/// or NULL for the original attribute operation (including an unbound slot).
+/// No dictionary, member lookup, callback, allocation or refcount is involved.
+///
+/// # Safety
+/// The same live sealed-field capability must have matched the exact receiver
+/// immediately before this call. Its NativeObjectMember variant supplies the
+/// byte offset, whose actual native member and data-descriptor precedence were
+/// permanently bound by construction. The caller pins the receiver and INCREFs
+/// a hit before any Python effect. A guessed offset or type address is not a
+/// capability, including when it passes the defensive range checks below.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_load_native_object_slot(
+    receiver: *mut c_void,
+    expected_type: *mut c_void,
+    offset: isize,
+) -> *mut c_void {
+    if receiver.is_null() || expected_type.is_null() {
+        return core::ptr::null_mut();
+    }
+    let object = receiver.cast::<RawPyObject>();
+    let actual_type = unsafe { (*object).ob_type.cast::<RawPyTypeObject>() };
+    if actual_type.cast::<c_void>() != expected_type
+        || offset < core::mem::size_of::<RawPyObject>() as isize
+        || offset % core::mem::size_of::<*mut c_void>() as isize != 0
+        || offset
+            > unsafe { (*actual_type).tp_basicsize } - core::mem::size_of::<*mut c_void>() as isize
+    {
+        return core::ptr::null_mut();
+    }
+    unsafe { *receiver.cast::<u8>().offset(offset).cast::<*mut c_void>() }
 }
 
 macro_rules! inline_values {
@@ -1043,7 +1236,7 @@ macro_rules! probe_field_value {
 }
 
 macro_rules! inline_values_for_unmaterialized_field {
-    ($obj:expr) => {{
+    ($obj:expr, $write:expr) => {{
         let obj = $obj;
         let obj_type = unsafe { (*obj).ob_type.cast::<RawPyTypeObject>() };
         let required_flags = PY_TPFLAGS_INLINE_VALUES | PY_TPFLAGS_MANAGED_DICT;
@@ -1059,7 +1252,9 @@ macro_rules! inline_values_for_unmaterialized_field {
                 core::ptr::null_mut()
             } else {
                 let values = inline_values!(obj, obj_type);
-                if unsafe { (*values).valid } == 0 {
+                // PREPARING=2 remains readable by probes but no raw writer
+                // may bypass the native attachment transaction.
+                if unsafe { (*values).valid } == 0 || ($write && unsafe { (*values).valid } != 1) {
                     core::ptr::null_mut()
                 } else {
                     values
@@ -1096,7 +1291,7 @@ pub unsafe extern "C" fn soac_runtime_probe_field_indexed_inline_values(
     debug_assert!(!key.is_null());
     debug_assert!(index >= 0);
 
-    let values = inline_values_for_unmaterialized_field!(obj);
+    let values = inline_values_for_unmaterialized_field!(obj, false);
     if values.is_null() {
         return core::ptr::null_mut();
     }
@@ -1124,14 +1319,17 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
 
     let dict = object_dict!(obj);
     const DICT_KEYS_SPLIT: u8 = 2;
+    const DICT_SOAC_POLICY: u64 = 1 << 12;
+    if !dict.is_null() && unsafe { (*dict).ma_watcher_tag } & DICT_SOAC_POLICY != 0 {
+        // The generic checked attribute path owns descriptor precedence and
+        // native dictionary policy checks; a profile is not authority to skip it.
+        return 0;
+    }
 
     let (keys, values) = if dict.is_null() {
         let obj_type = unsafe { (*obj).ob_type.cast::<RawPyTypeObject>() };
-        if unsafe { (*obj_type).tp_flags } & PY_TPFLAGS_INLINE_VALUES == 0 {
-            return 0;
-        }
-        let values = inline_values!(obj, obj_type);
-        if unsafe { (*values).valid } == 0 {
+        let values = inline_values_for_unmaterialized_field!(obj, true);
+        if values.is_null() {
             return 0;
         }
         (cached_keys!(obj_type), values)
@@ -1196,7 +1394,7 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed_inline_values(
     debug_assert!(!value.is_null());
     debug_assert!(index >= 0);
 
-    let values = inline_values_for_unmaterialized_field!(obj);
+    let values = inline_values_for_unmaterialized_field!(obj, true);
     if values.is_null() {
         return 0;
     }
@@ -1235,7 +1433,254 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed_inline_values(
 
 #[cfg(test)]
 mod tests {
-    use super::MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH;
+    use super::{
+        MAX_AFFINE_DISTINCT_PERMUTATION_WIDTH, PY_TPFLAGS_INLINE_VALUES, PY_TPFLAGS_MANAGED_DICT,
+        RawPyDictIndexedValues, RawPyDictKeysObject, RawPyDictObject, RawPyObject,
+        RawPyTupleObject, RawPyTypeObject,
+    };
+
+    #[test]
+    fn raw_incref_preserves_object_flags_and_overflow() {
+        // This is a POD header fixture, never an exposed CPython object or a
+        // late trailer installation. Native tests separately create real
+        // stateful allocations with the audited HAS_TYPE_STATE_SLOT bit.
+        // Native-linked soac_jit tests exercise the real decrement/deallocator
+        // path; this raw crate has no Python linker or fake deallocator stub.
+        for flags in [0, 0x10, 0x8010, u16::MAX] {
+            let mut object: RawPyObject = unsafe { core::mem::zeroed() };
+            object.ob_refcnt = super::PyObjectObRefcnt {
+                refcnt_and_flags: super::PyObjectObFlagsAndRefcnt {
+                    ob_refcnt: 7,
+                    ob_overflow: 0x5a5a,
+                    ob_flags: flags,
+                },
+            };
+            let pointer = &raw mut object;
+            unsafe {
+                assert!(super::incref_impl(pointer));
+                assert_eq!(object.ob_refcnt.refcnt_and_flags.ob_refcnt, 8);
+                assert_eq!(object.ob_refcnt.refcnt_and_flags.ob_overflow, 0x5a5a);
+                assert_eq!(object.ob_refcnt.refcnt_and_flags.ob_flags, flags);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_refcount_immortality_ignores_object_layout_flags() {
+        for flags in [0, 0x10, 0x8010, u16::MAX] {
+            for (count, skip_incref, skip_decref) in [
+                (7, false, false),
+                (1u32 << 31, false, true),
+                (3u32 << 30, true, true),
+                (u32::MAX, true, true),
+            ] {
+                let mut object: RawPyObject = unsafe { core::mem::zeroed() };
+                object.ob_refcnt = super::PyObjectObRefcnt {
+                    refcnt_and_flags: super::PyObjectObFlagsAndRefcnt {
+                        ob_refcnt: count,
+                        ob_overflow: 0xa5a5,
+                        ob_flags: flags,
+                    },
+                };
+                let pointer = &raw mut object;
+                unsafe {
+                    assert_eq!(super::can_skip_incref(pointer), skip_incref);
+                    assert_eq!(super::can_skip_decref(pointer), skip_decref);
+                    if skip_incref {
+                        assert!(!super::incref_impl(pointer));
+                    }
+                    assert_eq!(object.ob_refcnt.refcnt_and_flags.ob_refcnt, count);
+                    assert_eq!(object.ob_refcnt.refcnt_and_flags.ob_overflow, 0xa5a5);
+                    assert_eq!(object.ob_refcnt.refcnt_and_flags.ob_flags, flags);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_storage_preparing_is_readable_but_not_writable() {
+        use super::{MANAGED_DICT_OFFSET, RawPyDictSplitValues};
+
+        #[repr(C)]
+        struct Receiver {
+            preheader: [*mut RawPyObject; 4],
+            object: RawPyObject,
+            values: RawPyDictSplitValues,
+        }
+        let mut native_type: RawPyTypeObject = unsafe { core::mem::zeroed() };
+        native_type.tp_flags = PY_TPFLAGS_INLINE_VALUES | PY_TPFLAGS_MANAGED_DICT;
+        native_type.tp_basicsize = core::mem::size_of::<RawPyObject>() as isize;
+        let mut receiver: Receiver = unsafe { core::mem::zeroed() };
+        receiver.object.ob_type = (&raw mut native_type).cast();
+        let object = &raw mut receiver.object;
+        let values = &raw mut receiver.values;
+        assert_eq!(
+            (values as usize) - (object as usize),
+            native_type.tp_basicsize as usize,
+        );
+        for valid in [0, 1, 2] {
+            unsafe { (*values).valid = valid };
+            // Both exported raw writers select the writable arm; probes keep
+            // observing live native values during callback-scoped preparation.
+            let read = inline_values_for_unmaterialized_field!(object, false);
+            let write = inline_values_for_unmaterialized_field!(object, true);
+            assert_eq!(!read.is_null(), valid != 0);
+            assert_eq!(!write.is_null(), valid == 1);
+            assert_eq!(unsafe { (*values).valid }, valid);
+        }
+    }
+
+    #[test]
+    fn stable_field_receiver_guard_requires_exact_noninline_dictionary_owner() {
+        let mut owner: RawPyTypeObject = unsafe { core::mem::zeroed() };
+        owner.tp_dictoffset = core::mem::size_of::<RawPyObject>() as isize;
+        let owner_pointer = &raw mut owner;
+        let mut receiver: RawPyObject = unsafe { core::mem::zeroed() };
+        receiver.ob_type = owner_pointer.cast();
+        let receiver_pointer = &raw mut receiver;
+        assert_eq!(
+            stable_indexed_receiver_type!(receiver_pointer, owner_pointer),
+            owner_pointer
+        );
+
+        let mut ordinary_child: RawPyTypeObject = unsafe { core::mem::zeroed() };
+        ordinary_child.tp_base = owner_pointer.cast();
+        ordinary_child.tp_dictoffset = owner.tp_dictoffset;
+        unsafe { (*receiver_pointer).ob_type = (&raw mut ordinary_child).cast() };
+        assert!(stable_indexed_receiver_type!(receiver_pointer, owner_pointer).is_null());
+        unsafe { (*receiver_pointer).ob_type = owner_pointer.cast() };
+
+        unsafe { (*owner_pointer).tp_flags = PY_TPFLAGS_INLINE_VALUES };
+        assert!(stable_indexed_receiver_type!(receiver_pointer, owner_pointer).is_null());
+        unsafe {
+            (*owner_pointer).tp_flags = 0;
+            (*owner_pointer).tp_dictoffset = -8;
+        }
+        assert!(stable_indexed_receiver_type!(receiver_pointer, owner_pointer).is_null());
+        unsafe { (*owner_pointer).tp_flags = PY_TPFLAGS_MANAGED_DICT };
+        assert_eq!(
+            stable_indexed_receiver_type!(receiver_pointer, owner_pointer),
+            owner_pointer
+        );
+        assert!(stable_indexed_receiver_type!(core::ptr::null_mut(), owner_pointer).is_null());
+        assert!(stable_indexed_receiver_type!(receiver_pointer, core::ptr::null_mut()).is_null());
+    }
+
+    #[test]
+    fn stable_class_default_locator_uses_reserved_prefix_bounds_not_visible_order() {
+        let mut keys: RawPyDictKeysObject = unsafe { core::mem::zeroed() };
+        keys.dk_kind = 3;
+        let keys_pointer = &raw mut keys;
+        let mut prefix: RawPyDictKeysObject = unsafe { core::mem::zeroed() };
+        prefix.dk_nentries = 3;
+        // This guard inspects headers only. One visible entry can occupy
+        // prefix index two after earlier namespace bindings were deleted.
+        let mut values = RawPyDictIndexedValues {
+            capacity: 3,
+            order_size: 1,
+            prefix_keys: &raw mut prefix,
+            values: [core::ptr::null_mut()],
+        };
+        let mut dictionary: RawPyDictObject = unsafe { core::mem::zeroed() };
+        dictionary.ma_keys = keys_pointer;
+        dictionary.ma_values = (&raw mut values).cast();
+        let dictionary_pointer = &raw mut dictionary;
+        let mut declaring_type: RawPyTypeObject = unsafe { core::mem::zeroed() };
+        declaring_type.tp_dict = dictionary_pointer.cast();
+        let declaring_pointer = &raw mut declaring_type;
+        let mut mro: RawPyTupleObject = unsafe { core::mem::zeroed() };
+        mro.ob_base.ob_size = 1;
+        mro.ob_item[0] = declaring_pointer.cast();
+        let mut owner: RawPyTypeObject = unsafe { core::mem::zeroed() };
+        owner.tp_mro = (&raw mut mro).cast();
+        let owner_pointer = &raw mut owner;
+
+        assert_eq!(
+            indexed_class_default_dictionary!(owner_pointer, 0, 2),
+            dictionary_pointer
+        );
+        assert!(indexed_class_default_dictionary!(owner_pointer, 1, 2).is_null());
+        assert!(indexed_class_default_dictionary!(owner_pointer, 0, 3).is_null());
+        assert!(indexed_class_default_dictionary!(owner_pointer, -1, 2).is_null());
+        unsafe { (*dictionary_pointer).ma_watcher_tag = 1 << 13 };
+        assert!(indexed_class_default_dictionary!(owner_pointer, 0, 2).is_null());
+        unsafe { (*dictionary_pointer).ma_watcher_tag = 0 };
+        for ordinary_kind in [0, 1, 2] {
+            unsafe { (*keys_pointer).dk_kind = ordinary_kind };
+            assert!(indexed_class_default_dictionary!(owner_pointer, 0, 2).is_null());
+        }
+        unsafe { (*keys_pointer).dk_kind = 4 };
+        assert_eq!(
+            indexed_class_default_dictionary!(owner_pointer, 0, 2),
+            dictionary_pointer
+        );
+        unsafe { (*declaring_pointer).tp_dict = core::ptr::null_mut() };
+        assert!(indexed_class_default_dictionary!(owner_pointer, 0, 2).is_null());
+    }
+
+    #[test]
+    fn stable_class_default_guard_rechecks_slots_and_current_value_type() {
+        let mut plain_type: RawPyTypeObject = unsafe { core::mem::zeroed() };
+        let plain_pointer = &raw mut plain_type;
+        let mut value: RawPyObject = unsafe { core::mem::zeroed() };
+        value.ob_type = plain_pointer.cast();
+        let value_pointer = &raw mut value;
+        assert!(plain_class_default_value!(value_pointer));
+
+        // Only nullness is inspected; no descriptor callback is executed.
+        let mut callback_marker = 0_u8;
+        unsafe { (*plain_pointer).tp_descr_get = (&raw mut callback_marker).cast() };
+        assert!(!plain_class_default_value!(value_pointer));
+        unsafe {
+            (*plain_pointer).tp_descr_get = core::ptr::null_mut();
+            (*plain_pointer).tp_descr_set = (&raw mut callback_marker).cast();
+        }
+        assert!(!plain_class_default_value!(value_pointer));
+        unsafe { (*plain_pointer).tp_descr_set = core::ptr::null_mut() };
+        assert!(plain_class_default_value!(value_pointer));
+
+        let mut descriptor_type: RawPyTypeObject = unsafe { core::mem::zeroed() };
+        descriptor_type.tp_descr_get = (&raw mut callback_marker).cast();
+        unsafe { (*value_pointer).ob_type = (&raw mut descriptor_type).cast() };
+        assert!(!plain_class_default_value!(value_pointer));
+        assert!(!plain_class_default_value!(core::ptr::null_mut()));
+    }
+
+    #[test]
+    fn indexed_lookup_guard_requires_a_reserved_slot_without_aliases() {
+        use super::{RawPyDictIndexedValues, RawPyDictKeysObject, RawPyDictObject};
+
+        // Only the headers are inspected by this guard; no Python API is used.
+        let mut keys: RawPyDictKeysObject = unsafe { core::mem::zeroed() };
+        let mut prefix: RawPyDictKeysObject = unsafe { core::mem::zeroed() };
+        prefix.dk_nentries = 1;
+        let keys_ptr = &raw mut keys;
+        let prefix_ptr = &raw mut prefix;
+        let mut values = RawPyDictIndexedValues {
+            capacity: 1,
+            order_size: 0,
+            prefix_keys: prefix_ptr,
+            values: [core::ptr::null_mut()],
+        };
+        let mut dict: RawPyDictObject = unsafe { core::mem::zeroed() };
+        dict.ma_keys = keys_ptr;
+        dict.ma_values = (&raw mut values).cast();
+
+        for kind in [3, 4] {
+            unsafe { (*keys_ptr).dk_kind = kind };
+            assert_eq!(dict_guarded_index!(&raw mut dict, 0), 0);
+            assert_eq!(dict_guarded_index!(&raw mut dict, -1), -1);
+            assert_eq!(dict_guarded_index!(&raw mut dict, 1), -1);
+            dict.ma_watcher_tag = 1 << 13;
+            assert_eq!(dict_guarded_index!(&raw mut dict, 0), -1);
+            dict.ma_watcher_tag = 0;
+            unsafe { (*prefix_ptr).dk_nentries = 0 };
+            assert_eq!(dict_guarded_index!(&raw mut dict, 0), -1);
+            unsafe { (*prefix_ptr).dk_nentries = 1 };
+        }
+        unsafe { (*keys_ptr).dk_kind = 2 };
+        assert_eq!(dict_guarded_index!(&raw mut dict, 0), -1);
+    }
 
     fn count_affine_distinct_permutations(width: usize) -> Option<u64> {
         let Ok(width) = i64::try_from(width) else {

@@ -12,33 +12,105 @@ use crate::transformer::{walk_stmt, Transformer};
 
 pub(crate) const FUNCTION_ANNOTATE_PREFIX: &str = "_dp_annotate_func_";
 
-pub(crate) fn rewrite_ann_assign_to_dunder_annotate(_context: &Context, stmt: &mut Suite) {
+mod strict;
+
+/// CPython emits finally suites more than once (including inline unwinds), so
+/// one source annotation can have several distinct conditional indices. Until
+/// the native compiler exports that occurrence plan, reject only annotations
+/// affected by that duplication instead of pretending source order is enough.
+pub(crate) fn validate_strict_annotation_shapes(body: &Suite) -> anyhow::Result<()> {
+    struct Validator {
+        visible_annotations: bool,
+        finally_depth: usize,
+        unsupported: Option<ruff_text_size::TextRange>,
+    }
+    impl Validator {
+        fn nested_scope(&mut self, body: &mut Suite, visible_annotations: bool) {
+            let mut nested = Self {
+                visible_annotations,
+                finally_depth: 0,
+                unsupported: None,
+            };
+            nested.visit_body(body);
+            self.unsupported = self.unsupported.or(nested.unsupported);
+        }
+    }
+    impl Transformer for Validator {
+        fn visit_stmt(&mut self, statement: &mut Stmt) {
+            match statement {
+                Stmt::FunctionDef(function) => self.nested_scope(&mut function.body, false),
+                Stmt::ClassDef(class) => self.nested_scope(&mut class.body, true),
+                Stmt::Try(statement) => {
+                    self.visit_body(&mut statement.body);
+                    self.visit_body(&mut statement.orelse);
+                    for handler in &mut statement.handlers {
+                        self.visit_except_handler(handler);
+                    }
+                    self.finally_depth += 1;
+                    self.visit_body(&mut statement.finalbody);
+                    self.finally_depth -= 1;
+                }
+                Stmt::AnnAssign(annotation)
+                    if self.visible_annotations
+                        && self.finally_depth != 0
+                        && annotation.simple
+                        && matches!(annotation.target.as_ref(), Expr::Name(_)) =>
+                {
+                    self.unsupported.get_or_insert(annotation.range);
+                }
+                _ => walk_stmt(self, statement),
+            }
+        }
+    }
+    let mut validator = Validator {
+        visible_annotations: true,
+        finally_depth: 0,
+        unsupported: None,
+    };
+    validator.visit_body(&mut body.clone());
+    if let Some(range) = validator.unsupported {
+        anyhow::bail!("strict annotation replay does not yet support a module or class annotation in a finally suite at {}..{}; native occurrence-index provenance is required", range.start().to_u32(), range.end().to_u32());
+    }
+    Ok(())
+}
+
+pub(crate) fn rewrite_ann_assign_to_dunder_annotate(context: &Context, stmt: &mut Suite) {
+    if context.strict_source().is_some() {
+        strict::rewrite_module(context, stmt);
+        return;
+    }
     // Assume called with module body stmt, which gets __annotate__.
-    let entries = AnnotationStripper::strip(stmt);
+    let entries = AnnotationStripper::strip(context, stmt);
     if entries.is_empty() {
         return;
     }
-    let ds = build_annotate_fn(entries, "__annotate__");
+    let mut ds = build_annotate_fn(entries, "__annotate__");
+    let Stmt::FunctionDef(helper) = &mut ds else {
+        unreachable!()
+    };
+    context.record_module_annotation_helper(helper);
     stmt.push(ds);
 }
 
-#[derive(Default)]
-struct AnnotationStripper {
+struct AnnotationStripper<'a> {
+    context: &'a Context,
     entries: Vec<(String, Expr, String)>,
     indent: Indentation,
     capture_names: Vec<String>,
 }
 
-impl AnnotationStripper {
-    fn strip(stmt: &mut Suite) -> Vec<(String, Expr, String)> {
-        Self::strip_with_captures(stmt, Vec::new())
+impl<'a> AnnotationStripper<'a> {
+    fn strip(context: &'a Context, stmt: &mut Suite) -> Vec<(String, Expr, String)> {
+        Self::strip_with_captures(context, stmt, Vec::new())
     }
 
     fn strip_with_captures(
+        context: &'a Context,
         stmt: &mut Suite,
         capture_names: Vec<String>,
     ) -> Vec<(String, Expr, String)> {
         let mut collector = AnnotationStripper {
+            context,
             entries: Vec::new(),
             indent: Indentation::new("    ".to_string()),
             capture_names,
@@ -108,11 +180,17 @@ impl AnnotationStripper {
         }
         let mut capture_values = capture_name_values(&self.capture_names);
         capture_values.extend(type_param_capture_values(func_def.type_params.as_deref()));
-        Some(build_annotate_fn_with_capture_values(
+        let mut result = build_annotate_fn_with_capture_values(
             entries,
             &format!("{}{}", FUNCTION_ANNOTATE_PREFIX, func_def.name.id),
             capture_values,
-        ))
+        );
+        let Stmt::FunctionDef(helper) = &mut result else {
+            unreachable!()
+        };
+        self.context
+            .record_function_annotation_helper(func_def, helper);
+        Some(result)
     }
 }
 
@@ -205,13 +283,13 @@ fn type_param_capture_values(type_params: Option<&ast::TypeParams>) -> Vec<(Stri
         .collect()
 }
 
-impl Transformer for AnnotationStripper {
+impl Transformer for AnnotationStripper<'_> {
     fn visit_body(&mut self, body: &mut Suite) {
         let mut rewritten = Vec::with_capacity(body.len());
         for mut stmt in std::mem::take(body) {
             if let Stmt::FunctionDef(func_def) = &mut stmt {
                 let helper = self.function_annotation_helper(func_def);
-                AnnotationStripper::strip(&mut func_def.body);
+                AnnotationStripper::strip(self.context, &mut func_def.body);
                 if let Some(helper) = helper {
                     rewritten.push(helper);
                 }
@@ -221,28 +299,37 @@ impl Transformer for AnnotationStripper {
             self.visit_stmt(&mut stmt);
             rewritten.push(stmt);
         }
-        *body = rewritten;
+        *body = rewritten.into();
     }
 
     fn visit_stmt(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::FunctionDef(func_def) => {
-                AnnotationStripper::strip(&mut func_def.body);
+                AnnotationStripper::strip(self.context, &mut func_def.body);
                 // drop the collected annotations
             }
             Stmt::ClassDef(class_def) => {
                 let capture_names = type_param_names(class_def.type_params.as_deref());
                 let entries = AnnotationStripper::strip_with_captures(
+                    self.context,
                     &mut class_def.body,
                     capture_names.clone(),
                 );
                 if !entries.is_empty() {
                     // CPython stores class annotation thunks under __annotate_func__,
                     // and exposes __annotate__ via type-level descriptor logic.
-                    let ds = build_annotate_fn_with_capture_values(
+                    let mut ds = build_annotate_fn_with_capture_values(
                         entries,
                         "__annotate_func__",
                         capture_name_values(&capture_names),
+                    );
+                    let Stmt::FunctionDef(helper) = &mut ds else {
+                        unreachable!()
+                    };
+                    self.context.record_class_helper_origin(
+                        class_def.range,
+                        helper,
+                        soac_core::block_py::CallableSourceRole::AnnotationProvider,
                     );
                     class_def.body.push(ds);
                 }
@@ -387,4 +474,37 @@ def {annotate_name:id}(
         string_dict = string_dict,
         value_dict = value_dict,
     )
+}
+
+#[cfg(test)]
+mod strict_shape_tests {
+    use super::*;
+
+    fn validate(source: &str) -> anyhow::Result<()> {
+        let body = ruff_python_parser::parse_module(source)
+            .unwrap()
+            .into_syntax()
+            .body;
+        validate_strict_annotation_shapes(&body)
+    }
+
+    #[test]
+    fn duplicated_finally_annotation_occurrences_fail_explicitly() {
+        assert!(validate("try:\n    pass\nfinally:\n    value: int\n").is_err());
+        assert!(validate("class C:\n    try:\n        pass\n    finally:\n        if flag:\n            value: int\n").is_err());
+        assert!(validate(
+            "try:\n    pass\nexcept* ValueError:\n    pass\nfinally:\n    value: int\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unrelated_finally_suites_and_function_local_annotations_remain_supported() {
+        assert!(validate("try:\n    value: int\nexcept ValueError:\n    error: str\nelse:\n    success: bool\nfinally:\n    cleanup()\n").is_ok());
+        assert!(
+            validate("def f():\n    try:\n        pass\n    finally:\n        value: int\n")
+                .is_ok()
+        );
+        assert!(validate("try:\n    pass\nfinally:\n    target.value: int\n").is_ok());
+    }
 }

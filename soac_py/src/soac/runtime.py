@@ -3,8 +3,10 @@ from .bootstrap import (
     ELLIPSIS,
     EMPTY_TUPLE,
     FALSE,
+    INTERPOLATION_TYPE as _templatelib_Interpolation_type,
     NO_DEFAULT,
     NONE,
+    TEMPLATE_TYPE as _templatelib_Template_type,
     TRUE,
     _entry_template,
     code_with_freevars,
@@ -59,6 +61,10 @@ resume_generator = _soac_ext.resume_generator
 resume_async_generator = _soac_ext.resume_async_generator
 make_preserved_state = _soac_ext.make_preserved_state
 load_preserved_state = _soac_ext.load_preserved_state
+suspended_handled_exception = _soac_ext.suspended_handled_exception
+generator_resume_delivery = _soac_ext.generator_resume_delivery
+inject_generator_resume_exception = _soac_ext.inject_generator_resume_exception
+async_gen_wrap_yield = _soac_ext.async_gen_wrap_yield
 
 
 def _index(value, /):
@@ -189,13 +195,6 @@ typing_ParamSpec = _typing.ParamSpec
 typing_TypeAliasType = _typing.TypeAliasType
 typing_Unpack = _typing.Unpack
 
-# eval() gives us a native t-string without having this runtime bootstrap
-# expression rewritten back into a __soac__.templatelib_Template call.
-_templatelib_probe = _builtins.eval('t"{0}"')
-_templatelib_Template_type = type(_templatelib_probe)
-_templatelib_Interpolation_type = type(_templatelib_probe.interpolations[0])
-del _templatelib_probe
-
 
 def templatelib_Template(*parts):
     return _templatelib_Template_type(*parts)
@@ -233,13 +232,41 @@ def _is_cancelled_error(exc):
 
 
 def _reraise_control_flow(exc):
-    if isinstance(exc, GeneratorExit) or _is_cancelled_error(exc):
-        raise exc.with_traceback(None)
-    raise exc
+    try:
+        if isinstance(exc, GeneratorExit) or _is_cancelled_error(exc):
+            raise exc.with_traceback(None)
+        raise exc
+    finally:
+        # The traceback can outlive this helper. Its argument must not add a
+        # new frame -> exception edge to an otherwise finished generator.
+        del exc
 
 
 def _is_generator_closed(owner):
     return bool(load_preserved_state(owner._preserved_values, owner._closed_slot))
+
+
+def _reraise_after_generator_step(owner, exc):
+    # The caller has left its except suite: finalizers must see the surrounding
+    # handled exception, not the completed generator's transport exception.
+    context_descriptor = _builtins.BaseException.__context__
+    original_context = context_descriptor.__get__(exc)
+    try:
+        if _is_generator_closed(owner):
+            # The preserved frame has already released its cells. This separate
+            # wrapper edge owns the source function and its private captures.
+            # Keep the code and closed-state metadata; other live frames retain
+            # their own source-function references.
+            owner._resume_function = None
+        try:
+            _reraise_control_flow(exc)
+        finally:
+            # Raising outside the original handler must not replace its chain
+            # with this wrapper caller's handled exception. Use the builtin
+            # descriptor, not a user exception subclass's attribute hooks.
+            context_descriptor.__set__(exc, original_context)
+    finally:
+        del exc, original_context
 
 
 def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
@@ -252,7 +279,7 @@ def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
 
 
 def _current_throw_context(owner):
-    return load_preserved_state(owner._preserved_values, owner._throw_context_slot)
+    return suspended_handled_exception(owner._preserved_values)
 
 
 def make_generator_instance(
@@ -263,10 +290,12 @@ def make_generator_instance(
     initial_values,
     slot_kinds,
     yieldfrom_slot,
-    throw_context_slot,
     closed_slot,
+    operand_slots,
 ):
-    preserved_values = make_preserved_state(initial_values, slot_kinds)
+    # This factory is for compiler-intrinsic workers. Authenticated source
+    # generators, coroutines, and async generators use native construction.
+    preserved_values = make_preserved_state(initial_values, slot_kinds, operand_slots)
     is_async_gen = kind == 2
     template = code_template_async_gen if is_async_gen else code_template_gen
     source_code = getattr(resume_function, "__code__", None)
@@ -288,7 +317,6 @@ def make_generator_instance(
             code,
             preserved_values,
             yieldfrom_slot,
-            throw_context_slot,
             closed_slot,
         )
     generator = ClosureGenerator(
@@ -298,7 +326,6 @@ def make_generator_instance(
         code,
         preserved_values,
         yieldfrom_slot,
-        throw_context_slot,
         closed_slot,
     )
     if kind == 1:
@@ -328,13 +355,10 @@ def class_lookup_global(class_ns, name, globals_dict):
     try:
         return class_ns[name]
     except KeyError:
-        for type_param in class_ns.get("__type_params__", ()):
-            if getattr(type_param, "__name__", None) == name:
-                return type_param
-        for member in class_ns.values():
-            for type_param in getattr(member, "__type_params__", ()):
-                if getattr(type_param, "__name__", None) == name:
-                    return type_param
+        # This is LOAD_FROM_DICT_OR_GLOBALS, not type-parameter discovery.
+        # Lexical type parameters arrive through their resolved cells. Scanning
+        # unrelated members can run arbitrary __getattr__ or iterator code and
+        # would also let an unrelated method's parameter shadow a global.
         try:
             return globals_dict[name]
         except KeyError:
@@ -428,6 +452,8 @@ def unpack(iterable, spec):
     result.append(remainder)
     result.extend(tail)
     return _builtins.tuple(result)
+
+
 def call_super(super_fn, cls, instance_or_cls):
     if super_fn is _builtins.super:
         if isinstance(cls, _types.CellType):
@@ -641,12 +667,17 @@ def raise_from(exc, cause):
 
 
 def pep_479_exception(kind, cause):
-    if not isinstance(cause, StopIteration):
-        return cause
-    if kind == 0:
-        message = "generator raised StopIteration"
+    if isinstance(cause, StopIteration):
+        if kind == 0:
+            message = "generator raised StopIteration"
+        elif kind == 1:
+            message = "coroutine raised StopIteration"
+        else:
+            message = "async generator raised StopIteration"
+    elif kind == 2 and isinstance(cause, StopAsyncIteration):
+        message = "async generator raised StopAsyncIteration"
     else:
-        message = "coroutine raised StopIteration"
+        return cause
     error = RuntimeError(message)
     error.__cause__ = cause
     error.__context__ = cause
@@ -853,7 +884,6 @@ async def asynccontextmanager_exit(exit_fn, exc):
 # bootstrapping treat `__soac__.X` inside this module as ordinary module-global
 # references instead of installing duplicate bootstrap helper implementations.
 class IterRange:
-
     def __init__(self, start, stop, step, /):
         self.current = start
         self.stop = stop
@@ -884,7 +914,6 @@ class ClosureGenerator:
         "_resume_function",
         "_preserved_values",
         "_yield_from_slot",
-        "_throw_context_slot",
         "_closed_slot",
         "__name__",
         "__qualname__",
@@ -899,13 +928,11 @@ class ClosureGenerator:
         code,
         preserved_values,
         yieldfrom_slot,
-        throw_context_slot,
         closed_slot,
     ):
         self._resume_function = resume_function
         self._preserved_values = preserved_values
         self._yield_from_slot = yieldfrom_slot
-        self._throw_context_slot = throw_context_slot
         self._closed_slot = closed_slot
         self.__name__ = name
         self.__qualname__ = qualname
@@ -919,6 +946,7 @@ class ClosureGenerator:
 
     def send(self, value):
         if _is_generator_closed(self):
+            self._resume_function = None
             raise StopIteration
         try:
             return resume_generator(
@@ -929,10 +957,15 @@ class ClosureGenerator:
                 NO_DEFAULT,
             )
         except BaseException as exc:
-            _reraise_control_flow(exc)
+            error = exc
+        try:
+            _reraise_after_generator_step(self, error)
+        finally:
+            del error
 
     def throw(self, typ=None, val=None, tb=None):
         if _is_generator_closed(self):
+            self._resume_function = None
             exc = _normalize_throw_exc(
                 typ,
                 val,
@@ -956,10 +989,15 @@ class ClosureGenerator:
                 exc,
             )
         except BaseException as exc:
-            _reraise_control_flow(exc)
+            error = exc
+        try:
+            _reraise_after_generator_step(self, error)
+        finally:
+            del error
 
     def close(self):
         if _is_generator_closed(self):
+            self._resume_function = None
             return None
         try:
             self.throw(GeneratorExit)
@@ -1020,7 +1058,6 @@ class ClosureAsyncGenerator:
         "_resume_function",
         "_preserved_values",
         "_yield_from_slot",
-        "_throw_context_slot",
         "_closed_slot",
         "__name__",
         "__qualname__",
@@ -1035,13 +1072,11 @@ class ClosureAsyncGenerator:
         code,
         preserved_values,
         yieldfrom_slot,
-        throw_context_slot,
         closed_slot,
     ):
         self._resume_function = resume_function
         self._preserved_values = preserved_values
         self._yield_from_slot = yieldfrom_slot
-        self._throw_context_slot = throw_context_slot
         self._closed_slot = closed_slot
         self.__name__ = name
         self.__qualname__ = qualname
@@ -1122,28 +1157,40 @@ class AsyncGenSend:
             else self._send_value
         )
         try:
-            result = resume_async_generator(
-                self._generator._resume_function,
-                self._generator,
-                self._generator._preserved_values,
-                step_send_value,
-                self._resume_exception,
-                transport_sent,
-            )
-        except AsyncGenComplete:
-            self._is_done = True
-            self._resume_exception = NO_DEFAULT
-            raise StopAsyncIteration
-        except BaseException as exc:
-            self._is_done = True
-            self._resume_exception = NO_DEFAULT
-            if _is_cancelled_error(exc) or isinstance(exc, GeneratorExit):
-                _reraise_control_flow(exc)
-            if isinstance(exc, StopIteration):
-                raise RuntimeError("async generator raised StopIteration") from exc
-            if isinstance(exc, StopAsyncIteration):
-                raise RuntimeError("async generator raised StopAsyncIteration") from exc
-            raise exc
+            try:
+                result = resume_async_generator(
+                    self._generator._resume_function,
+                    self._generator,
+                    self._generator._preserved_values,
+                    step_send_value,
+                    self._resume_exception,
+                    transport_sent,
+                )
+            except AsyncGenComplete:
+                self._is_done = True
+                self._resume_exception = NO_DEFAULT
+                raise StopAsyncIteration
+            except BaseException as exc:
+                self._is_done = True
+                self._resume_exception = NO_DEFAULT
+                if _is_cancelled_error(exc) or isinstance(exc, GeneratorExit):
+                    _reraise_control_flow(exc)
+                if isinstance(exc, StopIteration):
+                    raise RuntimeError("async generator raised StopIteration") from exc
+                if isinstance(exc, StopAsyncIteration):
+                    raise RuntimeError(
+                        "async generator raised StopAsyncIteration"
+                    ) from exc
+                raise exc
+        except BaseException as exc:  # noqa: BLE001 - rethrow after restoring the caller handled state
+            error = exc
+        else:
+            error = None
+        if error is not None:
+            try:
+                _reraise_after_generator_step(self._generator, error)
+            finally:
+                del error
         self._resume_exception = NO_DEFAULT
         if _current_yieldfrom(self._generator) is None:
             self._is_done = True

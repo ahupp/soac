@@ -137,11 +137,12 @@ where
     }
 }
 
-impl<In> InstrField<In> for Option<Box<In>>
+impl<In, Field> InstrField<In> for Option<Field>
 where
     In: Instr,
+    Field: InstrField<In>,
 {
-    type Mapped<Out: Instr> = Option<Box<Out>>;
+    type Mapped<Out: Instr> = Option<Field::Mapped<Out>>;
 
     fn visit_field<V>(&self, visitor: &mut V)
     where
@@ -149,7 +150,7 @@ where
         V: Visit<In> + ?Sized,
     {
         if let Some(item) = self {
-            visitor.visit_instr(item);
+            item.visit_field(visitor);
         }
     }
 
@@ -159,7 +160,7 @@ where
         V: VisitMut<In> + ?Sized,
     {
         if let Some(item) = self {
-            visitor.visit_instr_mut(item);
+            item.visit_field_mut(visitor);
         }
     }
 
@@ -168,7 +169,7 @@ where
         Out: Instr,
         M: MapInstr<In, Out>,
     {
-        self.map(|value| Box::new(map.map_instr(*value)))
+        self.map(|value| value.map_field(map))
     }
 
     fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
@@ -176,8 +177,47 @@ where
         Out: Instr,
         M: TryMapInstr<In, Out, Error>,
     {
-        self.map(|value| map.try_map_instr(*value).map(Box::new))
-            .transpose()
+        self.map(|value| value.try_map_field(map)).transpose()
+    }
+}
+
+impl<In: Instr> InstrField<In> for super::FrameNamespace<In> {
+    type Mapped<Out: Instr> = super::FrameNamespace<Out>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized,
+    {
+        if let Some(mapping) = self.mapping() {
+            visitor.visit_instr(mapping);
+        }
+    }
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized,
+    {
+        if let Some(mapping) = self.mapping_mut() {
+            visitor.visit_instr_mut(mapping);
+        }
+    }
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>,
+    {
+        self.map_instr(|value| map.map_instr(value))
+    }
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>,
+    {
+        self.try_map_instr(|value| map.try_map_instr(value))
     }
 }
 
@@ -366,8 +406,10 @@ where
             }),
             BlockTerm::Raise(raise_stmt) => BlockTerm::Raise(TermRaise {
                 exc: raise_stmt.exc.map(|exc| self.map_instr(exc)),
+                disposition: raise_stmt.disposition,
             }),
             BlockTerm::Return(value) => BlockTerm::Return(self.map_instr(value)),
+            BlockTerm::GeneratorReturn(value) => BlockTerm::GeneratorReturn(self.map_instr(value)),
         }
     }
 }
@@ -380,13 +422,17 @@ where
 {
 }
 
-pub trait MapBlock<In, Out, InExtra = (), OutExtra = ()>: MapTerm<In, Out>
+pub trait MapBlock<In, Out, InExtra = BlockContext, OutExtra = BlockContext>:
+    MapTerm<In, Out>
 where
     In: Instr,
     Out: Instr,
-    OutExtra: Default,
+    InExtra: HasBlockContext,
+    OutExtra: Default + HasBlockContext,
 {
     fn map_block(&mut self, block: Block<In, InExtra>) -> Block<Out, OutExtra> {
+        let mut extra = OutExtra::default();
+        extra.set_block_context(block.extra.block_context());
         Block {
             label: block.label,
             body: block
@@ -397,7 +443,7 @@ where
             term: self.map_term(block.term),
             params: block.params,
             exc_edge: block.exc_edge,
-            extra: OutExtra::default(),
+            extra,
         }
     }
 }
@@ -406,7 +452,8 @@ impl<In, Out, InExtra, OutExtra, M> MapBlock<In, Out, InExtra, OutExtra> for M
 where
     In: Instr,
     Out: Instr,
-    OutExtra: Default,
+    InExtra: HasBlockContext,
+    OutExtra: Default + HasBlockContext,
     M: MapTerm<In, Out>,
 {
 }
@@ -456,6 +503,7 @@ where
     fn map_module(&mut self, module: BlockPyModule<PIn>) -> BlockPyModule<POut> {
         BlockPyModule {
             module_name_gen: module.module_name_gen,
+            strict_source: module.strict_source,
             global_names: module.global_names,
             callable_defs: module
                 .callable_defs
@@ -513,6 +561,7 @@ where
 {
     BlockPyModule {
         module_name_gen: module.module_name_gen,
+        strict_source: module.strict_source,
         global_names: module.global_names,
         callable_defs: module.callable_defs.into_iter().map(&mut map_fn).collect(),
         module_constants: module.module_constants,
@@ -546,8 +595,12 @@ where
                     .exc
                     .map(|exc| self.try_map_instr(exc))
                     .transpose()?,
+                disposition: raise_stmt.disposition,
             })),
             BlockTerm::Return(value) => Ok(BlockTerm::Return(self.try_map_instr(value)?)),
+            BlockTerm::GeneratorReturn(value) => {
+                Ok(BlockTerm::GeneratorReturn(self.try_map_instr(value)?))
+            }
         }
     }
 }
@@ -560,14 +613,17 @@ where
 {
 }
 
-pub trait TryMapBlock<In, Out, Error, InExtra = (), OutExtra = ()>:
+pub trait TryMapBlock<In, Out, Error, InExtra = BlockContext, OutExtra = BlockContext>:
     TryMapTerm<In, Out, Error>
 where
     In: Instr,
     Out: Instr,
-    OutExtra: Default,
+    InExtra: HasBlockContext,
+    OutExtra: Default + HasBlockContext,
 {
     fn try_map_block(&mut self, block: Block<In, InExtra>) -> Result<Block<Out, OutExtra>, Error> {
+        let mut extra = OutExtra::default();
+        extra.set_block_context(block.extra.block_context());
         Ok(Block {
             label: block.label,
             body: block
@@ -578,7 +634,7 @@ where
             term: self.try_map_term(block.term)?,
             params: block.params,
             exc_edge: block.exc_edge,
-            extra: OutExtra::default(),
+            extra,
         })
     }
 }
@@ -587,7 +643,8 @@ impl<In, Out, Error, InExtra, OutExtra, M> TryMapBlock<In, Out, Error, InExtra, 
 where
     In: Instr,
     Out: Instr,
-    OutExtra: Default,
+    InExtra: HasBlockContext,
+    OutExtra: Default + HasBlockContext,
     M: TryMapTerm<In, Out, Error>,
 {
 }
@@ -638,6 +695,7 @@ where
     fn try_map_module(&mut self, module: BlockPyModule<PIn>) -> Result<BlockPyModule<POut>, Error> {
         Ok(BlockPyModule {
             module_name_gen: module.module_name_gen,
+            strict_source: module.strict_source,
             global_names: module.global_names,
             callable_defs: module
                 .callable_defs

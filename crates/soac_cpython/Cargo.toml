@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 libc = "0.2"
 pyo3 = { workspace = true }
+
+[build-dependencies]
+build_support = { workspace = true }

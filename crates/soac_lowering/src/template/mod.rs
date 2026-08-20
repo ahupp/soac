@@ -177,7 +177,7 @@ pub(crate) fn expect_stmt<T: StmtTryFrom>(stmt: Stmt, template: &'static str) ->
 }
 
 fn body_from_stmts(stmts: Vec<Stmt>) -> Suite {
-    stmts
+    stmts.into()
 }
 
 pub(crate) fn is_simple(expr: &Expr) -> bool {
@@ -206,6 +206,12 @@ fn expand_body_stmt(stmt: Stmt) -> Vec<Stmt> {
 
 pub(crate) trait IntoPlaceholder {
     fn into_placeholder(self) -> Result<PlaceholderValue, Value>;
+}
+
+impl IntoPlaceholder for ast::Suite {
+    fn into_placeholder(self) -> Result<PlaceholderValue, Value> {
+        Ok(PlaceholderValue::Stmt(self.into()))
+    }
 }
 
 impl IntoPlaceholder for Expr {
@@ -434,7 +440,7 @@ impl SyntaxTemplate {
         transformer.visit_body(&mut self.stmts);
         transformer.finish();
         flatten(&mut self.stmts);
-        self.stmts
+        self.stmts.into()
     }
 
     pub(crate) fn instantiate_one(

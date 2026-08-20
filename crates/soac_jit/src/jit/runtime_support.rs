@@ -335,7 +335,9 @@ fn runtime_clif_for_reader(clif_text: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod runtime_clif_reader_tests {
-    use super::{inline_runtime_support_calls, runtime_clif_for_reader};
+    use super::{
+        inline_runtime_support_calls, parse_runtime_clif_functions, runtime_clif_for_reader,
+    };
     use crate::jit::codegen_env::declare_local_fn;
     use crate::jit::direct_abi::SOAC_RUNTIME_UNPACK_FIXED_SYMBOL;
     use crate::jit::new_jit_module;
@@ -344,6 +346,31 @@ mod runtime_clif_reader_tests {
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_module::{Linkage, Module};
     use soac_config::SoacEnvConfig;
+
+    #[test]
+    fn emitted_runtime_clif_has_a_closed_callable_symbol_graph() {
+        let functions = parse_runtime_clif_functions().expect("actual runtime CLIF parses");
+        let local_symbols: std::collections::HashSet<_> =
+            functions.iter().map(|function| &function.symbol).collect();
+        for parsed in &functions {
+            for callee in parsed.function.dfg.ext_funcs.values() {
+                let ir::ExternalName::User(name) = callee.name else {
+                    continue;
+                };
+                let name = &parsed.function.params.user_named_funcs()[name];
+                assert!(
+                    parsed.extern_symbols.contains_key(name)
+                        || parsed
+                            .runtime_function_symbols
+                            .get(name)
+                            .is_some_and(|symbol| local_symbols.contains(symbol)),
+                    "runtime helper {} references unloaded callable {name}: {:?}",
+                    parsed.symbol,
+                    parsed.runtime_function_symbols.get(name),
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_runtime_clif_with_unknown_target_isa_settings() {
@@ -571,7 +598,9 @@ fn parse_runtime_clif_runtime_function_symbols(
         let Some(symbol) = parse_runtime_clif_instance_symbol(line) else {
             continue;
         };
-        if symbol.starts_with("soac_runtime_") {
+        // Retain the identity even for an unsupported private Rust call so a
+        // closure failure names the missing helper instead of only a numeric ID.
+        if !line.contains("::{extern#") {
             runtime_symbols.insert(user_name, symbol);
         }
     }
@@ -732,8 +761,10 @@ fn remap_runtime_clif_extern_user_names(
             ir::UserExternalName::new(0, import_id.as_u32())
         } else {
             return Err(format!(
-                "unresolved non-extern runtime CLIF user function name {} while loading {}",
-                original_name, function.name
+                "unresolved non-extern runtime CLIF user function name {} ({:?}) while loading {}",
+                original_name,
+                runtime_function_symbols.get(&original_name),
+                function.name
             ));
         };
         function.params.reset_user_func_name(name_ref, mapped_name);

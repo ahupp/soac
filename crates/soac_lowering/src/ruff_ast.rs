@@ -35,6 +35,12 @@ impl ToRuffAst for &Vec<Stmt> {
     }
 }
 
+impl ToRuffAst for &ast::Suite {
+    fn to_ruff_ast(&self) -> Vec<Stmt> {
+        self.to_vec()
+    }
+}
+
 impl ToRuffAst for &Expr {
     fn to_ruff_ast(&self) -> Vec<Stmt> {
         let expr = self.to_owned().clone();

@@ -519,7 +519,6 @@ impl JitBatchPlan<'_> {
                     py,
                     &codegen_constants,
                     shared_state.module_name.as_str(),
-                    shared_state.source_hash(),
                 )
                 .map_err(|err| err.to_string())
             })?;
@@ -1372,6 +1371,9 @@ impl ProcessJitState {
         batch_function: &ProcessJitBatchFunction<'_>,
     ) -> Result<ReservedJitFunctionCompileInputs, String> {
         if let Some(shared_state) = batch_function.source.shared_state() {
+            if !shared_state.admits_function(&batch_function.function) {
+                return Err("runtime batch contains an unauthenticated function template".into());
+            }
             let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
                 Some(shared_state),
                 Some(inputs.session.as_ref()),
@@ -1740,12 +1742,18 @@ impl ProcessJitState {
                     function.function_id, function.names.qualname
                 )
             })?;
-        let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan_with_owned_constants(
+        let mut function_deopt_table = RuntimeJitDeoptTable::from_plan_with_owned_constants(
             original_function,
             function_jit_deopt_resume_plan,
             reserved_inputs.module_constant_ptrs.as_slice(),
+            function_module_constants,
             reserved_inputs.module_constant_owners.clone(),
-        )?);
+        )?;
+        // Source-region IDs remain stable across deoptimization and generator
+        // recompilation; any inlined native-only regions follow that prefix.
+        function_deopt_table
+            .handled_plan
+            .include_native_regions(function);
         let built = build_cranelift_run_bb_specialized_function(
             codegen_env,
             function_blocks,
@@ -1765,6 +1773,7 @@ impl ProcessJitState {
             reserved_inputs.symbol_scope.as_deref(),
             Some(&plan.predeclared),
             BuildSpecializedFunctionOptions {
+                handled_exception_plan: Some(function_deopt_table.handled_plan.clone()),
                 counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
                 runtime_supported_deopt_resume_points: Some(
                     function_deopt_table.supported_resume_points(),
@@ -1849,6 +1858,12 @@ impl ProcessJitState {
                 ));
             }
         };
+        if soac_instrument::InstrumentationConfig::from_env_config(&plan.env_config)
+            .deopt_entry_counters_enabled()
+            && let Some(shared_state) = batch_function.source.shared_state()
+        {
+            function_deopt_table.enable_entry_counters(shared_state)?;
+        }
         Ok(CompiledJitFunction {
             function_id: function.function_id,
             function_qualname: function.names.qualname.clone(),
@@ -1858,6 +1873,9 @@ impl ProcessJitState {
             default_adapter_id,
             default_adapter_symbol,
             stats: JitCodegenStats {
+                strict_sealed_field_site_count: built.strict_sealed_field_site_count,
+                strict_sealed_method_site_count: built.strict_sealed_method_site_count,
+                strict_checked_fixed_body_site_count: built.strict_checked_fixed_body_site_count,
                 clif_block_count,
                 clif_inst_count,
                 machine_code_size_bytes: compiled.artifact.code_size,
@@ -1866,7 +1884,7 @@ impl ProcessJitState {
             },
             compiled,
             default_adapter_compiled,
-            deopt_table: function_deopt_table,
+            deopt_table: Arc::new(function_deopt_table),
         })
     }
 
@@ -2080,6 +2098,33 @@ impl ProcessJitState {
                 );
                 signal_diag_elapsed += signal_diag_start.elapsed();
             }
+            if defined.stats.strict_sealed_field_site_count != 0 {
+                tracing::info!(
+                    target: "soac_jit_codegen",
+                    event = "soac.strict_field_codegen",
+                    function_id = defined.function_id.to_string(),
+                    function_qualname = defined.function_qualname,
+                    sealed_field_site_count = defined.stats.strict_sealed_field_site_count,
+                    clif_block_count = defined.stats.clif_block_count,
+                    clif_inst_count = defined.stats.clif_inst_count,
+                    machine_code_size_bytes = defined.stats.machine_code_size_bytes,
+                    "strict_field_codegen",
+                );
+            }
+            if defined.stats.strict_sealed_method_site_count != 0 {
+                tracing::info!(
+                    target: "soac_jit_codegen",
+                    event = "soac.strict_method_codegen",
+                    function_id = defined.function_id.to_string(),
+                    function_qualname = defined.function_qualname,
+                    sealed_method_site_count = defined.stats.strict_sealed_method_site_count,
+                    checked_fixed_body_site_count = defined.stats.strict_checked_fixed_body_site_count,
+                    clif_block_count = defined.stats.clif_block_count,
+                    clif_inst_count = defined.stats.clif_inst_count,
+                    machine_code_size_bytes = defined.stats.machine_code_size_bytes,
+                    "strict_method_codegen",
+                );
+            }
             committed.push((defined.function_id, compiled_handle, defined.stats));
         }
         let publish_elapsed = publish_start.elapsed();
@@ -2228,6 +2273,9 @@ fn resolve_process_jit_batch_function<'a>(
     if let Some(shared_state) = direct_call_resolver
         && let Some(function) = shared_state.lookup_function(function_id).cloned()
     {
+        if !shared_state.admits_function(&function) {
+            return Ok(None);
+        }
         return Ok(Some(ProcessJitBatchFunction {
             function,
             source: ProcessJitBatchFunctionSource::BorrowedSharedState(shared_state),
@@ -2235,6 +2283,7 @@ fn resolve_process_jit_batch_function<'a>(
     }
     Ok(session
         .lookup_shared_function(function_id)?
+        .filter(|(shared_state, function)| shared_state.admits_function(function))
         .map(|(shared_state, function)| ProcessJitBatchFunction {
             function,
             source: ProcessJitBatchFunctionSource::OwnedSharedState(shared_state),
@@ -2799,6 +2848,7 @@ impl ProcessJitEngine {
             .iter()
             .filter(|function| {
                 function.function_id != RuntimeFunctionId::global()
+                    && shared_state.admits_function(function)
                     && function.execution_mode() == FunctionExecutionMode::Jit
                     && !keeps_source_generator_vectorcall(
                         function.lowered_kind(),
@@ -3188,6 +3238,11 @@ impl ProcessJitEngine {
         module_constant_ptrs: &[*mut ffi::PyObject],
         direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     ) -> Result<DirectFunctionCompileResult, String> {
+        if direct_call_resolver.is_some_and(|shared| !shared.admits_function(function)) {
+            return Err(
+                "runtime compilation requires an individually authenticated strict template".into(),
+            );
+        }
         if function.execution_mode() != FunctionExecutionMode::Jit {
             return Err(format!(
                 "function {} id={} is marked for interpreted execution",
@@ -3664,6 +3719,45 @@ mod tests {
     }
 
     #[test]
+    fn reserved_codegen_accepts_all_native_iterator_and_collection_imports() {
+        let session = crate::session::CompileSession::new();
+        let module = ProcessJitModule::new(&session).unwrap();
+        let mut jit_module = module.lock_for_serial_phase().unwrap();
+        super::predeclare_jit_runtime_imports(&mut jit_module).unwrap();
+        let declarations = super::JitModuleDeclarationSnapshot::from_module(&jit_module);
+        let mut reserved = super::ReservedJitCodegenEnv {
+            isa: super::CraneliftTargetConfig::runtime(session.env_config().unwrap())
+                .build_isa()
+                .unwrap(),
+            declarations: &declarations,
+        };
+        let mut imports = crate::jit::imports::ModuleFuncImports::new();
+        for spec in crate::jit::native_iterator_runtime::primitive_bindings()
+            .into_iter()
+            .map(|(spec, _)| spec)
+            .chain(
+                crate::jit::collection_runtime::primitive_bindings()
+                    .into_iter()
+                    .map(|(spec, _)| spec),
+            )
+            .chain(
+                crate::jit::call_arguments_runtime::primitive_bindings()
+                    .into_iter()
+                    .map(|(spec, _)| spec),
+            )
+            .chain(
+                crate::jit::iteration_runtime::primitive_bindings()
+                    .into_iter()
+                    .map(|(spec, _)| spec),
+            )
+        {
+            // Exercise the same read-only signature lookup as a real worker,
+            // not just a symbol-name presence check on the registration list.
+            imports.ensure_declared(&mut reserved, spec).unwrap();
+        }
+    }
+
+    #[test]
     fn process_jit_registry_does_not_reuse_colliding_function_ids_with_different_shapes() {
         let compile_session = crate::session::CompileSession::new();
         let module =
@@ -3697,9 +3791,14 @@ mod tests {
                 1usize as *const u8,
                 first.params.len(),
                 Arc::new(RuntimeJitDeoptTable {
+                    entry_counters: None,
                     function_id: first.function_id,
+                    handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(
+                        &first,
+                    ),
                     function: Box::new(first.clone()),
                     module_constant_ptrs: Vec::new(),
+                    module_constant_runtime_names: Vec::new(),
                     points: Vec::new(),
                 }),
             )

@@ -5,7 +5,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyAnyMethods, PyList, PyModule, PyTuple};
+use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyModule, PyTuple};
 use soac_config::SoacEnvConfig;
 use soac_config::SpecializationMode;
 use soac_core::block_py::{
@@ -28,7 +28,7 @@ use std::io::Write;
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::info;
@@ -43,6 +43,181 @@ unsafe extern "C" {
 
 pub struct SoacExtModuleDataRef<'a> {
     pub shared_state: &'a SharedModuleState,
+    pub strict_runtime: Option<&'a crate::StrictModuleRuntimeState>,
+}
+
+/// Complete only objects produced by this authenticated module execution.
+/// Class-owned methods are adopted by their actual protected class, never by
+/// source membership alone: a framework class that declined participation
+/// must not have its methods frozen through this independent module path.
+pub fn finalize_strict_module_contents(
+    py: Python<'_>,
+    state: &crate::StrictModuleRuntimeState,
+    shared: &SharedModuleState,
+) -> PyResult<()> {
+    use crate::strict_function::{
+        authenticate_strict_function, eligible_function, finalize_eligible_function,
+    };
+    use crate::strict_module::StrictPendingKind;
+    use soac_core::block_py::CallableSourceRole;
+
+    let verified = shared.verified_strict_module().ok_or_else(|| {
+        crate::strict_runtime_unavailable(py, "strict finalization has no verified module")
+    })?;
+    // Upgrade one weak target at a time. Sealing an earlier target must not
+    // extend the lifetime of unrelated functions or their captured objects.
+    // A GC callback during optional publication can construct another target;
+    // repeat both phases until their existing registries are quiescent.
+    loop {
+        let mut progressed = false;
+        while let Some((kind, object)) = state.next_pending(py)? {
+            progressed = true;
+            let object = object.into_bound(py);
+            match kind {
+                StrictPendingKind::Function { function_id } => {
+                    // Determine adoption responsibility from the private pending
+                    // registry and immutable source policy before authenticating
+                    // mutable native metadata. Dynamic functions and functions
+                    // owned by an unparticipating class may have replaced code;
+                    // merely remaining alive must not give them a frozen contract.
+                    let template = shared
+                        .lookup_function_template(function_id)
+                        .map_err(|error| crate::strict_runtime_unavailable(py, error))?
+                        .ok_or_else(|| {
+                            crate::strict_runtime_unavailable(
+                                py,
+                                "pending function has no template",
+                            )
+                        })?;
+                    if let Some(origin) = template.function().scope.source_origin.as_ref() {
+                        match origin.role {
+                            CallableSourceRole::TypeParameterScope => continue,
+                            CallableSourceRole::SourceFunction => {
+                                let class_owned = verified
+                                    .type_facts()
+                                    .facts()
+                                    .source_class_owner(&origin.definition)
+                                    .is_some();
+                                if !eligible_function(shared, Some(origin))
+                                    || (class_owned
+                                        && !crate::strict_function::function_awaits_module_nominals(
+                                            py, &object,
+                                        )?)
+                                {
+                                    continue;
+                                }
+                                // Only an already mandatorily frozen method's
+                                // module-only stage reaches full authentication
+                                // below. Source membership never adopts a
+                                // dynamic/unparticipating framework method.
+                            }
+                            CallableSourceRole::AnnotationProvider
+                                if matches!(
+                                    origin.definition.definition_kind,
+                                    soac_contracts::DefinitionKind::Function
+                                        | soac_contracts::DefinitionKind::Class
+                                        | soac_contracts::DefinitionKind::TypeAlias
+                                        | soac_contracts::DefinitionKind::Parameter
+                                ) =>
+                            {
+                                // Functions/classes own dictionary-provider
+                                // adoption. Type evaluators deliberately remain
+                                // provenance-only, with no delayed target lookup.
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let Some(auth) = authenticate_strict_function(py, &object)? else {
+                        return Err(crate::strict_runtime_unavailable(
+                            py,
+                            "pending strict function lost its owner",
+                        ));
+                    };
+                    if !std::ptr::eq(auth.module_state()?.as_ref(), shared)
+                        || auth.function_id()? != function_id
+                    {
+                        return Err(crate::strict_runtime_unavailable(
+                            py,
+                            "pending function belongs to another execution",
+                        ));
+                    }
+                    if let Some(origin) = auth.origin() {
+                        if finalize_eligible_function(py, &object, &origin.definition)?
+                            && !auth.capability_nominal_bindings().is_empty()
+                        {
+                            state.defer_capability_publication(
+                                py,
+                                StrictPendingKind::Function { function_id },
+                                &object,
+                            )?;
+                        }
+                    }
+                }
+                StrictPendingKind::InterpreterFunction { .. } => {
+                    return Err(crate::strict_runtime_unavailable(
+                        py,
+                        "interpreter definition reached compiled-module finalization",
+                    ));
+                }
+                StrictPendingKind::Class { source } => {
+                    if !crate::strict_class::finalize_class(py, &object, &source)? {
+                        return Err(crate::strict_runtime_unavailable(
+                            py,
+                            "pending strict class lost its installed contract",
+                        ));
+                    }
+                    state.defer_capability_publication(
+                        py,
+                        StrictPendingKind::Class { source },
+                        &object,
+                    )?;
+                }
+            }
+        }
+        // Every live target is already permanently sealed. This second weak drain
+        // only fills missing optimization slots from exact captured nominal types;
+        // source order cannot turn a forward annotation into a permanent miss.
+        while let Some((kind, object)) = state.next_capability_publication(py)? {
+            progressed = true;
+            let object = object.into_bound(py);
+            match kind {
+                StrictPendingKind::Function { function_id } => {
+                    let auth = authenticate_strict_function(py, &object)?.ok_or_else(|| {
+                        crate::strict_runtime_unavailable(py, "capability function lost its owner")
+                    })?;
+                    if !std::ptr::eq(auth.module_state()?.as_ref(), shared)
+                        || auth.function_id()? != function_id
+                        || !auth.is_finalized()
+                    {
+                        return Err(crate::strict_runtime_unavailable(
+                            py,
+                            "capability function changed its sealed execution identity",
+                        ));
+                    }
+                    crate::strict_optimization::bind_nominal_function_capabilities(py, &object)?;
+                }
+                StrictPendingKind::InterpreterFunction { .. } => {
+                    return Err(crate::strict_runtime_unavailable(
+                        py,
+                        "interpreter definition cannot publish compiled capabilities",
+                    ));
+                }
+                StrictPendingKind::Class { source } => {
+                    if !crate::strict_class::finalize_class(py, &object, &source)? {
+                        return Err(crate::strict_runtime_unavailable(
+                            py,
+                            "capability class lost its installed contract",
+                        ));
+                    }
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -53,6 +228,8 @@ pub struct ModuleInfo {
 }
 
 pub struct SharedModuleState {
+    pub(crate) strict_module: Option<Arc<crate::VerifiedStrictModule>>,
+    pub(crate) strict_execution: Option<crate::strict_module::StrictModuleExecutionRef>,
     pub(crate) late_bound_owner_fields: LateBoundOwnerFieldRuntime,
     pub lowered_module: BlockPyModule<BlockPyModuleShape>,
     pub module_name: String,
@@ -63,7 +240,7 @@ pub struct SharedModuleState {
     function_index_by_id: HashMap<RuntimeFunctionId, usize>,
     function_templates:
         Mutex<HashMap<RuntimeFunctionId, Arc<crate::FunctionInstantiationTemplate>>>,
-    original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
+    pub(crate) original_code_by_function_id: crate::strict_admission::OriginalCodeStorage,
     module_constant_objs: Vec<Py<PyAny>>,
     // Each non-null slot owns one runtime-name reference for this module state; lookups return a
     // fresh owned reference by INCREFing the cached pointer.
@@ -71,9 +248,33 @@ pub struct SharedModuleState {
     counter_slots_by_id: Box<[CounterRuntimeSlot]>,
     counter_values: Box<[u64]>,
     top_value_counters: Box<[GilTopValueCounter]>,
+    deopt_entry_counters: Mutex<DeoptEntryCounterRegistry>,
     counter_dump_flush_tracker: Mutex<CounterDumpFlushTracker>,
-    pub(crate) precompiled_module_runtime:
-        OnceLock<Result<Arc<crate::jit::PrecompiledModuleRuntime>, String>>,
+}
+
+/// Counters for one finalized deopt table. These never resize or alias the
+/// module's already-published scalar storage. The owning module retains only
+/// this Python-free diagnostic state, not the table or its captured objects.
+pub(crate) struct DeoptEntryCounters {
+    entries: Box<[(CounterDef, AtomicU64)]>,
+}
+
+impl DeoptEntryCounters {
+    pub(crate) fn record(&self, ordinal: usize) {
+        self.entries[ordinal].1.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> impl Iterator<Item = (&CounterDef, u64)> {
+        self.entries
+            .iter()
+            .map(|(definition, value)| (definition, value.load(Ordering::Relaxed)))
+    }
+}
+
+#[derive(Default)]
+struct DeoptEntryCounterRegistry {
+    sets: Vec<Arc<DeoptEntryCounters>>,
+    count: usize,
 }
 
 #[repr(C)]
@@ -147,6 +348,67 @@ fn build_runtime_name_cache() -> Box<[AtomicUsize]> {
 }
 
 impl SharedModuleState {
+    pub(crate) fn register_deopt_entry_counters(
+        &self,
+        function_id: RuntimeFunctionId,
+        sources: Vec<DeoptEntrySource>,
+    ) -> Result<Arc<DeoptEntryCounters>, String> {
+        if self.lookup_function(function_id).is_none() {
+            return Err(format!(
+                "deopt counters have unknown function {function_id}"
+            ));
+        }
+        let mut registry = self
+            .deopt_entry_counters
+            .lock()
+            .map_err(|_| "deopt counter registry is poisoned".to_string())?;
+        let first_id = self
+            .lowered_module
+            .counter_defs
+            .len()
+            .checked_add(registry.count)
+            .ok_or("deopt counter id overflow")?;
+        let end_id = first_id
+            .checked_add(sources.len())
+            .ok_or("deopt counter id overflow")?;
+        u32::try_from(end_id).map_err(|_| "deopt counter ids do not fit the dump format")?;
+        let entries = sources
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, source)| {
+                (
+                    CounterDef::scalar(
+                        CounterId(first_id + ordinal),
+                        CounterScope::This,
+                        "deopt_entry_guard_miss",
+                        CounterSite::DeoptEntry {
+                            function_id,
+                            source,
+                        },
+                    ),
+                    AtomicU64::new(0),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let counters = Arc::new(DeoptEntryCounters { entries });
+        registry.count += counters.entries.len();
+        registry.sets.push(Arc::clone(&counters));
+        Ok(counters)
+    }
+
+    fn deopt_entry_counter_sets(&self) -> Vec<Arc<DeoptEntryCounters>> {
+        self.deopt_entry_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sets
+            .clone()
+    }
+
+    pub fn verified_strict_module(&self) -> Option<&crate::VerifiedStrictModule> {
+        self.strict_module.as_deref()
+    }
+
     pub(crate) unsafe fn runtime_name_owned_cached(
         &self,
         runtime_name: RuntimeName,
@@ -272,18 +534,40 @@ impl SharedModuleState {
             return Ok(None);
         }
         if let Some(function) = self.lookup_function(function_id) {
-            return Ok(Some(function.clone()));
+            return Ok(self.admits_function(function).then(|| function.clone()));
         }
         if function_id.runtime_module_id().as_u32() == self.module_id() {
             return Ok(None);
         }
         Ok(compile_session
             .lookup_shared_function(function_id)?
+            .filter(|(shared_state, function)| shared_state.admits_function(function))
             .map(|(_shared_state, function)| function))
     }
 
     pub fn lookup_original_code(&self, function_id: RuntimeFunctionId) -> Option<&Py<PyAny>> {
         self.original_code_by_function_id.get(&function_id)
+    }
+
+    pub(crate) fn lookup_generator_expression_code(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> Option<&Py<PyAny>> {
+        self.original_code_by_function_id
+            .generator_expression_code(&function_id)
+    }
+
+    pub(crate) fn admits_function<S: soac_core::block_py::ModuleShape>(
+        &self,
+        function: &BlockPyFunction<S>,
+    ) -> bool {
+        match (
+            self.verified_strict_module(),
+            self.original_code_by_function_id.authenticated(),
+        ) {
+            (Some(verified), Some(catalog)) => catalog.admits(verified, function),
+            _ => false,
+        }
     }
 
     pub(crate) fn module_constant_ptrs(&self) -> Vec<*mut ffi::PyObject> {
@@ -398,13 +682,13 @@ impl SharedModuleState {
             .lookup_function(function_id)
             .cloned()
             .ok_or_else(|| format!("missing direct-call target for function_id={function_id}"))?;
+        if !self.admits_function(&function) {
+            return Err(
+                "direct compilation requires an individually authenticated strict template".into(),
+            );
+        }
         if function.execution_mode() == FunctionExecutionMode::Interpreted {
             return Ok(None);
-        }
-        if let Some(handle) =
-            crate::jit::lookup_precompiled_direct_function_handle(compile_session, self, &function)?
-        {
-            return Ok(Some((handle, false)));
         }
         if let Some(handle) = compile_session
             .process_jit()?
@@ -483,7 +767,18 @@ impl SharedModuleState {
         {
             return;
         }
-        for counter in &self.lowered_module.counter_defs {
+        let deopt_counters = self.deopt_entry_counter_sets();
+        for (counter, scalar_value) in self
+            .lowered_module
+            .counter_defs
+            .iter()
+            .map(|counter| (counter, self.counter_value(counter.id)))
+            .chain(
+                deopt_counters
+                    .iter()
+                    .flat_map(|counters| counters.snapshot()),
+            )
+        {
             let kind = counter.kind.as_str();
             let is_specialization_counter = matches!(
                 kind,
@@ -509,7 +804,6 @@ impl SharedModuleState {
                     (value > 0).then_some((branch.name.as_str(), value))
                 })
                 .collect::<Vec<_>>();
-            let scalar_value = self.counter_value(counter.id);
             if scalar_value == 0 && branch_values.is_empty() {
                 continue;
             }
@@ -591,7 +885,18 @@ impl SharedModuleState {
         let (type_keys, type_table) = self.counter_dump_type_key_layouts();
 
         let mut rows = Vec::new();
-        for counter in &self.lowered_module.counter_defs {
+        let deopt_counters = self.deopt_entry_counter_sets();
+        for (counter, scalar_value) in self
+            .lowered_module
+            .counter_defs
+            .iter()
+            .map(|counter| (counter, self.counter_value(counter.id)))
+            .chain(
+                deopt_counters
+                    .iter()
+                    .flat_map(|counters| counters.snapshot()),
+            )
+        {
             let (
                 site_kind,
                 function_id,
@@ -692,7 +997,7 @@ impl SharedModuleState {
                         .collect();
                     row.value = row.branch_values.iter().map(|branch| branch.value).sum();
                 } else {
-                    row.value = self.counter_value(counter.id);
+                    row.value = scalar_value;
                 }
                 rows.push(row);
             }
@@ -948,20 +1253,12 @@ pub(crate) fn build_module_constant_objects(
     py: Python<'_>,
     codegen_constants: &ModuleCodegenConstants,
     module_name: &str,
-    source_hash: u64,
 ) -> PyResult<Vec<Py<PyAny>>> {
-    codegen_constants.build_python_constants_with_static_resolver(
-        py,
-        module_name == "soac.runtime",
-        |constant_id| {
-            crate::jit::lookup_precompiled_static_module_constant(
-                module_name,
-                source_hash,
-                constant_id,
-            )
-            .map_err(PyRuntimeError::new_err)
-        },
-    )
+    if module_name == "soac.runtime" {
+        codegen_constants.build_python_constants_for_soac_runtime(py)
+    } else {
+        codegen_constants.build_python_constants(py)
+    }
 }
 
 type OriginalCodeByQualname = HashMap<String, VecDeque<Py<PyAny>>>;
@@ -1035,6 +1332,961 @@ pub fn match_original_code_to_functions(
     Ok(code_by_function_id)
 }
 
+/// Compile only authenticated source bytes through the actual native compiler.
+/// Both execution backends consume this tuple directly; a Python-supplied
+/// tuple, code stamp, or public future bit cannot enter this constructor.
+pub(crate) fn compile_verified_native_details<'py>(
+    py: Python<'py>,
+    verified: &crate::VerifiedStrictModule,
+) -> PyResult<Bound<'py, PyTuple>> {
+    unsafe extern "C" {
+        fn PySoac_CompileVerifiedSourceDetails(
+            source: *const c_char,
+            length: ffi::Py_ssize_t,
+            filename: *mut ffi::PyObject,
+            optimize: c_int,
+        ) -> *mut ffi::PyObject;
+        fn PyCode_GetSoacStrictSourceId(code: *mut ffi::PyObject) -> u64;
+    }
+    let interpreter_id = unsafe { ffi::PyInterpreterState_GetID(ffi::PyInterpreterState_Get()) };
+    if interpreter_id != verified.interpreter_id() {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "strict native source interpreter mismatch",
+        ));
+    }
+    let source = std::str::from_utf8(verified.source())
+        .map_err(|_| crate::strict_runtime_unavailable(py, "strict source bytes are not UTF-8"))?;
+    let path = verified
+        .source_path()
+        .to_str()
+        .ok_or_else(|| crate::strict_runtime_unavailable(py, "strict source path is not UTF-8"))?;
+    let filename = pyo3::types::PyString::new(py, path);
+    let details = unsafe {
+        Bound::<PyAny>::from_owned_ptr_or_err(
+            py,
+            PySoac_CompileVerifiedSourceDetails(
+                source.as_ptr().cast(),
+                source.len() as ffi::Py_ssize_t,
+                filename.as_ptr(),
+                -1,
+            ),
+        )?
+    }
+    .cast_into::<PyTuple>()?;
+    if !details.is_exact_instance_of::<PyTuple>() || details.len() != 3 {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "invalid native source details",
+        ));
+    }
+    let root = details.get_item(0)?;
+    if unsafe { ffi::Py_TYPE(root.as_ptr()) } != ptr::addr_of_mut!(ffi::PyCode_Type)
+        || unsafe { PyCode_GetSoacStrictSourceId(root.as_ptr()) } == 0
+    {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "native compiler did not authenticate strict source",
+        ));
+    }
+    Ok(details)
+}
+
+/// The one privately compiled native root held across lowering. Ordinary
+/// source-string tuples never grant authority: only this constructor calls the
+/// native compiler on the verified bytes, and the same owned root is consumed
+/// into the admission catalog. This temporary owner is not stored in an Arc or
+/// added as a second hidden Python edge in SharedModuleState.
+pub struct CompiledStrictSource {
+    native_root: Py<PyAny>,
+    source: soac_core::block_py::StrictModuleSource,
+    interpreter_id: i64,
+    canonical_annotations: Arc<soac_lowering::CanonicalAnnotationStrings>,
+    canonical_class_bindings: Arc<soac_lowering::CanonicalClassBindings>,
+}
+
+impl CompiledStrictSource {
+    pub fn compile(py: Python<'_>, verified: &crate::VerifiedStrictModule) -> PyResult<Self> {
+        let details = compile_verified_native_details(py, verified)?;
+        let interpreter_id = verified.interpreter_id();
+        let source = std::str::from_utf8(verified.source()).map_err(|_| {
+            crate::strict_runtime_unavailable(py, "strict source bytes are not UTF-8")
+        })?;
+        let native_root = details.get_item(0)?;
+        let line_starts = std::iter::once(0)
+            .chain(
+                source
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+            )
+            .collect::<Vec<_>>();
+        let offset = |line: usize, column: usize| -> PyResult<u32> {
+            let index = line.checked_sub(1).ok_or_else(|| {
+                crate::strict_runtime_unavailable(py, "native annotation line is not one-based")
+            })?;
+            let start = *line_starts.get(index).ok_or_else(|| {
+                crate::strict_runtime_unavailable(py, "native annotation line is outside source")
+            })?;
+            let end = line_starts.get(index + 1).copied().unwrap_or(source.len());
+            if column > end - start {
+                return Err(crate::strict_runtime_unavailable(
+                    py,
+                    "native annotation column is outside source line",
+                ));
+            }
+            u32::try_from(start + column).map_err(|_| {
+                crate::strict_runtime_unavailable(
+                    py,
+                    "native annotation range exceeds source coordinates",
+                )
+            })
+        };
+        let rows = details.get_item(1)?.cast_into::<PyTuple>()?;
+        if !rows.is_exact_instance_of::<PyTuple>() {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "native annotation strings are not immutable",
+            ));
+        }
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            if !row.is_exact_instance_of::<PyTuple>() {
+                return Err(crate::strict_runtime_unavailable(
+                    py,
+                    "invalid native annotation string row",
+                ));
+            }
+            let (line, column, end_line, end_column, text) =
+                row.extract::<(usize, usize, usize, usize, String)>()?;
+            entries.push((
+                soac_contracts::SourceRange::new(
+                    offset(line, column)?,
+                    offset(end_line, end_column)?,
+                ),
+                text,
+            ));
+        }
+        let canonical_annotations = Arc::new(
+            soac_lowering::CanonicalAnnotationStrings::from_native_entries(source, entries)
+                .map_err(|error| crate::strict_runtime_unavailable(py, error.to_string()))?,
+        );
+        let canonical_class_bindings = Arc::new(crate::class_bindings::decode(
+            py,
+            source,
+            &native_root,
+            details.get_item(2)?,
+        )?);
+        Ok(Self {
+            native_root: native_root.unbind(),
+            source: soac_core::block_py::StrictModuleSource::from_verified(verified.type_facts()),
+            interpreter_id,
+            canonical_annotations,
+            canonical_class_bindings,
+        })
+    }
+
+    pub fn canonical_annotations(&self) -> Arc<soac_lowering::CanonicalAnnotationStrings> {
+        Arc::clone(&self.canonical_annotations)
+    }
+
+    pub fn canonical_class_bindings(&self) -> Arc<soac_lowering::CanonicalClassBindings> {
+        Arc::clone(&self.canonical_class_bindings)
+    }
+
+    pub fn into_function_catalog(
+        self,
+        py: Python<'_>,
+        verified: &crate::VerifiedStrictModule,
+        lowered_module: &BlockPyModule<BlockPyModuleShape>,
+    ) -> PyResult<crate::AuthenticatedCodeCatalog> {
+        let thread = unsafe { ffi::PyThreadState_Get() };
+        let interpreter = unsafe { ffi::PyThreadState_GetInterpreter(thread) };
+        let interpreter_id = unsafe { ffi::PyInterpreterState_GetID(interpreter) };
+        if interpreter_id != self.interpreter_id
+            || interpreter_id != verified.interpreter_id()
+            || !self.source.matches_verified(verified.type_facts())
+            || !lowered_module
+                .strict_source
+                .as_ref()
+                .is_some_and(|source| source == &self.source)
+        {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "strict native source owner mismatch",
+            ));
+        }
+        match_compiled_strict_functions(
+            py,
+            verified,
+            lowered_module,
+            self.native_root.into_bound(py),
+            &self.canonical_class_bindings,
+        )
+    }
+}
+
+fn match_compiled_strict_functions(
+    py: Python<'_>,
+    verified: &crate::VerifiedStrictModule,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
+    native_root: Bound<'_, PyAny>,
+    class_bindings: &soac_lowering::CanonicalClassBindings,
+) -> PyResult<crate::AuthenticatedCodeCatalog> {
+    let tree = crate::class_bindings::code_tree(py, &native_root)?;
+    if tree.len() != class_bindings.nodes().len() {
+        return Err(crate::strict_runtime_unavailable(
+            py,
+            "native class metadata lost its owned root",
+        ));
+    }
+    let (native_codes, native_parents): (Vec<_>, Vec<_>) = tree
+        .into_iter()
+        .map(|node| (node.code, node.parent.map(|id| id.0 as usize)))
+        .unzip();
+    let line_starts = std::iter::once(0)
+        .chain(
+            verified
+                .source()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1)),
+        )
+        .collect::<Vec<_>>();
+    let mut matched = HashSet::new();
+    let mut source_nodes = HashMap::new();
+    let mut result = HashMap::new();
+    for function in &lowered_module.callable_defs {
+        let Some(origin) = &function.scope.source_origin else {
+            continue;
+        };
+        if origin.role != soac_core::block_py::CallableSourceRole::SourceFunction {
+            continue;
+        }
+        let fact = verified
+            .type_facts()
+            .facts()
+            .functions
+            .iter()
+            .find(|fact| fact.identity == origin.definition)
+            .ok_or_else(|| {
+                crate::strict_runtime_unavailable(
+                    py,
+                    "strict callable has no matching authenticated source identity",
+                )
+            })?;
+        let first_offset = fact
+            .decorators
+            .iter()
+            .map(|decorator| decorator.expression_range.start)
+            .chain([fact.identity.source_range.start])
+            .min()
+            .unwrap();
+        let first_line = line_starts.partition_point(|start| *start <= first_offset as usize);
+        let mut candidates = native_codes.iter().enumerate().filter_map(|(index, code)| {
+            match strict_native_code_matches(code, function, fact, &line_starts, first_line) {
+                Ok(true) => Some(Ok((index, code))),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        });
+        let Some((index, candidate)) = candidates.next().transpose()? else {
+            // CPython may omit an unreachable definition. If it is ever
+            // instantiated, the strict function constructor rejects the missing
+            // native witness instead of attaching a name-based replacement.
+            continue;
+        };
+        if candidates.next().transpose()?.is_some() || !matched.insert(candidate.as_ptr() as usize)
+        {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "ambiguous strict source-to-native-code mapping",
+            ));
+        }
+        result.insert(function.function_id, candidate.clone().unbind());
+        source_nodes.insert(origin.definition.clone(), index);
+    }
+    for function in &lowered_module.callable_defs {
+        let Some(origin) = function.scope.source_origin.as_ref().filter(|origin| {
+            origin.role == soac_core::block_py::CallableSourceRole::TypeParameterScope
+        }) else {
+            continue;
+        };
+        let projection = function
+            .scope
+            .type_parameter_scope
+            .as_ref()
+            .ok_or_else(|| {
+                crate::strict_runtime_unavailable(
+                    py,
+                    "generic scope has no explicit native projection",
+                )
+            })?;
+        if projection.native_range != origin.definition.source_range
+            || projection.native_header_range.start < projection.native_range.start
+            || projection.native_header_range.start >= projection.native_range.end
+            || projection.native_header_range.end != projection.native_range.end
+            || !matches!(
+                origin.definition.definition_kind,
+                soac_contracts::DefinitionKind::Function
+                    | soac_contracts::DefinitionKind::Class
+                    | soac_contracts::DefinitionKind::TypeAlias
+            )
+        {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "generic scope declaration mismatch",
+            ));
+        }
+        let mut candidates = Vec::new();
+        for code in &native_codes {
+            if code.getattr("co_name")?.extract::<String>()? == function.names.display_name
+                && code.getattr("co_qualname")?.extract::<String>()? == projection.native_qualname
+                && code.getattr("co_firstlineno")?.extract::<u32>()? == projection.native_first_line
+                && strict_native_type_expression_range_matches(
+                    code,
+                    &projection.native_header_range,
+                    &line_starts,
+                )?
+            {
+                candidates.push(code);
+            }
+        }
+        let candidate = match candidates.as_slice() {
+            [] => continue,
+            [candidate] => *candidate,
+            _ => {
+                return Err(crate::strict_runtime_unavailable(
+                    py,
+                    "ambiguous native generic scope occurrence",
+                ));
+            }
+        };
+        let captures = function
+            .public_storage_layout()
+            .map_or_else(Vec::new, |layout| {
+                layout
+                    .freevars
+                    .iter()
+                    .map(|slot| slot.logical_name.clone())
+                    .collect::<Vec<_>>()
+            });
+        let names = candidate.getattr("co_varnames")?.extract::<Vec<String>>()?;
+        let native_captures = candidate.getattr("co_freevars")?.extract::<Vec<String>>()?;
+        if candidate.getattr("co_argcount")?.extract::<usize>()? != projection.inputs.len()
+            || candidate
+                .getattr("co_posonlyargcount")?
+                .extract::<usize>()?
+                != 0
+            || candidate.getattr("co_kwonlyargcount")?.extract::<usize>()? != 0
+            || names.len() < projection.inputs.len()
+            || names
+                .iter()
+                .zip(&projection.inputs)
+                .any(|(name, input)| name != input.kind.native_parameter_name())
+            || native_captures != captures
+            || !matched.insert(candidate.as_ptr() as usize)
+        {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                format!(
+                    "generic scope native projection differs for {}: native captures {:?}, lowered {:?}",
+                    origin.definition.lexical_qualname, native_captures, captures,
+                ),
+            ));
+        }
+        result.insert(function.function_id, candidate.clone().unbind());
+    }
+    for function in &lowered_module.callable_defs {
+        let Some(origin) = function.scope.source_origin.as_ref().filter(|origin| {
+            origin.role == soac_core::block_py::CallableSourceRole::AnnotationProvider
+        }) else {
+            continue;
+        };
+        let projection = function.scope.annotation_provider.as_ref().ok_or_else(|| {
+            crate::strict_runtime_unavailable(
+                py,
+                "strict annotation provider has no explicit native projection",
+            )
+        })?;
+        let type_expression =
+            projection.kind != soac_core::block_py::AnnotationProviderKind::Dictionary;
+        let candidate = if type_expression {
+            let range = projection.native_range.as_ref().ok_or_else(|| {
+                crate::strict_runtime_unavailable(py, "type evaluator has no native source span")
+            })?;
+            let definition = &origin.definition;
+            if !matches!(
+                definition.definition_kind,
+                soac_contracts::DefinitionKind::TypeAlias
+                    | soac_contracts::DefinitionKind::Parameter
+            ) || range.start < definition.source_range.start
+                || range.end > definition.source_range.end
+                || range.start >= range.end
+            {
+                return Err(crate::strict_runtime_unavailable(
+                    py,
+                    "type evaluator span is outside its declaration",
+                ));
+            }
+            let mut candidates = Vec::new();
+            for code in &native_codes {
+                if code.getattr("co_name")?.extract::<String>()? == function.names.display_name
+                    && code.getattr("co_qualname")?.extract::<String>()? == function.names.qualname
+                    && code.getattr("co_firstlineno")?.extract::<u32>()?
+                        == projection.native_first_line
+                    && strict_native_type_expression_range_matches(code, range, &line_starts)?
+                {
+                    candidates.push(code);
+                }
+            }
+            match candidates.as_slice() {
+                [] => continue,
+                [code] => *code,
+                _ => {
+                    return Err(crate::strict_runtime_unavailable(
+                        py,
+                        "ambiguous native type expression occurrence",
+                    ));
+                }
+            }
+        } else {
+            let first_line = projection.native_first_line;
+            let parent = match origin.definition.definition_kind {
+                soac_contracts::DefinitionKind::Module => 0,
+                soac_contracts::DefinitionKind::Function => {
+                    let Some(index) = source_nodes.get(&origin.definition) else {
+                        continue;
+                    };
+                    native_parents[*index].ok_or_else(|| {
+                        crate::strict_runtime_unavailable(
+                            py,
+                            "function annotation target has no native parent",
+                        )
+                    })?
+                }
+                soac_contracts::DefinitionKind::Class => {
+                    let fact = verified
+                        .type_facts()
+                        .facts()
+                        .classes
+                        .iter()
+                        .find(|class| class.identity == origin.definition)
+                        .ok_or_else(|| {
+                            crate::strict_runtime_unavailable(
+                                py,
+                                "class annotation target has no source definition",
+                            )
+                        })?;
+                    let offset = fact
+                        .decorators
+                        .iter()
+                        .map(|decorator| decorator.expression_range.start)
+                        .chain([fact.identity.source_range.start])
+                        .min()
+                        .unwrap();
+                    let class_line = line_starts.partition_point(|start| *start <= offset as usize);
+                    let mut candidates = Vec::new();
+                    for (index, code) in native_codes.iter().enumerate() {
+                        if code.getattr("co_qualname")?.extract::<String>()?
+                            == fact.identity.lexical_qualname
+                            && code.getattr("co_firstlineno")?.extract::<usize>()? == class_line
+                            && code.getattr("co_argcount")?.extract::<usize>()? == 0
+                        {
+                            candidates.push(index);
+                        }
+                    }
+                    match candidates.as_slice() {
+                        [] => continue,
+                        [index] => *index,
+                        _ => {
+                            return Err(crate::strict_runtime_unavailable(
+                                py,
+                                "ambiguous native class annotation parent",
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(crate::strict_runtime_unavailable(
+                        py,
+                        "unsupported native annotation target kind",
+                    ));
+                }
+            };
+            let mut candidates = Vec::new();
+            for (index, code) in native_codes.iter().enumerate() {
+                if native_parents[index] == Some(parent)
+                    && code.getattr("co_name")?.extract::<String>()? == "__annotate__"
+                    && code.getattr("co_firstlineno")?.extract::<u32>()? == first_line
+                {
+                    candidates.push(code);
+                }
+            }
+            match candidates.as_slice() {
+                [] => continue,
+                [code] => *code,
+                _ => {
+                    return Err(crate::strict_runtime_unavailable(
+                        py,
+                        "ambiguous native annotation provider occurrence",
+                    ));
+                }
+            }
+        };
+        let captures = function
+            .public_storage_layout()
+            .map_or_else(Vec::new, |layout| {
+                layout
+                    .freevars
+                    .iter()
+                    .map(|slot| slot.logical_name.clone())
+                    .collect::<Vec<_>>()
+            });
+        let native_captures = candidate.getattr("co_freevars")?.extract::<Vec<String>>()?;
+        if candidate.getattr("co_argcount")?.extract::<usize>()? != 1
+            || candidate
+                .getattr("co_posonlyargcount")?
+                .extract::<usize>()?
+                != 1
+            || candidate.getattr("co_kwonlyargcount")?.extract::<usize>()? != 0
+            || candidate
+                .getattr("co_varnames")?
+                .cast::<PyTuple>()?
+                .get_item(0)?
+                .extract::<String>()?
+                != projection.kind.parameter_name()
+            || candidate.getattr("co_qualname")?.extract::<String>()? != function.names.qualname
+            || native_captures != captures
+        {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                format!(
+                    "annotation provider native projection differs for {}: native captures {:?}, lowered {:?}",
+                    origin.definition.lexical_qualname, native_captures, captures
+                ),
+            ));
+        }
+        if !matched.insert(candidate.as_ptr() as usize) {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "native annotation provider has multiple source owners",
+            ));
+        }
+        result.insert(function.function_id, candidate.clone().unbind());
+    }
+    let mut generator_expression_codes = HashMap::new();
+    for function in &lowered_module.callable_defs {
+        let Some(projection) = &function.scope.generator_expression_code else {
+            continue;
+        };
+        if function.scope.source_origin.is_some()
+            || projection.expression_range.end > verified.source().len() as u32
+        {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "invalid generator code-exposure projection",
+            ));
+        }
+        let Some(index) = match_native_generator_expression_code(
+            &native_codes,
+            projection,
+            function.lowered_kind(),
+            &line_starts,
+        )?
+        else {
+            // Unreachable expressions can be absent from native compilation.
+            // Invocation with a required but missing exposure fails explicitly.
+            continue;
+        };
+        let candidate = &native_codes[index];
+        if !matched.insert(candidate.as_ptr() as usize) {
+            return Err(crate::strict_runtime_unavailable(
+                py,
+                "generator code has multiple source projections",
+            ));
+        }
+        generator_expression_codes.insert(function.function_id, candidate.clone().unbind());
+    }
+    crate::AuthenticatedCodeCatalog::from_compiled(
+        py,
+        verified,
+        lowered_module,
+        &native_root,
+        result,
+        generator_expression_codes,
+    )
+}
+
+/// Check the populated-table precondition before native address lookups.
+/// PyCode_Addr2Location assumes an actual table entry exists: with an empty
+/// co_linetable its failed range search can retreat before the table. A header
+/// synthesized from that memory is neither safe nor a source witness. The
+/// caller otherwise supplies the exact privately compiled native code tree.
+fn strict_native_location_code_length(code: &Bound<'_, PyAny>) -> PyResult<Option<i32>> {
+    unsafe extern "C" {
+        fn PyCode_GetCode(code: *mut ffi::PyCodeObject) -> *mut ffi::PyObject;
+    }
+    if unsafe { ffi::Py_TYPE(code.as_ptr()) } != ptr::addr_of_mut!(ffi::PyCode_Type) {
+        return Ok(None);
+    }
+    let locations = code
+        .getattr("co_linetable")?
+        .cast_into::<pyo3::types::PyBytes>()?;
+    if locations.as_bytes().is_empty() {
+        return Ok(None);
+    }
+    let bytecode = unsafe {
+        Bound::<PyAny>::from_owned_ptr_or_err(code.py(), PyCode_GetCode(code.as_ptr().cast()))?
+    };
+    let length = unsafe { ffi::PyBytes_Size(bytecode.as_ptr()) };
+    if length < 0 {
+        return Err(PyErr::fetch(code.py()));
+    }
+    let length = i32::try_from(length).map_err(|_| {
+        crate::strict_runtime_unavailable(code.py(), "native position bytecode is too large")
+    })?;
+    Ok((length != 0).then_some(length))
+}
+
+/// Code exposure is separate from callable admission. An exact outer-iterable
+/// location distinguishes even same-line genexprs with identical native names.
+/// The caller has already validated every node of the privately compiled tree.
+fn match_native_generator_expression_code(
+    native_codes: &[Bound<'_, PyAny>],
+    projection: &soac_core::block_py::GeneratorExpressionCode,
+    kind: &FunctionKind,
+    line_starts: &[usize],
+) -> PyResult<Option<usize>> {
+    let mut matched = None;
+    for (index, code) in native_codes.iter().enumerate() {
+        if strict_native_generator_expression_matches(code, projection, kind, line_starts)? {
+            if matched.replace(index).is_some() {
+                return Err(crate::strict_runtime_unavailable(
+                    code.py(),
+                    "ambiguous original generator-expression code",
+                ));
+            }
+        }
+    }
+    Ok(matched)
+}
+
+fn strict_native_generator_expression_matches(
+    code: &Bound<'_, PyAny>,
+    projection: &soac_core::block_py::GeneratorExpressionCode,
+    kind: &FunctionKind,
+    line_starts: &[usize],
+) -> PyResult<bool> {
+    unsafe extern "C" {
+        fn PyCode_Addr2Location(
+            code: *mut ffi::PyCodeObject,
+            offset: c_int,
+            start_line: *mut c_int,
+            start_column: *mut c_int,
+            end_line: *mut c_int,
+            end_column: *mut c_int,
+        ) -> c_int;
+    }
+    let expected_flag = match kind {
+        FunctionKind::Generator => ffi::CO_GENERATOR,
+        FunctionKind::AsyncGenerator => ffi::CO_ASYNC_GENERATOR,
+        _ => return Ok(false),
+    };
+    let expression = &projection.expression_range;
+    let iterable = &projection.iterable_range;
+    if expression.start >= expression.end
+        || iterable.start >= iterable.end
+        || iterable.start < expression.start
+        || iterable.end > expression.end
+        || unsafe { ffi::Py_TYPE(code.as_ptr()) } != ptr::addr_of_mut!(ffi::PyCode_Type)
+    {
+        return Ok(false);
+    }
+    let first_line = line_starts.partition_point(|start| *start <= expression.start as usize);
+    let flags = code.getattr("co_flags")?.extract::<i32>()?;
+    if code.getattr("co_name")?.extract::<String>()? != "<genexpr>"
+        || code.getattr("co_firstlineno")?.extract::<usize>()? != first_line
+        || flags & (ffi::CO_GENERATOR | ffi::CO_COROUTINE | ffi::CO_ASYNC_GENERATOR)
+            != expected_flag
+        || flags & (ffi::CO_VARARGS | ffi::CO_VARKEYWORDS) != 0
+        || code.getattr("co_argcount")?.extract::<usize>()? != 1
+        || code.getattr("co_posonlyargcount")?.extract::<usize>()? != 0
+        || code.getattr("co_kwonlyargcount")?.extract::<usize>()? != 0
+        || code
+            .getattr("co_varnames")?
+            .cast_into::<PyTuple>()?
+            .get_item(0)?
+            .extract::<String>()?
+            != ".0"
+    {
+        return Ok(false);
+    }
+    let py = code.py();
+    let Some(length) = strict_native_location_code_length(code)? else {
+        return Ok(false);
+    };
+    let offset = |line: i32, column: i32| -> Option<usize> {
+        let line = usize::try_from(line).ok()?.checked_sub(1)?;
+        line_starts
+            .get(line)?
+            .checked_add(usize::try_from(column).ok()?)
+    };
+    let mut first_span = None;
+    for instruction in (0..length).step_by(2) {
+        let (mut line, mut column, mut end_line, mut end_column) = (0, 0, 0, 0);
+        if unsafe {
+            PyCode_Addr2Location(
+                code.as_ptr().cast(),
+                instruction,
+                &mut line,
+                &mut column,
+                &mut end_line,
+                &mut end_column,
+            )
+        } == 0
+        {
+            return Err(if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                crate::strict_runtime_unavailable(py, "native generator source position is absent")
+            } else {
+                PyErr::fetch(py)
+            });
+        }
+        let (Some(start), Some(end)) = (offset(line, column), offset(end_line, end_column)) else {
+            continue;
+        };
+        if start == end {
+            continue;
+        }
+        if start < expression.start as usize || end > expression.end as usize || start > end {
+            return Ok(false);
+        }
+        first_span.get_or_insert((start, end));
+    }
+    Ok(first_span == Some((iterable.start as usize, iterable.end as usize)))
+}
+
+/// Native annotation-scope prologues carry the original alias/expression span.
+/// Match that exact span, not a generated helper name or a shared line number;
+/// bounds and defaults can have the same public name on the same source line.
+fn strict_native_type_expression_range_matches(
+    code: &Bound<'_, PyAny>,
+    range: &soac_contracts::SourceRange,
+    line_starts: &[usize],
+) -> PyResult<bool> {
+    unsafe extern "C" {
+        fn PyCode_Addr2Location(
+            code: *mut ffi::PyCodeObject,
+            offset: c_int,
+            start_line: *mut c_int,
+            start_column: *mut c_int,
+            end_line: *mut c_int,
+            end_column: *mut c_int,
+        ) -> c_int;
+    }
+    let py = code.py();
+    let Some(length) = strict_native_location_code_length(code)? else {
+        return Ok(false);
+    };
+    let offset = |line: i32, column: i32| -> Option<usize> {
+        let line = usize::try_from(line).ok()?.checked_sub(1)?;
+        let column = usize::try_from(column).ok()?;
+        line_starts.get(line)?.checked_add(column)
+    };
+    let (start, end) = (range.start as usize, range.end as usize);
+    let mut exact_scope = false;
+    for instruction in (0..length).step_by(2) {
+        let (mut line, mut column, mut end_line, mut end_column) = (0, 0, 0, 0);
+        if unsafe {
+            PyCode_Addr2Location(
+                code.as_ptr().cast(),
+                instruction,
+                &mut line,
+                &mut column,
+                &mut end_line,
+                &mut end_column,
+            )
+        } == 0
+        {
+            return Err(if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                crate::strict_runtime_unavailable(
+                    py,
+                    "native type expression source position is absent",
+                )
+            } else {
+                PyErr::fetch(py)
+            });
+        }
+        let (Some(native_start), Some(native_end)) =
+            (offset(line, column), offset(end_line, end_column))
+        else {
+            continue;
+        };
+        if native_start == native_end {
+            continue;
+        }
+        if native_start < start || native_end > end {
+            return Ok(false);
+        }
+        exact_scope |= native_start == start && native_end == end;
+    }
+    Ok(exact_scope)
+}
+
+fn strict_native_code_matches(
+    code: &Bound<'_, PyAny>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    fact: &soac_contracts::FunctionTypeFact,
+    line_starts: &[usize],
+    first_line: usize,
+) -> PyResult<bool> {
+    unsafe extern "C" {
+        fn PyCode_Addr2Location(
+            code: *mut ffi::PyCodeObject,
+            offset: c_int,
+            start_line: *mut c_int,
+            start_column: *mut c_int,
+            end_line: *mut c_int,
+            end_column: *mut c_int,
+        ) -> c_int;
+    }
+    // The source catalog validates the signed lexical identity independently
+    // and derives this exact native projection from the original AST. Native
+    // lambda/genexpr nesting is not the signed lexical naming convention.
+    if code.getattr("co_qualname")?.extract::<String>()? != function.names.qualname
+        || code.getattr("co_firstlineno")?.extract::<usize>()? != first_line
+    {
+        return Ok(false);
+    }
+    use soac_core::block_py::ParamKind;
+    let count = |kind| {
+        function
+            .params
+            .iter()
+            .filter(|parameter| parameter.kind == kind)
+            .count()
+    };
+    let positional = count(ParamKind::PosOnly) + count(ParamKind::Any);
+    if code.getattr("co_argcount")?.extract::<usize>()? != positional
+        || code.getattr("co_posonlyargcount")?.extract::<usize>()? != count(ParamKind::PosOnly)
+        || code.getattr("co_kwonlyargcount")?.extract::<usize>()? != count(ParamKind::KwOnly)
+    {
+        return Ok(false);
+    }
+    let flags = code.getattr("co_flags")?.extract::<i32>()?;
+    let native_kind = if flags & ffi::CO_ASYNC_GENERATOR != 0 {
+        FunctionKind::AsyncGenerator
+    } else if flags & ffi::CO_COROUTINE != 0 {
+        FunctionKind::Coroutine
+    } else if flags & ffi::CO_GENERATOR != 0 {
+        FunctionKind::Generator
+    } else {
+        FunctionKind::Function
+    };
+    if native_kind != *function.lowered_kind() {
+        return Ok(false);
+    }
+    if (flags & 4 != 0) != (count(ParamKind::VarArg) != 0)
+        || (flags & 8 != 0) != (count(ParamKind::KwArg) != 0)
+    {
+        return Ok(false);
+    }
+    let names = code.getattr("co_varnames")?.cast_into::<PyTuple>()?;
+    let expected_names = function
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::PosOnly | ParamKind::Any))
+        .chain(
+            function
+                .params
+                .iter()
+                .filter(|p| p.kind == ParamKind::KwOnly),
+        )
+        .chain(
+            function
+                .params
+                .iter()
+                .filter(|p| p.kind == ParamKind::VarArg),
+        )
+        .chain(
+            function
+                .params
+                .iter()
+                .filter(|p| p.kind == ParamKind::KwArg),
+        );
+    for (index, expected) in expected_names.enumerate() {
+        if names.get_item(index)?.extract::<String>()? != expected.name {
+            return Ok(false);
+        }
+    }
+    let Some(length) = strict_native_location_code_length(code)? else {
+        return Ok(false);
+    };
+    let offset = |line: i32, column: i32| -> Option<usize> {
+        let line = usize::try_from(line).ok()?.checked_sub(1)?;
+        let column = usize::try_from(column).ok()?;
+        line_starts.get(line)?.checked_add(column)
+    };
+    let start = fact.identity.source_range.start as usize;
+    let end = fact.identity.source_range.end as usize;
+    let mut has_source_position = false;
+    let mut has_header_anchor = false;
+    for instruction in (0..length).step_by(2) {
+        let (mut line, mut column, mut end_line, mut end_column) = (0, 0, 0, 0);
+        if unsafe {
+            PyCode_Addr2Location(
+                code.as_ptr().cast(),
+                instruction,
+                &mut line,
+                &mut column,
+                &mut end_line,
+                &mut end_column,
+            )
+        } == 0
+        {
+            return Err(if unsafe { ffi::PyErr_Occurred() }.is_null() {
+                crate::strict_runtime_unavailable(
+                    code.py(),
+                    "strict native source position is unavailable",
+                )
+            } else {
+                PyErr::fetch(code.py())
+            });
+        }
+        let (Some(native_start), Some(native_end)) =
+            (offset(line, column), offset(end_line, end_column))
+        else {
+            continue;
+        };
+        if native_start == native_end {
+            has_header_anchor |= line == end_line
+                && usize::try_from(line).ok() == Some(first_line)
+                && column == 0
+                && end_column == 0;
+            continue;
+        }
+        // Nonempty opcode spans disambiguate multiple lambdas on one line.
+        // The first RESUME can refer to a decorator line, which belongs to the
+        // same authenticated function but precedes its definition range.
+        if instruction == 0 && native_start < start {
+            continue;
+        }
+        if native_start < start || native_end > end {
+            return Ok(false);
+        }
+        has_source_position = true;
+    }
+    // Named bodies containing only declarations/docstrings can have no
+    // nonempty native opcode span. Their real linetable still anchors the
+    // exact first line (including an earlier decorator). The caller separately
+    // authenticates the complete native code tree and rejects reused/ambiguous
+    // matches; the name, line, signature and kind checks above remain required.
+    // Lambdas cannot use this fallback: same-line lambdas need their body span.
+    Ok(has_source_position
+        || (fact.identity.definition_kind == soac_contracts::DefinitionKind::Function
+            && has_header_anchor))
+}
+
 pub fn build_shared_state_for_inspection(
     py: Python<'_>,
     lowered_module: BlockPyModule<BlockPyModuleShape>,
@@ -1086,6 +2338,8 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         .map(|_| py.None())
         .collect::<Vec<_>>();
     Ok(Arc::new(SharedModuleState {
+        strict_module: None,
+        strict_execution: None,
         late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
             &lowered_module,
             module_name,
@@ -1098,14 +2352,16 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
         function_templates: Mutex::new(HashMap::new()),
-        original_code_by_function_id: HashMap::new(),
+        original_code_by_function_id: crate::strict_admission::OriginalCodeStorage::Inspection(
+            HashMap::new(),
+        ),
         module_constant_objs,
         runtime_name_cache: build_runtime_name_cache(),
         counter_slots_by_id,
         counter_values,
         top_value_counters,
+        deopt_entry_counters: Mutex::new(DeoptEntryCounterRegistry::default()),
         counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
-        precompiled_module_runtime: OnceLock::new(),
     }))
 }
 
@@ -1128,6 +2384,8 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
         .map(|_| py.None())
         .collect::<Vec<_>>();
     Ok(Arc::new(SharedModuleState {
+        strict_module: None,
+        strict_execution: None,
         late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
             &lowered_module,
             module_name,
@@ -1140,32 +2398,17 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
         function_templates: Mutex::new(HashMap::new()),
-        original_code_by_function_id: HashMap::new(),
+        original_code_by_function_id: crate::strict_admission::OriginalCodeStorage::Inspection(
+            HashMap::new(),
+        ),
         module_constant_objs,
         runtime_name_cache: build_runtime_name_cache(),
         counter_slots_by_id,
         counter_values,
         top_value_counters,
+        deopt_entry_counters: Mutex::new(DeoptEntryCounterRegistry::default()),
         counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
-        precompiled_module_runtime: OnceLock::new(),
     }))
-}
-
-#[cfg(test)]
-pub(crate) fn build_shared_state_for_testing_with_original_code(
-    py: Python<'_>,
-    lowered_module: BlockPyModule<BlockPyModuleShape>,
-    module_name: &str,
-    package_name: &str,
-    original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
-) -> PyResult<Arc<SharedModuleState>> {
-    build_shared_state_for_inspection_with_original_code(
-        py,
-        lowered_module,
-        module_name,
-        package_name,
-        original_code_by_function_id,
-    )
 }
 
 fn build_shared_state_for_inspection_with_original_code(
@@ -1203,9 +2446,10 @@ pub fn build_shared_state_for_inspection_with_original_code_and_source_hash(
     } else {
         ModuleCodegenConstants::collect_from_module(&lowered_module)
     };
-    let module_constant_objs =
-        build_module_constant_objects(py, &codegen_constants, module_name, source_hash)?;
+    let module_constant_objs = build_module_constant_objects(py, &codegen_constants, module_name)?;
     Ok(Arc::new(SharedModuleState {
+        strict_module: None,
+        strict_execution: None,
         late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
             &lowered_module,
             module_name,
@@ -1218,14 +2462,16 @@ pub fn build_shared_state_for_inspection_with_original_code_and_source_hash(
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
         function_templates: Mutex::new(HashMap::new()),
-        original_code_by_function_id,
+        original_code_by_function_id: crate::strict_admission::OriginalCodeStorage::Inspection(
+            original_code_by_function_id,
+        ),
         module_constant_objs,
         runtime_name_cache: build_runtime_name_cache(),
         counter_slots_by_id,
         counter_values,
         top_value_counters,
+        deopt_entry_counters: Mutex::new(DeoptEntryCounterRegistry::default()),
         counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
-        precompiled_module_runtime: OnceLock::new(),
     }))
 }
 
@@ -1260,7 +2506,15 @@ fn build_function_index_by_id(
 #[repr(C)]
 struct SoacExtModuleState {
     initialized: bool,
-    shared_state: MaybeUninit<Arc<SharedModuleState>>,
+    implementation: MaybeUninit<ModuleImplementation>,
+}
+
+enum ModuleImplementation {
+    Soac {
+        shared_state: Arc<SharedModuleState>,
+        strict_runtime: Option<crate::StrictModuleRuntimeState>,
+    },
+    Interpreter(crate::strict_interpreter::InterpreterModuleState),
 }
 
 impl SoacExtModuleState {
@@ -1269,10 +2523,12 @@ impl SoacExtModuleState {
         py: Python<'_>,
         compile_session: &Arc<crate::session::CompileSession>,
         lowered_module: BlockPyModule<BlockPyModuleShape>,
-        original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
+        original_code_by_function_id: crate::AuthenticatedCodeCatalog,
         module_name: String,
         package_name: String,
         source_hash: u64,
+        strict_module: Option<Arc<crate::VerifiedStrictModule>>,
+        strict_runtime: Option<crate::StrictModuleRuntimeState>,
     ) -> PyResult<()> {
         if self.initialized {
             return Err(PyRuntimeError::new_err(
@@ -1282,18 +2538,14 @@ impl SoacExtModuleState {
         let function_index_by_id = build_function_index_by_id(&lowered_module)?;
         let (counter_slots_by_id, counter_values, top_value_counters) =
             build_counter_storage(&lowered_module.counter_defs)?;
-        let codegen_constants = if module_name == "soac.runtime" {
-            ModuleCodegenConstants::collect_from_runtime_module(&lowered_module)
-        } else {
-            ModuleCodegenConstants::collect_from_module(&lowered_module)
-        };
-        let module_constant_objs = build_module_constant_objects(
-            py,
-            &codegen_constants,
-            module_name.as_str(),
-            source_hash,
-        )?;
+        let codegen_constants = ModuleCodegenConstants::collect_from_module(&lowered_module);
+        let module_constant_objs =
+            build_module_constant_objects(py, &codegen_constants, module_name.as_str())?;
         let shared_state = Arc::new(SharedModuleState {
+            strict_module,
+            strict_execution: strict_runtime
+                .as_ref()
+                .map(crate::StrictModuleRuntimeState::execution_ref),
             late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
                 &lowered_module,
                 module_name.as_str(),
@@ -1306,19 +2558,25 @@ impl SoacExtModuleState {
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_index_by_id,
             function_templates: Mutex::new(HashMap::new()),
-            original_code_by_function_id,
+            original_code_by_function_id:
+                crate::strict_admission::OriginalCodeStorage::Authenticated(
+                    original_code_by_function_id,
+                ),
             module_constant_objs,
             runtime_name_cache: build_runtime_name_cache(),
             counter_slots_by_id,
             counter_values,
             top_value_counters,
+            deopt_entry_counters: Mutex::new(DeoptEntryCounterRegistry::default()),
             counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
-            precompiled_module_runtime: OnceLock::new(),
         });
         compile_session
             .retain_shared_module_state(shared_state.clone())
             .map_err(PyRuntimeError::new_err)?;
-        self.shared_state.write(shared_state);
+        self.implementation.write(ModuleImplementation::Soac {
+            shared_state,
+            strict_runtime,
+        });
         self.initialized = true;
         Ok(())
     }
@@ -1327,7 +2585,25 @@ impl SoacExtModuleState {
         if !self.initialized {
             return;
         }
-        let shared_state = unsafe { self.shared_state.assume_init_ref().as_ref() };
+        // Publish terminal native state before any decref can reenter it.
+        self.initialized = false;
+        let implementation = unsafe { self.implementation.assume_init_read() };
+        let ModuleImplementation::Soac {
+            shared_state,
+            strict_runtime,
+        } = implementation
+        else {
+            if let ModuleImplementation::Interpreter(state) = implementation {
+                unsafe { state.release_from_native(Python::assume_attached()) };
+            }
+            return;
+        };
+        // A module wrapper may die while an escaped function still owns its
+        // globals. Only actual dictionary teardown terminates a sealed policy;
+        // dropping an unfinished execution still fails it closed.
+        if let Some(strict) = strict_runtime {
+            unsafe { strict.release_from_native(Python::assume_attached()) };
+        }
         shared_state.append_specialization_runtime_log();
         let mut flushed = true;
         if let Some(path) = counter_dump_file_from_env() {
@@ -1342,8 +2618,7 @@ impl SoacExtModuleState {
         if flushed && let Err(err) = shared_state.mark_counter_dump_module_cleared() {
             eprintln!("[soac counters] failed to mark cleared module: {err}");
         }
-        unsafe { ptr::drop_in_place(self.shared_state.as_mut_ptr()) };
-        self.initialized = false;
+        drop(shared_state);
     }
 
     unsafe fn data(&self) -> PyResult<SoacExtModuleDataRef<'_>> {
@@ -1352,9 +2627,18 @@ impl SoacExtModuleState {
                 "missing transformed-module lowering data in module state",
             ));
         }
-        Ok(SoacExtModuleDataRef {
-            shared_state: unsafe { self.shared_state.assume_init_ref().as_ref() },
-        })
+        match unsafe { self.implementation.assume_init_ref() } {
+            ModuleImplementation::Soac {
+                shared_state,
+                strict_runtime,
+            } => Ok(SoacExtModuleDataRef {
+                shared_state,
+                strict_runtime: strict_runtime.as_ref(),
+            }),
+            ModuleImplementation::Interpreter(_) => Err(PyRuntimeError::new_err(
+                "the CPython interpreter module has no SOAC lowering state",
+            )),
+        }
     }
 
     unsafe fn clone_shared_state(&self) -> PyResult<Arc<SharedModuleState>> {
@@ -1363,7 +2647,12 @@ impl SoacExtModuleState {
                 "missing transformed-module lowering data in module state",
             ));
         }
-        Ok(unsafe { self.shared_state.assume_init_ref().clone() })
+        match unsafe { self.implementation.assume_init_ref() } {
+            ModuleImplementation::Soac { shared_state, .. } => Ok(shared_state.clone()),
+            ModuleImplementation::Interpreter(_) => Err(PyRuntimeError::new_err(
+                "the CPython interpreter module has no SOAC shared state",
+            )),
+        }
     }
 }
 
@@ -1404,6 +2693,7 @@ fn append_jit_codegen_log(
         function_qualname = function.names.qualname,
         function_block_count = function.blocks.len(),
         function_entry_kind = entry_kind,
+        jit_strict_sealed_field_site_count = stats.strict_sealed_field_site_count,
         jit_codegen_total_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
         jit_clif_block_count = u64::try_from(stats.clif_block_count).unwrap_or(u64::MAX),
         jit_clif_inst_count = u64::try_from(stats.clif_inst_count).unwrap_or(u64::MAX),
@@ -1838,7 +3128,23 @@ unsafe extern "C" fn soac_ext_module_traverse(
     if state.is_null() || unsafe { !(*state).initialized } {
         return 0;
     }
-    let shared_state = unsafe { (*state).shared_state.assume_init_ref().as_ref() };
+    let implementation = unsafe { (*state).implementation.assume_init_ref() };
+    let ModuleImplementation::Soac {
+        shared_state,
+        strict_runtime,
+    } = implementation
+    else {
+        if let ModuleImplementation::Interpreter(state) = implementation {
+            return unsafe { state.traverse(visit, arg) };
+        }
+        return 0;
+    };
+    if let Some(strict) = strict_runtime {
+        let rc = unsafe { strict.traverse(visit, arg) };
+        if rc != 0 {
+            return rc;
+        }
+    }
     for obj in &shared_state.module_constant_objs {
         let rc = unsafe { visit(obj.as_ptr(), arg) };
         if rc != 0 {
@@ -1902,6 +3208,17 @@ unsafe fn soac_indexed_module_info_slot(module: *mut ffi::PyObject) -> *mut *mut
 }
 
 pub fn indexed_module_info(module: &Bound<'_, PyAny>) -> PyResult<ModuleInfo> {
+    if unsafe {
+        ffi::PyModule_Check(module.as_ptr()) != 0
+            && ffi::PyModule_GetDef(module.as_ptr()) == soac_strict_module_def()
+    } {
+        return SoacExtModule::with_data(module, |data| {
+            Ok(ModuleInfo {
+                hash: data.shared_state.source_hash,
+                indexed_module_keys: data.shared_state.lowered_module.global_names.clone(),
+            })
+        });
+    }
     if !module.is_instance(soac_indexed_module_type(module.py())?)? {
         return Err(PyTypeError::new_err(
             "expected an instance of _soac_ext.IndexedModuleType",
@@ -2068,10 +3385,87 @@ fn soac_ext_module_def() -> *mut ffi::PyModuleDef {
     }
 }
 
+// Strict modules use the exact immutable builtin ModuleType. A mutable heap
+// type or Python type cache cannot authorize permanent __dict__/__class__
+// semantics. This single-phase native definition supplies the same m_state
+// lifecycle without routing construction through a Python-visible type.
+static mut SOAC_STRICT_MODULE_DEF: ffi::PyModuleDef = ffi::PyModuleDef {
+    m_base: ffi::PyModuleDef_HEAD_INIT,
+    m_name: c"_soac_ext.strict_module_state".as_ptr(),
+    m_doc: ptr::null(),
+    m_size: std::mem::size_of::<SoacExtModuleState>() as ffi::Py_ssize_t,
+    m_methods: ptr::null_mut(),
+    m_slots: ptr::null_mut(),
+    m_traverse: Some(soac_ext_module_traverse),
+    m_clear: Some(soac_ext_module_clear),
+    m_free: Some(soac_ext_module_free),
+};
+
+fn soac_strict_module_def() -> *mut ffi::PyModuleDef {
+    ptr::addr_of_mut!(SOAC_STRICT_MODULE_DEF)
+}
+
+pub(crate) fn new_strict_module<'py>(
+    py: Python<'py>,
+    spec: &Bound<'py, PyAny>,
+    name: &str,
+    package: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    // Evaluate spec access before creating the new native module. These public
+    // attributes initialize Python-visible metadata; they do not become the
+    // source/deployment identity used by the strict owner.
+    let loader = spec.getattr("loader")?;
+    let has_location = spec.getattr("has_location")?.is_truthy()?;
+    let origin = has_location.then(|| spec.getattr("origin")).transpose()?;
+    let cached = has_location.then(|| spec.getattr("cached")).transpose()?;
+    let search = spec.getattr("submodule_search_locations")?;
+    let module = unsafe {
+        Bound::<PyAny>::from_owned_ptr_or_err(
+            py,
+            ffi::PyModule_Create2(soac_strict_module_def(), ffi::PYTHON_API_VERSION),
+        )?
+    };
+    let globals =
+        unsafe { Bound::<PyAny>::from_borrowed_ptr(py, ffi::PyModule_GetDict(module.as_ptr())) }
+            .cast_into::<PyDict>()?;
+    globals.set_item("__name__", name)?;
+    globals.set_item("__package__", package)?;
+    globals.set_item("__loader__", loader)?;
+    globals.set_item("__spec__", spec)?;
+    if let Some(origin) = origin {
+        globals.set_item("__file__", origin)?;
+    }
+    if let Some(cached) = cached {
+        globals.set_item("__cached__", cached)?;
+    }
+    if !search.is_none() {
+        globals.set_item("__path__", search)?;
+    }
+    Ok(module)
+}
+
+/// Match the ordinary exec/import insertion without normalizing an existing
+/// explicit builtins mapping. This runs during the one initializer attempt.
+pub fn ensure_module_builtins(globals: &Bound<'_, PyAny>) -> PyResult<()> {
+    let globals = globals.cast::<PyDict>()?;
+    if globals.get_item("__builtins__")?.is_some() {
+        return Ok(());
+    }
+    let builtins = unsafe { ffi::PyEval_GetBuiltins() };
+    if builtins.is_null() {
+        return Err(PyRuntimeError::new_err(
+            "module initialization has no native builtins",
+        ));
+    }
+    globals.set_item("__builtins__", unsafe {
+        Bound::<PyAny>::from_borrowed_ptr(globals.py(), builtins)
+    })
+}
+
 fn soac_ext_module_state(module: &Bound<'_, PyAny>) -> PyResult<*mut SoacExtModuleState> {
     unsafe {
         let module_def = ffi::PyModule_GetDef(module.as_ptr());
-        if module_def != soac_ext_module_def() {
+        if module_def != soac_ext_module_def() && module_def != soac_strict_module_def() {
             return Err(PyTypeError::new_err(
                 "expected a module created via _soac_ext.create_module",
             ));
@@ -2199,14 +3593,54 @@ unsafe fn tuple_from_global_names<'py>(
 pub struct SoacExtModule;
 
 impl SoacExtModule {
+    pub(crate) fn install_interpreter_state(
+        module: &Bound<'_, PyAny>,
+        implementation: crate::strict_interpreter::InterpreterModuleState,
+    ) -> PyResult<()> {
+        let state = soac_ext_module_state(module)?;
+        if unsafe { (*state).initialized } {
+            return Err(crate::strict_runtime_unavailable(
+                module.py(),
+                "strict native module state was initialized twice",
+            ));
+        }
+        unsafe {
+            (*state)
+                .implementation
+                .write(ModuleImplementation::Interpreter(implementation));
+            (*state).initialized = true;
+        }
+        Ok(())
+    }
+
+    /// Borrow only for callback-free inspection or snapshotting. Callers must
+    /// not keep this Rust borrow across Python callbacks or native m_clear.
+    pub(crate) fn with_interpreter_state<R>(
+        module: &Bound<'_, PyAny>,
+        f: impl FnOnce(Option<&crate::strict_interpreter::InterpreterModuleState>) -> PyResult<R>,
+    ) -> PyResult<R> {
+        let state = soac_ext_module_state(module)?;
+        if !unsafe { (*state).initialized } {
+            return Err(crate::strict_runtime_unavailable(
+                module.py(),
+                "strict module state is terminal",
+            ));
+        }
+        match unsafe { (*state).implementation.assume_init_ref() } {
+            ModuleImplementation::Interpreter(state) => f(Some(state)),
+            ModuleImplementation::Soac { .. } => f(None),
+        }
+    }
+
     pub fn new(
         py: Python<'_>,
         spec: &Bound<'_, PyAny>,
         compile_session: &Arc<crate::session::CompileSession>,
         mut lowered_module: BlockPyModule<BlockPyModuleShape>,
         mut module_info: ModuleInfo,
-        original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
-        _source: &str,
+        original_code_by_function_id: crate::AuthenticatedCodeCatalog,
+        source: &str,
+        strict_module: Arc<crate::VerifiedStrictModule>,
     ) -> PyResult<Py<PyAny>> {
         ensure_module_dict_metadata_names(&mut lowered_module.global_names);
         module_info.indexed_module_keys = lowered_module.global_names.clone();
@@ -2219,36 +3653,28 @@ impl SoacExtModule {
             .getattr("parent")?
             .extract::<String>()
             .map_err(|_| PyTypeError::new_err("expected a module spec with a string 'parent'"))?;
-        let specialization_mode = compile_session
-            .env_config()
-            .map_err(PyRuntimeError::new_err)?
-            .specialization_mode();
-        // Source-backed named generator frames own their CPython global lookup,
-        // so they always require the same ordinary globals dictionary.
-        let use_ordinary_source_named_generator_globals =
-            lowered_module.callable_defs.iter().any(|function| {
-                source_named_generator_globals_require_ordinary_dict(
-                    module_name.as_str(),
-                    specialization_mode,
-                    function.lowered_kind(),
-                    function.names.display_name.as_str(),
-                    original_code_by_function_id.contains_key(&function.function_id),
-                )
-            });
-        let module = unsafe {
-            Bound::from_owned_ptr_or_err(
-                py,
-                ffi::PyModule_FromDefAndSpec(soac_ext_module_def(), spec.as_ptr()),
-            )?
-        };
-        if use_ordinary_source_named_generator_globals {
-            unsafe { soac_init_module_info(module.as_ptr(), module_info)? };
-        } else {
-            unsafe { soac_init_indexed_module_object(py, module.as_ptr(), module_info)? };
+        match &lowered_module.strict_source {
+            Some(stamp)
+                if stamp.matches_verified(strict_module.type_facts())
+                    && original_code_by_function_id.matches_verified(&strict_module)
+                    && strict_module.source() == source.as_bytes()
+                    && stamp.module.module_name == module_name
+                    && stamp.module.source_hash == source_hash
+                    && strict_module.interpreter_id()
+                        == unsafe {
+                            ffi::PyInterpreterState_GetID(ffi::PyInterpreterState_Get())
+                        } => {}
+            _ => {
+                return Err(crate::strict_runtime_unavailable(
+                    py,
+                    "strict module IR/source/interpreter authentication mismatch",
+                ));
+            }
         }
-        if unsafe { ffi::PyModule_ExecDef(module.as_ptr(), soac_ext_module_def()) } != 0 {
-            return Err(PyErr::fetch(py));
-        }
+        let module = new_strict_module(py, spec, &module_name, &package_name)?;
+        // Native installation preserves this exact dictionary and reserves its
+        // prefix. Ordinary source never constructs a SOAC module object.
+        let strict_runtime = crate::StrictModuleRuntimeState::install(py, &module, &strict_module)?;
         let state = soac_ext_module_state(&module)?;
         unsafe {
             (*state).init(
@@ -2259,9 +3685,27 @@ impl SoacExtModule {
                 module_name,
                 package_name,
                 source_hash,
+                Some(strict_module),
+                Some(strict_runtime),
             )?
         };
         Ok(module.unbind())
+    }
+
+    /// Native module-definition identity survives m_clear. In particular a
+    /// terminal strict module is still ours: it must fail its owned execution
+    /// checks, never retry through an ordinary source loader.
+    pub fn owns_module(module: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if unsafe { ffi::PyModule_Check(module.as_ptr()) } == 0 {
+            return Err(PyTypeError::new_err(
+                "module execution requires a native module",
+            ));
+        }
+        let definition = unsafe { ffi::PyModule_GetDef(module.as_ptr()) };
+        if definition.is_null() && !unsafe { ffi::PyErr_Occurred() }.is_null() {
+            return Err(PyErr::fetch(module.py()));
+        }
+        Ok(definition == soac_ext_module_def() || definition == soac_strict_module_def())
     }
 
     pub fn with_data<R>(
@@ -2335,6 +3779,453 @@ def generated(limit):
                     .and_then(|value| value.extract::<String>())
                     .expect("original code should expose its qualified name");
                 assert_eq!(original_qualname, qualname);
+            }
+        });
+    }
+
+    #[test]
+    fn generator_expression_code_exposure_matches_unique_native_iterable_spans() {
+        use pyo3::types::{PyBytes, PyDict};
+        use soac_contracts::SourceRange;
+        use soac_core::block_py::GeneratorExpressionCode;
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            // Native-position kernel only. These ordinary code objects never
+            // create strict runtime admission; the loader separately proves the
+            // exact privately compiled source tree and compiler-creation edge.
+            for (source, expressions, kind) in [
+                (
+                    "def same_line(values):\n    return (value for value in values), (value + 1 for value in values)\n",
+                    vec![
+                        ("(value for value in values)", "values"),
+                        ("(value + 1 for value in values)", "values"),
+                    ],
+                    FunctionKind::Generator,
+                ),
+                (
+                    "def nested(values):\n    return ((value for value in row) for row in values)\n",
+                    vec![
+                        ("((value for value in row) for row in values)", "values"),
+                        ("(value for value in row)", "row"),
+                    ],
+                    FunctionKind::Generator,
+                ),
+                (
+                    "def multiline(values):\n    return (\n        value\n        for value in values\n    )\n",
+                    vec![(
+                        "(\n        value\n        for value in values\n    )",
+                        "values",
+                    )],
+                    FunctionKind::Generator,
+                ),
+                (
+                    "def captured(offset):\n    return (offset + value for value in range(2))\n",
+                    vec![("(offset + value for value in range(2))", "range(2)")],
+                    FunctionKind::Generator,
+                ),
+                (
+                    "async def asynchronous(values):\n    return (value async for value in values)\n",
+                    vec![("(value async for value in values)", "values")],
+                    FunctionKind::AsyncGenerator,
+                ),
+                (
+                    "def call_one(values):\n    return tuple(implicit_item for implicit_item in values)\n",
+                    vec![("(implicit_item for implicit_item in values)", "values")],
+                    FunctionKind::Generator,
+                ),
+                (
+                    "def call_multiline(values):\n    return tuple(\n        filtered_item\n        for filtered_item in values\n        if filtered_item\n    )\n",
+                    vec![(
+                        "(\n        filtered_item\n        for filtered_item in values\n        if filtered_item\n    )",
+                        "values",
+                    )],
+                    FunctionKind::Generator,
+                ),
+                (
+                    "def call_parenthesized(values):\n    return tuple((explicit_item for explicit_item in values))\n",
+                    vec![("(explicit_item for explicit_item in values)", "values")],
+                    FunctionKind::Generator,
+                ),
+            ] {
+                let root = PyModule::import(py, "builtins")
+                    .unwrap()
+                    .getattr("compile")
+                    .unwrap()
+                    .call1((source, "<genexpr-position-test>", "exec"))
+                    .unwrap();
+                let code_type = PyModule::import(py, "types")
+                    .unwrap()
+                    .getattr("CodeType")
+                    .unwrap();
+                let mut by_qualname = OriginalCodeByQualname::new();
+                collect_original_code_objects(&root, &code_type, &mut by_qualname).unwrap();
+                let codes = by_qualname
+                    .values()
+                    .flat_map(|codes| codes.iter().map(|code| code.bind(py).clone()))
+                    .collect::<Vec<_>>();
+                let line_starts = std::iter::once(0)
+                    .chain(
+                        source
+                            .bytes()
+                            .enumerate()
+                            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+                    )
+                    .collect::<Vec<_>>();
+                let mut selected = HashSet::new();
+                for (expression, iterable) in expressions {
+                    let start = source.find(expression).unwrap();
+                    let iterable_start = start + expression.rfind(iterable).unwrap();
+                    let projection = GeneratorExpressionCode {
+                        expression_range: SourceRange::new(
+                            start as u32,
+                            (start + expression.len()) as u32,
+                        ),
+                        iterable_range: SourceRange::new(
+                            iterable_start as u32,
+                            (iterable_start + iterable.len()) as u32,
+                        ),
+                    };
+                    let index = match_native_generator_expression_code(
+                        &codes,
+                        &projection,
+                        &kind,
+                        &line_starts,
+                    )
+                    .unwrap()
+                    .expect("exact parser-owned expression has its native code");
+                    assert!(
+                        selected.insert(index),
+                        "same-line/nested source occurrences remain distinct"
+                    );
+                    let code = &codes[index];
+                    for variant in 0..3 {
+                        let mut changed = projection.clone();
+                        match variant {
+                            0 => changed.iterable_range.end -= 1,
+                            1 => changed.expression_range.end = changed.iterable_range.end - 1,
+                            _ => changed.expression_range.start = changed.expression_range.end,
+                        }
+                        assert!(
+                            !strict_native_generator_expression_matches(
+                                code,
+                                &changed,
+                                &kind,
+                                &line_starts
+                            )
+                            .unwrap()
+                        );
+                    }
+                    assert!(
+                        !strict_native_generator_expression_matches(
+                            code,
+                            &projection,
+                            &FunctionKind::Function,
+                            &line_starts
+                        )
+                        .unwrap()
+                    );
+                    let duplicate = vec![code.clone(), code.clone()];
+                    assert!(
+                        match_native_generator_expression_code(
+                            &duplicate,
+                            &projection,
+                            &kind,
+                            &line_starts
+                        )
+                        .is_err(),
+                        "an ambiguous native occurrence cannot be chosen by order"
+                    );
+                    let replacements = PyDict::new(py);
+                    replacements
+                        .set_item("co_linetable", PyBytes::new(py, b""))
+                        .unwrap();
+                    let without_positions = code
+                        .call_method("replace", (), Some(&replacements))
+                        .unwrap();
+                    assert!(
+                        !matches!(
+                            strict_native_generator_expression_matches(
+                                &without_positions,
+                                &projection,
+                                &kind,
+                                &line_starts
+                            ),
+                            Ok(true)
+                        ),
+                        "a name/header without native positions is not a code-exposure witness"
+                    );
+                    let replacements = PyDict::new(py);
+                    replacements.set_item("co_name", "other").unwrap();
+                    let renamed = code
+                        .call_method("replace", (), Some(&replacements))
+                        .unwrap();
+                    assert!(
+                        !strict_native_generator_expression_matches(
+                            &renamed,
+                            &projection,
+                            &kind,
+                            &line_starts
+                        )
+                        .unwrap()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn strict_native_named_noop_bodies_keep_their_exact_header_anchor() {
+        use pyo3::types::PyBytes;
+        use soac_contracts::{
+            AnnotationOrigin, CallableSignature, DefinitionKind, FunctionTypeFact, ModuleTypeFacts,
+            ResolvedStrictPolicy, SourceDialect, SourceIdentity, SourceRange, StaticType,
+        };
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            for (source, qualname, first_line, kind) in [
+                ("def f():\n    pass\n", "f", 1, FunctionKind::Function),
+                (
+                    "def f():\n    global other\n",
+                    "f",
+                    1,
+                    FunctionKind::Function,
+                ),
+                ("def f():\n    value: int\n", "f", 1, FunctionKind::Function),
+                (
+                    "def f():\n    'only documentation'\n",
+                    "f",
+                    1,
+                    FunctionKind::Function,
+                ),
+                (
+                    "@decorate\ndef f():\n    global other\n",
+                    "f",
+                    1,
+                    FunctionKind::Function,
+                ),
+                (
+                    "async def f():\n    global other\n",
+                    "f",
+                    1,
+                    FunctionKind::Coroutine,
+                ),
+                (
+                    "def owner():\n    value = 1\n    def f():\n        nonlocal value\n",
+                    "owner.<locals>.f",
+                    3,
+                    FunctionKind::Function,
+                ),
+            ] {
+                let lowered = lower_python_to_blockpy_for_testing(source)
+                    .unwrap()
+                    .blockpy_module;
+                let function = lowered
+                    .callable_defs
+                    .iter()
+                    .find(|function| {
+                        function.names.qualname == qualname && *function.lowered_kind() == kind
+                    })
+                    .expect("the original source function is lowered");
+                // This is the native-position kernel only: compile the exact
+                // source, never execute decorators or fabricate admission.
+                let original = PyModule::import(py, "builtins")
+                    .unwrap()
+                    .getattr("compile")
+                    .unwrap()
+                    .call1((source, "<named-noop-position-test>", "exec"))
+                    .unwrap();
+                let code_type = PyModule::import(py, "types")
+                    .unwrap()
+                    .getattr("CodeType")
+                    .unwrap();
+                let mut codes = OriginalCodeByQualname::new();
+                collect_original_code_objects(&original, &code_type, &mut codes).unwrap();
+                let candidates = &codes[qualname];
+                assert_eq!(candidates.len(), 1, "one exact native named definition");
+                let code = candidates.front().unwrap().bind(py);
+                let line_starts = std::iter::once(0)
+                    .chain(
+                        source
+                            .bytes()
+                            .enumerate()
+                            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+                    )
+                    .collect::<Vec<_>>();
+                let facts = ModuleTypeFacts::new(
+                    "named_noop_position_test",
+                    source.as_bytes(),
+                    SourceDialect::OrdinaryPython,
+                    ResolvedStrictPolicy::default(),
+                )
+                .unwrap();
+                let definition_start = source
+                    .find("async def f")
+                    .or_else(|| source.find("def f"))
+                    .unwrap();
+                let mut fact = FunctionTypeFact {
+                    identity: SourceIdentity {
+                        module: facts.module,
+                        lexical_qualname: qualname.to_owned(),
+                        source_range: SourceRange::new(
+                            definition_start as u32,
+                            source.trim_end().len() as u32,
+                        ),
+                        definition_kind: DefinitionKind::Function,
+                    },
+                    function_kind: match kind {
+                        FunctionKind::Coroutine => soac_contracts::FunctionKind::Coroutine,
+                        _ => soac_contracts::FunctionKind::Synchronous,
+                    },
+                    signature: CallableSignature {
+                        parameters: Vec::new(),
+                        return_type: StaticType::Unknown,
+                        return_annotation_origin: AnnotationOrigin::Absent,
+                        uncertainty: Default::default(),
+                    },
+                    decorators: Vec::new(),
+                    uncertainty: Default::default(),
+                };
+                assert!(
+                    strict_native_code_matches(code, function, &fact, &line_starts, first_line)
+                        .unwrap(),
+                    "named no-op body should retain its native witness: {source}"
+                );
+                assert!(
+                    !strict_native_code_matches(
+                        code,
+                        function,
+                        &fact,
+                        &line_starts,
+                        first_line + 1,
+                    )
+                    .unwrap(),
+                    "a header-only witness still requires its exact first line"
+                );
+                let replacements = PyDict::new(py);
+                replacements
+                    .set_item("co_linetable", PyBytes::new(py, b""))
+                    .unwrap();
+                let without_positions = code
+                    .call_method("replace", (), Some(&replacements))
+                    .unwrap();
+                assert!(
+                    without_positions
+                        .getattr("co_linetable")
+                        .unwrap()
+                        .cast::<PyBytes>()
+                        .unwrap()
+                        .as_bytes()
+                        .is_empty()
+                );
+                assert_eq!(
+                    strict_native_location_code_length(&without_positions).unwrap(),
+                    None
+                );
+                assert!(
+                    !matches!(
+                        strict_native_code_matches(
+                            &without_positions,
+                            function,
+                            &fact,
+                            &line_starts,
+                            first_line,
+                        ),
+                        Ok(true)
+                    ),
+                    "entirely absent locations cannot become a named-body witness"
+                );
+                if source.contains("global other") {
+                    fact.identity.definition_kind = DefinitionKind::Lambda;
+                    assert!(
+                        !strict_native_code_matches(
+                            code,
+                            function,
+                            &fact,
+                            &line_starts,
+                            first_line,
+                        )
+                        .unwrap(),
+                        "anonymous definitions still require a nonempty source span"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn strict_native_generic_wrappers_require_the_exact_header_span() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            for (name, body) in [
+                ("Item", "class Item[T]:\n    value: T\n"),
+                ("item", "def item[T](value: T) -> T:\n    return value\n"),
+                (
+                    "item",
+                    "async def item[T](value: T) -> T:\n    return value\n",
+                ),
+            ] {
+                let source = format!(
+                    "from __future__ import strict\n@decorator\n# between decorator and header\n{body}"
+                );
+                // Compile only. The unresolved decorator is never called, and
+                // this native-position kernel grants no runtime admission.
+                let original = PyModule::import(py, "builtins")
+                    .unwrap()
+                    .getattr("compile")
+                    .unwrap()
+                    .call1((&source, "<generic-header-range-test>", "exec"))
+                    .unwrap();
+                let code_type = PyModule::import(py, "types")
+                    .unwrap()
+                    .getattr("CodeType")
+                    .unwrap();
+                let mut codes = OriginalCodeByQualname::new();
+                collect_original_code_objects(&original, &code_type, &mut codes).unwrap();
+                let candidates = &codes[&format!("<generic parameters of {name}>")];
+                assert_eq!(candidates.len(), 1);
+                let code = candidates[0].bind(py);
+                assert_eq!(
+                    code.getattr("co_firstlineno")
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    2
+                );
+                let line_starts = std::iter::once(0)
+                    .chain(
+                        source
+                            .bytes()
+                            .enumerate()
+                            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+                    )
+                    .collect::<Vec<_>>();
+                let native = soac_contracts::SourceRange::new(
+                    source.find(body).unwrap() as u32,
+                    source.trim_end().len() as u32,
+                );
+                assert!(
+                    strict_native_type_expression_range_matches(code, &native, &line_starts)
+                        .unwrap()
+                );
+                for wrong in [
+                    soac_contracts::SourceRange::new(
+                        source.find("@decorator").unwrap() as u32,
+                        native.end,
+                    ),
+                    soac_contracts::SourceRange::new(native.start + 1, native.end),
+                    soac_contracts::SourceRange::new(native.start, native.end - 1),
+                    soac_contracts::SourceRange::new(native.start, native.end + 1),
+                ] {
+                    assert!(
+                        !strict_native_type_expression_range_matches(code, &wrong, &line_starts)
+                            .unwrap(),
+                        "{body}: {wrong:?}"
+                    );
+                }
             }
         });
     }
@@ -2441,6 +4332,8 @@ def f():
         let entry_label_text = entry_label.to_string();
 
         let shared_state = SharedModuleState {
+            strict_module: None,
+            strict_execution: None,
             late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
                 &lowered,
                 "counter_test",
@@ -2459,9 +4352,11 @@ def f():
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: String::new(),
-            original_code_by_function_id: HashMap::new(),
+            original_code_by_function_id: crate::strict_admission::OriginalCodeStorage::Inspection(
+                HashMap::new(),
+            ),
+            deopt_entry_counters: Mutex::new(DeoptEntryCounterRegistry::default()),
             counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
-            precompiled_module_runtime: OnceLock::new(),
         };
 
         let record = shared_state
@@ -2521,6 +4416,8 @@ def f(x):
         });
 
         let shared_state = SharedModuleState {
+            strict_module: None,
+            strict_execution: None,
             late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
                 &lowered,
                 "counter_test",
@@ -2539,9 +4436,11 @@ def f(x):
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: String::new(),
-            original_code_by_function_id: HashMap::new(),
+            original_code_by_function_id: crate::strict_admission::OriginalCodeStorage::Inspection(
+                HashMap::new(),
+            ),
+            deopt_entry_counters: Mutex::new(DeoptEntryCounterRegistry::default()),
             counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
-            precompiled_module_runtime: OnceLock::new(),
         };
 
         let record = shared_state
@@ -2560,6 +4459,52 @@ def f(x):
         assert_eq!(row.block_label.as_deref(), Some(entry_label_text.as_str()));
         assert_eq!(row.instr_id, None);
         assert_eq!(row.value, 5);
+
+        // Two compiled tables for the same source function keep independent
+        // ordinals/IDs. Registering either must not move live scalar storage,
+        // and retiring a table must not discard its already-observed events.
+        let scalar_storage = shared_state.scalar_counter_values_ptr();
+        let first = shared_state
+            .register_deopt_entry_counters(
+                function_id,
+                vec![
+                    DeoptEntrySource::BeforeTerm {
+                        block_label: entry_label,
+                    },
+                    DeoptEntrySource::BlockEntry {
+                        block_label: entry_label,
+                    },
+                ],
+            )
+            .expect("first compiled table counters should register");
+        let second = shared_state
+            .register_deopt_entry_counters(
+                function_id,
+                vec![DeoptEntrySource::BeforeTerm {
+                    block_label: entry_label,
+                }],
+            )
+            .expect("second compiled table counters should register");
+        first.record(0);
+        first.record(0);
+        second.record(0);
+        drop(first);
+        assert_eq!(shared_state.scalar_counter_values_ptr(), scalar_storage);
+        assert_eq!(shared_state.counter_values.len(), 1);
+        let rows = shared_state.counter_dump_record().unwrap().rows;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.counter_id, row.value))
+                .collect::<Vec<_>>(),
+            vec![(0, 5), (1, 2), (2, 0), (3, 1)]
+        );
+        assert!(rows.iter().all(|row| {
+            row.kind == "deopt_entry_guard_miss"
+                && row.site_kind == "deopt_entry"
+                && row.function_id == Some(function_id)
+                && row.function_qualname.as_deref() == Some("f")
+                && row.block_label.as_deref() == Some(entry_label_text.as_str())
+        }));
     }
 
     #[test]
@@ -2807,6 +4752,8 @@ def f():
         define_module_block_entry_counters(&mut lowered);
 
         let shared_state = SharedModuleState {
+            strict_module: None,
+            strict_execution: None,
             late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
                 &lowered,
                 "counter_test",
@@ -2826,9 +4773,11 @@ def f():
             lowered_module: lowered,
             module_name: "counter_test".to_string(),
             package_name: "pkg".to_string(),
-            original_code_by_function_id: HashMap::new(),
+            original_code_by_function_id: crate::strict_admission::OriginalCodeStorage::Inspection(
+                HashMap::new(),
+            ),
+            deopt_entry_counters: Mutex::new(DeoptEntryCounterRegistry::default()),
             counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
-            precompiled_module_runtime: OnceLock::new(),
         };
 
         let unique = SystemTime::now()
@@ -2869,6 +4818,8 @@ def f():
         define_module_block_entry_counters(&mut lowered);
 
         let shared_state = SharedModuleState {
+            strict_module: None,
+            strict_execution: None,
             late_bound_owner_fields: LateBoundOwnerFieldRuntime::for_module(
                 &lowered,
                 "counter_flush_test",
@@ -2888,9 +4839,11 @@ def f():
             lowered_module: lowered,
             module_name: "counter_flush_test".to_string(),
             package_name: "pkg".to_string(),
-            original_code_by_function_id: HashMap::new(),
+            original_code_by_function_id: crate::strict_admission::OriginalCodeStorage::Inspection(
+                HashMap::new(),
+            ),
+            deopt_entry_counters: Mutex::new(DeoptEntryCounterRegistry::default()),
             counter_dump_flush_tracker: Mutex::new(CounterDumpFlushTracker::default()),
-            precompiled_module_runtime: OnceLock::new(),
         };
 
         let unique = SystemTime::now()

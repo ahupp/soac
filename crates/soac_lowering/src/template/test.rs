@@ -147,7 +147,7 @@ fn wraps_expr_in_stmt() {
 ",
         expr = expr,
     );
-    let mut body = vec![actual];
+    let mut body = [actual].into();
     flatten(&mut body);
     assert_ast_eq(
         body.first()

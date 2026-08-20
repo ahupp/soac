@@ -5,6 +5,7 @@ use soac_core::block_py::{
     ConstantExpr, HasSemanticInstrId, InstrKey, LocalLocation, NameLike, RuntimeName, UnaryOpKind,
     Visit,
 };
+use soac_core::block_py::{visit_operand_takes, visit_term_operand_takes};
 #[allow(unused_imports)]
 use soac_ir_typed::value_facts::{
     BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore, I32Facts, I64Facts, NoneFact,
@@ -91,10 +92,20 @@ impl FunctionFactInferer<'_> {
         for instr in &block.body {
             self.transfer_instr_env(instr, &mut env);
         }
+        visit_term_operand_takes(&block.term, |location| {
+            if let soac_core::block_py::OperandLocation::Local(location) = location {
+                env.remove_local_pyobj_fact(location);
+            }
+        });
         env
     }
 
     fn transfer_instr_env(&self, instr: &InstrBlockPy, env: &mut EnvFacts) {
+        visit_operand_takes(instr, |location| {
+            if let soac_core::block_py::OperandLocation::Local(location) = location {
+                env.remove_local_pyobj_fact(location);
+            }
+        });
         match instr {
             InstrBlockPy::Store(op) => {
                 let Some(location) = op.name.local_location() else {
@@ -108,6 +119,13 @@ impl FunctionFactInferer<'_> {
             InstrBlockPy::Del(op) => {
                 if let Some(location) = op.name.local_location() {
                     env.remove_local_pyobj_fact(location);
+                }
+            }
+            InstrBlockPy::CallArgumentOp(op) => {
+                for name in op.written_names() {
+                    if let Some(location) = name.local_location() {
+                        env.remove_local_pyobj_fact(location);
+                    }
                 }
             }
             _ => {}
@@ -138,7 +156,9 @@ impl FunctionFactInferer<'_> {
                 out.push((branch.default_label, exit.clone()));
                 out
             }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => Vec::new(),
+            BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {
+                Vec::new()
+            }
         }
     }
 

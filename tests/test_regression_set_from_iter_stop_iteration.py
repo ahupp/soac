@@ -1,7 +1,9 @@
-import pytest
+from pathlib import Path
 
+import pytest
 from soac import runtime
-from tests._integration import soac_module
+
+from tests._strict_integration import create_strict_project
 
 
 class _HashRaisesStopIteration:
@@ -40,13 +42,46 @@ def test_set_from_iter_preserves_successful_consumption(values, expected):
     assert runtime.set_from_iter(values) == expected
 
 
-def test_transformed_set_genexpr_preserves_stop_iteration_and_success(tmp_path):
+@pytest.fixture(scope="module")
+def strict_set_consumption_project(tmp_path_factory):
     source = """
+from __future__ import strict
+
 def collect(values):
     return set(value for value in values)
 """
+    return create_strict_project(
+        tmp_path_factory.mktemp("strict-set-consumption"),
+        {
+            "set_consumption_model.py": source,
+            "ordinary_set_consumption_model.py": source.replace(
+                "from __future__ import strict\n", "", 1
+            ),
+        },
+        modules={"set_consumption_model": "set_consumption_model.py"},
+    )
 
-    with soac_module(tmp_path, "set_genexpr_stop_iteration", source) as module:
+
+@pytest.mark.parametrize("entry_interpreter", [False, True])
+def test_transformed_set_genexpr_preserves_stop_iteration_and_success(
+    strict_set_consumption_project, entry_interpreter
+):
+    strict_set_consumption_project.run_case(
+        "set_consumption_model",
+        """
+import ctypes
+import pytest
+from soac import _soac_ext
+from tests.test_regression_set_from_iter_stop_iteration import _HashRaisesStopIteration, _CollisionRaisesStopIteration
+import ordinary_set_consumption_model
+
+def validate_module(module):
+    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+    owner.argtypes = [ctypes.py_object]
+    owner.restype = ctypes.c_void_p
+    assert not owner(ordinary_set_consumption_model.collect)
+    assert _soac_ext.strict_module_diagnostics(ordinary_set_consumption_model) is None
+    for module in (ordinary_set_consumption_model, module):
         with pytest.raises(StopIteration, match="hash"):
             module.collect([_HashRaisesStopIteration()])
 
@@ -57,3 +92,8 @@ def collect(values):
 
         assert module.collect([]) == set()
         assert module.collect([1, 2, 2]) == {1, 2}
+""",
+        Path(__file__),
+        required_functions=("collect",),
+        entry_interpreter=entry_interpreter,
+    )

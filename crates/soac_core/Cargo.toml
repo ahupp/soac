@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+soac_contracts = { path = "../soac_contracts" }
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 derive_more = { version = "2", features = ["from"] }
 memmap2 = "0.9"

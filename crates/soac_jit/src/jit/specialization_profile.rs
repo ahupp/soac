@@ -1,6 +1,6 @@
 use super::operation_specializations::{
     FieldIndexSpecialization, OptV3ResolvedIndexedFieldAccess,
-    field_index_specialization_from_opt_v3_for_function, prime_opt_v3_field_index_layouts,
+    field_index_specialization_from_opt_v3,
 };
 use super::precompile::PrecompileModuleIndex;
 use crate::config::{SpecializationMode, pre_optimization_module_cache_identity};
@@ -20,7 +20,6 @@ use soac_opt::access_emission_v3::{
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
     IndexedGlobalAccessPlan as OptV3IndexedGlobalAccessPlan,
     exact_list_items_for_function_from_artifacts as opt_v3_emitted_exact_list_items_for_function,
-    indexed_field_layout_groups as opt_v3_indexed_field_layout_groups,
     indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
     indexed_globals_for_function_from_artifacts as opt_v3_emitted_indexed_globals_for_function,
     prepare_indexed_field_accesses_for_codegen as opt_v3_prepare_indexed_field_accesses_for_codegen,
@@ -635,13 +634,9 @@ impl<'a> SpecializationProfile<'a> {
         ),
         String,
     > {
-        let opt_v3_planned_fields = self.opt_v3_indexed_field_access_plans();
-        let opt_v3_layout_groups =
-            opt_v3_indexed_field_layout_groups(opt_v3_planned_fields.iter().copied());
-        prime_opt_v3_field_index_layouts(opt_v3_layout_groups.iter())?;
         let opt_v3_by_instr = opt_v3_prepare_indexed_field_accesses_for_codegen(
             self.opt_v3_emitted_indexed_fields.get(&function_id),
-            |request| field_index_specialization_from_opt_v3_for_function(function_id, request),
+            field_index_specialization_from_opt_v3,
         )?;
         Ok((HashMap::new(), HashMap::new(), opt_v3_by_instr))
     }

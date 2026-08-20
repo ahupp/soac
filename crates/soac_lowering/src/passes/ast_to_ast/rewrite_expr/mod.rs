@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use ruff_python_ast::{self as ast, Expr, Stmt};
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 
 use crate::passes::ast_to_ast::ast_rewrite::ExprRewritePass;
 use crate::passes::ast_to_ast::scope_helpers::ScopeKind;
@@ -16,7 +16,12 @@ fn lower_generator_expr(
     context: &Context,
     mut elt: Expr,
     mut generators: Vec<ast::Comprehension>,
+    expression_range: TextRange,
 ) -> LoweredExpr {
+    // Native genexpr YIELD_VALUE is attributed to LOC(elt), not a synthetic
+    // helper statement. Capture it before any class named-expression rewrite
+    // can replace the element with an expression carrying template metadata.
+    let element_source_range = elt.range();
     let scope = context.current_scope();
     let named_targets = collect_named_expr_targets(&elt, &generators);
     let mut global_targets: HashSet<String> = HashSet::new();
@@ -101,7 +106,15 @@ def {func:id}({param:id}):
     };
 
     let iter_param_expr = py_expr!("{name:id}", name = iter_param.as_str());
-    let mut body = vec![py_stmt!("yield {value:expr}", value = elt)];
+    let mut body = vec![Stmt::Expr(ast::StmtExpr {
+        range: element_source_range,
+        node_index: Default::default(),
+        value: Box::new(Expr::Yield(ast::ExprYield {
+            range: element_source_range,
+            node_index: Default::default(),
+            value: Some(Box::new(elt)),
+        })),
+    })];
     let gen_count = generators.len();
     for (rev_index, gen) in generators.into_iter().rev().enumerate() {
         let is_outermost = rev_index + 1 == gen_count;
@@ -115,12 +128,24 @@ def {func:id}({param:id}):
             if is_outermost {
                 let iter_name = context.fresh("iter");
                 let target_tmp = context.fresh("tmp");
+                // Native async-comprehension GET_ANEXT / SEND / YIELD_VALUE
+                // use LOC(the whole comprehension), unlike the element yield.
+                // Stamp this generated await before inserting it into the
+                // template; rewriting the enclosing statement is not enough.
+                let next_value = Expr::Await(ast::ExprAwait {
+                    range: expression_range,
+                    node_index: Default::default(),
+                    value: Box::new(py_expr!(
+                        "__soac__.anext({iter_name:id})",
+                        iter_name = iter_name.as_str(),
+                    )),
+                });
                 crate::template::py_stmts!(
                     r#"
 {iter_name:id} = {iter:expr}
 while True:
     try:
-        {target_tmp:id} = await __soac__.anext({iter_name:id})
+        {target_tmp:id} = {next_value:expr}
     except __soac__.StopAsyncIteration:
         break
     {target:expr} = {target_tmp:id}
@@ -129,11 +154,12 @@ while True:
                     iter_name = iter_name.as_str(),
                     iter = iter,
                     target_tmp = target_tmp.as_str(),
+                    next_value = next_value,
                     target = gen.target,
                     body = loop_body,
                 )
             } else {
-                vec![py_stmt!(
+                let mut for_stmt: ast::StmtFor = py_stmt_typed!(
                     r#"
 async for {target:expr} in {iter:expr}:
     {body:stmt}
@@ -141,7 +167,12 @@ async for {target:expr} in {iter:expr}:
                     target = gen.target,
                     iter = iter,
                     body = loop_body,
-                )]
+                );
+                // Structural async-for lowering derives its implicit await
+                // from this statement. Every clause shares the native
+                // comprehension event location, not the template's offsets.
+                for_stmt.range = expression_range;
+                vec![for_stmt.into()]
             }
         } else if is_outermost {
             let iter_name = context.fresh("iter");
@@ -205,7 +236,8 @@ for {target:expr} in {iter:expr}:
         }));
     }
     func_body.extend(body);
-    func_def.body = func_body;
+    func_def.body = func_body.into();
+    context.record_generator_expression(expression_range, &mut func_def);
 
     let mut prefix: Vec<Stmt> = Vec::new();
     for name in dummy_targets {
@@ -315,7 +347,7 @@ fn expr_requires_async(expr: &Expr) -> bool {
                     generators,
                     ..
                 }) => {
-                    if comp_is_async(key.as_ref(), Some(value.as_ref()), generators) {
+                    if comp_is_async(value.as_ref(), key.as_deref(), generators) {
                         self.found = true;
                     }
                     return;
@@ -381,7 +413,24 @@ impl Transformer for NamedExprTargetCollector {
                 self.visit_expr(value);
                 return;
             }
-            Expr::Lambda(_) | Expr::Generator(_) => {
+            Expr::Lambda(lambda) => {
+                // A default is evaluated by the surrounding comprehension,
+                // so its walrus target follows that containing scope too.
+                if let Some(parameters) = &mut lambda.parameters {
+                    for parameter in parameters
+                        .posonlyargs
+                        .iter_mut()
+                        .chain(parameters.args.iter_mut())
+                        .chain(parameters.kwonlyargs.iter_mut())
+                    {
+                        if let Some(default) = &mut parameter.default {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+                return;
+            }
+            Expr::Generator(_) => {
                 return;
             }
             _ => {}
@@ -445,10 +494,18 @@ impl ExprRewritePass for ScopedHelperExprPass {
                 value,
                 generators,
                 ..
-            }) => comprehension::lower_dict_comp(context, *key, *value, generators),
+            }) => comprehension::lower_dict_comp(
+                context,
+                *key.expect("dict unpacking comprehensions must be rejected by source preflight"),
+                *value,
+                generators,
+            ),
             Expr::Generator(ast::ExprGenerator {
-                elt, generators, ..
-            }) => lower_generator_expr(context, *elt, generators),
+                elt,
+                generators,
+                range,
+                ..
+            }) => lower_generator_expr(context, *elt, generators, range),
             other => LoweredExpr::unmodified(other),
         }
     }

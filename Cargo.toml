@@ -2,6 +2,8 @@
 members = [
     "crates/build_support",
     "crates/soac_core",
+    "crates/soac_contracts",
+    "crates/soac_source",
     "crates/soac_ir_blockpy",
     "crates/soac_ir_typed",
     "crates/soac_opt",
@@ -17,6 +19,8 @@ members = [
 ]
 default-members = [
     "crates/soac_core",
+    "crates/soac_contracts",
+    "crates/soac_source",
     "crates/soac_ir_blockpy",
     "crates/soac_ir_typed",
     "crates/soac_opt",
@@ -29,8 +33,10 @@ default-members = [
     "crates/soac_jit",
     "crates/soac_inspector",
 ]
-# soac_jit_runtime is standalone since it is built to CLIF.
-exclude = ["crates/soac_jit_runtime"]
+# The local runtime and offline checker have independent build pipelines.
+# Vendored dependencies and uv's native Python build sources are independent
+# workspaces too; a repo-local cache must not make them implicit SOAC members.
+exclude = ["crates/soac_jit_runtime", "tools/ty", "vendor/ruff", "work", ".uv-cache"]
 resolver = "2"
 
 [profile.release-ext]
@@ -41,12 +47,12 @@ panic = "abort"
 build_support = { path = "crates/build_support" }
 pyo3 = { git = "https://github.com/PyO3/pyo3", branch = "main" }
 pyo3-ffi = { git = "https://github.com/PyO3/pyo3", branch = "main" }
-ruff_python_ast = { git = "https://github.com/astral-sh/ruff", rev = "2d16d8425179c3a235f8c57e72494728ff61a4f7" }
-ruff_python_codegen = { git = "https://github.com/astral-sh/ruff", rev = "2d16d8425179c3a235f8c57e72494728ff61a4f7" }
-ruff_python_parser = { git = "https://github.com/astral-sh/ruff", rev = "2d16d8425179c3a235f8c57e72494728ff61a4f7" }
-ruff_python_semantic = { git = "https://github.com/astral-sh/ruff", rev = "2d16d8425179c3a235f8c57e72494728ff61a4f7" }
-ruff_source_file = { git = "https://github.com/astral-sh/ruff", rev = "2d16d8425179c3a235f8c57e72494728ff61a4f7" }
-ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "2d16d8425179c3a235f8c57e72494728ff61a4f7" }
+ruff_python_ast = { path = "vendor/ruff/crates/ruff_python_ast" }
+ruff_python_codegen = { path = "vendor/ruff/crates/ruff_python_codegen" }
+ruff_python_parser = { path = "vendor/ruff/crates/ruff_python_parser" }
+ruff_python_semantic = { path = "vendor/ruff/crates/ruff_python_semantic" }
+ruff_source_file = { path = "vendor/ruff/crates/ruff_source_file" }
+ruff_text_size = { path = "vendor/ruff/crates/ruff_text_size" }
 
 [profile.dev.package.cranelift-codegen]
 opt-level = 3

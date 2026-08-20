@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "benchmarks": {
+    "2to3": {
+      "script": "run_benchmark.py",
+      "stock_source_fingerprint": "2543be9c08e7ecd78736629bab36f4ba44e694dedc47a18824856389571dcba6",
+      "packages": [
+        {
+          "path": "vendor",
+          "distribution": "lib2to3",
+          "version": "3.12",
+          "when_python": ">=3.13.0a0",
+          "source_sha256": "86a15440c7543ec429987593f3db9368e527971fd7bc297c5eaf6e112ac0fd4b"
+        }
+      ]
+    }
+  }
+}

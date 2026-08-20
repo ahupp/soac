@@ -1,3 +1,7 @@
+---
+title: "SOAC Special Names"
+---
+
 # SOAC Special Names
 
 This file is the intended inventory for names that carry compiler or runtime

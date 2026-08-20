@@ -11,6 +11,7 @@ doctest = false
 soac_lowering = { path = "../soac_lowering" }
 soac_driver = { path = "../soac_driver" }
 soac_config = { path = "../soac_config" }
+soac_contracts = { path = "../soac_contracts" }
 soac_core = { path = "../soac_core" }
 soac_ir_blockpy = { path = "../soac_ir_blockpy" }
 soac_ir_typed = { path = "../soac_ir_typed" }
@@ -18,6 +19,8 @@ soac_instrument = { path = "../soac_instrument" }
 soac_opt = { path = "../soac_opt" }
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 ruff_python_ast = { workspace = true }
+ruff_python_parser = { workspace = true }
+ruff_text_size = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module"] }
 tracing = "0.1"
 cranelift-codegen = { version = "0.130.1", features = ["incremental-cache"] }
@@ -37,3 +40,4 @@ pyo3-build-config = { git = "https://github.com/PyO3/pyo3", branch = "main", fea
 
 [dev-dependencies]
 soac_cpython = { path = "../soac_cpython" }
+soac_jit_runtime = { path = "../soac_jit_runtime" }

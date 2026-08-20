@@ -56,7 +56,7 @@ pub fn planner_fact_hints_from_module_constants_v3(
 ) -> PlannerFactHints {
     let mut hints = PlannerFactHints::default();
     for value in &region.values {
-        let ExtractedValueKind::LoadName { name } = &value.kind else {
+        let ExtractedValueKind::LoadName { name, .. } = &value.kind else {
             continue;
         };
         let NameLocation::Constant(index) = name.location else {

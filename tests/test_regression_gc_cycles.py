@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import gc
-from pathlib import Path
 import sys
 import weakref
+from pathlib import Path
 
 import pytest
 
-from tests._integration import soac_module, stock_module
-
+from tests._strict_integration import create_strict_project
 
 _ALIAS_SOURCE = """
 class Token:
@@ -95,11 +94,43 @@ def _observe_external_collection(module: object) -> dict[str, object]:
     }
 
 
-def _configure_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str) -> None:
-    monkeypatch.setenv("SOAC_OPT_MODE", mode)
-    monkeypatch.setenv("SOAC_WORK_DIR", str(tmp_path / f"gc-cycles-{mode}"))
-    monkeypatch.setenv("SOAC_COMPILE_MODE", "eager")
-    monkeypatch.setenv("SOAC_BACKGROUND_JIT", "0")
+@pytest.fixture(scope="module")
+def strict_gc_project(tmp_path_factory):
+    return create_strict_project(
+        tmp_path_factory.mktemp("strict-gc-cycles"),
+        {
+            "alias_model.py": "from __future__ import strict\n" + _ALIAS_SOURCE,
+            "ordinary_alias_model.py": _ALIAS_SOURCE,
+            "cycle_model.py": "from __future__ import strict\n" + _CYCLE_SOURCE,
+            "ordinary_cycle_model.py": _CYCLE_SOURCE,
+        },
+        modules={"alias_model": "alias_model.py", "cycle_model": "cycle_model.py"},
+    )
+
+
+def _run_gc_validation(project, model, validation, witnesses, *, mode, entry_interpreter):
+    import textwrap
+
+    project.run_case(
+        model,
+        "import ctypes\nimport importlib\n"
+        "from soac import _soac_ext\n"
+        "from tests.test_regression_gc_cycles import "
+        "_observe_borrowed_argument_alias, _observe_borrowed_loop_alias, _observe_external_collection\n"
+        "def validate_module(transformed):\n"
+        + f"    stock = importlib.import_module({'ordinary_' + model!r})\n"
+        + "    assert _soac_ext.strict_module_diagnostics(stock) is None\n"
+        + "    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner\n"
+        + "    owner.argtypes = [ctypes.py_object]\n"
+        + "    owner.restype = ctypes.c_void_p\n"
+        + f"    for name in {witnesses!r}:\n"
+        + "        assert not owner(getattr(stock, name))\n"
+        + textwrap.indent(textwrap.dedent(validation), "    "),
+        Path(__file__),
+        required_functions=witnesses,
+        entry_interpreter=entry_interpreter,
+        opt_mode=mode,
+    )
 
 
 def _observe_borrowed_argument_alias(module: object) -> tuple[int, int, bool]:
@@ -127,81 +158,99 @@ def _observe_borrowed_loop_alias(module: object) -> tuple[int, int, bool, bool]:
 
 
 @pytest.mark.parametrize("mode", ["none", "profile"])
+@pytest.mark.parametrize("entry_interpreter", [False, True])
 def test_transformed_borrowed_argument_alias_releases_owned_temporary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    strict_gc_project, mode: str, entry_interpreter: bool
 ) -> None:
-    _configure_runtime(monkeypatch, tmp_path, mode)
-
-    with stock_module(tmp_path, f"argument_alias_stock_{mode}", _ALIAS_SOURCE) as stock:
-        expected = _observe_borrowed_argument_alias(stock)
+    _run_gc_validation(
+        strict_gc_project,
+        "alias_model",
+        """
+    expected = _observe_borrowed_argument_alias(stock)
     assert expected[0] == expected[1]
     assert expected[2] is True
 
-    with soac_module(tmp_path, f"argument_alias_soac_{mode}", _ALIAS_SOURCE) as transformed:
-        actual = _observe_borrowed_argument_alias(transformed)
-
+    actual = _observe_borrowed_argument_alias(transformed)
     assert actual == expected
+""",
+        ("alias_only",),
+        mode=mode,
+        entry_interpreter=entry_interpreter,
+    )
 
 
 @pytest.mark.parametrize("mode", ["none", "profile"])
+@pytest.mark.parametrize("entry_interpreter", [False, True])
 def test_transformed_borrowed_alias_stays_borrowed_across_loop_edges(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    strict_gc_project, mode: str, entry_interpreter: bool
 ) -> None:
-    _configure_runtime(monkeypatch, tmp_path, mode)
-
-    with stock_module(tmp_path, f"loop_alias_stock_{mode}", _ALIAS_SOURCE) as stock:
-        expected = _observe_borrowed_loop_alias(stock)
+    _run_gc_validation(
+        strict_gc_project,
+        "alias_model",
+        """
+    expected = _observe_borrowed_loop_alias(stock)
     assert expected[1] == expected[0] + 1
     assert expected[2:] == (True, False)
 
-    with soac_module(tmp_path, f"loop_alias_soac_{mode}", _ALIAS_SOURCE) as transformed:
-        actual = _observe_borrowed_loop_alias(transformed)
-
+    actual = _observe_borrowed_loop_alias(transformed)
     assert actual == expected
+""",
+        ("alias_across_loop",),
+        mode=mode,
+        entry_interpreter=entry_interpreter,
+    )
 
 
 @pytest.mark.parametrize("mode", ["none", "profile"])
+@pytest.mark.parametrize("entry_interpreter", [False, True])
 def test_transformed_cycle_builder_releases_returned_roots(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    strict_gc_project, mode: str, entry_interpreter: bool
 ) -> None:
-    _configure_runtime(monkeypatch, tmp_path, mode)
-
-    with stock_module(tmp_path, f"gc_cycles_external_stock_{mode}", _CYCLE_SOURCE) as stock:
-        expected = _observe_external_collection(stock)
-
+    _run_gc_validation(
+        strict_gc_project,
+        "cycle_model",
+        """
+    expected = _observe_external_collection(stock)
     assert expected["tracked"] == (True, True, True, True), expected
     assert expected["before_collection"] == (True, True, True, True), expected
     assert expected["after_collection"] == (False, False, False, False), expected
 
-    with soac_module(tmp_path, f"gc_cycles_external_soac_{mode}", _CYCLE_SOURCE) as transformed:
-        actual = _observe_external_collection(transformed)
-
+    actual = _observe_external_collection(transformed)
     assert actual["tracked"] == expected["tracked"], actual
     assert actual["before_collection"] == expected["before_collection"], actual
     assert actual["after_collection"] == expected["after_collection"], actual
     assert actual["collected"] >= 12, actual
+""",
+        ("create_gc_cycles", "create_cycle"),
+        mode=mode,
+        entry_interpreter=entry_interpreter,
+    )
 
 
 @pytest.mark.parametrize("mode", ["none", "profile"])
+@pytest.mark.parametrize("entry_interpreter", [False, True])
 def test_transformed_cyclic_gc_matches_stock_inside_native_caller(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    strict_gc_project, mode: str, entry_interpreter: bool
 ) -> None:
-    _configure_runtime(monkeypatch, tmp_path, mode)
-
-    with stock_module(tmp_path, f"gc_cycles_internal_stock_{mode}", _CYCLE_SOURCE) as stock:
-        expected = stock.collect_inside(4, 2)
-
+    _run_gc_validation(
+        strict_gc_project,
+        "cycle_model",
+        """
+    expected = stock.collect_inside(4, 2)
     expected_count, expected_tracked, expected_before, expected_after = expected
     assert expected_count >= 12, expected
     assert expected_tracked is True, expected
     assert expected_before is True, expected
     assert expected_after is False, expected
 
-    with soac_module(tmp_path, f"gc_cycles_internal_soac_{mode}", _CYCLE_SOURCE) as transformed:
-        actual = transformed.collect_inside(4, 2)
-
+    actual = transformed.collect_inside(4, 2)
     collected, tracked, before_collection, after_collection = actual
     assert tracked == expected_tracked, actual
     assert before_collection == expected_before, actual
     assert after_collection == expected_after, actual
     assert collected >= 12, actual
+""",
+        ("collect_inside",),
+        mode=mode,
+        entry_interpreter=entry_interpreter,
+    )

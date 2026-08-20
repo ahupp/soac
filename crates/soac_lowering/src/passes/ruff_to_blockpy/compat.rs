@@ -1,6 +1,7 @@
 use super::*;
 use crate::block_py::{
-    Block, BlockEdge, BlockLabel, BlockTerm, Instr, InstrWithConstantNone, TermIf, TermRaise,
+    Block, BlockEdge, BlockLabel, BlockTerm, Instr, InstrWithConstantNone, RaiseDisposition,
+    TermIf, TermRaise,
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
@@ -20,7 +21,7 @@ fn try_lower_direct_expr<E>(
 where
     E: RuffToBlockPyExpr + InstrWithConstantNone,
 {
-    let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
+    let lowerer = ScopedSetupExprLowerer::new(context);
     match expr {
         InstrRuff::ExprIf(if_expr) => {
             try_lower_if_expr_direct::<_, E>(&lowerer, name_gen, if_expr, None)
@@ -37,7 +38,7 @@ fn try_lower_direct_return_expr<E>(
 where
     E: RuffToBlockPyExpr + InstrWithConstantNone,
 {
-    let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
+    let lowerer = ScopedSetupExprLowerer::new(context);
     match expr {
         InstrRuff::ExprIf(if_expr) => {
             try_lower_if_expr_return_direct::<_, E>(&lowerer, name_gen, if_expr, None)
@@ -53,17 +54,18 @@ fn try_lower_direct_raise_expr<E>(
     context: &Context,
     name_gen: &FunctionNameGen,
     expr: InstrRuff,
+    disposition: RaiseDisposition,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr + InstrWithConstantNone,
 {
-    let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
+    let lowerer = ScopedSetupExprLowerer::new(context);
     match expr {
         InstrRuff::ExprIf(if_expr) => {
-            try_lower_if_expr_raise_direct::<_, E>(&lowerer, name_gen, if_expr, None)
+            try_lower_if_expr_raise_direct::<_, E>(&lowerer, name_gen, if_expr, disposition, None)
         }
         InstrRuff::ExprBoolOp(bool_op) => {
-            try_lower_boolop_raise_direct::<_, E>(&lowerer, name_gen, bool_op, None)
+            try_lower_boolop_raise_direct::<_, E>(&lowerer, name_gen, bool_op, disposition, None)
         }
         _ => None,
     }
@@ -105,7 +107,11 @@ fn with_exc_meta<E: Instr>(
     mut block: crate::block_py::Block<E>,
     exc_target: Option<&BlockLabel>,
 ) -> LoweredBlockPyBlock<E> {
-    block.exc_edge = exc_target.cloned().map(crate::block_py::BlockEdge::new);
+    // A nested expression may already own a compiler cleanup/dispatch edge.
+    // The enclosing region supplies only the fallback for unclaimed blocks.
+    if block.exc_edge.is_none() {
+        block.exc_edge = exc_target.cloned().map(crate::block_py::BlockEdge::new);
+    }
     block
 }
 
@@ -238,40 +244,14 @@ pub(crate) fn set_region_exc_param<E: Instr>(
     exc_param: &str,
 ) {
     for block in &mut blocks[region.clone()] {
-        let old_exc_param = block.exception_param().map(ToString::to_string);
-        block.set_exception_param(exc_param.to_string());
-        if let Some(old_exc_param) = old_exc_param {
-            if old_exc_param != exc_param {
-                rename_exception_edge_args(block, old_exc_param.as_str(), exc_param);
-            }
+        match block.exception_param() {
+            None => block.set_exception_param(exc_param.to_string()),
+            Some(current) if current == exc_param => {}
+            Some(_) => block.ensure_param(
+                exc_param,
+                crate::block_py::BlockParamRole::EnclosingException,
+            ),
         }
-    }
-}
-
-fn rename_exception_edge_args<E: Instr>(
-    block: &mut LoweredBlockPyBlock<E>,
-    old_exc_param: &str,
-    new_exc_param: &str,
-) {
-    fn rewrite_edge_args(
-        args: &mut [crate::block_py::BlockArg],
-        old_exc_param: &str,
-        new_exc_param: &str,
-    ) {
-        for arg in args {
-            if let crate::block_py::BlockArg::Name(name) = arg {
-                if name == old_exc_param {
-                    *name = new_exc_param.to_string();
-                }
-            }
-        }
-    }
-
-    if let BlockTerm::Jump(edge) = &mut block.term {
-        rewrite_edge_args(&mut edge.args, old_exc_param, new_exc_param);
-    }
-    if let Some(edge) = &mut block.exc_edge {
-        rewrite_edge_args(&mut edge.args, old_exc_param, new_exc_param);
     }
 }
 
@@ -401,7 +381,8 @@ where
 {
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
     if let Some(expr) = exc.exc.clone() {
-        let lowered_terminal = try_lower_direct_raise_expr::<E>(context, name_gen, expr.clone());
+        let lowered_terminal =
+            try_lower_direct_raise_expr::<E>(context, name_gen, expr.clone(), exc.disposition);
         if let Some(Ok(fragment)) = lowered_terminal {
             let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
                 blocks,
@@ -437,6 +418,7 @@ where
                     Vec::new(),
                     BlockTerm::Raise(TermRaise {
                         exc: Some(E::from_lowered_expr(lowered.value)),
+                        disposition: exc.disposition,
                     }),
                     Vec::new(),
                     None,
@@ -458,6 +440,7 @@ where
         }
     }
     let exc = TermRaise {
+        disposition: exc.disposition,
         exc: exc
             .exc
             .map(|expr| {

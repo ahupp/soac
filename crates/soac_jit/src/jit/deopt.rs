@@ -2,12 +2,12 @@ use super::planning::{LocalRefKind, PlannedJitDeoptPointId, PlannedJitDeoptResum
 use super::runtime_context::FunctionRuntimeDataLayout;
 use super::specialized_helpers::ObjPtr;
 use super::{BlockPyBlock, blockpy_intrinsics, transient_local_needs_decref};
-use crate::module_constants::ModuleConstantId;
+use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use pyo3::{Py, PyAny, ffi};
 use soac_core::block_py::{
     BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, CallArgKeyword, CallArgPositional,
-    CellLocation, InstrLocationMap, LocalLocation, NameLocation, ParamKind, RuntimeFunctionId,
-    StorageLayout, current_instr_locations,
+    CellLocation, DeoptEntrySource, InstrLocationMap, LocalLocation, NameLocation, ParamKind,
+    RuntimeFunctionId, RuntimeName, StorageLayout, current_instr_locations,
 };
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
@@ -20,9 +20,14 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 pub(super) struct RuntimeJitDeoptTable {
+    pub(super) entry_counters: Option<Arc<crate::module_type::DeoptEntryCounters>>,
     pub(super) function_id: RuntimeFunctionId,
+    pub(super) handled_plan: crate::handled_exception::HandledExceptionPlan,
     pub(super) function: Box<BlockPyFunction<BlockPyModuleShape>>,
     pub(super) module_constant_ptrs: Vec<ObjPtr>,
+    // Compiler roles accompany the exact constant-index layout. Python objects
+    // may be shared by distinct runtime names and cannot identify an operation.
+    pub(super) module_constant_runtime_names: Vec<Option<RuntimeName>>,
     #[cfg(not(test))]
     _module_constant_owners: Option<Arc<Vec<Py<PyAny>>>>,
     pub(super) points: Vec<RuntimeJitDeoptRecord>,
@@ -50,6 +55,9 @@ pub(super) struct RuntimeJitDeoptInvocation<'a> {
     builtins_obj: ObjPtr,
     function_data_obj: ObjPtr,
     live_values: &'a [ObjPtr],
+    live_values_consumed: std::cell::Cell<bool>,
+    handled_state: *mut crate::handled_exception::HandledExceptionState,
+    strict_activation: *const crate::strict_function::StrictFunctionCall,
 }
 
 pub(super) struct RuntimeJitDeoptLocal<'a> {
@@ -61,6 +69,34 @@ pub(super) struct RuntimeJitDeoptLocal<'a> {
 pub(super) struct RuntimeJitDeoptLocals<'a> {
     locals_by_slot: Vec<Option<RuntimeJitDeoptLocal<'a>>>,
     len: usize,
+}
+
+/// The raw caller transfers every owned entry, including entries after a
+/// failed scalar materialization. Keep the whole validated slice protected
+/// until the reconstructed locals accept ownership atomically.
+struct IncomingDeoptOwners<'a> {
+    bindings: &'a [LocalEnvResumeBinding],
+    values: &'a [ObjPtr],
+    armed: bool,
+}
+
+impl Drop for IncomingDeoptOwners<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // A deallocator may execute Python; retain the original boxing or
+        // admission error without exposing a partly admitted frame.
+        unsafe {
+            let error = ffi::PyErr_GetRaisedException();
+            for (binding, value) in self.bindings.iter().zip(self.values) {
+                if transient_local_needs_decref(binding.ownership) {
+                    ffi::Py_XDECREF(value.cast());
+                }
+            }
+            ffi::PyErr_SetRaisedException(error);
+        }
+    }
 }
 
 pub(super) struct RuntimeFunctionEntryParam {
@@ -201,6 +237,40 @@ impl RuntimeFunctionEntryPlan {
             .collect::<Result<Vec<_>, String>>()?
             .into_boxed_slice();
 
+        // Binding uses the Python-visible signature. An executable body can
+        // have different logical names for the same positional ABI (native
+        // annotation providers are one such caller). A separately recorded
+        // public storage layout, as used by suspended functions, already
+        // describes the public entry and must retain its public names.
+        let local_params = if function.public_storage_layout.is_some() {
+            &function.params
+        } else {
+            function.body_params()
+        };
+        if local_params.len() != params.len()
+            || local_params
+                .iter()
+                .zip(params.iter())
+                .any(|(body, public)| body.kind != public.kind)
+        {
+            return Err(format!(
+                "entry interpreter has no public-to-body parameter projection for function {}",
+                function.function_id
+            ));
+        }
+        let mut local_param_indices_by_name = HashMap::with_capacity(local_params.len());
+        for (index, parameter) in local_params.iter().enumerate() {
+            if local_param_indices_by_name
+                .insert(parameter.name.as_str(), index)
+                .is_some()
+            {
+                return Err(format!(
+                    "entry interpreter found duplicate body parameter {:?} in function {}",
+                    parameter.name, function.function_id
+                ));
+            }
+        }
+
         let mut param_has_stack_slot = vec![false; params.len()];
         let mut local_bindings = Vec::with_capacity(layout.stack_slots().len());
         let mut local_param_indices = Vec::with_capacity(layout.stack_slots().len());
@@ -218,7 +288,7 @@ impl RuntimeFunctionEntryPlan {
                     function.function_id
                 )
             })?);
-            let param_index = param_indices_by_name.get(name.as_str()).copied();
+            let param_index = local_param_indices_by_name.get(name.as_str()).copied();
             if let Some(param_index) = param_index {
                 param_has_stack_slot[param_index] = true;
             }
@@ -244,7 +314,7 @@ impl RuntimeFunctionEntryPlan {
             });
             local_param_indices.push(param_index);
         }
-        for (param_index, param) in params.iter().enumerate() {
+        for (param_index, param) in local_params.iter().enumerate() {
             if !param_has_stack_slot[param_index] {
                 return Err(format!(
                     "entry interpreter expected param {:?} in stack slots for function {}",
@@ -383,14 +453,22 @@ impl RuntimeJitDeoptTable {
         function: &BlockPyFunction<BlockPyModuleShape>,
         plan: &PlannedJitDeoptResumeFunction,
         module_constant_ptrs: &[*mut ffi::PyObject],
+        module_constants: &ModuleCodegenConstants,
     ) -> Result<Self, String> {
-        Self::from_plan_with_owned_constants(function, plan, module_constant_ptrs, None)
+        Self::from_plan_with_owned_constants(
+            function,
+            plan,
+            module_constant_ptrs,
+            module_constants,
+            None,
+        )
     }
 
     pub(super) fn from_plan_with_owned_constants(
         function: &BlockPyFunction<BlockPyModuleShape>,
         plan: &PlannedJitDeoptResumeFunction,
         module_constant_ptrs: &[*mut ffi::PyObject],
+        module_constants: &ModuleCodegenConstants,
         #[cfg_attr(test, allow(unused_variables))] module_constant_owners: Option<
             Arc<Vec<Py<PyAny>>>,
         >,
@@ -417,11 +495,16 @@ impl RuntimeJitDeoptTable {
             });
         }
         let table = Self {
+            entry_counters: None,
             function_id: function.function_id,
+            handled_plan: crate::handled_exception::HandledExceptionPlan::for_function(function),
             function: Box::new(function.clone()),
             module_constant_ptrs: module_constant_ptrs
                 .iter()
                 .map(|ptr| ptr.cast::<c_void>())
+                .collect(),
+            module_constant_runtime_names: (0..module_constant_ptrs.len())
+                .map(|index| module_constants.constant_runtime_name(ModuleConstantId(index)))
                 .collect(),
             #[cfg(not(test))]
             _module_constant_owners: module_constant_owners,
@@ -468,6 +551,33 @@ impl RuntimeJitDeoptTable {
 
     pub(super) fn function_id(&self) -> RuntimeFunctionId {
         self.function_id
+    }
+
+    pub(super) fn enable_entry_counters(
+        &mut self,
+        shared_state: &crate::module_type::SharedModuleState,
+    ) -> Result<(), String> {
+        if self.entry_counters.is_some() {
+            return Err("deopt table counters were already registered".into());
+        }
+        let sources = self
+            .points
+            .iter()
+            .map(|record| match record.resume_point {
+                LocalEnvResumePoint::BlockEntry { block, .. } => {
+                    DeoptEntrySource::BlockEntry { block_label: block }
+                }
+                LocalEnvResumePoint::BeforeInstr { key } => DeoptEntrySource::BeforeInstr {
+                    instr_id: key.instr_id,
+                },
+                LocalEnvResumePoint::BeforeTerm { block, .. } => {
+                    DeoptEntrySource::BeforeTerm { block_label: block }
+                }
+            })
+            .collect();
+        self.entry_counters =
+            Some(shared_state.register_deopt_entry_counters(self.function_id, sources)?);
+        Ok(())
     }
 
     pub(super) fn supported_resume_points(&self) -> Vec<LocalEnvResumePoint> {
@@ -728,6 +838,122 @@ fn nested_guard_candidate_seen_before_replay_unsafe_effect(
 
 fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mut bool) -> bool {
     match expr {
+        InstrTyped::IteratorStep(_) | InstrTyped::TakeOperand(_) => {
+            mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::BuildCollection(op) => {
+            op.values
+                .iter()
+                .all(|value| typed_nested_guard_scan_expr(value, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::CallArgumentOp(op) => {
+            op.value
+                .as_deref()
+                .is_none_or(|value| typed_nested_guard_scan_expr(value, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::PreparedCall(op) => {
+            std::iter::once(op.func.as_ref())
+                .chain(std::iter::once(op.arguments.as_ref()))
+                .chain(op.keywords.as_deref())
+                .all(|value| typed_nested_guard_scan_expr(value, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::ComprehensionInsert(op) => {
+            op.key
+                .as_deref()
+                .into_iter()
+                .chain([op.value.as_ref()])
+                .all(|value| typed_nested_guard_scan_expr(value, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::NewAnnotationSet(_) => mark_replay_unsafe_effect(saw_replay_unsafe_effect),
+        InstrTyped::SetupAnnotations(op) => {
+            op.namespace.as_deref().is_none_or(|namespace| {
+                typed_nested_guard_scan_expr(namespace, saw_replay_unsafe_effect)
+            }) && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::CreateTypeAlias(op) => {
+            op.operands()
+                .into_iter()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::ConstructTypeParameterScope(op) => {
+            op.operands()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::SubscriptGeneric(op) => {
+            op.operands()
+                .into_iter()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::SetFunctionTypeParameters(op) => {
+            op.operands()
+                .into_iter()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::CreateTypeParameter(op) => {
+            op.operands()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::SetTypeParameterDefault(op) => {
+            op.operands()
+                .into_iter()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::RecordAnnotation(op) => {
+            typed_nested_guard_scan_expr(&op.indices, saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::CheckAnnotationFormat(op) => {
+            typed_nested_guard_scan_expr(&op.format, saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::ConstructClass(op) => {
+            op.operands()
+                .into_iter()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::PrepareClassDecorator(op) => {
+            op.operands()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::ApplyClassDecorator(op) => {
+            op.operands()
+                .into_iter()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::DiscardClassDecorator(op) => {
+            op.operands()
+                .into_iter()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::DiscardClassConstructionCaptures(op) => {
+            op.operands()
+                .into_iter()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::CompleteFunctionDefinition(op) => {
+            typed_nested_guard_scan_expr(&op.function, saw_replay_unsafe_effect)
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::ApplyFunctionDescriptor(op) => {
+            op.operands()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
         InstrTyped::Truthy(op) => {
             typed_nested_guard_scan_expr(op.value(), saw_replay_unsafe_effect)
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
@@ -937,12 +1163,8 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
         InstrTyped::IncrementCounter(_) => mark_replay_unsafe_effect(saw_replay_unsafe_effect),
         InstrTyped::CellRef(_) => true,
         InstrTyped::MakeFunctionWithClosure(op) => {
-            typed_nested_guard_scan_expr(op.captures.as_ref(), saw_replay_unsafe_effect)
-                && typed_nested_guard_scan_expr(
-                    op.param_defaults.as_ref(),
-                    saw_replay_unsafe_effect,
-                )
-                && typed_nested_guard_scan_expr(op.annotate_fn.as_ref(), saw_replay_unsafe_effect)
+            op.operands()
+                .all(|operand| typed_nested_guard_scan_expr(operand, saw_replay_unsafe_effect))
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
     }
@@ -1017,6 +1239,10 @@ impl<'a> RuntimeJitDeoptSupportCtx<'a> {
         (slot as usize) < self.runtime_layout.closure_len()
     }
 
+    fn private_cell_supported(&self, slot: u32) -> bool {
+        (slot as usize) < self.runtime_layout.private_cell_len()
+    }
+
     fn preserved_cell_supported(&self, slot: u32) -> bool {
         self.storage_layout
             .and_then(|layout| layout.preserved_slot(slot))
@@ -1031,6 +1257,48 @@ fn runtime_jit_deopt_expr_supported(
     support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
     match expr {
+        InstrBlockPy::TakeOperand(op) => support
+            .storage_layout
+            .is_some_and(|layout| op.validate_resolved(layout).is_ok()),
+        InstrBlockPy::IteratorStep(op) => support
+            .storage_layout
+            .is_some_and(|layout| op.validate_resolved(layout).is_ok()),
+        InstrBlockPy::BuildCollection(op) => {
+            op.validate_shape().is_ok()
+                && op
+                    .values
+                    .iter()
+                    .all(|value| runtime_jit_deopt_expr_supported(value, support))
+        }
+        InstrBlockPy::CallArgumentOp(op) => {
+            support
+                .storage_layout
+                .is_some_and(|layout| op.validate_resolved(layout).is_ok())
+                && op
+                    .value
+                    .as_deref()
+                    .is_none_or(|value| runtime_jit_deopt_expr_supported(value, support))
+        }
+        InstrBlockPy::PreparedCall(op) => {
+            support
+                .storage_layout
+                .is_some_and(|layout| op.validate_resolved(layout).is_ok())
+                && std::iter::once(op.func.as_ref())
+                    .chain(std::iter::once(op.arguments.as_ref()))
+                    .chain(op.keywords.as_deref())
+                    .all(|value| runtime_jit_deopt_expr_supported(value, support))
+        }
+        InstrBlockPy::ComprehensionInsert(op) => {
+            support
+                .storage_layout
+                .is_some_and(|layout| op.validate_resolved(layout).is_ok())
+                && op
+                    .key
+                    .as_deref()
+                    .into_iter()
+                    .chain([op.value.as_ref()])
+                    .all(|value| runtime_jit_deopt_expr_supported(value, support))
+        }
         InstrBlockPy::Load(load) => match load.name.location {
             NameLocation::Cell(CellLocation::Owned(slot)) => support.owned_cell_supported(slot),
             NameLocation::Cell(CellLocation::Preserved(slot)) => {
@@ -1040,6 +1308,7 @@ fn runtime_jit_deopt_expr_supported(
             | NameLocation::Cell(CellLocation::CapturedSource(slot)) => {
                 support.closure_cell_supported(slot)
             }
+            NameLocation::Cell(CellLocation::Private(slot)) => support.private_cell_supported(slot),
             _ => true,
         },
         InstrBlockPy::BinOp(binop) => {
@@ -1091,10 +1360,63 @@ fn runtime_jit_deopt_expr_supported(
             .map_or(true, |initial_value| {
                 runtime_jit_deopt_expr_supported(initial_value, support)
             }),
-        InstrBlockPy::MakeFunctionWithClosure(make_function) => {
-            runtime_jit_deopt_expr_supported(&make_function.captures, support)
-                && runtime_jit_deopt_expr_supported(&make_function.param_defaults, support)
-                && runtime_jit_deopt_expr_supported(&make_function.annotate_fn, support)
+        InstrBlockPy::MakeFunctionWithClosure(make_function) => make_function
+            .operands()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::ConstructClass(op) => op
+            .operands()
+            .into_iter()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::PrepareClassDecorator(op) => op
+            .operands()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::ApplyClassDecorator(op) => op
+            .operands()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::DiscardClassDecorator(op) => op
+            .operands()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::DiscardClassConstructionCaptures(op) => op
+            .operands()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::NewAnnotationSet(_) => true,
+        InstrBlockPy::SetupAnnotations(op) => op
+            .namespace
+            .as_deref()
+            .is_none_or(|namespace| runtime_jit_deopt_expr_supported(namespace, support)),
+        InstrBlockPy::CreateTypeAlias(op) => op
+            .operands()
+            .into_iter()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::ConstructTypeParameterScope(op) => op
+            .operands()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::SubscriptGeneric(op) => op
+            .operands()
+            .into_iter()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::SetFunctionTypeParameters(op) => op
+            .operands()
+            .into_iter()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::CreateTypeParameter(op) => op
+            .operands()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::SetTypeParameterDefault(op) => op
+            .operands()
+            .into_iter()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::CompleteFunctionDefinition(op) => {
+            runtime_jit_deopt_expr_supported(&op.function, support)
+        }
+        InstrBlockPy::ApplyFunctionDescriptor(op) => op
+            .operands()
+            .all(|operand| runtime_jit_deopt_expr_supported(operand, support)),
+        InstrBlockPy::RecordAnnotation(op) => {
+            runtime_jit_deopt_expr_supported(&op.indices, support)
+        }
+        InstrBlockPy::CheckAnnotationFormat(op) => {
+            runtime_jit_deopt_expr_supported(&op.format, support)
         }
         InstrBlockPy::CellRef(cell_ref) => match cell_ref.location {
             CellLocation::Owned(slot) => support.owned_cell_supported(slot),
@@ -1102,6 +1424,7 @@ fn runtime_jit_deopt_expr_supported(
             CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
                 support.closure_cell_supported(slot)
             }
+            CellLocation::Private(slot) => support.private_cell_supported(slot),
         },
     }
 }
@@ -1117,6 +1440,7 @@ fn runtime_jit_deopt_name_location_supported(
         | NameLocation::Cell(CellLocation::CapturedSource(slot)) => {
             support.closure_cell_supported(slot)
         }
+        NameLocation::Cell(CellLocation::Private(slot)) => support.private_cell_supported(slot),
         _ => true,
     }
 }
@@ -1183,7 +1507,9 @@ fn runtime_jit_deopt_term_supported(
     support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
     match term {
-        BlockTerm::Return(value) => runtime_jit_deopt_expr_supported(value, support),
+        BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => {
+            runtime_jit_deopt_expr_supported(value, support)
+        }
         BlockTerm::Jump(edge) => edge.args.iter().all(|arg| {
             matches!(
                 arg,
@@ -1220,35 +1546,51 @@ impl RuntimeJitDeoptInvocation<'_> {
         record_ordinal: i64,
         live_values: ObjPtr,
         live_value_count: i64,
+        handled_state: *mut crate::handled_exception::HandledExceptionState,
+        strict_activation: *const crate::strict_function::StrictFunctionCall,
     ) -> Result<RuntimeJitDeoptInvocation<'a>, String> {
-        if deopt_table.is_null() {
-            return Err(format!(
-                "null deopt table pointer, ordinal {record_ordinal}, live values {live_value_count}"
-            ));
-        }
-        let table = unsafe { &*(deopt_table.cast::<RuntimeJitDeoptTable>()) };
-        let record = table.record_for_ordinal(record_ordinal)?;
-        record.validate_live_value_buffer(live_values, live_value_count)?;
-        let live_value_count = usize::try_from(live_value_count).map_err(|_| {
-            format!("live value count {live_value_count} is negative or does not fit usize")
-        })?;
-        let live_values = if live_value_count == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(live_values.cast::<ObjPtr>(), live_value_count) }
-        };
-        Ok(RuntimeJitDeoptInvocation {
-            table,
-            record,
-            globals_obj,
-            builtins_obj,
-            function_data_obj,
-            live_values,
-        })
+        let result = (|| {
+            if deopt_table.is_null() {
+                return Err(format!(
+                    "null deopt table pointer, ordinal {record_ordinal}, live values {live_value_count}"
+                ));
+            }
+            let table = unsafe { &*(deopt_table.cast::<RuntimeJitDeoptTable>()) };
+            let record = table.record_for_ordinal(record_ordinal)?;
+            record.validate_live_value_buffer(live_values, live_value_count)?;
+            let live_value_count = usize::try_from(live_value_count).map_err(|_| {
+                format!("live value count {live_value_count} is negative or does not fit usize")
+            })?;
+            let live_values = if live_value_count == 0 {
+                &[]
+            } else {
+                unsafe {
+                    std::slice::from_raw_parts(live_values.cast::<ObjPtr>(), live_value_count)
+                }
+            };
+            Ok(RuntimeJitDeoptInvocation {
+                table,
+                record,
+                globals_obj,
+                builtins_obj,
+                function_data_obj,
+                live_values,
+                live_values_consumed: std::cell::Cell::new(false),
+                handled_state,
+                strict_activation,
+            })
+        })();
+        result
     }
 
     pub(super) fn record(&self) -> &'_ RuntimeJitDeoptRecord {
         self.record
+    }
+
+    pub(super) fn record_native_entry(&self) {
+        if let Some(counters) = &self.table.entry_counters {
+            counters.record(self.record.id.ordinal);
+        }
     }
 
     pub(super) fn function(&self) -> &BlockPyFunction<BlockPyModuleShape> {
@@ -1267,9 +1609,29 @@ impl RuntimeJitDeoptInvocation<'_> {
         self.function_data_obj
     }
 
+    pub(super) fn handled_state(&self) -> *mut crate::handled_exception::HandledExceptionState {
+        self.handled_state
+    }
+
+    pub(super) fn strict_activation(&self) -> *const crate::strict_function::StrictFunctionCall {
+        self.strict_activation
+    }
+
+    pub(super) fn handled_plan(&self) -> &crate::handled_exception::HandledExceptionPlan {
+        &self.table.handled_plan
+    }
+
     pub(super) fn module_constant_ptr(&self, constant_index: u32) -> Result<ObjPtr, String> {
         self.table
             .module_constant_ptr(ModuleConstantId(constant_index as usize))
+    }
+
+    pub(super) fn module_constant_runtime_name(&self, constant_index: u32) -> Option<RuntimeName> {
+        self.table
+            .module_constant_runtime_names
+            .get(constant_index as usize)
+            .copied()
+            .flatten()
     }
 
     pub(super) fn live_bindings(
@@ -1282,7 +1644,10 @@ impl RuntimeJitDeoptInvocation<'_> {
     }
 
     pub(super) fn materialize_locals(&self) -> Result<RuntimeJitDeoptLocals<'_>, String> {
-        RuntimeJitDeoptLocals::from_live_bindings(self.live_bindings())
+        if self.live_values_consumed.replace(true) {
+            return Err("deopt live values were already consumed".into());
+        }
+        RuntimeJitDeoptLocals::from_live_bindings(self.record.locals(), self.live_values)
             .map_err(|err| format!("{err}; while materializing locals for {}", self.describe()))
     }
 
@@ -1318,16 +1683,16 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
         Ok(())
     }
 
-    fn from_live_bindings(
-        live_bindings: impl IntoIterator<Item = (&'a LocalEnvResumeBinding, ObjPtr)>,
-    ) -> Result<Self, String> {
+    fn validate_live_bindings(
+        bindings: &'a [LocalEnvResumeBinding],
+        values: &[ObjPtr],
+    ) -> Result<(), String> {
+        // from_raw validated the record and complete buffer shape before any
+        // element is examined; no partially consumed iterator owns the tail.
+        debug_assert_eq!(bindings.len(), values.len());
         let mut names = HashSet::new();
         let mut locations = HashSet::new();
-        let mut locals = Self {
-            locals_by_slot: Vec::new(),
-            len: 0,
-        };
-        for (binding, value) in live_bindings {
+        for (binding, value) in bindings.iter().zip(values.iter().copied()) {
             if !names.insert(binding.name.as_str()) {
                 return Err(format!(
                     "duplicate deopt local name {} while reconstructing runtime locals",
@@ -1355,12 +1720,37 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
                 }
                 _ => {}
             }
-            locals.insert_local(RuntimeJitDeoptLocal {
+            Self::local_slot_index(binding.location)?;
+        }
+        Ok(())
+    }
+
+    fn from_live_bindings(
+        bindings: &'a [LocalEnvResumeBinding],
+        values: &[ObjPtr],
+    ) -> Result<Self, String> {
+        let validation = Self::validate_live_bindings(bindings, values);
+        let mut incoming = IncomingDeoptOwners {
+            bindings,
+            values,
+            armed: true,
+        };
+        validation?;
+        let mut locals = Self {
+            locals_by_slot: Vec::new(),
+            len: 0,
+        };
+        for (binding, value) in bindings.iter().zip(values.iter().copied()) {
+            if let Err(detail) = locals.insert_local(RuntimeJitDeoptLocal {
                 binding,
                 value,
-                release_on_frame_exit: transient_local_needs_decref(binding.ownership),
-            })?;
+                release_on_frame_exit: false,
+            }) {
+                return Err(detail);
+            }
         }
+        locals.accept_incoming_ownership();
+        incoming.armed = false;
         Ok(locals)
     }
 
@@ -1398,10 +1788,19 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
             locals.insert_local(RuntimeJitDeoptLocal {
                 binding,
                 value,
-                release_on_frame_exit: transient_local_needs_decref(binding.ownership),
+                // Unlike deopt, entry's caller still owns and releases the
+                // complete input buffer if this admission returns an error.
+                release_on_frame_exit: false,
             })?;
         }
+        locals.accept_incoming_ownership();
         Ok(locals)
+    }
+
+    fn accept_incoming_ownership(&mut self) {
+        for local in self.locals_by_slot.iter_mut().filter_map(Option::as_mut) {
+            local.release_on_frame_exit = transient_local_needs_decref(local.binding.ownership);
+        }
     }
 
     pub(super) fn len(&self) -> usize {
@@ -1465,6 +1864,15 @@ impl<'a> RuntimeJitDeoptLocals<'a> {
     }
 }
 
+impl Drop for RuntimeJitDeoptLocals<'_> {
+    fn drop(&mut self) {
+        // These locals only exist during an attached Python invocation.
+        // Ordinary frame cleanup clears the flags; admission failure reaches
+        // this path with the accepted owners still present.
+        unsafe { self.release_frame_owned_values() };
+    }
+}
+
 impl RuntimeJitDeoptLocal<'_> {
     pub(super) fn binding(&self) -> &'_ LocalEnvResumeBinding {
         self.binding
@@ -1472,6 +1880,24 @@ impl RuntimeJitDeoptLocal<'_> {
 
     pub(super) fn value(&self) -> ObjPtr {
         self.value
+    }
+
+    /// Raw class-slot operations transfer an edge, not a checked Python load.
+    /// An immortal input needs no counted edge; other borrowed inputs cannot
+    /// silently acquire ownership merely by being copied to a raw slot.
+    pub(super) fn has_transferable_nullable_owner(&self) -> bool {
+        self.value.is_null()
+            || self.release_on_frame_exit
+            || self.binding.ownership == LocalRefKind::Immortal
+    }
+
+    /// Caller prevalidates every participant before beginning a multi-slot
+    /// transaction. No callback or refcount operation occurs until all changed
+    /// slots have been published and the returned old owner can be released.
+    pub(super) fn replace_nullable_owner_without_release(&mut self, value: ObjPtr) -> ObjPtr {
+        assert!(self.has_transferable_nullable_owner());
+        self.release_on_frame_exit = !value.is_null();
+        std::mem::replace(&mut self.value, value)
     }
 
     pub(super) unsafe fn replace_with_owned_value(&mut self, value: ObjPtr) {
@@ -1489,12 +1915,14 @@ impl RuntimeJitDeoptLocal<'_> {
     }
 
     unsafe fn release_frame_owned_value(&mut self) {
-        if self.release_on_frame_exit && !self.value.is_null() {
+        let value = std::mem::replace(&mut self.value, std::ptr::null_mut());
+        let release = std::mem::replace(&mut self.release_on_frame_exit, false);
+        if release && !value.is_null() {
             unsafe {
-                ffi::Py_DECREF(self.value.cast::<ffi::PyObject>());
+                let error = ffi::PyErr_GetRaisedException();
+                ffi::Py_DECREF(value.cast::<ffi::PyObject>());
+                ffi::PyErr_SetRaisedException(error);
             }
         }
-        self.value = std::ptr::null_mut();
-        self.release_on_frame_exit = false;
     }
 }

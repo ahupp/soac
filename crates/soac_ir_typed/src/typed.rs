@@ -1,4 +1,5 @@
 use crate::emit_v3::MechanicalRegionEmission;
+use crate::native_iterator::TypedNativeIteratorPipelinePlan;
 use crate::plan_v3::{
     ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemGuardKind, ExactListItemShape,
     IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalGuardKind, RegionPlan,
@@ -8,14 +9,20 @@ use crate::value_facts::ValueFacts;
 use soac_core::block_py;
 #[allow(unused_imports)]
 use soac_core::block_py::{
-    BinOp, Block, BlockPyFunction, BlockPyModule, Call, CallArgKeyword, CallArgPositional,
-    CallDirect, CalleeFunctionId, CellRef, ChildVisitable, ConstantExpr, Del, DelItem, GetAttr,
-    GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, Instr, InstrId, InstrWithConstantNone,
-    Load, LocalLocation, MakeCell, MakeFunctionWithClosure, MapFunction, MapInstr, MapModule,
-    Mappable, Meta, ModuleShape, NameLike, PrettyPrint, PrettyPrinter, ResolvedName,
-    RuntimeFunctionId, RuntimeName, SetAttr, SetItem, Store, TryMapInstr, Tuple, UnaryOp, Visit,
-    VisitMut, WithMeta, define_instr, define_ruff_instr,
+    ApplyClassDecorator, ApplyFunctionDescriptor, BinOp, Block, BlockPyFunction, BlockPyModule,
+    Call, CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId, CellRef,
+    CheckAnnotationFormat, ChildVisitable, CompleteFunctionDefinition, ComprehensionInsert,
+    ConstantExpr, ConstructClass, ConstructTypeParameterScope, CreateTypeAlias,
+    CreateTypeParameter, Del, DelItem, DiscardClassConstructionCaptures, DiscardClassDecorator,
+    FrameNamespace, GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, Instr,
+    InstrId, InstrWithConstantNone, Load, LocalLocation, MakeCell, MakeFunctionWithClosure,
+    MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, NewAnnotationSet,
+    PrepareClassDecorator, PrettyPrint, PrettyPrinter, RecordAnnotation, ResolvedName,
+    RuntimeFunctionId, RuntimeName, SetAttr, SetFunctionTypeParameters, SetItem,
+    SetTypeParameterDefault, SetupAnnotations, Store, SubscriptGeneric, TakeOperand, TryMapInstr,
+    Tuple, UnaryOp, Visit, VisitMut, WithMeta, define_instr, define_ruff_instr,
 };
+use soac_core::block_py::{BuildCollection, CallArgumentOp, IteratorStep, PreparedCall};
 #[allow(unused_imports)]
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
@@ -78,6 +85,9 @@ pub enum TypedDirectCallableCallGuard {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedCallAccessPlan {
     Generic,
+    /// A source-bound request, not a receiver or argument proof. The active
+    /// function supplies the actual immutable family capability at this slot.
+    GuardedSealedMethod(Box<TypedSealedMethodAccessPlan>),
     GuardedCallable {
         function_guards: Vec<TypedDirectFunctionCallGuard>,
     },
@@ -169,6 +179,7 @@ pub struct TypedCall<E: Instr> {
     pub func: Box<E>,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
+    pub frame_namespace: Option<FrameNamespace<E>>,
     pub access: TypedCallAccessPlan,
 }
 
@@ -184,6 +195,7 @@ impl<E: Instr> TypedCall<E> {
             func: func.into(),
             args: args.into(),
             keywords: keywords.into(),
+            frame_namespace: None,
             access: TypedCallAccessPlan::Generic,
         }
     }
@@ -195,14 +207,37 @@ impl<E: Instr> TypedCall<E> {
             func: op.func,
             args: op.args,
             keywords: op.keywords,
+            frame_namespace: op.frame_namespace,
             access: TypedCallAccessPlan::Generic,
         }
     }
 
     pub fn into_legacy(self) -> Call<E> {
         Call::new(self.func, self.args, self.keywords)
+            .with_frame_namespace(self.frame_namespace)
             .with_extra(self.extra)
             .with_meta(self._meta)
+    }
+}
+
+impl TypedCall<InstrTyped> {
+    /// Preserve the same explicit input-ownership shape through planning and
+    /// codegen. Ordinary loads and non-generic call plans are not selected.
+    pub fn has_owned_operand_inputs(
+        &self,
+        layout: &block_py::StorageLayout,
+    ) -> Result<bool, String> {
+        if !matches!(&self.access, TypedCallAccessPlan::Generic) {
+            return Ok(false);
+        }
+        block_py::call_has_owned_operand_inputs(
+            self.func.as_ref(),
+            &self.args,
+            !self.keywords.is_empty(),
+            self.frame_namespace.is_some(),
+            layout,
+            |input| matches!(input, InstrTyped::CallTyped(_)),
+        )
     }
 }
 
@@ -212,6 +247,7 @@ impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedCall<E> {
             .field("func", &self.func)
             .field("args", &self.args)
             .field("keywords", &self.keywords)
+            .field("frame_namespace", &self.frame_namespace)
             .field("access", &self.access)
             .finish()
     }
@@ -245,6 +281,9 @@ where
         for keyword in &self.keywords {
             visitor.visit_instr(keyword.expr());
         }
+        if let Some(FrameNamespace::Mapping(namespace)) = &self.frame_namespace {
+            visitor.visit_instr(namespace);
+        }
     }
 
     fn visit_children_mut<V>(&mut self, visitor: &mut V)
@@ -257,6 +296,9 @@ where
         }
         for keyword in &mut self.keywords {
             visitor.visit_instr_mut(keyword.expr_mut());
+        }
+        if let Some(FrameNamespace::Mapping(namespace)) = &mut self.frame_namespace {
+            visitor.visit_instr_mut(namespace);
         }
     }
 }
@@ -284,6 +326,9 @@ impl<E: Instr> Mappable<E> for TypedCall<E> {
                 .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
                 .collect(),
             access: self.access,
+            frame_namespace: self
+                .frame_namespace
+                .map(|value| value.map_instr(|value| map.map_instr(value))),
         }
     }
 
@@ -307,6 +352,10 @@ impl<E: Instr> Mappable<E> for TypedCall<E> {
                 .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
                 .collect::<Result<Vec<_>, _>>()?,
             access: self.access,
+            frame_namespace: self
+                .frame_namespace
+                .map(|value| value.try_map_instr(|value| map.try_map_instr(value)))
+                .transpose()?,
         })
     }
 
@@ -329,6 +378,9 @@ impl<E: Instr> Mappable<E> for TypedCall<E> {
                 .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
                 .collect(),
             access: self.access,
+            frame_namespace: self
+                .frame_namespace
+                .map(|value| value.map_instr(|value| map.map_instr(value))),
         }
     }
 
@@ -351,6 +403,10 @@ impl<E: Instr> Mappable<E> for TypedCall<E> {
                 .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
                 .collect::<Result<Vec<_>, _>>()?,
             access: self.access,
+            frame_namespace: self
+                .frame_namespace
+                .map(|value| value.try_map_instr(|value| map.try_map_instr(value)))
+                .transpose()?,
         })
     }
 }
@@ -380,6 +436,10 @@ impl<E: Instr> TypedDirectCallableCall<E> {
     }
 
     pub fn from_typed_call(call: TypedCall<E>, guard: TypedDirectCallableCallGuard) -> Self {
+        assert!(
+            call.frame_namespace.is_none(),
+            "direct calls require an explicit class-frame transfer plan"
+        );
         Self {
             _meta: call._meta,
             extra: call.extra,
@@ -527,6 +587,10 @@ impl<E: Instr> TypedGuardedCallableCall<E> {
         call: TypedCall<E>,
         function_guards: Vec<TypedDirectFunctionCallGuard>,
     ) -> Self {
+        assert!(
+            call.frame_namespace.is_none(),
+            "guarded calls require an explicit class-frame transfer plan"
+        );
         Self {
             _meta: call._meta,
             extra: call.extra,
@@ -547,6 +611,7 @@ impl<E: Instr> TypedGuardedCallableCall<E> {
             access: TypedCallAccessPlan::GuardedCallable {
                 function_guards: self.function_guards,
             },
+            frame_namespace: None,
         }
     }
 }
@@ -717,6 +782,10 @@ impl<E: Instr> TypedGuardedMethodCall<E> {
         method_name: String,
         method_guards: Vec<TypedDirectMethodCallGuard>,
     ) -> Self {
+        assert!(
+            call.frame_namespace.is_none(),
+            "guarded methods require an explicit class-frame transfer plan"
+        );
         Self {
             _meta: call._meta,
             extra: call.extra,
@@ -739,6 +808,7 @@ impl<E: Instr> TypedGuardedMethodCall<E> {
                 method_name: self.method_name,
                 method_guards: self.method_guards,
             },
+            frame_namespace: None,
         }
     }
 }
@@ -1193,9 +1263,56 @@ pub struct TypedLateBoundOwnerFieldPlan {
     pub cell_index: u32,
 }
 
+/// An authenticated source-site request for an optional runtime capability.
+/// It contains no predicted offset or receiver proof. The active function's
+/// matching slot must hold a sealed construction witness before a raw load;
+/// a missing slot or failed receiver/lookup guard uses ordinary getattr.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedSealedFieldAccessPlan {
+    pub site: soac_contracts::AttributeSiteIdentity,
+    pub receiver_class: soac_contracts::ClassReference,
+    pub name: String,
+    pub capability_slot: u32,
+}
+
+/// The method layout is independent of physical instance-field storage. A
+/// request names one source attribute; only actual class adoption can fill its
+/// runtime slot with a particular construction's family and dispatch position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedSealedMethodAccessPlan {
+    pub site: soac_contracts::AttributeSiteIdentity,
+    pub receiver_class: soac_contracts::ClassReference,
+    pub name: String,
+    pub capability_slot: u32,
+}
+
+/// Request an authenticated positional source-body call. The actual callable
+/// and current entry remain guarded; the ordinary binder supplies defaults
+/// and reports binding errors. This plan carries no argument or return types.
+/// Methods include their receiver in the full bound body arity. Unsupported
+/// shapes use the captured public entry without replaying evaluation/binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedSourceCallPlan {
+    pub caller_source: soac_contracts::SourceIdentity,
+    pub argument_count: usize,
+    pub body_target: Option<TypedSourceBodyTarget>,
+}
+
+/// A source-selected native target, never unchecked callable authority. After
+/// ordinary binding the actual activation's pinned body pointer must
+/// equal this declared target before a fixed native call may use its actual
+/// environment. An override or a different compilation keeps virtual dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedSourceBodyTarget {
+    pub source: soac_contracts::SourceIdentity,
+    pub function_id: RuntimeFunctionId,
+    pub argument_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedAttrAccessPlan {
     Generic,
+    GuardedSealedField(Box<TypedSealedFieldAccessPlan>),
     IndexedField {
         source: TypedIndexedFieldPlanSource,
         counter_source: Option<TypedIndexedFieldCounterSource>,
@@ -1351,6 +1468,12 @@ impl<E: Instr> TypedSetAttr<E> {
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub enum InstrTyped {
+    TakeOperand(TakeOperand<Self>),
+    ComprehensionInsert(ComprehensionInsert<Self>),
+    BuildCollection(BuildCollection<Self>),
+    CallArgumentOp(CallArgumentOp<Self>),
+    PreparedCall(PreparedCall<Self>),
+    IteratorStep(IteratorStep<Self>),
     Truthy(TypedTruthy<Self>),
     Load(Load<Self>),
     BinOp(BinOp<Self>),
@@ -1372,9 +1495,26 @@ pub enum InstrTyped {
     Store(Store<Self>),
     Del(Del<Self>),
     MakeCell(MakeCell<Self>),
+    NewAnnotationSet(NewAnnotationSet<Self>),
+    SetupAnnotations(SetupAnnotations<Self>),
+    ConstructTypeParameterScope(ConstructTypeParameterScope<Self>),
+    SubscriptGeneric(SubscriptGeneric<Self>),
+    SetFunctionTypeParameters(SetFunctionTypeParameters<Self>),
+    CreateTypeAlias(CreateTypeAlias<Self>),
+    CreateTypeParameter(CreateTypeParameter<Self>),
+    SetTypeParameterDefault(SetTypeParameterDefault<Self>),
+    CheckAnnotationFormat(CheckAnnotationFormat<Self>),
+    RecordAnnotation(RecordAnnotation<Self>),
     IncrementCounter(IncrementCounter),
     CellRef(CellRef),
     MakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
+    CompleteFunctionDefinition(CompleteFunctionDefinition<Self>),
+    ApplyFunctionDescriptor(ApplyFunctionDescriptor<Self>),
+    PrepareClassDecorator(PrepareClassDecorator<Self>),
+    ApplyClassDecorator(ApplyClassDecorator<Self>),
+    DiscardClassDecorator(DiscardClassDecorator<Self>),
+    DiscardClassConstructionCaptures(DiscardClassConstructionCaptures<Self>),
+    ConstructClass(ConstructClass<Self>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1545,15 +1685,21 @@ pub struct TypedInstrExtra {
     pub trusted_generator_resume_function: Option<RuntimeFunctionId>,
     pub indexed_global_access: Option<TypedIndexedGlobalAccessPlan>,
     pub exact_list_item_access: Option<TypedExactListItemAccessPlan>,
-    pub exact_int_branch: Option<TypedExactIntBranchPlan>,
-    pub exact_int_return: Option<TypedExactIntReturnPlan>,
+    // Complete regions are optional sidecars, not inline storage paid by every
+    // recursive expression. Inlining clones and remaps only selected regions.
+    pub exact_int_branch: Option<Box<TypedExactIntBranchPlan>>,
+    pub exact_int_return: Option<Box<TypedExactIntReturnPlan>>,
     pub constructor_init: Option<TypedConstructorInitPlan>,
     pub builtin_implementation: Option<TypedBuiltinImplementationPlan>,
+    pub native_iterator_pipeline: Option<Box<TypedNativeIteratorPipelinePlan>>,
     pub resolved_descriptor_function_guards: Option<Vec<TypedDirectFunctionCallGuard>>,
     pub generator_instance: Option<TypedGeneratorInstancePlan>,
     pub generator_resume: Option<TypedGeneratorResumePlan>,
     pub opaque_fused_iteration: Option<TypedOpaqueFusedIterationPlan>,
     pub exact_float_expression: Option<TypedExactFloatExpressionPlan>,
+    // This source/ABI sidecar is large and present only on selected calls.
+    // Do not make every recursive typed expression pay its inline size.
+    pub source_call: Option<Box<TypedSourceCallPlan>>,
     pub guard_miss_deopt: bool,
 }
 
@@ -1567,6 +1713,17 @@ pub enum TypedBlockLayoutHint {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypedBlockExtra {
     pub layout: TypedBlockLayoutHint,
+    pub context: soac_core::block_py::BlockContext,
+}
+
+impl soac_core::block_py::HasBlockContext for TypedBlockExtra {
+    fn block_context(&self) -> soac_core::block_py::BlockContext {
+        self.context
+    }
+
+    fn set_block_context(&mut self, context: soac_core::block_py::BlockContext) {
+        self.context = context;
+    }
 }
 
 pub type TypedBlock = Block<InstrTyped, TypedBlockExtra>;
@@ -1691,18 +1848,18 @@ impl TypedInstrExtra {
     }
 
     pub fn exact_int_branch_plan(&self) -> Option<&TypedExactIntBranchPlan> {
-        self.exact_int_branch.as_ref()
+        self.exact_int_branch.as_deref()
     }
 
     pub fn exact_int_branch_plan_mut(&mut self) -> Option<&mut TypedExactIntBranchPlan> {
-        self.exact_int_branch.as_mut()
+        self.exact_int_branch.as_deref_mut()
     }
 
     pub fn set_exact_int_branch_plan(&mut self, plan: TypedExactIntBranchPlan) -> bool {
-        if self.exact_int_branch.as_ref() == Some(&plan) {
+        if self.exact_int_branch.as_deref() == Some(&plan) {
             return false;
         }
-        self.exact_int_branch = Some(plan);
+        self.exact_int_branch = Some(Box::new(plan));
         true
     }
 
@@ -1711,18 +1868,18 @@ impl TypedInstrExtra {
     }
 
     pub fn exact_int_return_plan(&self) -> Option<&TypedExactIntReturnPlan> {
-        self.exact_int_return.as_ref()
+        self.exact_int_return.as_deref()
     }
 
     pub fn exact_int_return_plan_mut(&mut self) -> Option<&mut TypedExactIntReturnPlan> {
-        self.exact_int_return.as_mut()
+        self.exact_int_return.as_deref_mut()
     }
 
     pub fn set_exact_int_return_plan(&mut self, plan: TypedExactIntReturnPlan) -> bool {
-        if self.exact_int_return.as_ref() == Some(&plan) {
+        if self.exact_int_return.as_deref() == Some(&plan) {
             return false;
         }
-        self.exact_int_return = Some(plan);
+        self.exact_int_return = Some(Box::new(plan));
         true
     }
 
@@ -1763,6 +1920,25 @@ impl TypedInstrExtra {
 
     pub fn clear_builtin_implementation_plan(&mut self) -> bool {
         self.builtin_implementation.take().is_some()
+    }
+
+    pub fn native_iterator_pipeline_plan(&self) -> Option<&TypedNativeIteratorPipelinePlan> {
+        self.native_iterator_pipeline.as_deref()
+    }
+
+    pub fn set_native_iterator_pipeline_plan(
+        &mut self,
+        plan: TypedNativeIteratorPipelinePlan,
+    ) -> bool {
+        if self.native_iterator_pipeline.as_deref() == Some(&plan) {
+            return false;
+        }
+        self.native_iterator_pipeline = Some(Box::new(plan));
+        true
+    }
+
+    pub fn clear_native_iterator_pipeline_plan(&mut self) -> bool {
+        self.native_iterator_pipeline.take().is_some()
     }
 
     pub fn generator_instance_plan(&self) -> Option<&TypedGeneratorInstancePlan> {
@@ -1865,8 +2041,31 @@ impl InstrTyped {
             Self::DelItem(op) => Some(op.extra()),
             Self::Store(op) => Some(op.extra()),
             Self::Del(op) => Some(op.extra()),
+            Self::TakeOperand(op) => Some(op.extra()),
+            Self::ComprehensionInsert(op) => Some(op.extra()),
+            Self::BuildCollection(op) => Some(op.extra()),
+            Self::CallArgumentOp(op) => Some(op.extra()),
+            Self::PreparedCall(op) => Some(op.extra()),
+            Self::IteratorStep(op) => Some(op.extra()),
             Self::MakeCell(op) => Some(op.extra()),
+            Self::NewAnnotationSet(op) => Some(op.extra()),
+            Self::SetupAnnotations(op) => Some(op.extra()),
+            Self::ConstructTypeParameterScope(op) => Some(op.extra()),
+            Self::SubscriptGeneric(op) => Some(op.extra()),
+            Self::SetFunctionTypeParameters(op) => Some(op.extra()),
+            Self::CreateTypeAlias(op) => Some(op.extra()),
+            Self::CreateTypeParameter(op) => Some(op.extra()),
+            Self::SetTypeParameterDefault(op) => Some(op.extra()),
+            Self::CheckAnnotationFormat(op) => Some(op.extra()),
+            Self::RecordAnnotation(op) => Some(op.extra()),
             Self::MakeFunctionWithClosure(op) => Some(op.extra()),
+            Self::ConstructClass(op) => Some(op.extra()),
+            Self::PrepareClassDecorator(op) => Some(op.extra()),
+            Self::ApplyClassDecorator(op) => Some(op.extra()),
+            Self::DiscardClassDecorator(op) => Some(op.extra()),
+            Self::DiscardClassConstructionCaptures(op) => Some(op.extra()),
+            Self::CompleteFunctionDefinition(op) => Some(op.extra()),
+            Self::ApplyFunctionDescriptor(op) => Some(op.extra()),
             Self::IncrementCounter(_) | Self::CellRef(_) => None,
         }
     }
@@ -1893,8 +2092,31 @@ impl InstrTyped {
             Self::DelItem(op) => Some(op.extra_mut()),
             Self::Store(op) => Some(op.extra_mut()),
             Self::Del(op) => Some(op.extra_mut()),
+            Self::TakeOperand(op) => Some(op.extra_mut()),
+            Self::ComprehensionInsert(op) => Some(op.extra_mut()),
+            Self::BuildCollection(op) => Some(op.extra_mut()),
+            Self::CallArgumentOp(op) => Some(op.extra_mut()),
+            Self::PreparedCall(op) => Some(op.extra_mut()),
+            Self::IteratorStep(op) => Some(op.extra_mut()),
             Self::MakeCell(op) => Some(op.extra_mut()),
+            Self::NewAnnotationSet(op) => Some(op.extra_mut()),
+            Self::SetupAnnotations(op) => Some(op.extra_mut()),
+            Self::ConstructTypeParameterScope(op) => Some(op.extra_mut()),
+            Self::SubscriptGeneric(op) => Some(op.extra_mut()),
+            Self::SetFunctionTypeParameters(op) => Some(op.extra_mut()),
+            Self::CreateTypeAlias(op) => Some(op.extra_mut()),
+            Self::CreateTypeParameter(op) => Some(op.extra_mut()),
+            Self::SetTypeParameterDefault(op) => Some(op.extra_mut()),
+            Self::CheckAnnotationFormat(op) => Some(op.extra_mut()),
+            Self::RecordAnnotation(op) => Some(op.extra_mut()),
             Self::MakeFunctionWithClosure(op) => Some(op.extra_mut()),
+            Self::ConstructClass(op) => Some(op.extra_mut()),
+            Self::PrepareClassDecorator(op) => Some(op.extra_mut()),
+            Self::ApplyClassDecorator(op) => Some(op.extra_mut()),
+            Self::DiscardClassDecorator(op) => Some(op.extra_mut()),
+            Self::DiscardClassConstructionCaptures(op) => Some(op.extra_mut()),
+            Self::CompleteFunctionDefinition(op) => Some(op.extra_mut()),
+            Self::ApplyFunctionDescriptor(op) => Some(op.extra_mut()),
             Self::IncrementCounter(_) | Self::CellRef(_) => None,
         }
     }
@@ -1914,6 +2136,11 @@ impl InstrTyped {
     pub fn builtin_implementation_plan(&self) -> Option<&TypedBuiltinImplementationPlan> {
         self.typed_extra()
             .and_then(TypedInstrExtra::builtin_implementation_plan)
+    }
+
+    pub fn native_iterator_pipeline_plan(&self) -> Option<&TypedNativeIteratorPipelinePlan> {
+        self.typed_extra()
+            .and_then(TypedInstrExtra::native_iterator_pipeline_plan)
     }
 
     pub fn generator_instance_plan(&self) -> Option<&TypedGeneratorInstancePlan> {
@@ -1939,6 +2166,15 @@ impl InstrTyped {
     pub fn guard_miss_deopt_enabled(&self) -> bool {
         self.typed_extra()
             .is_some_and(TypedInstrExtra::guard_miss_deopt_enabled)
+    }
+}
+
+impl soac_core::block_py::TakeOperandInstruction for InstrTyped {
+    fn as_take_operand(&self) -> Option<&TakeOperand<Self>> {
+        match self {
+            Self::TakeOperand(op) => Some(op),
+            _ => None,
+        }
     }
 }
 
@@ -1977,10 +2213,65 @@ impl MapInstr<InstrBlockPy, InstrTyped> for BlockPyToTyped {
             InstrBlockPy::Store(op) => InstrTyped::Store(op.map_children(self)),
             InstrBlockPy::Del(op) => InstrTyped::Del(op.map_children(self)),
             InstrBlockPy::MakeCell(op) => InstrTyped::MakeCell(op.map_children(self)),
+            InstrBlockPy::NewAnnotationSet(op) => {
+                InstrTyped::NewAnnotationSet(op.map_children(self))
+            }
+            InstrBlockPy::SetupAnnotations(op) => {
+                InstrTyped::SetupAnnotations(op.map_children(self))
+            }
+            InstrBlockPy::ConstructTypeParameterScope(op) => {
+                InstrTyped::ConstructTypeParameterScope(op.map_children(self))
+            }
+            InstrBlockPy::SubscriptGeneric(op) => {
+                InstrTyped::SubscriptGeneric(op.map_children(self))
+            }
+            InstrBlockPy::SetFunctionTypeParameters(op) => {
+                InstrTyped::SetFunctionTypeParameters(op.map_children(self))
+            }
+            InstrBlockPy::CreateTypeAlias(op) => InstrTyped::CreateTypeAlias(op.map_children(self)),
+            InstrBlockPy::CreateTypeParameter(op) => {
+                InstrTyped::CreateTypeParameter(op.map_children(self))
+            }
+            InstrBlockPy::SetTypeParameterDefault(op) => {
+                InstrTyped::SetTypeParameterDefault(op.map_children(self))
+            }
+            InstrBlockPy::CheckAnnotationFormat(op) => {
+                InstrTyped::CheckAnnotationFormat(op.map_children(self))
+            }
+            InstrBlockPy::RecordAnnotation(op) => {
+                InstrTyped::RecordAnnotation(op.map_children(self))
+            }
             InstrBlockPy::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
             InstrBlockPy::CellRef(op) => InstrTyped::CellRef(op),
             InstrBlockPy::MakeFunctionWithClosure(op) => {
                 InstrTyped::MakeFunctionWithClosure(op.map_children(self))
+            }
+            InstrBlockPy::ConstructClass(op) => InstrTyped::ConstructClass(op.map_children(self)),
+            InstrBlockPy::PrepareClassDecorator(op) => {
+                InstrTyped::PrepareClassDecorator(op.map_children(self))
+            }
+            InstrBlockPy::ApplyClassDecorator(op) => {
+                InstrTyped::ApplyClassDecorator(op.map_children(self))
+            }
+            InstrBlockPy::DiscardClassDecorator(op) => {
+                InstrTyped::DiscardClassDecorator(op.map_children(self))
+            }
+            InstrBlockPy::TakeOperand(op) => InstrTyped::TakeOperand(op.map_children(self)),
+            InstrBlockPy::ComprehensionInsert(op) => {
+                InstrTyped::ComprehensionInsert(op.map_children(self))
+            }
+            InstrBlockPy::BuildCollection(op) => InstrTyped::BuildCollection(op.map_children(self)),
+            InstrBlockPy::CallArgumentOp(op) => InstrTyped::CallArgumentOp(op.map_children(self)),
+            InstrBlockPy::PreparedCall(op) => InstrTyped::PreparedCall(op.map_children(self)),
+            InstrBlockPy::IteratorStep(op) => InstrTyped::IteratorStep(op.map_children(self)),
+            InstrBlockPy::DiscardClassConstructionCaptures(op) => {
+                InstrTyped::DiscardClassConstructionCaptures(op.map_children(self))
+            }
+            InstrBlockPy::CompleteFunctionDefinition(op) => {
+                InstrTyped::CompleteFunctionDefinition(op.map_children(self))
+            }
+            InstrBlockPy::ApplyFunctionDescriptor(op) => {
+                InstrTyped::ApplyFunctionDescriptor(op.map_children(self))
             }
         }
     }

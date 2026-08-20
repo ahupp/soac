@@ -21,7 +21,7 @@ use super::runtime_support::compile_runtime_support_clif_for_object;
 use super::symbols::direct_function_backend_name;
 use super::typed_pipeline::{
     apply_profile_call_emission_plans_to_typed_function, collect_codegen_constants_for_module_name,
-    optimize_blockpy,
+    optimize_blockpy_with_boundary_modules,
 };
 use super::{
     BuildSpecializedFunctionOptions, SpecializationProfile,
@@ -75,6 +75,7 @@ pub struct PrecompileModuleIndex {
     modules_by_identity: HashMap<(String, u64), PrecompileIndexedModule>,
     functions_by_id: HashMap<RuntimeFunctionId, PrecompileIndexedFunction>,
     ambiguous_function_ids: HashSet<RuntimeFunctionId>,
+    public_boundary_modules: HashSet<u32>,
 }
 
 impl PrecompileModuleIndex {
@@ -91,6 +92,9 @@ impl PrecompileModuleIndex {
     fn insert(&mut self, entry: PrecompileModuleIndexEntry<'_>) -> Result<(), String> {
         let identity = (entry.module_name.to_string(), entry.source_hash);
         let module_id = entry.module.module_name_gen.runtime_module_id();
+        if entry.module.strict_source.is_some() {
+            self.public_boundary_modules.insert(module_id.as_u32());
+        }
         if self
             .modules_by_identity
             .insert(identity.clone(), PrecompileIndexedModule { module_id })
@@ -135,7 +139,11 @@ impl PrecompileModuleIndex {
     }
 
     fn function(&self, function_id: RuntimeFunctionId) -> Option<&PrecompileIndexedFunction> {
-        if self.ambiguous_function_ids.contains(&function_id) {
+        if self.ambiguous_function_ids.contains(&function_id)
+            || self
+                .public_boundary_modules
+                .contains(&function_id.runtime_module_id().as_u32())
+        {
             return None;
         }
         self.functions_by_id.get(&function_id)
@@ -164,7 +172,11 @@ fn precompile_external_direct_call_target_functions(
     let mut target_ids = HashSet::new();
     for function in &module.callable_defs {
         let mut typed_function = function.clone();
-        apply_profile_call_emission_plans_to_typed_function(&mut typed_function, profile)?;
+        apply_profile_call_emission_plans_to_typed_function(
+            &mut typed_function,
+            profile,
+            &module_index.public_boundary_modules,
+        )?;
         lower_typed_function_call_access_plan_instrs(&mut typed_function);
         target_ids.extend(collect_typed_call_direct_targets(&typed_function));
     }
@@ -287,7 +299,14 @@ pub(super) fn precompile_codegen_module_to_object_bytes(
         module_index,
         counter_dump_path,
     )?;
-    let jit_module_plan = optimize_blockpy(module, Some(&specialization_profile), env_config)?;
+    let jit_module_plan = optimize_blockpy_with_boundary_modules(
+        module,
+        Some(&specialization_profile),
+        env_config,
+        module_index
+            .map(|index| index.public_boundary_modules.clone())
+            .unwrap_or_default(),
+    )?;
     let planned_module = jit_module_plan.module.as_ref();
 
     let module_constants = collect_codegen_constants_for_module_name(module_name, planned_module);

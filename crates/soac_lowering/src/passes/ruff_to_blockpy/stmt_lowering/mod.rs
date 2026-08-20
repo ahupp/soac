@@ -1,5 +1,5 @@
 use super::*;
-use crate::block_py::{BlockTerm, Expr, HasMeta, TermRaise, WithMeta};
+use crate::block_py::{BlockTerm, Expr, HasMeta, RaiseDisposition, TermRaise, WithMeta};
 use crate::passes::ast_to_ast::ast_rewrite::Rewrite;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::InstrRuff;
@@ -236,6 +236,7 @@ pub(super) fn simplify_instr_head_for_blockpy(
         ),
         InstrRuff::StmtImport(stmt) => instrs_from_rewrite(
             crate::passes::ast_to_ast::rewrite_import::rewrite(ast::StmtImport {
+                is_lazy: false,
                 range: stmt.meta().range,
                 node_index: stmt.meta().node_index,
                 names: stmt.names,
@@ -245,6 +246,7 @@ pub(super) fn simplify_instr_head_for_blockpy(
             instrs_from_rewrite(crate::passes::ast_to_ast::rewrite_import::rewrite_from(
                 context,
                 ast::StmtImportFrom {
+                    is_lazy: false,
                     range: stmt.meta().range,
                     node_index: stmt.meta().node_index,
                     module: stmt.module,
@@ -308,7 +310,9 @@ fn plan_simplified_instr_head_for_blockpy(
         | InstrRuff::StmtNonlocal(_)
         | InstrRuff::StmtAugAssign(_)
         | InstrRuff::StmtTypeAlias(_)
-        | InstrRuff::StmtImportFrom(_) => StmtSequenceHeadPlan::Linear(simplified),
+        | InstrRuff::StmtImportFrom(_)
+        | InstrRuff::Store(_)
+        | InstrRuff::TakeOperand(_) => StmtSequenceHeadPlan::Linear(simplified),
         InstrRuff::StmtFunctionDef(func_def) => StmtSequenceHeadPlan::FunctionDef(func_def),
         InstrRuff::StmtRaise(raise_stmt) => StmtSequenceHeadPlan::Raise(raise_stmt),
         InstrRuff::StmtReturn(ret) => StmtSequenceHeadPlan::Return(*ret.value),
@@ -395,6 +399,34 @@ where
         };
     match stmt {
         InstrRuff::StmtGlobal(_) | InstrRuff::StmtNonlocal(_) | InstrRuff::StmtPass(_) => Ok(()),
+        InstrRuff::Store(store) => {
+            let value =
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context,
+                    (*store.value).clone(),
+                    out,
+                    loop_ctx,
+                )?;
+            out.push_stmt(
+                crate::block_py::Store::new(store.name.clone(), value)
+                    .with_lifetime(store.lifetime)
+                    .with_purpose(store.purpose)
+                    .with_meta(store.meta())
+                    .into(),
+            );
+            Ok(())
+        }
+        InstrRuff::TakeOperand(_) => {
+            let value =
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context,
+                    stmt.clone(),
+                    out,
+                    loop_ctx,
+                )?;
+            out.push_stmt(value);
+            Ok(())
+        }
         InstrRuff::StmtExpr(stmt) => {
             if let Some(lowered) =
                 crate::passes::ruff_to_blockpy::expr_lowering::try_lower_effect_only_expr_direct_with_context(
@@ -486,7 +518,10 @@ where
                     )
                 })
                 .transpose()?;
-            out.set_term(BlockTerm::Raise(TermRaise { exc }));
+            out.set_term(BlockTerm::Raise(TermRaise {
+                exc,
+                disposition: RaiseDisposition::Source,
+            }));
             Ok(())
         }
         InstrRuff::StmtFunctionDef(func_def) => {

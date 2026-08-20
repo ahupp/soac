@@ -402,7 +402,7 @@ macro_rules! define_instr {
         [$($struct_fields:tt)*]
         [$($ctor_args:tt)*]
         [$($ctor_init:tt)*]
-        $field:ident : Option<Box<$inner_expr_ty:ident>>,
+        $field:ident : Option<$wrapper:ident<$inner_expr_ty:ident>>,
         $($rest:tt)*
     ) => {
         define_instr!(
@@ -412,8 +412,8 @@ macro_rules! define_instr {
             [$name]
             [$expr_ty]
             [$($raw_fields)*]
-            [$($struct_fields)* pub $field: Option<Box<$inner_expr_ty>>,]
-            [$($ctor_args)* $field: impl Into<Option<Box<$inner_expr_ty>>>,]
+            [$($struct_fields)* pub $field: Option<$wrapper<$inner_expr_ty>>,]
+            [$($ctor_args)* $field: impl Into<Option<$wrapper<$inner_expr_ty>>>,]
             [$($ctor_init)* $field: $field.into(),]
             $($rest)*
         );
@@ -428,7 +428,7 @@ macro_rules! define_instr {
         [$($struct_fields:tt)*]
         [$($ctor_args:tt)*]
         [$($ctor_init:tt)*]
-        $field:ident : Option<Box<$inner_expr_ty:ident>>
+        $field:ident : Option<$wrapper:ident<$inner_expr_ty:ident>>
     ) => {
         define_instr!(
             @collect_fields
@@ -437,8 +437,8 @@ macro_rules! define_instr {
             [$name]
             [$expr_ty]
             [$($raw_fields)*]
-            [$($struct_fields)* pub $field: Option<Box<$inner_expr_ty>>,]
-            [$($ctor_args)* $field: impl Into<Option<Box<$inner_expr_ty>>>,]
+            [$($struct_fields)* pub $field: Option<$wrapper<$inner_expr_ty>>,]
+            [$($ctor_args)* $field: impl Into<Option<$wrapper<$inner_expr_ty>>>,]
             [$($ctor_init)* $field: $field.into(),]
         );
     };
@@ -531,11 +531,11 @@ macro_rules! define_instr {
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
         $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
     };
-    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
         define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
-    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
@@ -560,13 +560,13 @@ macro_rules! define_instr {
             $visitor.visit_instr(item);
         }
     };
-    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         if let Some(item) = &$self.$field {
             $visitor.visit_instr(item);
         }
         define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
-    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         if let Some(item) = &$self.$field {
             $visitor.visit_instr(item);
         }
@@ -586,11 +586,11 @@ macro_rules! define_instr {
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
         $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
     };
-    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
         define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
-    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
@@ -615,13 +615,13 @@ macro_rules! define_instr {
             $visitor.visit_instr_mut(item);
         }
     };
-    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         if let Some(item) = &mut $self.$field {
             $visitor.visit_instr_mut(item);
         }
         define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
-    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         if let Some(item) = &mut $self.$field {
             $visitor.visit_instr_mut(item);
         }
@@ -665,14 +665,14 @@ macro_rules! define_instr {
         std::fmt::Write::write_str($printer, $sep)?;
         define_instr!(@pretty_field $printer, & $self.$field, [Vec<$expr_ty>])
     }};
-    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {{
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {{
         std::fmt::Write::write_str($printer, $sep)?;
-        define_instr!(@pretty_field $printer, & $self.$field, [Option<Box<$expr_ty>>])?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Option<$wrapper<$expr_ty>>])?;
         define_instr!(@pretty_tuple_fields $printer, $self, ", ", $($rest)*)
     }};
-    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Option<Box<$expr_ty:ident>>) => {{
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {{
         std::fmt::Write::write_str($printer, $sep)?;
-        define_instr!(@pretty_field $printer, & $self.$field, [Option<Box<$expr_ty>>])
+        define_instr!(@pretty_field $printer, & $self.$field, [Option<$wrapper<$expr_ty>>])
     }};
     (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : $ty:ty, $($rest:tt)*) => {{
         std::fmt::Write::write_str($printer, $sep)?;
@@ -692,7 +692,7 @@ macro_rules! define_instr {
     (@pretty_field $printer:ident, $value:expr, [Vec<$expr_ty:ident>]) => {
         $crate::block_py::PrettyPrint::fmt_pretty($value, $printer)
     };
-    (@pretty_field $printer:ident, $value:expr, [Option<Box<$expr_ty:ident>>]) => {
+    (@pretty_field $printer:ident, $value:expr, [Option<$wrapper:ident<$expr_ty:ident>>]) => {
         $crate::block_py::PrettyPrint::fmt_pretty($value, $printer)
     };
     (@pretty_field $printer:ident, $value:expr, [$ty:ty]) => {
@@ -756,7 +756,7 @@ macro_rules! define_instr {
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
         $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
     };
-    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
@@ -766,7 +766,7 @@ macro_rules! define_instr {
             $($rest)*
         )
     };
-    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
@@ -821,7 +821,7 @@ macro_rules! define_instr {
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
         $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: self.$field.into_iter().map(|value| $map.map_instr(value)).collect(), }
     };
-    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
@@ -831,7 +831,7 @@ macro_rules! define_instr {
             $($rest)*
         )
     };
-    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $self.$field.map(|value| Box::new($map.map_instr(*value))), }
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident,) => {
@@ -863,7 +863,7 @@ macro_rules! define_instr {
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
     };
-    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
@@ -873,7 +873,7 @@ macro_rules! define_instr {
             $($rest)*
         )
     };
-    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
@@ -928,7 +928,7 @@ macro_rules! define_instr {
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $self.$field.into_iter().map(|value| $map.try_map_instr(value)).collect::<Result<Vec<_>, _>>()?, })
     };
-    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
@@ -938,7 +938,7 @@ macro_rules! define_instr {
             $($rest)*
         )
     };
-    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $self.$field.map(|value| $map.try_map_instr(*value).map(Box::new)).transpose()?, })
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident,) => {
@@ -970,7 +970,7 @@ macro_rules! define_instr {
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
         $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
     };
-    (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         define_instr!(
             @build_same_mapped
             [$($mapped_ctor)+]
@@ -980,7 +980,7 @@ macro_rules! define_instr {
             $($rest)*
         )
     };
-    (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
@@ -1051,7 +1051,7 @@ macro_rules! define_instr {
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
     };
-    (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
+    (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
         define_instr!(
             @build_try_same_mapped
             [$($mapped_ctor)+]
@@ -1061,7 +1061,7 @@ macro_rules! define_instr {
             $($rest)*
         )
     };
-    (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
+    (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<$wrapper:ident<$expr_ty:ident>>) => {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {

@@ -232,7 +232,7 @@ fn lower_function(
                 node_index: ast::AtomicNodeIndex::default(),
             }),
             InlineCompKind::Dict => Expr::DictComp(ast::ExprDictComp {
-                key: Box::new(elt_or_key),
+                key: Some(Box::new(elt_or_key)),
                 value: Box::new(value.unwrap_or_else(|| py_expr!("None"))),
                 generators,
                 range: TextRange::default(),
@@ -292,7 +292,15 @@ fn lower_function(
     let result_expr = py_expr!("{name:id}", name = result_name.as_str());
     let init_stmt = match kind {
         InlineCompKind::List => py_stmt!("{name:id} = []", name = result_name.as_str()),
-        InlineCompKind::Set => py_stmt!("{name:id} = set()", name = result_name.as_str()),
+        InlineCompKind::Set => py_stmt!(
+            "{name:id} = {empty:expr}",
+            name = result_name.as_str(),
+            empty = Expr::Set(ast::ExprSet {
+                elts: Vec::new(),
+                range: TextRange::default(),
+                node_index: ast::AtomicNodeIndex::default(),
+            }),
+        ),
         InlineCompKind::Dict => py_stmt!("{name:id} = {}", name = result_name.as_str()),
     };
 
@@ -460,7 +468,7 @@ for {target:expr} in {iter:expr}:
     func_body.extend(body);
     func_body.push(py_stmt!("return {result:expr}", result = result_expr));
 
-    func_def.body = func_body;
+    func_def.body = func_body.into();
 
     let mut prefix: Vec<Stmt> = Vec::new();
     for name in dummy_targets {
@@ -577,7 +585,7 @@ fn expr_requires_async(expr: &Expr) -> bool {
                     generators,
                     ..
                 }) => {
-                    if comp_is_async(key.as_ref(), Some(value.as_ref()), generators) {
+                    if comp_is_async(value.as_ref(), key.as_deref(), generators) {
                         self.found = true;
                     }
                     return;

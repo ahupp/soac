@@ -1,202 +1,194 @@
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import textwrap
+import pytest
+
+from tests._strict_integration import create_strict_project
 
 
-def test_synthetic_functions_reuse_prepared_code_metadata_without_extra_events(
-    tmp_path: Path,
-) -> None:
-    module_name = "synthetic_function_metadata_case"
-    (tmp_path / f"{module_name}.py").write_text(
-        textwrap.dedent(
-            """
-            def captured(offset):
-                return [offset + value for value in range(3)]
+# Original ordinary source, retained unchanged. Strict enrollment is explicit
+# in the fixture; import-hook/mode settings alone are never admission evidence.
+_MODULE_SOURCE = """
+def captured(offset):
+    return [offset + value for value in range(3)]
 
 
-            def noncanonical(offset):
-                return [offset + value for value in range(3)]
+def noncanonical(offset):
+    return [offset + value for value in range(3)]
 
 
-            def original_outer(offset):
-                def original_inner(value):
-                    return offset + value
+def original_outer(offset):
+    def original_inner(value):
+        return offset + value
 
-                return original_inner
-            """
-        ),
-        encoding="utf-8",
+    return original_inner
+"""
+
+
+@pytest.fixture(scope="module", params=("soac", "cpython"))
+def metadata_project(tmp_path_factory, request):
+    return create_strict_project(
+        tmp_path_factory.mktemp(f"source-metadata-{request.param}"),
+        {
+            "metadata_source.py": "from __future__ import strict\n" + _MODULE_SOURCE,
+            "metadata_ordinary.py": _MODULE_SOURCE,
+        },
+        modules={"metadata_source": "metadata_source.py"},
+        backend=request.param,
     )
 
-    script = textwrap.dedent(
-        f"""
-        import ctypes
-        import json
-        import sys
 
-        sys.path.insert(0, {str(tmp_path)!r})
-        from soac.import_hook import install
-        install()
-        import {module_name} as module
-        import soac.bootstrap as bootstrap
-        import soac.runtime as runtime
-
-        EVENT_CREATE = 0
-        EVENT_MODIFY_QUALNAME = 5
-        created = []
-        qualname_changes = []
-        callback_errors = []
-
-        callback_type = ctypes.CFUNCTYPE(
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
+def test_actual_source_function_metadata_cells_and_callbacks(metadata_project):
+    path = metadata_project.root / "metadata-validation.py"
+    path.write_text(_VALIDATION)
+    for entry in ((False, True) if metadata_project.backend == "soac" else (False,)):
+        metadata_project.run_case(
+            "metadata_source", _VALIDATION, path, entry_interpreter=entry,
+            required_functions=("captured", "noncanonical", "original_outer"),
         )
 
-        @callback_type
-        def watch_function(event, function_ptr, _new_value):
-            if event not in (EVENT_CREATE, EVENT_MODIFY_QUALNAME):
-                return 0
-            try:
-                function = ctypes.cast(function_ptr, ctypes.py_object).value
-                code = function.__code__
-                if (
-                    code.co_name == "<listcomp>"
-                    and code.co_qualname.startswith("captured.<locals>.")
-                    and function.__globals__ is module.__dict__
-                ):
-                    if event == EVENT_CREATE:
-                        created.append(function)
-                    else:
-                        qualname_changes.append(code.co_qualname)
-            except BaseException as error:
-                callback_errors.append(type(error).__name__)
+
+_VALIDATION = r'''
+import ctypes
+import sys
+import types
+import metadata_ordinary as stock
+from soac import _soac_ext
+
+def validate_module(module):
+    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
+    owner.argtypes = [ctypes.py_object]
+    owner.restype = ctypes.c_void_p
+    seal = ctypes.pythonapi.PyFunction_GetSoacStrictId
+    seal.argtypes = [ctypes.py_object]
+    seal.restype = ctypes.c_uint64
+    source_id = ctypes.pythonapi.PyCode_GetSoacStrictSourceId
+    source_id.argtypes = [ctypes.py_object]
+    source_id.restype = ctypes.c_uint64
+    assert owner(stock.original_outer) is None and seal(stock.original_outer) == 0
+    created = {"ordinary": [], "strict": []}
+    qualname_changes, callback_errors, code_events, explicit_audits = [], [], [], []
+    reject_audit = False
+    audit_error = RuntimeError("explicit code audit rejected")
+
+    def audit(event, arguments):
+        if event == "code.__new__" and len(arguments) >= 3:
+            # Observe all real events without prescribing whether an internal
+            # comprehension code object must be allocated or eliminated.
+            code_events.append(arguments[2])
+            if arguments[2] == "soac_explicit_metadata_audit":
+                explicit_audits.append("code.__new__")
+                if reject_audit:
+                    raise audit_error
+    sys.addaudithook(audit)
+
+    callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    @callback_type
+    def watch(event, pointer, new_value):
+        if event not in (0, 5):
             return 0
-
-        add_watcher = ctypes.pythonapi.PyFunction_AddWatcher
-        add_watcher.argtypes = [callback_type]
-        add_watcher.restype = ctypes.c_int
-        clear_watcher = ctypes.pythonapi.PyFunction_ClearWatcher
-        clear_watcher.argtypes = [ctypes.c_int]
-        clear_watcher.restype = ctypes.c_int
-
-        watcher_id = add_watcher(watch_function)
-        assert watcher_id >= 0, watcher_id
-
         try:
-            assert module.captured(0) == [0, 1, 2]
-            canonical_created = len(created)
-            assert canonical_created == 0, (created, callback_errors)
+            function = ctypes.cast(pointer, ctypes.py_object).value
+            code = function.__code__
+            if code.co_name != "original_inner":
+                return 0
+            if function.__globals__ is module.__dict__:
+                group = "strict"
+            elif function.__globals__ is stock.__dict__:
+                group = "ordinary"
+            else:
+                return 0
+            if event == 0:
+                created[group].append(function)
+            else:
+                qualname_changes.append((group, function, ctypes.cast(new_value, ctypes.py_object).value))
+        except BaseException as error:
+            callback_errors.append(type(error).__name__)
+        return 0
 
-            class NoncanonicalCodeCache(dict):
-                pass
+    add = ctypes.pythonapi.PyFunction_AddWatcher
+    add.argtypes = [callback_type]
+    add.restype = ctypes.c_int
+    clear = ctypes.pythonapi.PyFunction_ClearWatcher
+    clear.argtypes = [ctypes.c_int]
+    clear.restype = ctypes.c_int
+    watcher = add(watch)
+    assert watcher >= 0
+    try:
+        for offset in (0, 1, 10, 100):
+            assert module.captured(offset) == stock.captured(offset) == [offset + value for value in range(3)]
+        for offset in (5, 50):
+            assert module.noncanonical(offset) == stock.noncanonical(offset) == [offset + value for value in range(3)]
 
-            original_cache = bootstrap._DP_CODE_WITH_FREEVARS_CACHE
-            values = []
-            bootstrap._DP_CODE_WITH_FREEVARS_CACHE = NoncanonicalCodeCache(
-                original_cache
-            )
-            try:
-                for offset in (1, 10, 100):
-                    values.append(module.captured(offset))
-            finally:
-                bootstrap._DP_CODE_WITH_FREEVARS_CACHE = original_cache
-            assert values == [[1, 2, 3], [10, 11, 12], [100, 101, 102]]
-            assert len(created) == 3, (len(created), callback_errors)
-
-            cells = []
-            for function in created:
-                offset_index = function.__code__.co_freevars.index("offset")
-                cells.append(function.__closure__[offset_index])
-            assert len({{id(function) for function in created}}) == 3
-            assert len({{id(cell) for cell in cells}}) == 3
+        ordinary = [stock.original_outer(offset) for offset in (1, 10, 100)]
+        actual = [module.original_outer(offset) for offset in (1, 10, 100)]
+        assert created == {"ordinary": ordinary, "strict": actual}
+        for functions in (ordinary, actual):
+            assert all(type(function) is types.FunctionType for function in functions)
+            assert len({id(function) for function in functions}) == 3
+            assert functions[0].__code__ is functions[1].__code__ is functions[2].__code__
+            cells = [function.__closure__[function.__code__.co_freevars.index("offset")] for function in functions]
+            assert len({id(cell) for cell in cells}) == 3
             assert [cell.cell_contents for cell in cells] == [1, 10, 100]
+            assert [function(1) for function in functions] == [2, 11, 101]
+            for function in functions:
+                assert function.__name__ == "original_inner"
+                assert function.__qualname__ == "original_outer.<locals>.original_inner"
+                assert function.__name__ is function.__code__.co_name
+                assert function.__qualname__ is function.__code__.co_qualname
+        # Real source-created functions are observable. Unlike an eliminated
+        # internal helper, their creation and initial metadata callbacks remain
+        # required behavior, not an optimization-count assertion.
+        assert qualname_changes == []
+        before = [(owner(function), seal(function), function.__code__) for function in actual]
+        assert all(actual_owner and actual_seal and source_id(code) for actual_owner, actual_seal, code in before)
+        assert all(owner(function) is None and seal(function) == 0 and source_id(function.__code__) == 0 for function in ordinary)
+        for function in actual:
+            if __dp_integration_mode__ == "cpython":
+                diagnostic = _soac_ext.strict_function_diagnostics(function)
+                assert diagnostic["backend"] == "cpython" and diagnostic["entry_kind"] == "original_code"
+            else:
+                expected = "entry_interpreter" if __dp_integration_entry__ else "checked_native"
+                assert _soac_ext.strict_function_entry_kind(function) == expected
 
-            name_identity = [
-                function.__name__ is function.__code__.co_name
-                for function in created
-            ]
-            qualname_identity = [
-                function.__qualname__ is function.__code__.co_qualname
-                for function in created
-            ]
-            canonical_qualname_changes = list(qualname_changes)
+        # Display names are not protected code/default/dispatch metadata. Keep
+        # their actual supported setters, including their explicit watcher event.
+        for functions in (ordinary, actual):
+            functions[0].__name__ = "user_name"
+            functions[0].__qualname__ = "user.qualname"
+            assert functions[0].__name__ == "user_name"
+            assert functions[0].__qualname__ == "user.qualname"
+            assert functions[1].__name__ == "original_inner"
+            assert functions[1].__qualname__ == "original_outer.<locals>.original_inner"
+            assert functions[0].__code__.co_name == "original_inner"
+            assert functions[0].__code__.co_qualname == "original_outer.<locals>.original_inner"
+            assert [function(1) for function in functions] == [2, 11, 101]
+        assert qualname_changes == [("ordinary", ordinary[0], "user.qualname"), ("strict", actual[0], "user.qualname")]
+        assert before == [(owner(function), seal(function), function.__code__) for function in actual]
+        try:
+            actual[0].__code__ = actual[0].__code__
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("display-name mutation reopened sealed source code")
+        assert before == [(owner(function), seal(function), function.__code__) for function in actual]
 
-            original_factory = runtime.code_with_freevars
-            fallback_calls = []
-
-            def noncanonical_factory(names, is_async, is_generator):
-                fallback_calls.append(tuple(names))
-                return original_factory(names, is_async, is_generator)
-
-            runtime.code_with_freevars = noncanonical_factory
-            try:
-                assert module.noncanonical(5) == [5, 6, 7]
-                assert module.noncanonical(50) == [50, 51, 52]
-            finally:
-                runtime.code_with_freevars = original_factory
-            assert len(fallback_calls) == 2, fallback_calls
-
-            first = module.original_outer(7)
-            second = module.original_outer(70)
-            assert first is not second
-            assert first(1) == 8
-            assert second(1) == 71
-            assert first.__code__ is second.__code__
-            assert first.__name__ == "original_inner"
-            assert first.__qualname__ == "original_outer.<locals>.original_inner"
+        # These ordinary, explicit code operations must still deliver audit
+        # callbacks, including callback exceptions. They grant no source owner.
+        copied = ordinary[0].__code__.replace(co_name="soac_explicit_metadata_audit")
+        assert copied.co_name == "soac_explicit_metadata_audit" and source_id(copied) == 0
+        reject_audit = True
+        try:
+            ordinary[0].__code__.replace(co_name="soac_explicit_metadata_audit")
+        except RuntimeError as error:
+            assert error is audit_error
+        else:
+            raise AssertionError("code.__new__ audit exception was suppressed")
         finally:
-            assert clear_watcher(watcher_id) == 0
-
-        created[0].__name__ = "user_name"
-        created[0].__qualname__ = "user.qualname"
-        assert created[0].__name__ == "user_name"
-        assert created[0].__qualname__ == "user.qualname"
-        assert created[1].__name__ == "<listcomp>"
-
-        print(json.dumps({{
-            "canonical_created": canonical_created,
-            "created": len(created),
-            "name_identity": name_identity,
-            "qualname_identity": qualname_identity,
-            "qualname_changes": canonical_qualname_changes,
-            "fallback_calls": len(fallback_calls),
-            "callback_errors": callback_errors,
-        }}))
-        """
-    )
-
-    env = dict(os.environ)
-    env.pop("SOAC_LOG", None)
-    env.update(
-        {
-            "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
-            "SOAC_WORK_DIR": str(tmp_path / "soac-work"),
-            "SOAC_OPT_MODE": "apply",
-            "SOAC_COMPILE_MODE": "eager",
-            "SOAC_BACKGROUND_JIT": "0",
-        }
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=45,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    result = json.loads(completed.stdout.splitlines()[-1])
-    assert result["callback_errors"] == []
-    assert result["canonical_created"] == 0
-    assert result["created"] == 3
-    assert result["name_identity"] == [True, True, True], result
-    assert result["qualname_identity"] == [True, True, True], result
-    assert result["qualname_changes"] == [], result
-    assert result["fallback_calls"] == 2
+            reject_audit = False
+        assert explicit_audits == ["code.__new__", "code.__new__"]
+        assert code_events.count("soac_explicit_metadata_audit") == 2
+        assert callback_errors == []
+        assert [function(1) for function in actual] == [2, 11, 101]
+    finally:
+        assert clear(watcher) == 0
+'''

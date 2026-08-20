@@ -9,6 +9,274 @@ use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::test_name_gen;
 use ruff_python_ast::{Expr, Stmt};
 
+fn lowered_assignment_function(
+    source: &str,
+) -> crate::block_py::BlockPyFunction<soac_ir_blockpy::BlockPyModuleShape> {
+    crate::lower_python_to_blockpy_for_testing(source)
+        .expect("assignment source should lower through the production pipeline")
+        .blockpy_module
+        .callable_defs
+        .into_iter()
+        .find(|function| function.names.qualname == "assign")
+        .expect("the source assignment function must remain present")
+}
+
+fn assignment_normal_path(
+    function: &crate::block_py::BlockPyFunction<soac_ir_blockpy::BlockPyModuleShape>,
+) -> Vec<&soac_ir_blockpy::InstrBlockPy> {
+    let mut visited = std::collections::HashSet::new();
+    let mut block = function.entry_block();
+    let mut result = Vec::new();
+    loop {
+        assert!(
+            visited.insert(block.label),
+            "the assignment source has no loop"
+        );
+        result.extend(&block.body);
+        match &block.term {
+            crate::block_py::BlockTerm::Jump(edge) => {
+                block = function
+                    .blocks
+                    .iter()
+                    .find(|block| block.label == edge.target)
+                    .unwrap();
+            }
+            crate::block_py::BlockTerm::Return(_) => return result,
+            _ => panic!("the source assignment's successful path is straight-line"),
+        }
+    }
+}
+
+#[test]
+fn assignment_operand_sole_attribute_moves_replacement_and_captured_receiver() {
+    use soac_ir_blockpy::InstrBlockPy;
+
+    let function =
+        lowered_assignment_function("def assign(target, make):\n    target().value = make()\n");
+    let path = assignment_normal_path(&function);
+    let layout = function.storage_layout().as_ref().unwrap();
+    let (set_index, set) = path
+        .iter()
+        .enumerate()
+        .find_map(|(index, instr)| match instr {
+            InstrBlockPy::SetAttr(op) => Some((index, op)),
+            _ => None,
+        })
+        .expect("the source attribute assignment must remain an explicit operation");
+    let InstrBlockPy::TakeOperand(replacement) = set.replacement.as_ref() else {
+        panic!("the sole target consumes its staged replacement without a second owner");
+    };
+    let InstrBlockPy::TakeOperand(receiver) = set.value.as_ref() else {
+        panic!("a captured receiver moves into the setter without a second owner");
+    };
+    for take in [replacement, receiver] {
+        take.validate_resolved(layout).unwrap();
+        let stores = path[..set_index]
+            .iter()
+            .filter_map(|instr| match instr {
+                InstrBlockPy::Store(store) if store.name.location == take.name.location => {
+                    Some(store)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1, "the source child is acquired only once");
+        assert!(matches!(stores[0].lifetime, StoreLifetime::Operand { .. }));
+        assert!(matches!(stores[0].value.as_ref(), InstrBlockPy::Call(_)));
+        assert!(
+            !path[set_index + 1..].iter().any(|instr| matches!(
+                instr,
+                InstrBlockPy::Del(del) if del.name.location == take.name.location
+            )),
+            "a moved operand must not be deleted again after the setter"
+        );
+    }
+}
+
+#[test]
+fn assignment_operand_subscript_moves_receiver_key_and_replacement() {
+    use soac_ir_blockpy::InstrBlockPy;
+
+    let function = lowered_assignment_function(
+        "def assign(target, key, make):\n    target()[key()] = make()\n",
+    );
+    let path = assignment_normal_path(&function);
+    let layout = function.storage_layout().as_ref().unwrap();
+    let (set_index, set) = path
+        .iter()
+        .enumerate()
+        .find_map(|(index, instr)| match instr {
+            InstrBlockPy::SetItem(op) => Some((index, op)),
+            _ => None,
+        })
+        .expect("the source subscript assignment remains an explicit operation");
+    let mut acquired = Vec::new();
+    for input in [
+        set.replacement.as_ref(),
+        set.value.as_ref(),
+        set.index.as_ref(),
+    ] {
+        let InstrBlockPy::TakeOperand(take) = input else {
+            panic!("every captured source input must move into the setter");
+        };
+        take.validate_resolved(layout).unwrap();
+        let stores = path[..set_index]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instr)| match instr {
+                InstrBlockPy::Store(store) if store.name.location == take.name.location => {
+                    Some((index, store))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1, "each source child is acquired once");
+        assert!(matches!(
+            stores[0].1.lifetime,
+            StoreLifetime::Operand { .. }
+        ));
+        assert!(matches!(stores[0].1.value.as_ref(), InstrBlockPy::Call(_)));
+        acquired.push(stores[0].0);
+        assert!(
+            !path[set_index + 1..].iter().any(|instr| matches!(
+                instr,
+                InstrBlockPy::Del(del) if del.name.location == take.name.location
+            )),
+            "the operation already owns the captured input on both result edges"
+        );
+    }
+    assert!(acquired[0] < acquired[1] && acquired[1] < acquired[2]);
+}
+
+#[test]
+fn assignment_operand_chained_targets_copy_until_the_last_move() {
+    use soac_ir_blockpy::InstrBlockPy;
+
+    let function = lowered_assignment_function(
+        "def assign(first, second, make):\n    first().value = second().value = make()\n",
+    );
+    let path = assignment_normal_path(&function);
+    let setters = path
+        .iter()
+        .filter_map(|instr| match instr {
+            InstrBlockPy::SetAttr(op) => Some(op),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [first, last] = setters.as_slice() else {
+        panic!("both source targets must execute in order");
+    };
+    let InstrBlockPy::TakeOperand(copy) = first.replacement.as_ref() else {
+        panic!("the earlier target consumes its explicit COPY operand");
+    };
+    let InstrBlockPy::TakeOperand(take) = last.replacement.as_ref() else {
+        panic!("only the last target consumes the staged RHS owner");
+    };
+    assert_ne!(copy.name.location, take.name.location);
+    let copy_store = path
+        .iter()
+        .find_map(|instr| match instr {
+            InstrBlockPy::Store(store) if store.name.location == copy.name.location => Some(store),
+            _ => None,
+        })
+        .expect("an earlier target must acquire a separate owned duplicate");
+    assert!(matches!(copy_store.lifetime, StoreLifetime::Operand { .. }));
+    assert!(
+        matches!(
+            copy_store.value.as_ref(),
+            InstrBlockPy::Load(load) if load.name.location == take.name.location
+        ),
+        "the duplicate must come from the once-evaluated original RHS"
+    );
+    copy.validate_resolved(function.storage_layout().as_ref().unwrap())
+        .unwrap();
+    take.validate_resolved(function.storage_layout().as_ref().unwrap())
+        .unwrap();
+    assert_eq!(
+        path.iter()
+            .filter(|instr| matches!(
+                instr,
+                InstrBlockPy::Store(store) if store.name.location == take.name.location
+            ))
+            .count(),
+        1,
+        "chained assignment evaluates its RHS once"
+    );
+    assert!(setters
+        .iter()
+        .all(|set| matches!(set.value.as_ref(), InstrBlockPy::TakeOperand(_))));
+    assert!(
+        !path.iter().any(|instr| matches!(
+            instr,
+            InstrBlockPy::Del(del) if del.name.location == take.name.location
+        )),
+        "the final move already clears the staged RHS"
+    );
+}
+
+#[test]
+fn assignment_operand_receiver_failure_precedes_replacement_consumption() {
+    use crate::block_py::instr_any;
+    use soac_ir_blockpy::InstrBlockPy;
+
+    let function = lowered_assignment_function(
+        "def assign(receiver, make, record):\n    try:\n        receiver().value = make()\n    except LookupError:\n        record()\n",
+    );
+    let path = assignment_normal_path(&function);
+    let (set_index, set) = path
+        .iter()
+        .enumerate()
+        .find_map(|(index, instr)| match instr {
+            InstrBlockPy::SetAttr(op) => Some((index, op)),
+            _ => None,
+        })
+        .expect("source setter");
+    let InstrBlockPy::TakeOperand(replacement) = set.replacement.as_ref() else {
+        panic!("the replacement moves only at the final setter operation");
+    };
+    let InstrBlockPy::TakeOperand(receiver) = set.value.as_ref() else {
+        panic!("the successfully prepared receiver moves into the setter");
+    };
+    let acquisition_index = |location| {
+        path.iter()
+            .position(|instr| {
+                matches!(
+                    instr,
+                    InstrBlockPy::Store(store) if store.name.location == location
+                )
+            })
+            .expect("explicit Operand acquisition")
+    };
+    let rhs_index = acquisition_index(replacement.name.location);
+    let receiver_index = acquisition_index(receiver.name.location);
+    assert!(rhs_index < receiver_index && receiver_index < set_index);
+    assert!(
+        !path[..set_index]
+            .iter()
+            .any(|instr| instr_any(*instr, |child| matches!(
+                child,
+                InstrBlockPy::TakeOperand(take) if take.name.location == replacement.name.location
+            ))),
+        "a failing receiver must still find the unconsumed RHS primary for cleanup"
+    );
+    let receiver_block = function
+        .blocks
+        .iter()
+        .find(|block| {
+            block.body.iter().any(|instr| {
+                matches!(
+                    instr,
+                    InstrBlockPy::Store(store) if store.name.location == receiver.name.location
+                )
+            })
+        })
+        .expect("receiver producer block");
+    assert!(
+        receiver_block.exc_edge.is_some(),
+        "the real raising receiver has a handled error edge"
+    );
+}
+
 fn is_soac_attr_call(expr: &Expr, expected_attr: &str) -> bool {
     let Expr::Call(call) = expr else {
         return false;

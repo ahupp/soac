@@ -1,0 +1,418 @@
+{
+  "kwonly_default": {
+    "test": "test_soac_keyword_only_default_is_used_when_omitted",
+    "source": "def value(*, marker=3):\n    return marker\n",
+    "validation": "assert module.value() == 3\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "multiple_genexprs": {
+    "test": "test_soac_function_can_evaluate_multiple_generator_expressions",
+    "source": "def convert(value):\n    return value\n\ndef positive(value):\n    return value > 0\n\ndef value(items):\n    converted = tuple(convert(item) for item in items)\n    return all(positive(item) for item in converted)\n",
+    "validation": "assert module.value([1, 2, 3]) is True\nassert sys.exception() is None\n",
+    "required_functions": [
+      "convert",
+      "positive",
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "nested_raise_from": {
+    "test": "test_soac_nested_try_can_raise_from_caught_exception",
+    "source": "def wrap(should_wrap):\n    if should_wrap:\n        try:\n            raise ValueError(\"inner\")\n        except ValueError as exc:\n            raise RuntimeError(\"outer\") from exc\n\ntry:\n    wrap(True)\nexcept RuntimeError as exc:\n    WRAPPED = str(exc)\n",
+    "validation": "assert module.WRAPPED == \"outer\"\n",
+    "required_functions": [
+      "wrap"
+    ],
+    "dependencies": {}
+  },
+  "complex_literal": {
+    "test": "test_soac_complex_literal_uses_literal_value",
+    "source": "VALUE = 1j\n",
+    "validation": "assert module.VALUE == 1j\n",
+    "required_functions": [],
+    "dependencies": {}
+  },
+  "pow_mod_argument": {
+    "test": "test_soac_builtin_pow_accepts_mod_argument",
+    "source": "VALUE = pow(2, 5, 7)\n",
+    "validation": "assert module.VALUE == 4\n",
+    "required_functions": [],
+    "dependencies": {}
+  },
+  "missing_from_import_attr": {
+    "test": "test_soac_missing_from_import_attribute_raises_import_error",
+    "source": "try:\n    from math import __soac_missing_attr__\nexcept ImportError as exc:\n    VALUE = exc.name\nelse:\n    VALUE = \"imported\"\n",
+    "validation": "assert module.VALUE == \"math\"\n",
+    "required_functions": [],
+    "dependencies": {}
+  },
+  "from_import_cached_submodule": {
+    "test": "test_soac_from_import_sys_modules_fallback_does_not_set_parent_attr",
+    "source": "import from_import_cached_pkg.child as child\nimport from_import_cached_pkg as parent\ndel parent.child\nfrom from_import_cached_pkg import child as imported\nVALUE = (imported is child, hasattr(parent, \"child\"))\n",
+    "validation": "assert module.VALUE == (True, False)\n",
+    "required_functions": [],
+    "dependencies": {
+      "from_import_cached_pkg/__init__.py": "",
+      "from_import_cached_pkg/child.py": "VALUE = 42\n"
+    }
+  },
+  "helper_scoped_to_temp_module": {
+    "test": "test_soac_module_helper_does_not_transform_stdlib_imports_by_default",
+    "source": "import sys\n\nsys.modules.pop(\"colorsys\", None)\nimport colorsys\n\nVALUE = type(colorsys.__spec__.loader).__name__\n",
+    "validation": "assert module.VALUE != \"SoacLoader\"\n",
+    "required_functions": [],
+    "dependencies": {}
+  },
+  "locals_recent_assignment": {
+    "test": "test_soac_function_locals_fails_explicitly",
+    "source": "def value():\n    optdict = {\"verbose\": \"\"}\n    expected_opts = {\"verbose\": \"\"}\n    args = []\n    return \"%(optdict)s %(expected_opts)s %(args)s\" % locals()\n",
+    "validation": "with pytest.raises(\n    NotImplementedError, match=\"frame-sensitive globals/locals/eval/exec\"\n):\n    module.value()\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "eval_current_locals": {
+    "test": "test_soac_eval_fails_explicitly",
+    "source": "def value():\n    left = 3\n    right = 4\n    return eval(\"left + right\")\n",
+    "validation": "with pytest.raises(\n    NotImplementedError, match=\"frame-sensitive globals/locals/eval/exec\"\n):\n    module.value()\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "eval_for_loop_target_local": {
+    "test": "test_soac_eval_in_loop_fails_explicitly",
+    "source": "def value():\n    for item in [12]:\n        bad_format_spec = \"%M\"\n        try:\n            eval(\"f'xx{item:{bad_format_spec}}yy'\")\n        except ValueError as exc:\n            return \"Invalid format specifier\" in str(exc)\n    return False\n",
+    "validation": "with pytest.raises(\n    NotImplementedError, match=\"frame-sensitive globals/locals/eval/exec\"\n):\n    module.value()\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "nested_coroutine_nonlocal_method": {
+    "test": "test_soac_nested_coroutine_nonlocal_capture_in_method",
+    "source": "def build():\n    cancelled = False\n\n    class Test:\n        async def test_leaking_task(self):\n            async def coro():\n                nonlocal cancelled\n                cancelled = True\n\n            await coro()\n\n        def was_cancelled(self):\n            return cancelled\n\n    return Test()\n",
+    "validation": "instance = module.build()\ncoroutine = instance.test_leaking_task()\ntry:\n    coroutine.send(None)\nexcept StopIteration as exc:\n    assert exc.value is None\nelse:\n    raise AssertionError(\"coroutine should finish without suspension\")\nassert instance.was_cancelled() is True\n",
+    "required_functions": [
+      "build"
+    ],
+    "dependencies": {}
+  },
+  "lambda_function_decorator": {
+    "test": "test_soac_lambda_in_function_decorator_is_lowered",
+    "source": "def keep(value):\n    def decorator(func):\n        return value\n    return decorator\n\nsentinel = object()\n\n@keep(lambda: sentinel)\ndef chosen():\n    return None\n\nVALUE = chosen()\n",
+    "validation": "assert module.VALUE is module.sentinel\n",
+    "required_functions": [
+      "keep"
+    ],
+    "dependencies": {}
+  },
+  "coroutine_global_store": {
+    "test": "test_soac_coroutine_global_store_updates_module",
+    "source": "flag = False\n\nasync def set_flag():\n    global flag\n    flag = True\n\ndef value():\n    coroutine = set_flag()\n    try:\n        coroutine.send(None)\n    except StopIteration as exc:\n        assert exc.value is None\n    else:\n        raise AssertionError(\"coroutine should finish without suspension\")\n    return flag\n",
+    "validation": "assert module.value() is True\nassert module.flag is True\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "updated_positional_defaults": {
+    "test": "test_soac_function_uses_updated_positional_defaults",
+    "source": "def first_func(a, b):\n    return a + b\n\nfirst_func.__defaults__ = (1, 2)\nVALUE = first_func()\n",
+    "validation": "assert module.VALUE == 3\n",
+    "required_functions": [
+      "first_func"
+    ],
+    "dependencies": {}
+  },
+  "dict_conditional_value": {
+    "test": "test_soac_dict_value_can_use_conditional_expression",
+    "source": "VALUE = {\"flags\": tuple([1]) if True else None}\n",
+    "validation": "assert module.VALUE == {\"flags\": (1,)}\n",
+    "required_functions": [],
+    "dependencies": {}
+  },
+  "while_generator_condition": {
+    "test": "test_soac_while_condition_can_use_generator_expression",
+    "source": "class Worker:\n    def is_alive(self):\n        return True\n\ndef value():\n    count = 0\n    workers = [Worker()]\n    while count < 1 and all(worker.is_alive() for worker in workers):\n        count += 1\n    return count\n",
+    "validation": "assert module.value() == 1\n",
+    "required_functions": [
+      "value",
+      "Worker.is_alive"
+    ],
+    "dependencies": {}
+  },
+  "nested_class_base_local": {
+    "test": "test_soac_nested_class_base_uses_enclosing_function_local",
+    "source": "def value():\n    class A:\n        pass\n\n    class B:\n        pass\n\n    class C(B):\n        pass\n\n    C.__bases__ = (A,)\n    return C.__bases__[0].__name__\n",
+    "validation": "assert module.value() == \"A\"\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "nested_nonlocal_classcell": {
+    "test": "test_soac_nested_class_nonlocal_classcell_keeps_inner_method_classcell",
+    "source": "class Outer:\n    def value(self):\n        class Inner:\n            nonlocal __class__\n            __class__ = 42\n\n            def cls():\n                return __class__\n\n        outer_classcell_value = __class__\n        return outer_classcell_value, Inner.cls(), Inner\n",
+    "validation": "outer_value, inner_value, inner_cls = module.Outer().value()\nassert outer_value == 42\nassert inner_value is inner_cls\n",
+    "required_functions": [
+      "Outer.value"
+    ],
+    "dependencies": {}
+  },
+  "nested_class_body_dunder_class": {
+    "test": "test_soac_nested_class_body_dunder_class_does_not_steal_inner_method_classcell",
+    "source": "class Host:\n    def value(self):\n        class Inner:\n            outer = __class__\n\n            def cls():\n                return __class__\n\n        return Inner.outer, Inner.cls(), Inner\n",
+    "validation": "outer_value, inner_value, inner_cls = module.Host().value()\nassert outer_value is module.Host\nassert inner_value is inner_cls\n",
+    "required_functions": [
+      "Host.value"
+    ],
+    "dependencies": {}
+  },
+  "class_body_dunder_class_assignment": {
+    "test": "test_soac_class_body_dunder_class_assignment_does_not_leak_method_classcell",
+    "source": "class Base:\n    def marker(self):\n        return \"base\"\n\nclass Host:\n    def value(self):\n        class First(Base):\n            def marker(self):\n                return super().marker()\n\n            __class__ = 413\n\n        class Second:\n            outer = __class__\n\n            def cls():\n                return __class__\n\n        return First().marker(), First().__class__, Second.outer, Second.cls(), Second\n",
+    "validation": "first_marker, first_class_attr, second_outer, second_value, second_cls = (\n    module.Host().value()\n)\nassert first_marker == \"base\"\nassert first_class_attr == 413\nassert second_outer is module.Host\nassert second_value is second_cls\n",
+    "required_functions": [
+      "Host.value"
+    ],
+    "dependencies": {}
+  },
+  "assigned_dunder_class_method_super": {
+    "test": "test_soac_class_body_dunder_class_assignment_keeps_method_super_classcell",
+    "source": "class Base:\n    def marker(self):\n        return \"base\"\n\ndef value():\n    class Derived(Base):\n        def marker(self):\n            return super().marker()\n\n        __class__ = 413\n\n    instance = Derived()\n    return instance.marker(), instance.__class__\n",
+    "validation": "assert module.value() == (\"base\", 413)\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "nested_method_super_class_attr": {
+    "test": "test_soac_nested_method_super_class_attr_does_not_require_outer_classcell_capture",
+    "source": "class Host:\n    def value(self):\n        class Inner:\n            def method(self):\n                return super().__class__\n\n        return Inner().method()\n",
+    "validation": "assert module.Host().value() is super\n",
+    "required_functions": [
+      "Host.value"
+    ],
+    "dependencies": {}
+  },
+  "init_subclass_for_loop": {
+    "test": "test_soac_init_subclass_for_loop_uses_iterator",
+    "source": "class Base:\n    def __init_subclass__(cls, /, **kwargs):\n        cls.SEEN = []\n        for item in cls.__mro__:\n            cls.SEEN.append(item.__name__)\n\nclass Child(Base):\n    pass\n",
+    "validation": "assert module.Child.SEEN[:2] == [\"Child\", \"Base\"]\n",
+    "required_functions": [],
+    "dependencies": {}
+  },
+  "classcell_missing": {
+    "test": "test_soac_classcell_missing_raises_runtime_error",
+    "source": "def value():\n    class Meta(type):\n        def __new__(cls, name, bases, namespace):\n            namespace.pop(\"__classcell__\", None)\n            return super().__new__(cls, name, bases, namespace)\n\n    class WithClassRef(metaclass=Meta):\n        def f(self):\n            return __class__\n",
+    "validation": "with pytest.raises(RuntimeError, match=\"__class__ not set.*__classcell__ propagated\"):\n    module.value()\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "classcell_wrong_cell": {
+    "test": "test_soac_classcell_wrong_cell_raises_type_error",
+    "source": "def value():\n    class Meta(type):\n        def __new__(cls, name, bases, namespace):\n            cls = super().__new__(cls, name, bases, namespace)\n            type(\"Other\", (), namespace)\n            return cls\n\n    class WithClassRef(metaclass=Meta):\n        def f(self):\n            return __class__\n",
+    "validation": "with pytest.raises(TypeError):\n    module.value()\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "dynamic_global_super": {
+    "test": "test_soac_zero_arg_super_uses_dynamic_global_super",
+    "source": "class MySuper:\n    msg = \"super super\"\n\nclass C:\n    def method(self):\n        return super().msg\n\ndef value():\n    global super\n    previous = super\n    super = MySuper\n    try:\n        return C().method()\n    finally:\n        super = previous\n",
+    "validation": "assert module.value() == \"super super\"\n",
+    "required_functions": [
+      "value",
+      "C.method"
+    ],
+    "dependencies": {}
+  },
+  "nested_zero_arg_super_no_args": {
+    "test": "test_soac_nested_zero_arg_super_without_self_reports_no_arguments",
+    "source": "class Host:\n    def value(self):\n        def nested():\n            super()\n\n        nested()\n",
+    "validation": "with pytest.raises(RuntimeError, match=\"no arguments\"):\n    module.Host().value()\n",
+    "required_functions": [
+      "Host.value"
+    ],
+    "dependencies": {}
+  },
+  "deleted_super_first_arg": {
+    "test": "test_soac_deleted_super_first_arg_reports_arg_deleted",
+    "source": "class Host:\n    def value(self):\n        def nested(x):\n            del x\n            super()\n\n        nested(self)\n",
+    "validation": "with pytest.raises(RuntimeError, match=r\"arg\\[0\\] deleted\"):\n    module.Host().value()\n",
+    "required_functions": [
+      "Host.value"
+    ],
+    "dependencies": {}
+  },
+  "except_handled_exception_state": {
+    "test": "test_soac_except_body_sets_cpython_handled_exception",
+    "source": "import sys\nimport traceback\n\ndef capture(flag):\n    try:\n        raise ValueError(\"boom\")\n    except:\n        if flag:\n            text = traceback.format_exc()\n            active_type = type(sys.exception()).__name__\n        else:\n            text = \"missing\"\n            active_type = type(sys.exception()).__name__\n    return \"ValueError: boom\" in text, active_type, sys.exception()\n",
+    "validation": "assert module.capture(True) == (True, \"ValueError\", None)\n",
+    "required_functions": [
+      "capture"
+    ],
+    "dependencies": {}
+  },
+  "typed_except_return_expr": {
+    "test": "test_soac_typed_except_catches_return_expression_error",
+    "source": "def f():\n    try:\n        return {}[\"x\"]\n    except KeyError:\n        return \"ok\"\n",
+    "validation": "assert module.f() == \"ok\"\n",
+    "required_functions": [
+      "f"
+    ],
+    "dependencies": {}
+  },
+  "outer_try_with_body_exception": {
+    "test": "test_soac_outer_try_catches_exception_from_with_body",
+    "source": "class Manager:\n    def __enter__(self):\n        return self\n\n    def __exit__(self, exc_type, exc, tb):\n        return False\n\ndef f():\n    try:\n        with Manager():\n            open(None)\n    except TypeError as exc:\n        return str(exc).split(\":\")[0]\n    return \"miss\"\n",
+    "validation": "assert module.f() == \"expected str, bytes or os.PathLike object, not NoneType\"\n",
+    "required_functions": [
+      "f"
+    ],
+    "dependencies": {}
+  },
+  "generator_contextmanager_with_body_reraise": {
+    "test": "test_soac_generator_contextmanager_with_body_reraises_thrown_exception",
+    "source": "from contextlib import contextmanager\n\nclass Manager:\n    def __enter__(self):\n        return self\n\n    def __exit__(self, exc_type, exc, tb):\n        return False\n\n@contextmanager\ndef manager():\n    with Manager():\n        yield\n\nclass MarkerError(Exception):\n    pass\n\ndef check_exit():\n    cm = manager()\n    cm.__enter__()\n    try:\n        raise MarkerError(\"boom\")\n    except MarkerError as exc:\n        return cm.__exit__(type(exc), exc, exc.__traceback__)\n",
+    "validation": "assert module.check_exit() is False\n",
+    "required_functions": [
+      "check_exit"
+    ],
+    "dependencies": {}
+  },
+  "lone_surrogate_string_literal": {
+    "test": "test_soac_lone_surrogate_string_literal_uses_replacement_character",
+    "source": "VALUE = \"\\uD82A\"\n",
+    "validation": "assert module.VALUE == chr(0xD82A)\n",
+    "required_functions": [],
+    "dependencies": {}
+  },
+  "assignment_temp_gc_cycle": {
+    "test": "test_soac_attribute_assignment_temps_do_not_keep_cycle_alive",
+    "source": "import ast\nimport gc\nimport weakref\n\ndef value():\n    class X:\n        pass\n    a = ast.AST()\n    a.x = X()\n    a.x.a = a\n    ref = weakref.ref(a.x)\n    del a\n    gc.collect()\n    return ref()\n",
+    "validation": "assert module.value() is None\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "except_body_implicit_context": {
+    "test": "test_soac_except_body_exception_keeps_implicit_context",
+    "source": "import ast\nimport unittest\n\ndef value():\n    case = unittest.TestCase()\n    try:\n        1 / 0\n    except Exception:\n        with case.assertRaises(SyntaxError) as caught:\n            ast.literal_eval(r\"'\\U'\")\n        return type(caught.exception.__context__).__name__\n    return \"missing\"\n",
+    "validation": "assert module.value() == \"ZeroDivisionError\"\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "try_finally_keeps_handled_exception": {
+    "test": "test_soac_try_finally_preserves_callers_handled_exception",
+    "source": "import sys\n\ndef inner():\n    try:\n        pass\n    finally:\n        marker = 1\n    return marker\n\ndef value():\n    try:\n        1 / 0\n    except Exception:\n        before = type(sys.exception()).__name__\n        inner()\n        after = sys.exception()\n        return before, type(after).__name__ if after is not None else None\n",
+    "validation": "assert module.value() == (\"ZeroDivisionError\", \"ZeroDivisionError\")\n",
+    "required_functions": [
+      "inner",
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "nested_closure_rebound_argument": {
+    "test": "test_soac_nested_closure_sees_rebound_argument",
+    "source": "def f(value=None):\n    value = \"updated\"\n\n    def inner():\n        return value\n\n    return value, inner()\n",
+    "validation": "assert module.f() == (\"updated\", \"updated\")\n",
+    "required_functions": [
+      "f"
+    ],
+    "dependencies": {}
+  },
+  "function_replaced_code": {
+    "test": "test_soac_function_uses_replaced_code_object",
+    "source": "def replacement():\n    return 3\n\ndef target():\n    pass\n\ntarget.__code__ = replacement.__code__\nVALUE = target()\n",
+    "validation": "assert module.VALUE == 3\n",
+    "required_functions": [
+      "replacement"
+    ],
+    "dependencies": {}
+  },
+  "function_dict_empty": {
+    "test": "test_soac_function_dict_starts_empty",
+    "source": "def value():\n    pass\n\nVALUE = value.__dict__\n",
+    "validation": "assert module.VALUE == {}\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "generic_function_type_params": {
+    "test": "test_soac_generic_function_exposes_type_params",
+    "source": "import typing\n\ndef generic[T]():\n    pass\n\nT, = generic.__type_params__\nVALUE = isinstance(T, typing.TypeVar), generic.__type_params__\n",
+    "validation": "is_type_var, type_params = module.VALUE\nassert is_type_var is True\nassert type_params == (type_params[0],)\n",
+    "required_functions": [
+      "generic"
+    ],
+    "dependencies": {}
+  },
+  "empty_closure_cell": {
+    "test": "test_soac_empty_closure_cell_raises_value_error",
+    "source": "def value():\n    def f():\n        return a\n\n    try:\n        f.__closure__[0].cell_contents\n    except ValueError:\n        return \"empty\"\n    else:\n        return \"filled\"\n\n    a = 12\n",
+    "validation": "assert module.value() == \"empty\"\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "owned_cell_condition": {
+    "test": "test_soac_owned_cell_survives_jump_to_cell_backed_condition",
+    "source": "def outer(reason):\n    def decorator(test_item):\n        return reason\n\n    if isinstance(reason, int):\n        return decorator(reason)\n    return decorator\n\nVALUE = outer(\"why\")(object)\n",
+    "validation": "assert module.VALUE == \"why\"\n",
+    "required_functions": [
+      "outer"
+    ],
+    "dependencies": {}
+  },
+  "empty_cell_comparison": {
+    "test": "test_soac_empty_cell_comparison_matches_cpython",
+    "source": "def cell(value):\n    def f():\n        return a\n\n    a = value\n    return f.__closure__[0]\n\ndef empty_cell():\n    def f():\n        return a\n\n    if False:\n        a = 1729\n    return f.__closure__[0]\n\nVALUE = empty_cell() < cell(\"saturday\")\n",
+    "validation": "assert module.VALUE is True\n",
+    "required_functions": [
+      "cell",
+      "empty_cell"
+    ],
+    "dependencies": {}
+  },
+  "mutating_closure_cell": {
+    "test": "test_soac_mutating_closure_cell_updates_function_and_outer",
+    "source": "def value():\n    a = 12\n\n    def f():\n        return a\n\n    c = f.__closure__\n    c[0].cell_contents = 9\n    return c[0].cell_contents, f(), a\n",
+    "validation": "assert module.value() == (9, 9, 9)\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "deleted_closure_cell": {
+    "test": "test_soac_deleted_closure_cell_raises_name_errors",
+    "source": "def value():\n    a = 12\n\n    def f():\n        return a\n\n    cell = f.__closure__[0]\n    del cell.cell_contents\n\n    try:\n        f()\n    except NameError:\n        inner = True\n    else:\n        inner = False\n\n    try:\n        a\n    except UnboundLocalError:\n        outer = True\n    else:\n        outer = False\n\n    return inner, outer\n",
+    "validation": "assert module.value() == (True, True)\n",
+    "required_functions": [
+      "value"
+    ],
+    "dependencies": {}
+  },
+  "method_local_class_base": {
+    "test": "test_soac_method_local_class_base_does_not_leak_to_outer_class",
+    "source": "class Container:\n    def method(self):\n        class RawBase:\n            pass\n\n        class Derived(RawBase):\n            pass\n\n        return Derived.__mro__[1] is RawBase\n\nVALUE = Container().method()\n",
+    "validation": "assert module.VALUE is True\n",
+    "required_functions": [
+      "Container.method"
+    ],
+    "dependencies": {}
+  }
+}

@@ -246,10 +246,17 @@ fn trusted_i64_value_for_expr(
     state: &TrustedOwnerState,
     module_constants: &[ConstantExpr],
 ) -> Option<i64> {
-    let InstrTyped::Load(load) = expr else {
-        return None;
-    };
-    trusted_i64_value_for_name(&load.name, state, module_constants)
+    trusted_i64_value_for_name(trusted_value_name(expr)?, state, module_constants)
+}
+
+/// A move reads the same value identity as a load. Its source-slot facts are
+/// invalidated separately, after the enclosing operation's transfer is derived.
+fn trusted_value_name(expr: &InstrTyped) -> Option<&ResolvedName> {
+    match expr {
+        InstrTyped::Load(load) => Some(&load.name),
+        InstrTyped::TakeOperand(take) => Some(&take.name),
+        _ => None,
+    }
 }
 
 pub fn trusted_object_origin_for_name(
@@ -308,14 +315,14 @@ pub fn trusted_runtime_name_for_expr(
     state: &TrustedOwnerState,
     module_constants: &[ConstantExpr],
 ) -> Option<RuntimeName> {
-    if let InstrTyped::Load(load) = expr {
-        if let Some(runtime_name) = load.name.runtime_name_id() {
+    if let Some(name) = trusted_value_name(expr) {
+        if let Some(runtime_name) = name.runtime_name_id() {
             return Some(runtime_name);
         }
-        if let Some(runtime_name) = trusted_runtime_name_for_name(&load.name, state) {
+        if let Some(runtime_name) = trusted_runtime_name_for_name(name, state) {
             return Some(runtime_name);
         }
-        if let Some(index) = load.name.location.as_constant()
+        if let Some(index) = name.location.as_constant()
             && let Some(ConstantExpr::RuntimeName(runtime_name)) =
                 module_constants.get(index as usize)
         {
@@ -329,19 +336,17 @@ pub fn trusted_function_id_for_expr(
     expr: &InstrTyped,
     state: &TrustedOwnerState,
 ) -> Option<RuntimeFunctionId> {
-    match expr {
-        InstrTyped::MakeFunctionWithClosure(op) => Some(op.function_id),
-        InstrTyped::Load(load) => {
-            if let Some(location) = load.name.local_location() {
-                return state.local_functions.get(&location).copied();
-            }
-            state
-                .preserved_functions
-                .get(&load.name.preserved_location()?)
-                .copied()
-        }
-        _ => None,
+    if let InstrTyped::MakeFunctionWithClosure(op) = expr {
+        return Some(op.function_id);
     }
+    let name = trusted_value_name(expr)?;
+    if let Some(location) = name.local_location() {
+        return state.local_functions.get(&location).copied();
+    }
+    state
+        .preserved_functions
+        .get(&name.preserved_location()?)
+        .copied()
 }
 
 fn trusted_function_id_for_store_value(
@@ -688,10 +693,10 @@ fn trusted_identity_iter_store_value(
     let [CallArgPositional::Positional(receiver)] = call.args.as_slice() else {
         return None;
     };
-    let (owner_type_ref, origin) = if let InstrTyped::Load(receiver) = receiver {
+    let (owner_type_ref, origin) = if let Some(receiver) = trusted_value_name(receiver) {
         (
-            trusted_owner_state_for_name(&receiver.name, state)?.clone(),
-            trusted_object_origin_for_name(&receiver.name, state)?,
+            trusted_owner_state_for_name(receiver, state)?.clone(),
+            trusted_object_origin_for_name(receiver, state)?,
         )
     } else {
         let plan = receiver.generator_instance_plan()?;
@@ -728,10 +733,7 @@ fn trusted_identity_iter_resume_function_for_store_value(
         .then(|| TrustedResumeFunctionFact::new(plan.function_id, origin));
     }
 
-    let InstrTyped::Load(receiver) = receiver else {
-        return None;
-    };
-    trusted_resume_function_fact_for_name(&receiver.name, state)
+    trusted_resume_function_fact_for_name(trusted_value_name(receiver)?, state)
         .filter(|fact| fact.exact_origin() == Some(origin))
         .cloned()
 }
@@ -756,14 +758,17 @@ fn trusted_runtime_next_receiver_is_internal_consumption(
     if !is_next_call || !call.keywords.is_empty() {
         return false;
     }
-    let Some(CallArgPositional::Positional(InstrTyped::Load(receiver))) = call.args.first() else {
+    let Some(CallArgPositional::Positional(receiver)) = call.args.first() else {
         return false;
     };
-    let Some(owner_type_ref) = trusted_owner_state_for_name(&receiver.name, state) else {
+    let Some(receiver) = trusted_value_name(receiver) else {
+        return false;
+    };
+    let Some(owner_type_ref) = trusted_owner_state_for_name(receiver, state) else {
         return false;
     };
     trusted_runtime_iterator_owner_type(owner_type_ref)
-        && trusted_object_origin_for_name(&receiver.name, state).is_some()
+        && trusted_object_origin_for_name(receiver, state).is_some()
 }
 
 fn trusted_generator_state_reader_is_internal_observation(
@@ -876,10 +881,7 @@ fn trusted_owner_state_for_store_value(
     ) {
         return Some(owner_type_ref);
     }
-    let InstrTyped::Load(load) = value else {
-        return None;
-    };
-    trusted_owner_state_for_name(&load.name, state).cloned()
+    trusted_owner_state_for_name(trusted_value_name(value)?, state).cloned()
 }
 
 fn trusted_object_origin_for_store_value(
@@ -906,10 +908,7 @@ fn trusted_object_origin_for_store_value(
     {
         return Some(instr_id);
     }
-    let InstrTyped::Load(load) = value else {
-        return None;
-    };
-    trusted_object_origin_for_name(&load.name, state)
+    trusted_object_origin_for_name(trusted_value_name(value)?, state)
 }
 
 fn trusted_object_origin_candidates_for_store_value(
@@ -935,10 +934,7 @@ fn trusted_object_origin_candidates_for_store_value(
     {
         return Some(HashSet::from([instr_id]));
     }
-    let InstrTyped::Load(load) = value else {
-        return None;
-    };
-    trusted_object_origin_candidates_for_name(&load.name, state)
+    trusted_object_origin_candidates_for_name(trusted_value_name(value)?, state)
         .map(|candidates| candidates.into_iter().collect())
 }
 
@@ -1018,10 +1014,7 @@ fn trusted_resume_function_for_store_value(
         }
         return Some(fact);
     }
-    let InstrTyped::Load(load) = value else {
-        return None;
-    };
-    trusted_resume_function_fact_for_name(&load.name, state).cloned()
+    trusted_resume_function_fact_for_name(trusted_value_name(value)?, state).cloned()
 }
 
 fn trusted_generator_boundary_attr_load(
@@ -1489,10 +1482,24 @@ fn trusted_escaping_object_origins_in_expr(
                 }
                 return;
             }
-            if let InstrTyped::Load(load) = expr
-                && let Some(origin) = trusted_object_origin_for_name(&load.name, self.state)
+            let named_owner = match expr {
+                InstrTyped::Load(load) => Some(&load.name),
+                InstrTyped::TakeOperand(op) => Some(&op.name),
+                InstrTyped::ComprehensionInsert(op) => Some(&op.container),
+                InstrTyped::IteratorStep(op) => Some(&op.name),
+                _ => None,
+            };
+            if let Some(origin) =
+                named_owner.and_then(|name| trusted_object_origin_for_name(name, self.state))
             {
                 self.origins.insert(origin);
+            }
+            if let InstrTyped::CallArgumentOp(op) = expr {
+                for name in op.read_names() {
+                    if let Some(origin) = trusted_object_origin_for_name(name, self.state) {
+                        self.origins.insert(origin);
+                    }
+                }
             }
             expr.visit_children(self);
         }
@@ -1521,10 +1528,13 @@ fn mark_trusted_owner_escapes_for_instr(
         InstrTyped::Store(store)
             if (store.name.local_location().is_some()
                 || store.name.preserved_location().is_some())
-                && matches!(store.value.as_ref(), InstrTyped::Load(_)) =>
+                && trusted_value_name(store.value.as_ref()).is_some() =>
         {
             HashSet::new()
         }
+        // A standalone take discards an owned compiler operand. Takes nested
+        // in unknown calls or escaping stores still go through the visitor.
+        InstrTyped::TakeOperand(_) => HashSet::new(),
         InstrTyped::Store(store)
             if trusted_identity_iter_store_value(store.value.as_ref(), state, module_constants)
                 .is_some() =>
@@ -1586,6 +1596,43 @@ fn mark_trusted_owner_escapes_for_instr(
     }
 }
 
+fn invalidate_trusted_owner_operand(
+    state: &mut TrustedOwnerState,
+    location: soac_core::block_py::OperandLocation,
+) {
+    match location {
+        soac_core::block_py::OperandLocation::Local(location) => {
+            state.locals.remove(&location);
+            state.runtime_names.remove(&location);
+            state.i64_values.remove(&location);
+            state.object_origins.remove(&location);
+            state.object_origin_candidates.remove(&location);
+            state.local_functions.remove(&location);
+            state.resume_functions.remove(&location);
+        }
+        soac_core::block_py::OperandLocation::Preserved(location) => {
+            state.preserved_owners.remove(&location);
+            state.preserved_runtime_names.remove(&location);
+            state.preserved_i64_values.remove(&location);
+            state.preserved_object_origins.remove(&location);
+            state.preserved_object_origin_candidates.remove(&location);
+            state.preserved_functions.remove(&location);
+            state.preserved_resume_functions.remove(&location);
+        }
+    }
+}
+
+struct TrustedStoreValueFacts {
+    owner: Option<TypedAttrOwnerRef>,
+    runtime_name: Option<RuntimeName>,
+    i64_value: Option<i64>,
+    origin: Option<InstrId>,
+    origin_candidates: Option<HashSet<InstrId>>,
+    resume_function: Option<TrustedResumeFunctionFact>,
+    function_id: Option<RuntimeFunctionId>,
+    identity_iter_resume: Option<TrustedResumeFunctionFact>,
+}
+
 fn transfer_trusted_owner_instr(
     instr: &InstrTyped,
     state: &mut TrustedOwnerState,
@@ -1594,6 +1641,11 @@ fn transfer_trusted_owner_instr(
     trusted_constructor_init_owners: &HashMap<RuntimeFunctionId, TypedAttrOwnerRef>,
 ) {
     mark_trusted_owner_escapes_for_instr(instr, state, module_constants);
+    if !matches!(instr, InstrTyped::Store(_) | InstrTyped::SetAttrTyped(_)) {
+        soac_core::block_py::visit_operand_takes(instr, |location| {
+            invalidate_trusted_owner_operand(state, location);
+        });
+    }
     match instr {
         InstrTyped::Store(store) => {
             if tracing::enabled!(
@@ -1654,55 +1706,71 @@ fn transfer_trusted_owner_instr(
                     );
                 }
             }
-            if let Some(fact) = trusted_identity_iter_resume_function_for_store_value(
-                store.value.as_ref(),
-                state,
-                module_constants,
-            ) && let Some(origin) = fact.exact_origin()
+            // Evaluate the result's identity against the pre-consumption
+            // state. In particular, iter(TakeOperand(x)) moves x's exact
+            // iterator identity before making x unbound on this normal edge.
+            let value = store.value.as_ref();
+            let facts = TrustedStoreValueFacts {
+                owner: trusted_owner_state_for_store_value(
+                    value,
+                    state,
+                    module_constants,
+                    trusted_constructor_calls,
+                    trusted_constructor_init_owners,
+                ),
+                runtime_name: trusted_runtime_name_for_store_value(value, state, module_constants),
+                i64_value: trusted_i64_value_for_expr(value, state, module_constants),
+                origin: trusted_object_origin_for_store_value(
+                    value,
+                    state,
+                    module_constants,
+                    trusted_constructor_calls,
+                ),
+                origin_candidates: trusted_object_origin_candidates_for_store_value(
+                    value,
+                    state,
+                    module_constants,
+                    trusted_constructor_calls,
+                ),
+                resume_function: trusted_resume_function_for_store_value(
+                    value,
+                    state,
+                    module_constants,
+                ),
+                function_id: trusted_function_id_for_store_value(value, state, module_constants),
+                identity_iter_resume: trusted_identity_iter_resume_function_for_store_value(
+                    value,
+                    state,
+                    module_constants,
+                ),
+            };
+            soac_core::block_py::visit_operand_takes(instr, |location| {
+                invalidate_trusted_owner_operand(state, location);
+            });
+            if let Some(fact) = facts.identity_iter_resume
+                && let Some(origin) = fact.exact_origin()
             {
                 state
                     .function_fields
                     .insert((origin, "_resume_function".to_string()), fact.function_id);
             }
             if let Some(location) = store.name.local_location() {
-                if let Some(owner_type_ref) = trusted_owner_state_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                    trusted_constructor_calls,
-                    trusted_constructor_init_owners,
-                ) {
+                if let Some(owner_type_ref) = facts.owner {
                     state.locals.insert(location, owner_type_ref);
                 } else {
                     state.locals.remove(&location);
                 }
-                if let Some(runtime_name) = trusted_runtime_name_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                ) {
+                if let Some(runtime_name) = facts.runtime_name {
                     state.runtime_names.insert(location, runtime_name);
                 } else {
                     state.runtime_names.remove(&location);
                 }
-                if let Some(value) =
-                    trusted_i64_value_for_expr(store.value.as_ref(), state, module_constants)
-                {
+                if let Some(value) = facts.i64_value {
                     state.i64_values.insert(location, value);
                 } else {
                     state.i64_values.remove(&location);
                 }
-                let resume_function = trusted_resume_function_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                );
-                if let Some(origin) = trusted_object_origin_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                    trusted_constructor_calls,
-                ) {
+                if let Some(origin) = facts.origin {
                     state.object_origins.insert(location, origin);
                     if store.value.try_semantic_instr_id() == Some(origin) {
                         state.escaped_origins.remove(&origin);
@@ -1710,28 +1778,19 @@ fn transfer_trusted_owner_instr(
                 } else {
                     state.object_origins.remove(&location);
                 }
-                if let Some(candidate_origins) = trusted_object_origin_candidates_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                    trusted_constructor_calls,
-                ) {
+                if let Some(candidate_origins) = facts.origin_candidates {
                     state
                         .object_origin_candidates
                         .insert(location, candidate_origins);
                 } else {
                     state.object_origin_candidates.remove(&location);
                 }
-                if let Some(fact) = resume_function {
+                if let Some(fact) = facts.resume_function {
                     state.resume_functions.insert(location, fact);
                 } else {
                     state.resume_functions.remove(&location);
                 }
-                if let Some(function_id) = trusted_function_id_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                ) {
+                if let Some(function_id) = facts.function_id {
                     state.local_functions.insert(location, function_id);
                 } else {
                     state.local_functions.remove(&location);
@@ -1743,46 +1802,23 @@ fn transfer_trusted_owner_instr(
                         .function_fields
                         .insert((origin, "_resume_function".to_string()), plan.function_id);
                 }
-            }
-            if let Some(location) = store.name.preserved_location() {
-                if let Some(owner_type_ref) = trusted_owner_state_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                    trusted_constructor_calls,
-                    trusted_constructor_init_owners,
-                ) {
+            } else if let Some(location) = store.name.preserved_location() {
+                if let Some(owner_type_ref) = facts.owner {
                     state.preserved_owners.insert(location, owner_type_ref);
                 } else {
                     state.preserved_owners.remove(&location);
                 }
-                if let Some(runtime_name) = trusted_runtime_name_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                ) {
+                if let Some(runtime_name) = facts.runtime_name {
                     state.preserved_runtime_names.insert(location, runtime_name);
                 } else {
                     state.preserved_runtime_names.remove(&location);
                 }
-                if let Some(value) =
-                    trusted_i64_value_for_expr(store.value.as_ref(), state, module_constants)
-                {
+                if let Some(value) = facts.i64_value {
                     state.preserved_i64_values.insert(location, value);
                 } else {
                     state.preserved_i64_values.remove(&location);
                 }
-                let resume_function = trusted_resume_function_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                );
-                if let Some(origin) = trusted_object_origin_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                    trusted_constructor_calls,
-                ) {
+                if let Some(origin) = facts.origin {
                     state.preserved_object_origins.insert(location, origin);
                     if store.value.try_semantic_instr_id() == Some(origin) {
                         state.escaped_origins.remove(&origin);
@@ -1790,31 +1826,31 @@ fn transfer_trusted_owner_instr(
                 } else {
                     state.preserved_object_origins.remove(&location);
                 }
-                if let Some(candidate_origins) = trusted_object_origin_candidates_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                    trusted_constructor_calls,
-                ) {
+                if let Some(candidate_origins) = facts.origin_candidates {
                     state
                         .preserved_object_origin_candidates
                         .insert(location, candidate_origins);
                 } else {
                     state.preserved_object_origin_candidates.remove(&location);
                 }
-                if let Some(fact) = resume_function {
+                if let Some(fact) = facts.resume_function {
                     state.preserved_resume_functions.insert(location, fact);
                 } else {
                     state.preserved_resume_functions.remove(&location);
                 }
-                if let Some(function_id) = trusted_function_id_for_store_value(
-                    store.value.as_ref(),
-                    state,
-                    module_constants,
-                ) {
+                if let Some(function_id) = facts.function_id {
                     state.preserved_functions.insert(location, function_id);
                 } else {
                     state.preserved_functions.remove(&location);
+                }
+            }
+        }
+        InstrTyped::CallArgumentOp(op) => {
+            for name in op.written_names() {
+                if let Some(location) =
+                    soac_core::block_py::OperandLocation::from_name_location(name.location)
+                {
+                    invalidate_trusted_owner_operand(state, location);
                 }
             }
         }
@@ -1839,27 +1875,36 @@ fn transfer_trusted_owner_instr(
             }
         }
         InstrTyped::SetAttrTyped(op) => {
-            let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants) else {
-                return;
-            };
-            let InstrTyped::Load(receiver) = op.value.as_ref() else {
-                return;
-            };
-            let Some(origin) = trusted_object_origin_for_name(&receiver.name, state) else {
+            // Like a Store, a field assignment transfers the evaluated value's
+            // identity before consuming any of its operand slots. The receiver
+            // may itself be an owned temporary moved into the setter.
+            let field_name = typed_constant_string(op.attr.as_ref(), module_constants);
+            let receiver = trusted_value_name(op.value.as_ref());
+            let origin = receiver.and_then(|name| trusted_object_origin_for_name(name, state));
+            let function_id = trusted_function_id_for_expr(op.replacement.as_ref(), state);
+            soac_core::block_py::visit_operand_takes(instr, |location| {
+                invalidate_trusted_owner_operand(state, location);
+            });
+            let (Some(field_name), Some(receiver), Some(origin)) = (field_name, receiver, origin)
+            else {
                 return;
             };
             let key = (origin, field_name.to_string());
-            if let Some(function_id) = trusted_function_id_for_expr(op.replacement.as_ref(), state)
-            {
+            // Field identity belongs to the object, but per-slot resume facts
+            // must not bring a consumed receiver (or alias consumed by another
+            // operand) back into the normal-edge state.
+            let receiver_still_bound =
+                trusted_object_origin_for_name(receiver, state) == Some(origin);
+            if let Some(function_id) = function_id {
                 state.function_fields.insert(key, function_id);
-                if field_name == "_resume_function" {
-                    if let Some(location) = receiver.name.local_location() {
+                if field_name == "_resume_function" && receiver_still_bound {
+                    if let Some(location) = receiver.local_location() {
                         state.resume_functions.insert(
                             location,
                             TrustedResumeFunctionFact::new(function_id, origin),
                         );
                     }
-                    if let Some(location) = receiver.name.preserved_location() {
+                    if let Some(location) = receiver.preserved_location() {
                         state.preserved_resume_functions.insert(
                             location,
                             TrustedResumeFunctionFact::new(function_id, origin),
@@ -1869,10 +1914,10 @@ fn transfer_trusted_owner_instr(
             } else {
                 state.function_fields.remove(&key);
                 if field_name == "_resume_function" {
-                    if let Some(location) = receiver.name.local_location() {
+                    if let Some(location) = receiver.local_location() {
                         state.resume_functions.remove(&location);
                     }
-                    if let Some(location) = receiver.name.preserved_location() {
+                    if let Some(location) = receiver.preserved_location() {
                         state.preserved_resume_functions.remove(&location);
                     }
                 }
@@ -2219,7 +2264,7 @@ pub fn trusted_owner_block_predecessor_edges(
                     },
                 );
             }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
         }
         if let Some(exc_edge) = &block.exc_edge {
             predecessors
@@ -2856,6 +2901,14 @@ fn queue_trusted_owner_incremental_block_edge_states(
 }
 
 fn transfer_trusted_function_instr(instr: &InstrTyped, state: &mut TrustedOwnerState) {
+    soac_core::block_py::visit_operand_takes(instr, |location| match location {
+        soac_core::block_py::OperandLocation::Local(location) => {
+            state.local_functions.remove(&location);
+        }
+        soac_core::block_py::OperandLocation::Preserved(location) => {
+            state.preserved_functions.remove(&location);
+        }
+    });
     match instr {
         InstrTyped::Store(store) => {
             if let Some(location) = store.name.local_location() {
@@ -2881,6 +2934,16 @@ fn transfer_trusted_function_instr(instr: &InstrTyped, state: &mut TrustedOwnerS
             }
             if let Some(location) = del.name.preserved_location() {
                 state.preserved_functions.remove(&location);
+            }
+        }
+        InstrTyped::CallArgumentOp(op) => {
+            for name in op.written_names() {
+                if let Some(location) = name.local_location() {
+                    state.local_functions.remove(&location);
+                }
+                if let Some(location) = name.preserved_location() {
+                    state.preserved_functions.remove(&location);
+                }
             }
         }
         _ => {}
@@ -3039,6 +3102,9 @@ pub fn analyze_trusted_function_states(
             for instr in &block.body {
                 transfer_trusted_function_instr(instr, &mut state);
             }
+            soac_core::block_py::visit_term_operand_takes(&block.term, |location| {
+                invalidate_trusted_owner_operand(&mut state, location);
+            });
             state
         });
         if out_states[block_index] == out_state {
@@ -3566,6 +3632,9 @@ pub fn analyze_trusted_owner_states(
                     pending_resume_case_keys.insert(location, key);
                 }
             }
+            soac_core::block_py::visit_term_operand_takes(&block.term, |location| {
+                invalidate_trusted_owner_operand(&mut state, location);
+            });
             for key in pending_resume_case_keys.into_values() {
                 if merge_trusted_owner_resume_case_state(
                     &mut resume_protocol_states.resume_case_states,
@@ -3765,6 +3834,9 @@ pub fn analyze_trusted_owner_states(
                     pending_resume_case_keys.insert(location, key);
                 }
             }
+            soac_core::block_py::visit_term_operand_takes(&block.term, |location| {
+                invalidate_trusted_owner_operand(&mut state, location);
+            });
             for key in pending_resume_case_keys.into_values() {
                 if merge_trusted_owner_resume_case_state(
                     &mut resume_protocol_states.resume_case_states,
@@ -4041,7 +4113,7 @@ pub fn visit_trusted_owner_term_instrs(
                 visitor.visit_instr(exc);
             }
         }
-        BlockTerm::Return(value) => visitor.visit_instr(value),
+        BlockTerm::Return(value) | BlockTerm::GeneratorReturn(value) => visitor.visit_instr(value),
         BlockTerm::Jump(_) => {}
     }
 }
@@ -4050,6 +4122,186 @@ pub fn visit_trusted_owner_term_instrs(
 mod tests {
     use super::*;
     use soac_ir_typed::lower_blockpy_module_to_typed;
+
+    #[test]
+    fn setattr_take_preserves_callable_field_identity_and_retires_operand_facts() {
+        for capture_receiver in [false, true] {
+            let assignment = if capture_receiver {
+                "    make()._resume_function = callback\n"
+            } else {
+                "    owner = make()\n    owner._resume_function = callback\n"
+            };
+            let source = format!(
+                "def make():\n    return None\n\n\
+def caller():\n    def callback():\n        return None\n{assignment}"
+            );
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(&source)
+                .expect("the field assignment fixture must lower");
+            let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+            let caller = typed
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "caller")
+                .unwrap();
+            let callback_id = typed
+                .callable_defs
+                .iter()
+                .find(|function| function.names.qualname == "caller.<locals>.callback")
+                .unwrap()
+                .function_id;
+            let constructor_calls = caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .filter_map(|instr| match instr {
+                    InstrTyped::Store(store) => match store.value.as_ref() {
+                        InstrTyped::CallTyped(call) => call.try_semantic_instr_id(),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [origin] = constructor_calls.as_slice() else {
+                panic!("the source must contain exactly one constructor call");
+            };
+            let owner_type = TypedAttrOwnerRef::TypeKey {
+                module_name: "fixture".to_string(),
+                qualname: "Owner".to_string(),
+            };
+            let constructors = HashMap::from([(*origin, owner_type)]);
+            let analysis = analyze_trusted_owner_states(
+                caller,
+                &typed.module_constants,
+                &constructors,
+                &HashMap::new(),
+            );
+            let mut assignments = 0;
+            for block in &caller.blocks {
+                for (instr_index, instr) in block.body.iter().enumerate() {
+                    let InstrTyped::SetAttrTyped(op) = instr else {
+                        continue;
+                    };
+                    assignments += 1;
+                    assert_eq!(
+                        matches!(op.value.as_ref(), InstrTyped::TakeOperand(_)),
+                        capture_receiver,
+                    );
+                    let InstrTyped::TakeOperand(replacement) = op.replacement.as_ref() else {
+                        panic!("the actual assignment must consume its RHS operand");
+                    };
+                    let receiver = trusted_value_name(op.value.as_ref()).unwrap();
+                    let before = &analysis.body_before_instr[&TypedVirtualBodyInstr {
+                        block: block.label,
+                        instr_index,
+                    }];
+                    assert_eq!(
+                        trusted_object_origin_for_name(receiver, before),
+                        Some(*origin),
+                    );
+                    assert_eq!(
+                        trusted_function_id_for_expr(op.replacement.as_ref(), before),
+                        Some(callback_id),
+                    );
+
+                    // Exercise both physical owner kinds with the same actual
+                    // lowered move, including an overwrite with unknown identity.
+                    for preserved in [false, true] {
+                        for known_replacement in [false, true] {
+                            let mut op = op.clone();
+                            let receiver = if preserved {
+                                receiver
+                                    .clone()
+                                    .with_location(NameLocation::Preserved(PreservedLocation(0)))
+                            } else {
+                                receiver.clone()
+                            };
+                            let replacement = if preserved {
+                                replacement
+                                    .name
+                                    .clone()
+                                    .with_location(NameLocation::Preserved(PreservedLocation(1)))
+                            } else {
+                                replacement.name.clone()
+                            };
+                            match op.value.as_mut() {
+                                InstrTyped::Load(load) => load.name = receiver.clone(),
+                                InstrTyped::TakeOperand(take) => take.name = receiver.clone(),
+                                _ => unreachable!(),
+                            }
+                            let InstrTyped::TakeOperand(take) = op.replacement.as_mut() else {
+                                unreachable!()
+                            };
+                            take.name = replacement.clone();
+                            let mut state = TrustedOwnerState::default();
+                            let resume =
+                                TrustedResumeFunctionFact::new(caller.function_id, *origin);
+                            if preserved {
+                                state
+                                    .preserved_object_origins
+                                    .insert(PreservedLocation(0), *origin);
+                                state
+                                    .preserved_resume_functions
+                                    .insert(PreservedLocation(0), resume);
+                                if known_replacement {
+                                    state
+                                        .preserved_functions
+                                        .insert(PreservedLocation(1), callback_id);
+                                }
+                            } else {
+                                let location = receiver.local_location().unwrap();
+                                state.object_origins.insert(location, *origin);
+                                state.resume_functions.insert(location, resume);
+                                if known_replacement {
+                                    state
+                                        .local_functions
+                                        .insert(replacement.local_location().unwrap(), callback_id);
+                                }
+                            }
+                            state.function_fields.insert(
+                                (*origin, "_resume_function".to_string()),
+                                caller.function_id,
+                            );
+                            let instr = InstrTyped::SetAttrTyped(op);
+                            transfer_trusted_owner_instr(
+                                &instr,
+                                &mut state,
+                                &typed.module_constants,
+                                &constructors,
+                                &HashMap::new(),
+                            );
+                            assert_eq!(
+                                trusted_function_field_target_for_origin(
+                                    *origin,
+                                    "_resume_function",
+                                    &state,
+                                ),
+                                known_replacement.then_some(callback_id),
+                                "preserved={preserved} captured={capture_receiver}",
+                            );
+                            assert_eq!(
+                                trusted_object_origin_for_name(&receiver, &state),
+                                (!capture_receiver).then_some(*origin),
+                            );
+                            assert_eq!(
+                                trusted_generator_resume_function_fact_for_name(&receiver, &state)
+                                    .map(|fact| fact.function_id),
+                                (known_replacement && !capture_receiver).then_some(callback_id),
+                                "a field update must not resurrect a consumed receiver slot",
+                            );
+                            assert!(
+                                trusted_function_id_for_expr(
+                                    &InstrTyped::Load(Load::new(replacement)),
+                                    &state,
+                                )
+                                .is_none()
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(assignments, 1);
+        }
+    }
 
     struct NestedIdentityIterFixture {
         function: BlockPyFunction<TypedBlockPyModuleShape>,
@@ -4152,6 +4404,9 @@ mod tests {
 
     impl Visit<InstrTyped> for NextReceiverCollector<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::IteratorStep(step) = expr {
+                self.receivers.push(step.name.clone());
+            }
             if let InstrTyped::CallTyped(call) = expr
                 && typed_expr_is_runtime_name_load(
                     call.func.as_ref(),
@@ -4425,6 +4680,13 @@ mod tests {
                 trusted_function_field_target_for_origin(origin, "_resume_function", state),
                 Some(fixture.generator_function_id)
             );
+        }
+    }
+
+    fn assert_unescaped_generator_identity_iter(fixture: &NestedIdentityIterFixture) {
+        assert_exact_generator_identity_iter(fixture);
+        let origin = fixture.generator_origin.unwrap();
+        for (_, state) in next_receiver_states(fixture) {
             assert!(
                 !trusted_generator_origin_has_escaped(origin, state),
                 "identity iteration alone must not make a generator escape"
@@ -4440,7 +4702,7 @@ def caller(limit):\n    iterator = iter(values(limit))\n    return next(iterator
             Some(FunctionKind::Generator),
         );
 
-        assert_exact_generator_identity_iter(&fixture);
+        assert_unescaped_generator_identity_iter(&fixture);
     }
 
     #[test]
@@ -4452,6 +4714,102 @@ def caller(limit):\n    for value in values(limit):\n        return value\n    r
         );
 
         assert_exact_generator_identity_iter(&fixture);
+    }
+
+    #[test]
+    fn iterator_step_exposes_receiver_but_retirement_only_drops_slot_facts() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    for value in values(limit):\n        pass\n    return None\n",
+            Some(FunctionKind::Generator),
+        );
+        assert_exact_generator_identity_iter(&fixture);
+        let receivers = next_receiver_states(&fixture);
+        let receiver = &receivers.first().expect("the source loop has a step").0;
+        let origin = fixture.generator_origin.unwrap();
+        let mut steps = 0;
+        let mut retirements = 0;
+        for block in &fixture.function.blocks {
+            for (instr_index, instr) in block.body.iter().enumerate() {
+                let Some(before) = fixture
+                    .analysis
+                    .body_before_instr
+                    .get(&TypedVirtualBodyInstr {
+                        block: block.label,
+                        instr_index,
+                    })
+                else {
+                    continue;
+                };
+                if let InstrTyped::Store(store) = instr
+                    && matches!(store.value.as_ref(), InstrTyped::IteratorStep(_))
+                {
+                    assert_eq!(
+                        trusted_escaping_object_origins_in_expr(
+                            store.value.as_ref(),
+                            before,
+                            &fixture.module_constants,
+                        ),
+                        HashSet::from([origin]),
+                        "a native Step can expose its receiver without an admitted template proof"
+                    );
+                    steps += 1;
+                }
+                if !matches!(instr, InstrTyped::TakeOperand(take)
+                    if take.name.location == receiver.location)
+                {
+                    continue;
+                }
+                assert_eq!(
+                    trusted_object_origin_for_name(receiver, before),
+                    Some(origin)
+                );
+                let escaped_before = trusted_generator_origin_has_escaped(origin, before);
+                let mut after = before.clone();
+                transfer_trusted_owner_instr(
+                    instr,
+                    &mut after,
+                    &fixture.module_constants,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                );
+                assert!(trusted_owner_state_for_name(receiver, &after).is_none());
+                assert!(trusted_object_origin_for_name(receiver, &after).is_none());
+                assert!(
+                    trusted_generator_resume_function_fact_for_name(receiver, &after).is_none()
+                );
+                assert_eq!(
+                    trusted_generator_origin_has_escaped(origin, &after),
+                    escaped_before,
+                    "retirement neither adds an escape nor erases a prior Step observation"
+                );
+                retirements += 1;
+            }
+        }
+        assert!(
+            steps > 0,
+            "the real source loop must perform a borrowed Step"
+        );
+        assert!(retirements > 0, "the real loop exit must consume its owner");
+    }
+
+    #[test]
+    fn iterator_step_requires_a_proven_internal_receiver_origin() {
+        let fixture = nested_identity_iter_fixture(
+            "def values(limit):\n    yield limit\n\n\
+def caller(limit):\n    for value in values(limit):\n        return value\n    return None\n",
+            None,
+        );
+        let receivers = next_receiver_states(&fixture);
+        assert!(
+            !receivers.is_empty(),
+            "the source loop must still contain IteratorStep"
+        );
+        for (receiver, state) in receivers {
+            assert!(trusted_owner_state_for_name(&receiver, state).is_none());
+            assert!(trusted_object_origin_for_name(&receiver, state).is_none());
+            assert!(trusted_generator_resume_function_fact_for_name(&receiver, state).is_none());
+        }
     }
 
     #[test]
@@ -4473,7 +4831,7 @@ def caller(limit):\n    iterable = values(limit)\n    try:\n        iterator = i
             Some(FunctionKind::Generator),
         );
 
-        assert_exact_generator_identity_iter(&fixture);
+        assert_unescaped_generator_identity_iter(&fixture);
     }
 
     #[test]
@@ -4484,7 +4842,7 @@ def caller(limit):\n    gen = values(limit)\n    iterator = iter(gen)\n    retur
             Some(FunctionKind::Generator),
         );
 
-        assert_exact_generator_identity_iter(&fixture);
+        assert_unescaped_generator_identity_iter(&fixture);
     }
 
     #[test]

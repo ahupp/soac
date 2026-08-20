@@ -1,11 +1,51 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import subprocess
-import sys
 import textwrap
+
+from scripts.strict_pyperformance_sources import strict_opt_in
+from tests._strict_integration import _VALIDATION_PRELUDE, create_strict_project
+
+
+_FUNCTION_WITNESS = """
+_native_function_id = ctypes.pythonapi.PyFunction_GetSoacFunctionId
+_native_function_id.argtypes = [ctypes.py_object]
+_native_function_id.restype = ctypes.c_uint64
+_native_seal_id = ctypes.pythonapi.PyFunction_GetSoacStrictId
+_native_seal_id.argtypes = [ctypes.py_object]
+_native_seal_id.restype = ctypes.c_uint64
+
+def _assert_selected_functions(module):
+    diagnostic = _soac_ext.strict_module_diagnostics(module)
+    assert diagnostic is not None, 'selected source executed as ordinary Python'
+    assert diagnostic['sealed'] is True
+    assert diagnostic['module_name'] == __EXPECTED_MODULE__
+    assert diagnostic['source_path'] == __EXPECTED_SOURCE__
+    assert diagnostic['artifact_generation'] == __EXPECTED_GENERATION__
+    assert diagnostic['initializer_entry_kind'] == 'entry_interpreter'
+    observed = []
+    for name in ('zero', 'exact_one', 'exact_two', 'defaulted', 'keyword_only', 'variadic', 'nested', 'finite_recursion', 'invoke_c_callback', 'retain', 'fail', 'explicit_recursion_error', 'drive'):
+        function = _plain_function_witness(module, name)
+        assert metadata(function), name
+        actual_owner = owner(function)
+        assert actual_owner, name
+        function_id = _native_function_id(function)
+        seal_id = _native_seal_id(function)
+        # Sealing does not publish the optional unchecked direct-call ID.
+        assert function_id == 0 and seal_id > 0, (name, function_id, seal_id)
+        actual_entry = _soac_ext.strict_function_entry_kind(function)
+        assert actual_entry == 'checked_native', (name, actual_entry)
+        observed.append((name, actual_owner, function_id, seal_id))
+    return tuple(observed)
+
+def _assert_ordinary_functions(namespace):
+    for name in ('zero', 'exact_one', 'exact_two', 'defaulted', 'keyword_only', 'variadic', 'nested', 'finite_recursion', 'invoke_c_callback', 'retain', 'fail', 'explicit_recursion_error', 'drive'):
+        function = namespace[name]
+        assert owner(function) is None and metadata(function) is None, name
+        assert _native_function_id(function) == 0, name
+        assert _native_seal_id(function) == 0, name
+"""
 
 
 _SOURCE = """
@@ -65,7 +105,7 @@ def drive(value):
 
 
 def _run_mode(
-    tmp_path: Path, module_name: str, work_dir: Path, mode: str
+    project, tmp_path: Path, module_name: str, work_dir: Path, mode: str
 ) -> dict[str, object]:
     script = textwrap.dedent(
         """
@@ -83,11 +123,10 @@ def _run_mode(
         stock = {"__name__": "stock_native_recursion_guard", "__builtins__": builtins.__dict__}
         exec(compile(source, "<stock-native-recursion-guard>", "exec"), stock)
 
-        sys.path.insert(0, root)
-        from soac.import_hook import install
 
-        install()
+        _assert_ordinary_functions(stock)
         module = importlib.import_module(name)
+        source_owners = _assert_selected_functions(module)
 
         get_thread_state = ctypes.pythonapi.PyThreadState_GetUnchecked
         get_thread_state.argtypes = []
@@ -232,17 +271,25 @@ def _run_mode(
             finally:
                 sys.setrecursionlimit(original_limit)
 
-            previous_profiler = sys.getprofile()
+            outcomes["nested_result"] = namespace["nested"](12)
+            if not transformed:
+                # Native CPython observers remain a positive ordinary control.
+                # SOAC call/recursion/thread-state semantics are checked above
+                # and below without requiring observer events or refusal.
+                previous_profiler = sys.getprofile()
+                profile_events = []
 
-            def profiler(frame, event, argument):
-                return None
+                def profiler(frame, event, argument):
+                    if frame.f_code is namespace["nested"].__code__:
+                        profile_events.append(event)
 
-            sys.setprofile(profiler)
-            try:
-                assert sys.getprofile() is profiler
-                outcomes["profile_observer"] = namespace["nested"](12)
-            finally:
-                sys.setprofile(previous_profiler)
+                sys.setprofile(profiler)
+                try:
+                    assert sys.getprofile() is profiler
+                    assert namespace["nested"](12) == outcomes["nested_result"]
+                finally:
+                    sys.setprofile(previous_profiler)
+                assert profile_events == ["call", "return"], profile_events
 
             barrier = threading.Barrier(3)
             worker_results = []
@@ -310,6 +357,8 @@ def _run_mode(
         for value in range(40):
             assert module.drive(value) == 3 * value + 6
 
+        _assert_ordinary_functions(stock)
+        assert _assert_selected_functions(module) == source_owners
         print(json.dumps({"mode": mode, "outcomes": actual_outcomes}))
         """
     )
@@ -318,21 +367,18 @@ def _run_mode(
         .replace("__NAME__", repr(module_name))
         .replace("__MODE__", repr(mode))
     )
-    environment = {
-        **os.environ,
-        "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
-        "SOAC_WORK_DIR": str(work_dir),
-        "SOAC_OPT_MODE": mode,
-        "SOAC_COMPILE_MODE": "eager",
-        "SOAC_BACKGROUND_JIT": "0",
-    }
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        check=False,
-        env=environment,
-        text=True,
+    witness = (
+        _FUNCTION_WITNESS.replace("__EXPECTED_MODULE__", repr(module_name))
+        .replace("__EXPECTED_SOURCE__", repr(str(project.project / f"{module_name}.py")))
+        .replace("__EXPECTED_GENERATION__", repr(project.publication["generation"]))
+    )
+    program = _VALIDATION_PRELUDE + witness + script
+    completed = project.run(
+        program,
+        opt_mode=mode,
+        extra_env={"SOAC_WORK_DIR": str(work_dir)},
         timeout=90,
+        check=False,
     )
     assert completed.returncode == 0, (
         f"{mode} native-recursion worker failed:\n"
@@ -348,9 +394,18 @@ def test_native_recursion_stack_guard_preserves_cpython_calls_and_thread_state(
     (tmp_path / f"{module_name}.py").write_text(
         textwrap.dedent(_SOURCE), encoding="utf-8"
     )
+    # Preserve the exact ordinary source; authenticate only the separate copy.
+    relative = f"{module_name}.py"
+    original_source = (tmp_path / relative).read_bytes()
+    project = create_strict_project(
+        tmp_path / "strict-project",
+        {relative: strict_opt_in(original_source, relative)[0].decode()},
+        modules={module_name: relative},
+    )
+
     work_dir = tmp_path / "soac-work"
     results = {
-        mode: _run_mode(tmp_path, module_name, work_dir, mode)
+        mode: _run_mode(project, tmp_path, module_name, work_dir, mode)
         for mode in ("profile", "verify", "apply")
     }
 

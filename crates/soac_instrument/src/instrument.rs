@@ -320,6 +320,20 @@ pub(crate) fn define_call_counters(
     function_id: RuntimeFunctionId,
     instr_id: InstrId,
 ) {
+    counters.define_branch_counter_if_missing(
+        CounterScope::This,
+        "method_dispatch",
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+        [
+            "family_hit",
+            "family_fallback",
+            "checked_entry_hit",
+            "checked_entry_fallback",
+        ],
+    );
     counters.define_if_missing(
         CounterScope::This,
         "call_hot_targets",

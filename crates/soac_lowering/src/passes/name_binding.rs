@@ -1,15 +1,16 @@
 use crate::block_py::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
-    compute_storage_layout_from_scope, core_runtime_positional_call_expr_with_meta,
-    is_runtime_closure_name, literal_expr, BindingKind, BindingPurpose, BindingTarget, Block,
-    BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional,
-    CallableScopeInfo, CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation,
-    CellRef, CellRefForName, ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del,
-    DelItem, EffectiveBinding, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved,
-    IntLiteral, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
-    MapTerm, Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue,
-    PreservedSlotStorage, ResolvedName, RuntimeFunctionId, RuntimeName, SetItem, StorageLayout,
-    Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
+    compute_storage_layout_from_scope, core_runtime_positional_call_expr_with_meta, literal_expr,
+    BindingKind, BindingPurpose, BindingTarget, Block, BlockArg, BlockPyFunction, BlockPyModule,
+    BlockTerm, Call, CallArgPositional, CallableScopeInfo, CallableScopeKind, CellBindingKind,
+    CellCaptureBinding, CellCaptureProjection, CellLoadBinding, CellLocation, CellRef,
+    CellRefForName, ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem,
+    EffectiveBinding, FrameNamespace, FunctionKind, HasMeta, InstrLow, InstrResolved,
+    InstrUnresolved, IntLiteral, Load, MakeCell, MakeFunction, MakeFunctionWithClosure,
+    MapFunction, MapInstr, MapTerm, Mappable, NameLike, NameLocation, NumberLiteral,
+    NumberLiteralValue, PreservedSlotStorage, ResolvedName, RuntimeFunctionId, RuntimeName,
+    SetItem, StorageLayout, Store, StorePurpose, StringLiteral, Tuple, UnresolvedName, Visit,
+    VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -236,7 +237,7 @@ fn cell_expr_for_name(
     range: ruff_text_size::TextRange,
 ) -> InstrUnresolved {
     let _ = scope;
-    CellRefForName::new(name.to_string())
+    CellRefForName::new(name.to_string(), None)
         .with_meta(crate::block_py::Meta::new(node_index, range))
         .into()
 }
@@ -289,7 +290,9 @@ fn rewrite_name_load(
         return Load::new(name).with_meta(meta).into();
     }
 
-    if scope.scope_kind == CallableScopeKind::Class {
+    if scope.scope_kind == CallableScopeKind::Class
+        || scope.native_class_dictionary_binding().is_some()
+    {
         return match scope.effective_binding(name.as_str(), BindingPurpose::Load) {
             Some(EffectiveBinding::ClassBody(ClassBodyFallback::Cell)) => {
                 rewrite_class_name_load_cell(name, meta, scope)
@@ -298,7 +301,7 @@ fn rewrite_name_load(
             Some(EffectiveBinding::Global) => rewrite_global_name_load(name, meta),
             Some(EffectiveBinding::Local) => rewrite_local_name_load(name, meta, resolver),
             Some(EffectiveBinding::ClassBody(ClassBodyFallback::Global)) | None => {
-                rewrite_class_name_load_global(name, meta)
+                rewrite_class_name_load_global(name, meta, scope)
             }
         };
     }
@@ -328,7 +331,7 @@ fn rewrite_cell_ref_expr(
     range: ruff_text_size::TextRange,
 ) -> InstrUnresolved {
     op_expr(
-        CellRefForName::new(logical_name.to_string())
+        CellRefForName::new(logical_name.to_string(), None)
             .with_meta(crate::block_py::Meta::new(node_index.clone(), range)),
     )
 }
@@ -345,11 +348,16 @@ fn rewrite_class_namespace_binding_assign(
     target: UnresolvedName,
     value: InstrUnresolved,
     meta: crate::block_py::Meta,
+    scope: &CallableScopeInfo,
 ) -> CoreStmt {
     let bind_name = target.id_str().to_string();
     op_stmt(
         SetItem::new(
-            Box::new(class_namespace_expr(meta.node_index.clone(), meta.range)),
+            Box::new(class_namespace_expr(
+                scope,
+                meta.node_index.clone(),
+                meta.range,
+            )),
             Box::new(core_string_expr(
                 bind_name,
                 meta.node_index.clone(),
@@ -397,7 +405,11 @@ fn rewrite_binding_delete(
         }
         BindingTarget::ClassNamespace => op_stmt(
             DelItem::new(
-                Box::new(class_namespace_expr(meta.node_index.clone(), meta.range)),
+                Box::new(class_namespace_expr(
+                    scope,
+                    meta.node_index.clone(),
+                    meta.range,
+                )),
                 Box::new(core_string_expr(
                     bind_name,
                     meta.node_index.clone(),
@@ -450,15 +462,36 @@ fn compat_range() -> ruff_text_size::TextRange {
 }
 
 fn class_namespace_expr(
+    scope: &CallableScopeInfo,
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
 ) -> InstrUnresolved {
-    core_name_expr("_dp_class_ns", ast::ExprContext::Load, node_index, range)
+    let name = scope
+        .class_bindings
+        .as_ref()
+        .map_or("_dp_class_ns", |class| class.namespace_binding.as_str());
+    core_name_expr(name, ast::ExprContext::Load, node_index, range)
+}
+
+fn call_namespace(
+    scope: &CallableScopeInfo,
+    meta: crate::block_py::Meta,
+) -> Option<FrameNamespace<InstrUnresolved>> {
+    match scope.scope_kind {
+        CallableScopeKind::Module => Some(FrameNamespace::ModuleGlobals),
+        CallableScopeKind::Class => Some(FrameNamespace::Mapping(Box::new(class_namespace_expr(
+            scope,
+            meta.node_index,
+            meta.range,
+        )))),
+        CallableScopeKind::Function => None,
+    }
 }
 
 fn rewrite_class_name_load_global(
     name: ast::name::Name,
     meta: crate::block_py::Meta,
+    scope: &CallableScopeInfo,
 ) -> InstrUnresolved {
     let bind_name = name.to_string();
     core_runtime_positional_call_expr_with_meta(
@@ -466,7 +499,7 @@ fn rewrite_class_name_load_global(
         meta.node_index.clone(),
         meta.range,
         vec![
-            class_namespace_expr(meta.node_index.clone(), meta.range),
+            annotation_or_class_namespace_expr(scope, meta.node_index.clone(), meta.range),
             core_string_expr(bind_name, meta.node_index.clone(), meta.range),
             globals_expr(meta.node_index, meta.range),
         ],
@@ -484,11 +517,22 @@ fn rewrite_class_name_load_cell(
         meta.node_index.clone(),
         meta.range,
         vec![
-            class_namespace_expr(meta.node_index.clone(), meta.range),
+            annotation_or_class_namespace_expr(scope, meta.node_index.clone(), meta.range),
             core_string_expr(bind_name, meta.node_index.clone(), meta.range),
             cell_expr_for_name(name.as_str(), scope, meta.node_index, meta.range),
         ],
     )
+}
+
+fn annotation_or_class_namespace_expr(
+    scope: &CallableScopeInfo,
+    node_index: ast::AtomicNodeIndex,
+    range: ruff_text_size::TextRange,
+) -> InstrUnresolved {
+    match scope.native_class_dictionary_binding() {
+        Some(binding) => core_name_expr(binding, ast::ExprContext::Load, node_index, range),
+        None => class_namespace_expr(scope, node_index, range),
+    }
 }
 
 fn rewrite_quiet_delete_marker(
@@ -507,7 +551,11 @@ fn rewrite_quiet_delete_marker(
             BindingTarget::ModuleGlobal => op_stmt(Del::new(name, true).with_meta(meta)),
             BindingTarget::ClassNamespace => op_stmt(
                 DelItem::new(
-                    Box::new(class_namespace_expr(meta.node_index.clone(), meta.range)),
+                    Box::new(class_namespace_expr(
+                        scope,
+                        meta.node_index.clone(),
+                        meta.range,
+                    )),
                     Box::new(core_string_expr(
                         name.to_string(),
                         meta.node_index.clone(),
@@ -543,7 +591,12 @@ fn quiet_delete_marker_target(expr: &InstrUnresolved) -> Option<ast::name::Name>
 }
 
 fn cell_ref_marker_target(expr: &InstrUnresolved) -> Option<String> {
-    let InstrUnresolved::CellRefForName(CellRefForName { logical_name, .. }) = expr else {
+    let InstrUnresolved::CellRefForName(CellRefForName {
+        logical_name,
+        lexical_scope: None,
+        ..
+    }) = expr
+    else {
         return None;
     };
     Some(logical_name.clone())
@@ -640,6 +693,9 @@ fn prepend_owned_cell_init_preamble(callable: &mut BlockPyFunction<CoreModuleSha
     let init_stmts = match callable.kind {
         FunctionKind::Function => {
             let mut storage_bindings = collect_owned_cell_storage_bindings(callable);
+            if let Some(class) = &callable.scope.class_bindings {
+                storage_bindings.retain(|(_, storage)| !class.is_current_cell_binding(storage));
+            }
             if storage_bindings.is_empty() {
                 return;
             }
@@ -695,18 +751,40 @@ impl NameBindingMapper<'_> {
             .into_iter()
             .flat_map(|captures| captures.iter())
             .map(|capture| {
+                let cell = match capture.projection {
+                    CellCaptureProjection::CellReference => {
+                        // Resolve a lexical owner/capture in the creating
+                        // frame, not by the callee's incoming carrier name.
+                        // An explicit construction cell can instead have a
+                        // distinct carrier while the source name is global.
+                        let source = if matches!(
+                            self.scope.binding_kind(&capture.logical_name),
+                            Some(BindingKind::Cell(_))
+                        ) {
+                            capture.logical_name.as_str()
+                        } else {
+                            capture.source_name.as_str()
+                        };
+                        rewrite_cell_ref_expr(
+                            source,
+                            self.scope,
+                            meta.node_index.clone(),
+                            meta.range,
+                        )
+                    }
+                    CellCaptureProjection::CellObject => Load::new(UnresolvedName::SourceName(
+                        capture.source_name.clone().into(),
+                    ))
+                    .with_meta(meta.clone())
+                    .into(),
+                };
                 Tuple::new(vec![
                     core_string_expr(
                         capture.logical_name.clone(),
                         meta.node_index.clone(),
                         meta.range,
                     ),
-                    rewrite_cell_ref_expr(
-                        capture.source_name.as_str(),
-                        self.scope,
-                        meta.node_index.clone(),
-                        meta.range,
-                    ),
+                    cell,
                 ])
                 .with_meta(meta.clone())
                 .into()
@@ -727,6 +805,12 @@ impl NameBindingMapper<'_> {
             captures_expr,
             self.map_instr(*op.param_defaults),
             self.map_instr(*op.annotate_fn),
+            op.class_namespace
+                .map(|namespace| Box::new(self.map_instr(*namespace))),
+            op.creation_cells
+                .into_iter()
+                .map(|cell| self.map_instr(cell))
+                .collect::<Vec<_>>(),
         )
         .with_meta(meta)
         .into()
@@ -749,7 +833,7 @@ fn rewrite_binding_assign_by_name(
     match scope.binding_target_for_name(name.as_str(), BindingPurpose::Store) {
         BindingTarget::ModuleGlobal => rewrite_global_binding_assign(target, value, meta),
         BindingTarget::ClassNamespace => {
-            rewrite_class_namespace_binding_assign(target, value, meta)
+            rewrite_class_namespace_binding_assign(target, value, meta, scope)
         }
         BindingTarget::Local => op_stmt(Store::new(target, Box::new(value)).with_meta(meta)),
     }
@@ -757,11 +841,122 @@ fn rewrite_binding_assign_by_name(
 
 impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
     fn map_instr(&mut self, expr: InstrUnresolved) -> InstrUnresolved {
+        use soac_core::block_py::{ClassBindingAccessContext, ClassBindingAccessSelection};
+        let access = match &expr {
+            InstrUnresolved::Load(op) => native_class_access(
+                self.scope,
+                &op.meta(),
+                &op.name,
+                ClassBindingAccessContext::Load,
+            ),
+            InstrUnresolved::Store(op) => native_class_access(
+                self.scope,
+                &op.meta(),
+                &op.name,
+                ClassBindingAccessContext::Store,
+            ),
+            InstrUnresolved::Del(op) if !op.quietly => native_class_access(
+                self.scope,
+                &op.meta(),
+                &op.name,
+                ClassBindingAccessContext::Delete,
+            ),
+            _ => None,
+        };
+        if let Some(access) = access.cloned() {
+            if access.selection == ClassBindingAccessSelection::NamespaceOrCell {
+                let meta = expr.meta();
+                let class = self
+                    .scope
+                    .class_bindings
+                    .as_ref()
+                    .expect("native class access");
+                let raw = class
+                    .slot_binding(access.source)
+                    .expect("native class current slot");
+                let native = &class.node.slots[access.source.index as usize];
+                return core_runtime_positional_call_expr_with_meta(
+                    "class_lookup_cell",
+                    meta.node_index.clone(),
+                    meta.range,
+                    vec![
+                        class_namespace_expr(self.scope, meta.node_index.clone(), meta.range),
+                        core_string_expr(native.name.clone(), meta.node_index.clone(), meta.range),
+                        CellRefForName::new(raw.to_owned(), None)
+                            .with_meta(meta)
+                            .into(),
+                    ],
+                );
+            }
+            // Source metadata survives until physical binding, where the exact
+            // native row chooses RawSlot versus CellValue. Never infer that
+            // decision from an equal spelling in the semantic cell table.
+            return expr.map_same_children(self);
+        }
+        if self.scope.class_bindings.is_some() {
+            let source_operand = match &expr {
+                InstrUnresolved::Load(op) => Some((&op.name, BindingPurpose::Load)),
+                InstrUnresolved::Store(op) => Some((&op.name, BindingPurpose::Store)),
+                InstrUnresolved::Del(op) if !op.quietly => Some((&op.name, BindingPurpose::Store)),
+                _ => None,
+            };
+            if let Some((name, purpose)) = source_operand {
+                if !name.is_runtime_name() {
+                    let effective = self.scope.effective_binding(name.id_str(), purpose);
+                    // Preserve the independent source namespace decision even
+                    // if the native function also captures an equal-name FREE
+                    // slot. Raw-carrier names and value aliases are explicit
+                    // compiler bindings, not namespace keys.
+                    if matches!(
+                        effective,
+                        Some(EffectiveBinding::ClassBody(ClassBodyFallback::Global))
+                    ) {
+                        let meta = expr.meta();
+                        return match expr {
+                            InstrUnresolved::Load(op) => {
+                                rewrite_class_name_load_global(op.name.name(), meta, self.scope)
+                            }
+                            InstrUnresolved::Store(op) => {
+                                assert_eq!(op.purpose, StorePurpose::Binding);
+                                let value = self.map_instr(*op.value);
+                                rewrite_class_namespace_binding_assign(
+                                    op.name, value, meta, self.scope,
+                                )
+                            }
+                            InstrUnresolved::Del(op) => DelItem::new(
+                                Box::new(class_namespace_expr(
+                                    self.scope,
+                                    meta.node_index.clone(),
+                                    meta.range,
+                                )),
+                                Box::new(core_string_expr(
+                                    op.name.id_str().to_owned(),
+                                    meta.node_index.clone(),
+                                    meta.range,
+                                )),
+                            )
+                            .with_meta(meta)
+                            .into(),
+                            _ => unreachable!("source namespace operand"),
+                        };
+                    }
+                    // The fallible driver preflight uses this same decision.
+                    // Keep an invariant for internal callers bypassing the driver.
+                    validate_native_class_cell_operation(self.scope, &expr)
+                        .unwrap_or_else(|message| panic!("{message}"));
+                }
+            }
+        }
         if let Some(name) = quiet_delete_marker_target(&expr) {
             return rewrite_quiet_delete_marker(name, expr.meta(), self.scope, self);
         }
-        if let Some((name, value, node_index, range)) = unresolved_semantic_store_parts(&expr) {
-            return rewrite_binding_assign_by_name(
+        if let Some((name, value, node_index, range)) =
+            unresolved_semantic_store_parts(&expr, self.scope)
+        {
+            let InstrUnresolved::Store(original) = &expr else {
+                unreachable!("semantic store parts require an actual store");
+            };
+            let mut rewritten = rewrite_binding_assign_by_name(
                 name,
                 self.map_instr(value),
                 self.scope,
@@ -769,8 +964,19 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
                 node_index,
                 range,
             );
+            if let InstrUnresolved::Store(store) = &mut rewritten {
+                store.lifetime = original.lifetime;
+                store.purpose = original.purpose;
+            } else {
+                assert_eq!(
+                    original.purpose,
+                    StorePurpose::Binding,
+                    "block-parameter transport cannot target a nonlocal source binding",
+                );
+            }
+            return rewritten;
         }
-        if let Some((target, meta)) = unresolved_semantic_delete_target(&expr) {
+        if let Some((target, meta)) = unresolved_semantic_delete_target(&expr, self.scope) {
             return rewrite_binding_delete(target, meta, self.scope, self);
         }
         if let Some(target_name) = cell_ref_marker_target(&expr) {
@@ -788,7 +994,15 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
                 if op.name.is_runtime_name() {
                     Load::new(op.name).with_meta(meta).into()
                 } else if let UnresolvedName::SourceName(name) = op.name {
-                    if resolve_cell_storage_name(self.scope, name.as_str()).is_some() {
+                    if matches!(
+                        self.scope.effective_binding(name.as_str(), BindingPurpose::Load),
+                        Some(EffectiveBinding::ClassBody(_))
+                    ) {
+                        // A native cell's physical/logical spelling can also
+                        // occur as an original source Name. Its explicit
+                        // dictionary-first lookup wins over storage aliases.
+                        rewrite_name_load(name.into_ast_name(), meta, self.scope, self)
+                    } else if resolve_cell_storage_name(self.scope, name.as_str()).is_some() {
                         rewrite_raw_cell_storage_name_load(
                             name.clone().into_ast_name(),
                             meta.clone(),
@@ -807,12 +1021,19 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
             },
             InstrUnresolved::Literal(literal) => InstrUnresolved::Literal(literal),
             InstrUnresolved::MakeFunction(op) => self.materialize_make_function_expr(op.meta(), op),
-            InstrUnresolved::Call(call)
-                if call.keywords.is_empty()
-                    && call.args.len() == 3
-                    && raw_load_name(call.func.as_ref())
-                        .as_ref()
-                        .is_some_and(|name| name == "class_lookup_cell") =>
+            InstrUnresolved::SetupAnnotations(mut op) => {
+                assert!(op.namespace.is_none(), "annotation namespace was already selected");
+                match self.scope.scope_kind {
+                    CallableScopeKind::Class => {
+                        let meta = op.meta();
+                        op.namespace = Some(Box::new(class_namespace_expr(self.scope, meta.node_index, meta.range)));
+                    }
+                    CallableScopeKind::Module => {}
+                    _ => panic!("annotation namespace setup is not valid in a function body"),
+                }
+                op.into()
+            },
+            InstrUnresolved::Call(call) if is_class_lookup_cell_marker(&call) =>
             {
                 let meta = call.meta();
                 let mut mapped_args = Vec::with_capacity(3);
@@ -831,7 +1052,38 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
                     .with_meta(meta)
                     .into()
             },
-            InstrUnresolved::Call(call) => call.map_same_children(self).into(),
+            InstrUnresolved::Call(call) => {
+                let meta = call.meta();
+                let mut call = call.map_same_children(self);
+                if let Some(namespace) = call_namespace(self.scope, meta) {
+                    call.frame_namespace = Some(namespace);
+                }
+                call.into()
+            },
+            InstrUnresolved::PrepareClassDecorator(op) => {
+                let meta = op.meta();
+                let mut op = op.map_same_children(self);
+                if let Some(namespace) = call_namespace(self.scope, meta) {
+                    op.frame_namespace = Some(namespace);
+                }
+                op.into()
+            },
+            InstrUnresolved::ApplyClassDecorator(op) => {
+                let meta = op.meta();
+                let mut op = op.map_same_children(self);
+                if let Some(namespace) = call_namespace(self.scope, meta) {
+                    op.frame_namespace = Some(namespace);
+                }
+                op.into()
+            },
+            InstrUnresolved::ApplyFunctionDescriptor(op) => {
+                let meta = op.meta();
+                let mut op = op.map_same_children(self);
+                if let Some(namespace) = call_namespace(self.scope, meta) {
+                    op.frame_namespace = Some(namespace);
+                }
+                op.into()
+            },
             rest => rest.map_children(self).into(),
         })
     }
@@ -843,6 +1095,7 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
 
 fn unresolved_semantic_store_parts(
     expr: &InstrUnresolved,
+    scope: &CallableScopeInfo,
 ) -> Option<(
     String,
     InstrUnresolved,
@@ -852,7 +1105,7 @@ fn unresolved_semantic_store_parts(
     let InstrUnresolved::Store(op) = expr else {
         return None;
     };
-    if op.name.is_runtime_name() || is_internal_symbol(op.name.id_str()) {
+    if op.name.is_runtime_name() || !should_late_bind_name(op.name.id_str(), scope) {
         return None;
     }
     let meta = op.meta();
@@ -866,11 +1119,12 @@ fn unresolved_semantic_store_parts(
 
 fn unresolved_semantic_delete_target(
     expr: &InstrUnresolved,
+    scope: &CallableScopeInfo,
 ) -> Option<(ast::name::Name, crate::block_py::Meta)> {
     let InstrUnresolved::Del(op) = expr else {
         return None;
     };
-    if op.quietly || op.name.is_runtime_name() || is_internal_symbol(op.name.id_str()) {
+    if op.quietly || op.name.is_runtime_name() || !should_late_bind_name(op.name.id_str(), scope) {
         return None;
     }
     Some((op.name.clone().name(), op.meta()))
@@ -923,6 +1177,28 @@ fn rewrite_raw_cell_loads_in_expr(
         | InstrUnresolved::Store(_)
         | InstrUnresolved::Del(_)
         | InstrUnresolved::MakeCell(_)
+        | InstrUnresolved::CompleteFunctionDefinition(_)
+        | InstrUnresolved::ApplyFunctionDescriptor(_)
+        | InstrUnresolved::PrepareClassDecorator(_)
+        | InstrUnresolved::DiscardClassDecorator(_)
+        | InstrUnresolved::DiscardClassConstructionCaptures(_)
+        | InstrUnresolved::TakeOperand(_)
+        | InstrUnresolved::ComprehensionInsert(_)
+        | InstrUnresolved::BuildCollection(_)
+        | InstrUnresolved::CallArgumentOp(_)
+        | InstrUnresolved::PreparedCall(_)
+        | InstrUnresolved::IteratorStep(_)
+        | InstrUnresolved::ApplyClassDecorator(_)
+        | InstrUnresolved::NewAnnotationSet(_)
+        | InstrUnresolved::SetupAnnotations(_)
+        | InstrUnresolved::ConstructTypeParameterScope(_)
+        | InstrUnresolved::SubscriptGeneric(_)
+        | InstrUnresolved::SetFunctionTypeParameters(_)
+        | InstrUnresolved::CreateTypeAlias(_)
+        | InstrUnresolved::CreateTypeParameter(_)
+        | InstrUnresolved::SetTypeParameterDefault(_)
+        | InstrUnresolved::CheckAnnotationFormat(_)
+        | InstrUnresolved::RecordAnnotation(_)
         | InstrUnresolved::CellRefForName(_)
         | InstrUnresolved::CellRef(_)
         | InstrUnresolved::MakeFunction(_)
@@ -1006,7 +1282,7 @@ fn normal_successor_labels(term: &BlockTerm<InstrUnresolved>) -> Vec<&crate::blo
             targets.push(&branch.default_label);
             targets
         }
-        BlockTerm::Raise(_) | BlockTerm::Return(_) => Vec::new(),
+        BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => Vec::new(),
     }
 }
 
@@ -1078,6 +1354,12 @@ fn sync_block_param_preserved_slot_in_block(
         .iter()
         .find(|slot| slot.logical_name == param.name)
         .cloned()?;
+    let purpose = match preserved_slot.storage {
+        PreservedSlotStorage::PyCellObject => StorePurpose::Binding,
+        PreservedSlotStorage::PyObjectOrNull | PreservedSlotStorage::I64 => {
+            StorePurpose::BlockParameterTransport
+        }
+    };
     let target_name = match preserved_slot.storage {
         PreservedSlotStorage::PyCellObject => preserved_slot.logical_name,
         PreservedSlotStorage::PyObjectOrNull | PreservedSlotStorage::I64 => {
@@ -1094,6 +1376,7 @@ fn sync_block_param_preserved_slot_in_block(
             ast::name::Name::new(target_name),
             Box::new(rewrite_local_name_load(param_load, meta.clone(), resolver)),
         )
+        .with_purpose(purpose)
         .with_meta(crate::block_py::Meta::new(node_index, range)),
     ))
 }
@@ -1149,7 +1432,25 @@ fn collect_remaining_names_in_expr(expr: &InstrUnresolved, names: &mut HashSet<S
         InstrUnresolved::Del(op) => {
             names.insert(op.name.id_str().to_string());
         }
-        InstrUnresolved::Literal(_)
+        InstrUnresolved::TakeOperand(op) => {
+            names.insert(op.name.id_str().to_string());
+        }
+        InstrUnresolved::ComprehensionInsert(op) => {
+            names.insert(op.container.id_str().to_string());
+        }
+        InstrUnresolved::IteratorStep(op) => {
+            names.insert(op.name.id_str().to_owned());
+        }
+        InstrUnresolved::CallArgumentOp(op) => {
+            names.extend(
+                op.read_names()
+                    .chain(op.written_names())
+                    .map(|name| name.id_str().to_owned()),
+            );
+        }
+        InstrUnresolved::BuildCollection(_)
+        | InstrUnresolved::PreparedCall(_)
+        | InstrUnresolved::Literal(_)
         | InstrUnresolved::BinOp(_)
         | InstrUnresolved::UnaryOp(_)
         | InstrUnresolved::Tuple(_)
@@ -1160,6 +1461,22 @@ fn collect_remaining_names_in_expr(expr: &InstrUnresolved, names: &mut HashSet<S
         | InstrUnresolved::SetItem(_)
         | InstrUnresolved::DelItem(_)
         | InstrUnresolved::MakeCell(_)
+        | InstrUnresolved::CompleteFunctionDefinition(_)
+        | InstrUnresolved::ApplyFunctionDescriptor(_)
+        | InstrUnresolved::PrepareClassDecorator(_)
+        | InstrUnresolved::DiscardClassDecorator(_)
+        | InstrUnresolved::DiscardClassConstructionCaptures(_)
+        | InstrUnresolved::ApplyClassDecorator(_)
+        | InstrUnresolved::NewAnnotationSet(_)
+        | InstrUnresolved::SetupAnnotations(_)
+        | InstrUnresolved::ConstructTypeParameterScope(_)
+        | InstrUnresolved::SubscriptGeneric(_)
+        | InstrUnresolved::SetFunctionTypeParameters(_)
+        | InstrUnresolved::CreateTypeAlias(_)
+        | InstrUnresolved::CreateTypeParameter(_)
+        | InstrUnresolved::SetTypeParameterDefault(_)
+        | InstrUnresolved::CheckAnnotationFormat(_)
+        | InstrUnresolved::RecordAnnotation(_)
         | InstrUnresolved::CellRefForName(_)
         | InstrUnresolved::CellRef(_)
         | InstrUnresolved::MakeFunction(_)
@@ -1314,6 +1631,16 @@ fn materialize_preserved_block_arg_sources(callable: &mut BlockPyFunction<CoreMo
     if preserved_slots.is_empty() {
         return;
     }
+    let raw_preserved_slots = callable
+        .storage_layout
+        .as_ref()
+        .expect("preserved argument locations require a storage layout")
+        .preserved_slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.storage != PreservedSlotStorage::PyCellObject)
+        .map(|(index, _)| index as u32)
+        .collect::<HashSet<_>>();
     let name_gen = callable.name_gen.share();
     for block in &mut callable.blocks {
         let current_param_names = block
@@ -1327,11 +1654,17 @@ fn materialize_preserved_block_arg_sources(callable: &mut BlockPyFunction<CoreMo
             let BlockArg::Name(source_name) = arg else {
                 continue;
             };
-            if !preserved_slots.contains_key(source_name.as_str())
-                || current_param_names.contains(source_name)
-            {
+            let Some(preserved_slot) = preserved_slots.get(source_name.as_str()) else {
+                continue;
+            };
+            if current_param_names.contains(source_name) {
                 continue;
             }
+            let purpose = if raw_preserved_slots.contains(preserved_slot) {
+                StorePurpose::BlockParameterTransport
+            } else {
+                StorePurpose::Binding
+            };
             let local_name = name_gen.next_tmp_name("preserved_arg").to_string();
             let meta = crate::block_py::Meta::new(compat_node_index(), compat_range());
             block.body.push(op_stmt(
@@ -1342,6 +1675,7 @@ fn materialize_preserved_block_arg_sources(callable: &mut BlockPyFunction<CoreMo
                         meta.clone(),
                     )),
                 )
+                .with_purpose(purpose)
                 .with_meta(meta),
             ));
             *source_name = local_name;
@@ -1351,25 +1685,37 @@ fn materialize_preserved_block_arg_sources(callable: &mut BlockPyFunction<CoreMo
 
 fn collect_cell_bindings(
     callable: &BlockPyFunction<CoreModuleShape>,
-) -> HashMap<String, (String, CellBindingKind)> {
+) -> HashMap<String, (String, CellLoadBinding)> {
     let mut bindings = HashMap::new();
     let Some(layout) = callable.storage_layout.as_ref() else {
         return bindings;
     };
 
-    let mut add_binding = |name: &str, storage_name: &str, binding_kind: CellBindingKind| {
-        bindings.insert(name.to_string(), (storage_name.to_string(), binding_kind));
-    };
+    let mut add_binding =
+        |name: &str, storage_name: &str, logical_name: &str, kind: CellBindingKind| {
+            bindings.insert(
+                name.to_string(),
+                (
+                    storage_name.to_string(),
+                    CellLoadBinding {
+                        logical_name: logical_name.into(),
+                        kind,
+                    },
+                ),
+            );
+        };
 
     for slot in &layout.freevars {
         add_binding(
             slot.logical_name.as_str(),
             slot.storage_name.as_str(),
+            slot.logical_name.as_str(),
             CellBindingKind::Capture,
         );
         add_binding(
             slot.storage_name.as_str(),
             slot.storage_name.as_str(),
+            slot.logical_name.as_str(),
             CellBindingKind::Capture,
         );
         let capture_source_name = callable
@@ -1378,6 +1724,7 @@ fn collect_cell_bindings(
         add_binding(
             capture_source_name.as_str(),
             slot.storage_name.as_str(),
+            slot.logical_name.as_str(),
             CellBindingKind::Capture,
         );
     }
@@ -1386,11 +1733,13 @@ fn collect_cell_bindings(
         add_binding(
             logical_name.as_str(),
             storage_name.as_str(),
+            logical_name.as_str(),
             CellBindingKind::Owner,
         );
         add_binding(
             storage_name.as_str(),
             storage_name.as_str(),
+            logical_name.as_str(),
             CellBindingKind::Owner,
         );
     }
@@ -1402,15 +1751,23 @@ fn collect_cell_bindings(
         add_binding(
             slot.logical_name.as_str(),
             slot.storage_name.as_str(),
+            slot.logical_name.as_str(),
             CellBindingKind::Owner,
         );
         add_binding(
             slot.storage_name.as_str(),
             slot.storage_name.as_str(),
+            slot.logical_name.as_str(),
             CellBindingKind::Owner,
         );
     }
 
+    for (alias, logical) in &callable.scope.cell_value_aliases {
+        let binding = bindings.get(logical).cloned().unwrap_or_else(|| {
+            panic!("cell value projection {alias} has no selected logical cell {logical}")
+        });
+        bindings.insert(alias.clone(), binding);
+    }
     bindings
 }
 
@@ -1419,7 +1776,9 @@ fn is_remaining_local_name(
     scope: &CallableScopeInfo,
     has_explicit_store: bool,
 ) -> bool {
-    if resolve_cell_storage_name(scope, name).is_some() {
+    if scope.cell_value_aliases.contains_key(name)
+        || resolve_cell_storage_name(scope, name).is_some()
+    {
         return false;
     }
     if has_explicit_store {
@@ -1578,7 +1937,7 @@ struct NameLocator<'a> {
     owned_cell_slots: HashMap<String, u32>,
     preserved_cell_slots: HashMap<String, u32>,
     preserved_slots: HashMap<String, u32>,
-    cell_bindings: HashMap<String, (String, CellBindingKind)>,
+    cell_bindings: HashMap<String, (String, CellLoadBinding)>,
 }
 
 impl NameLocator<'_> {
@@ -1600,7 +1959,7 @@ impl NameLocator<'_> {
             term: self.map_term(block.term),
             params: block.params,
             exc_edge: block.exc_edge,
-            extra: Default::default(),
+            extra: block.extra,
         };
         self.current_block_param_names = previous_block_param_names;
         block
@@ -1608,8 +1967,13 @@ impl NameLocator<'_> {
 
     fn map_callable(
         &mut self,
-        func: BlockPyFunction<CoreModuleShape>,
+        mut func: BlockPyFunction<CoreModuleShape>,
     ) -> BlockPyFunction<ResolvedStorageModuleShape> {
+        let class_bindings = self.class_binding_projection(&func);
+        func.storage_layout
+            .as_mut()
+            .expect("resolved storage layout")
+            .class_bindings = class_bindings;
         BlockPyFunction {
             function_id: func.function_id,
             name_gen: func.name_gen,
@@ -1661,8 +2025,8 @@ impl NameLocator<'_> {
             return CellLocation::CapturedSource(slot);
         }
 
-        if let Some((storage_name, binding_kind)) = self.cell_bindings.get(name_text) {
-            return match binding_kind {
+        if let Some((storage_name, binding)) = self.cell_bindings.get(name_text) {
+            return match binding.kind {
                 CellBindingKind::Owner => {
                     if let Some(slot) = self
                         .preserved_cell_slots
@@ -1698,11 +2062,13 @@ impl NameLocator<'_> {
         }
 
         panic!(
-            "raw cell target {name_text} did not resolve to a cell-backed location in {}; owned={:?}; captured={:?}; bindings={:?}",
+            "raw cell target {name_text} did not resolve to a cell-backed location in {}; owned={:?}; captured={:?}; bindings={:?}; scope_bindings={:?}; capture_sources={:?}",
             self.scope.names.qualname,
             self.owned_cell_slots,
             self.captured_cell_slots,
-            self.cell_bindings
+            self.cell_bindings,
+            self.scope.bindings,
+            self.scope.cell_capture_source_names
         );
     }
 
@@ -1716,9 +2082,66 @@ impl NameLocator<'_> {
         self.resolve_raw_cell_location(source_name.as_str())
     }
 
+    fn resolve_lexical_cell_location(
+        &self,
+        binding: &soac_core::block_py::LexicalCellBinding,
+    ) -> CellLocation {
+        if self.scope.source_origin.as_ref().is_some_and(|origin| {
+            origin.role == soac_core::block_py::CallableSourceRole::SourceFunction
+                && origin.definition == binding.scope
+        }) {
+            let location = self.resolve_cell_ref_location(&binding.name);
+            assert!(
+                matches!(
+                    location,
+                    CellLocation::Owned(_) | CellLocation::Preserved(_)
+                ),
+                "an original lexical owner requires its own physical cell"
+            );
+            return location;
+        }
+        let scope = self
+            .scope
+            .private_lexical
+            .as_ref()
+            .expect("explicit lexical forwarding scope");
+        let projection = scope
+            .captures
+            .iter()
+            .find(|projection| &projection.cell.binding == binding)
+            .expect("exact lexical binding projection");
+        if let Some(name) = &projection.native_closure {
+            assert!(self.scope.source_origin.as_ref().is_some_and(
+                |origin| origin.role == soac_core::block_py::CallableSourceRole::SourceFunction
+            ));
+            let location = self.resolve_cell_ref_location(name);
+            assert!(
+                matches!(
+                    location,
+                    CellLocation::Closure(_) | CellLocation::CapturedSource(_)
+                ),
+                "native forwarding must resolve to an existing public closure slot"
+            );
+            location
+        } else {
+            CellLocation::Private(
+                scope
+                    .private_cell_index(binding)
+                    .expect("private lexical slot"),
+            )
+        }
+    }
+
     fn locate_name(&mut self, name: crate::block_py::BlockPyName) -> ResolvedName {
         let name_text = name.to_string();
-        let location = if self.current_block_param_names.contains(name_text.as_str()) {
+        let location = if native_class_current_cell(self.scope, &name_text) {
+            NameLocation::local(
+                *self
+                    .local_slots
+                    .get(&name_text)
+                    .expect("native current cell has its exact raw local carrier"),
+            )
+        } else if self.current_block_param_names.contains(name_text.as_str()) {
             let slot = self
                 .local_slots
                 .get(name_text.as_str())
@@ -1740,10 +2163,10 @@ impl NameLocator<'_> {
                 )
             });
             NameLocation::captured_source_cell(slot)
-        } else if let Some((storage_name, binding_kind)) =
+        } else if let Some((storage_name, binding)) =
             self.cell_bindings.get(name_text.as_str()).cloned()
         {
-            match binding_kind {
+            match binding.kind {
                 CellBindingKind::Owner => {
                     if let Some(slot) = self
                         .preserved_cell_slots
@@ -1794,10 +2217,8 @@ impl NameLocator<'_> {
         name: crate::block_py::BlockPyName,
     ) -> ResolvedName {
         let name_text = name.to_string();
-        if let Some((storage_name, CellBindingKind::Owner)) =
-            self.cell_bindings.get(name_text.as_str())
-        {
-            if name_text != *storage_name {
+        if let Some((storage_name, binding)) = self.cell_bindings.get(name_text.as_str()) {
+            if binding.kind == CellBindingKind::Owner && name_text != *storage_name {
                 if let Some(slot) = self.local_slots.get(name_text.as_str()).copied() {
                     return ResolvedName {
                         id: name,
@@ -1819,6 +2240,25 @@ impl NameLocator<'_> {
         }
     }
 
+    fn load_with_binding(&self, name: ResolvedName, meta: crate::block_py::Meta) -> InstrResolved {
+        let cell_binding = name.cell_location().map(|_| {
+            self.cell_bindings
+                .get(name.id.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "cell load {} has no original binding in {}",
+                        name.id, self.scope.names.qualname,
+                    )
+                })
+                .1
+                .clone()
+        });
+        Load::new(name)
+            .with_cell_binding(cell_binding)
+            .with_meta(meta)
+            .into()
+    }
+
     fn mark_raw_cell_store_name(&self, name: ResolvedName) -> ResolvedName {
         let name_text = name.id.to_string();
         if self
@@ -1826,6 +2266,14 @@ impl NameLocator<'_> {
             .logical_name_for_cell_storage(name_text.as_str())
             .is_some()
         {
+            if let Some(slot) = self.preserved_cell_slots.get(name_text.as_str()).copied() {
+                // This name denotes the frame-owned cell object, not the
+                // source binding stored inside it. Terminal frame cleanup
+                // must release that reference while escaped closures retain
+                // the cell and its value. A source `del value` still resolves
+                // through the logical name to CellLocation::Preserved.
+                return name.with_location(NameLocation::preserved(slot));
+            }
             if let Some(slot) = self.local_slots.get(name_text.as_str()).copied() {
                 return name.with_location(NameLocation::local(slot));
             }
@@ -1845,7 +2293,7 @@ impl NameLocator<'_> {
                 location: NameLocation::RuntimeName(name),
             },
         };
-        Load::new(name).with_meta(meta).into()
+        self.load_with_binding(name, meta)
     }
 
     fn mark_raw_cell_name(&self, name: ResolvedName) -> ResolvedName {
@@ -1897,16 +2345,30 @@ impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
             InstrLow::Literal(literal) => InstrResolved::Literal(literal),
             InstrLow::Load(op) => {
                 let meta = op.meta();
+                if let Some(access) = native_class_access(
+                    self.scope, &meta, &op.name, soac_core::block_py::ClassBindingAccessContext::Load,
+                ) {
+                    let (name, cell_binding) = self.native_class_access_name(access);
+                    return Load::new(name).with_cell_binding(cell_binding).with_meta(meta).into();
+                }
                 let name = self.locate_unresolved_name(op.name);
                 let name = if name.is_runtime_name() {
                     name
                 } else {
                     self.mark_raw_cell_name(name)
                 };
-                Load::new(name).with_meta(meta).into()
+                self.load_with_binding(name, meta)
             },
             InstrLow::Store(op) => {
                 let meta = op.meta();
+                if let Some(access) = native_class_access(
+                    self.scope, &meta, &op.name, soac_core::block_py::ClassBindingAccessContext::Store,
+                ) {
+                    let (name, _) = self.native_class_access_name(access);
+                    let value = self.map_instr(*op.value);
+                    return Store::new(name, Box::new(value)).with_lifetime(op.lifetime)
+                        .with_purpose(op.purpose).with_meta(meta).into();
+                }
                 let name = self.locate_unresolved_name(op.name);
                 let name = if name.is_runtime_name() {
                     name
@@ -1914,10 +2376,18 @@ impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
                     self.mark_raw_cell_store_name(name)
                 };
                 let value = self.map_instr(*op.value);
-                Store::new(name, Box::new(value)).with_meta(meta).into()
+                Store::new(name, Box::new(value)).with_lifetime(op.lifetime).with_purpose(op.purpose).with_meta(meta).into()
             },
             InstrLow::Del(op) => {
                 let meta = op.meta();
+                if !op.quietly {
+                    if let Some(access) = native_class_access(
+                        self.scope, &meta, &op.name, soac_core::block_py::ClassBindingAccessContext::Delete,
+                    ) {
+                        let (name, _) = self.native_class_access_name(access);
+                        return Del::new(name, false).with_meta(meta).into();
+                    }
+                }
                 let name = self.locate_unresolved_name(op.name);
                 let name = if name.is_runtime_name() {
                     name
@@ -1928,7 +2398,14 @@ impl MapInstr<InstrUnresolved, InstrResolved> for NameLocator<'_> {
             },
             InstrLow::CellRefForName(op) => {
                 let meta = op.meta();
-                let location = self.resolve_cell_ref_location(op.logical_name.as_str());
+                let location = if let Some(scope) = &op.lexical_scope {
+                    self.resolve_lexical_cell_location(&soac_core::block_py::LexicalCellBinding {
+                        scope: scope.clone(),
+                        name: op.logical_name.clone(),
+                    })
+                } else {
+                    self.resolve_cell_ref_location(op.logical_name.as_str())
+                };
                 CellRef::new(location).with_meta(meta).into()
             },
             InstrLow::Call(call) => {
@@ -1991,23 +2468,22 @@ fn collect_make_function_callee_ids_in_expr(
     expr: &InstrUnresolved,
     out: &mut Vec<RuntimeFunctionId>,
 ) {
-    match expr {
-        InstrUnresolved::Literal(_) => {}
-        InstrUnresolved::MakeFunction(op) => out.push(op.function_id),
-        _ => {
-            struct CalleeVisitor<'a> {
-                out: &'a mut Vec<RuntimeFunctionId>,
-            }
+    if let InstrUnresolved::MakeFunction(op) = expr {
+        out.push(op.function_id);
+    }
+    // Creation operands can contain another creation, notably the actual
+    // annotation provider. Its lexical cells belong to this producer too.
+    struct CalleeVisitor<'a> {
+        out: &'a mut Vec<RuntimeFunctionId>,
+    }
 
-            impl crate::block_py::Visit<InstrUnresolved> for CalleeVisitor<'_> {
-                fn visit_instr(&mut self, expr: &InstrUnresolved) {
-                    collect_make_function_callee_ids_in_expr(expr, self.out);
-                }
-            }
-
-            expr.visit_children(&mut CalleeVisitor { out });
+    impl crate::block_py::Visit<InstrUnresolved> for CalleeVisitor<'_> {
+        fn visit_instr(&mut self, expr: &InstrUnresolved) {
+            collect_make_function_callee_ids_in_expr(expr, self.out);
         }
     }
+
+    expr.visit_children(&mut CalleeVisitor { out });
 }
 
 fn collect_make_function_callee_ids(
@@ -2097,7 +2573,11 @@ fn compute_callable_storage_layout_for_name_binding(
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
-    let param_name_set = callable.params.names().into_iter().collect::<HashSet<_>>();
+    let param_name_set = callable
+        .body_params()
+        .names()
+        .into_iter()
+        .collect::<HashSet<_>>();
     let mut local_cell_slots = base_layout
         .as_ref()
         .map(|layout| {
@@ -2131,6 +2611,15 @@ fn compute_callable_storage_layout_for_name_binding(
                 continue;
             };
             for slot in &callee_layout.freevars {
+                let callee_scope = callable_by_id[callee_id].public_scope();
+                let selected_source = callee_scope.cell_capture_source_name(&slot.logical_name);
+                if (callee_scope.cell_capture_projection(&slot.logical_name)
+                    == CellCaptureProjection::CellObject
+                    && callable.body_params().names().contains(&selected_source))
+                    || base_cellvar_storage_names.contains(&selected_source)
+                {
+                    continue;
+                }
                 let capture_source_name = callable
                     .scope
                     .cell_capture_source_name(slot.logical_name.as_str());
@@ -2186,7 +2675,14 @@ fn compute_callable_storage_layout_for_name_binding(
                 .scope
                 .logical_name_for_cell_storage(storage_name.as_str())
                 .unwrap_or_else(|| storage_name.clone());
-            let init = if param_name_set.contains(logical_name.as_str()) {
+            let init = if callable
+                .scope
+                .class_bindings
+                .as_ref()
+                .is_some_and(|class| class.is_current_cell_binding(&storage_name))
+            {
+                ClosureInit::Deferred
+            } else if param_name_set.contains(logical_name.as_str()) {
                 ClosureInit::Parameter
             } else {
                 ClosureInit::EmptyCell
@@ -2200,9 +2696,6 @@ fn compute_callable_storage_layout_for_name_binding(
         capture_names.sort();
         capture_names.dedup();
         for logical_name in capture_names {
-            if is_runtime_closure_name(logical_name.as_str()) {
-                continue;
-            }
             let storage_name = callable.scope.cell_storage_name(logical_name.as_str());
             if layout.has_storage_name(storage_name.as_str()) {
                 continue;
@@ -2364,6 +2857,9 @@ fn compute_module_make_function_capture_names(
                         .freevars
                         .iter()
                         .map(|slot| CellCaptureBinding {
+                            projection: callable
+                                .public_scope()
+                                .cell_capture_projection(&slot.logical_name),
                             logical_name: slot.logical_name.clone(),
                             source_name: make_function_capture_source_name(
                                 callable.public_scope(),
@@ -2403,6 +2899,17 @@ fn compute_module_make_function_capture_names(
                         visiting,
                     );
                 for capture in callee_captures {
+                    // An explicit cell-object argument belongs to this
+                    // namespace invocation, not to the enclosing lexical
+                    // closure. Do not propagate it to a class factory.
+                    if capture.projection == CellCaptureProjection::CellObject
+                        && callable
+                            .body_params()
+                            .names()
+                            .contains(&capture.source_name)
+                    {
+                        continue;
+                    }
                     let mut logical_name = capture.logical_name;
                     let requested_source_name = capture.source_name;
                     loop {
@@ -2437,6 +2944,7 @@ fn compute_module_make_function_capture_names(
                         continue;
                     }
                     captures.push(CellCaptureBinding {
+                        projection: callable.scope.cell_capture_projection(&logical_name),
                         logical_name,
                         source_name,
                     });
@@ -2490,6 +2998,9 @@ fn compute_module_make_function_capture_names(
                             .freevars
                             .iter()
                             .map(|slot| CellCaptureBinding {
+                                projection: callable
+                                    .public_scope()
+                                    .cell_capture_projection(&slot.logical_name),
                                 logical_name: slot.logical_name.clone(),
                                 source_name: make_function_capture_source_name(
                                     callable.public_scope(),
@@ -2533,7 +3044,7 @@ fn refresh_bb_callable_block_params(
                 term: block.term,
                 params,
                 exc_edge: block.exc_edge,
-                extra: Default::default(),
+                extra: block.extra,
             }
         })
         .collect::<Vec<_>>();
@@ -2589,12 +3100,11 @@ fn populate_jump_edge_args(blocks: &mut [crate::block_py::ResolvedStorageBlock])
                 {
                     return BlockArg::Name(target_param.name.clone());
                 }
-                if let Some(source_same_role) = source_params
-                    .iter()
-                    .find(|source_param| source_param.role == target_param.role)
-                {
-                    return BlockArg::Name(source_same_role.name.clone());
-                }
+                // Roles describe transport kinds, not binding identities.
+                // Entering a different handled/finally region must not adopt
+                // another region's exception merely because both are marked
+                // Exception. A producer that renames a real value supplies an
+                // explicit edge argument; an absent implicit binding is None.
                 BlockArg::None
             })
             .collect::<Vec<_>>();
@@ -2645,6 +3155,7 @@ fn lower_name_binding_callable(
         locate_names_in_callable(lowered),
     ));
     ensure_storage_layout_covers_block_params(&mut lowered);
+    crate::passes::block_parameter_roles::record_resolved_block_parameter_roles(&mut lowered);
     lowered
 }
 
@@ -2698,10 +3209,7 @@ impl ModuleConstantExtractor {
                 expr,
                 InstrResolved::Load(op)
                     if op.name.is_runtime_name()
-                        && !matches!(
-                            op.name.runtime_name_id(),
-                            Some(RuntimeName::Globals | RuntimeName::UnpackFixed)
-                        )
+                        && !op.name.runtime_name_id().is_some_and(RuntimeName::is_language_intrinsic)
             )
         {
             let meta = expr.meta();
@@ -2832,11 +3340,14 @@ struct RuntimeNameGlobalNameRewriter;
 impl crate::block_py::VisitMut<InstrResolved> for RuntimeNameGlobalNameRewriter {
     fn visit_instr_mut(&mut self, expr: &mut InstrResolved) {
         if let InstrResolved::Load(op) = expr {
+            // A source None literal, including async-generator completion,
+            // cannot become a mutable module binding. The bootstrap constant
+            // loader supplies it without importing soac.runtime.
             if op.name.location.is_runtime_name()
-                && !matches!(
-                    op.name.runtime_name_id(),
-                    Some(RuntimeName::Globals | RuntimeName::UnpackFixed)
-                )
+                && !op
+                    .name
+                    .runtime_name_id()
+                    .is_some_and(|name| name == RuntimeName::None || name.is_language_intrinsic())
             {
                 op.name.location = NameLocation::global_name();
             }
@@ -2863,6 +3374,7 @@ pub(crate) fn lower_name_binding_in_core_blockpy_module_with_unsound_runtime_bui
         compute_module_make_function_capture_names(&callable_defs);
     let mut module = BlockPyModule {
         module_name_gen: module.module_name_gen,
+        strict_source: module.strict_source,
         global_names: Vec::new(),
         callable_defs: callable_defs
             .into_iter()
@@ -2873,7 +3385,11 @@ pub(crate) fn lower_name_binding_in_core_blockpy_module_with_unsound_runtime_bui
         module_constants: Vec::new(),
         counter_defs: Vec::new(),
     };
-    if unsound_runtime_builtin_names {
+    // Strict globals are append-only, not closed: an initially absent source
+    // name may later shadow its live captured builtin. Keep those reads global
+    // so global_index reserves their slots. Explicit compiler RuntimeNames
+    // already have their own binding and are unaffected by this restriction.
+    if unsound_runtime_builtin_names && module.strict_source.is_none() {
         module = rewrite_unsound_builtin_loads_as_runtime_names(module);
     }
     if runtime_names_as_globals {
@@ -2891,4 +3407,268 @@ pub(crate) fn lower_name_binding_in_core_blockpy_module_with_options(
         true,
         runtime_names_as_globals,
     )
+}
+
+fn is_class_lookup_cell_marker(call: &Call<InstrUnresolved>) -> bool {
+    call.keywords.is_empty()
+        && call.args.len() == 3
+        && raw_load_name(call.func.as_ref())
+            .as_ref()
+            .is_some_and(|name| name == "class_lookup_cell")
+}
+
+fn validate_native_class_cell_operation(
+    scope: &CallableScopeInfo,
+    expr: &InstrUnresolved,
+) -> Result<(), String> {
+    use soac_core::block_py::ClassBindingAccessContext;
+
+    let Some(class) = scope.class_bindings.as_ref() else {
+        return Ok(());
+    };
+    let (name, context, purpose) = match expr {
+        InstrUnresolved::Load(op) => (
+            &op.name,
+            ClassBindingAccessContext::Load,
+            BindingPurpose::Load,
+        ),
+        InstrUnresolved::Store(op) => (
+            &op.name,
+            ClassBindingAccessContext::Store,
+            BindingPurpose::Store,
+        ),
+        InstrUnresolved::Del(op) if !op.quietly => (
+            &op.name,
+            ClassBindingAccessContext::Delete,
+            BindingPurpose::Store,
+        ),
+        _ => return Ok(()),
+    };
+    if name.is_runtime_name()
+        || scope.cell_value_aliases.contains_key(name.id_str())
+        || native_class_access(scope, &expr.meta(), name, context).is_some()
+        || !matches!(
+            scope.effective_binding(name.id_str(), purpose),
+            Some(EffectiveBinding::Cell(_) | EffectiveBinding::ClassBody(ClassBodyFallback::Cell))
+        )
+    {
+        return Ok(());
+    }
+    // The actual operation's semantic binding matters, not the presence of an
+    // equal-name native FREE slot. A namespace-local store may forward that slot.
+    Err(format!(
+        "retained class {}: {:?} {} has no canonical native slot access \
+         (operation range {:?}, class source {:?})",
+        class.source.lexical_qualname,
+        context,
+        name.id_str(),
+        expr.meta().range,
+        class.source.source_range,
+    ))
+}
+
+pub(crate) fn validate_native_class_cell_operations(
+    module: &BlockPyModule<CoreModuleShape>,
+) -> Result<(), String> {
+    struct Validator<'a> {
+        scope: &'a CallableScopeInfo,
+        error: Option<String>,
+    }
+
+    impl Visit<InstrUnresolved> for Validator<'_> {
+        fn visit_instr(&mut self, expr: &InstrUnresolved) {
+            if self.error.is_some() || quiet_delete_marker_target(expr).is_some() {
+                return;
+            }
+            // These existing marker operands describe raw carriers. They are
+            // not executable Loads; visit exactly the children the mapper maps.
+            if let InstrUnresolved::Call(call) = expr {
+                if is_class_lookup_cell_marker(call) {
+                    self.visit_instr(call.func.as_ref());
+                    for arg in call.args.iter().take(2) {
+                        match arg {
+                            CallArgPositional::Positional(value)
+                            | CallArgPositional::Starred(value) => self.visit_instr(value),
+                        }
+                    }
+                    return;
+                }
+            }
+            if let Err(message) = validate_native_class_cell_operation(self.scope, expr) {
+                self.error = Some(message);
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    for callable in &module.callable_defs {
+        if callable.scope.class_bindings.is_none() {
+            continue;
+        }
+        let mut validator = Validator {
+            scope: &callable.scope,
+            error: None,
+        };
+        for block in &callable.blocks {
+            for statement in &block.body {
+                validator.visit_instr(statement);
+            }
+            crate::block_py::walk_term(&mut validator, &block.term);
+            if let Some(message) = validator.error.take() {
+                return Err(message);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn native_class_access<'a>(
+    scope: &'a CallableScopeInfo,
+    meta: &crate::block_py::Meta,
+    name: &UnresolvedName,
+    context: soac_core::block_py::ClassBindingAccessContext,
+) -> Option<&'a soac_core::block_py::ClassBindingAccess> {
+    let class = scope.class_bindings.as_ref()?;
+    if name.is_runtime_name() {
+        return None;
+    }
+    let range =
+        soac_contracts::SourceRange::new(meta.range.start().to_u32(), meta.range.end().to_u32());
+    let mut matches = class.recipe.accesses.iter().filter(|access| {
+        access.source_range == range && access.context == context
+            // Corroborate the original source operand. This never selects a
+            // slot by spelling: the exact native access row selects its ID.
+            && class.node.slots[access.source.index as usize].name == name.id_str()
+    });
+    let access = matches.next()?;
+    assert!(
+        matches.next().is_none(),
+        "one native original Name operation"
+    );
+    Some(access)
+}
+
+fn native_class_current_cell(scope: &CallableScopeInfo, name: &str) -> bool {
+    scope
+        .class_bindings
+        .as_ref()
+        .is_some_and(|class| class.is_current_cell_binding(name))
+}
+
+impl NameLocator<'_> {
+    fn class_binding_projection(
+        &self,
+        function: &BlockPyFunction<CoreModuleShape>,
+    ) -> Option<soac_core::block_py::ClassBindingProjection> {
+        use soac_core::block_py::{
+            ClassBindingProjection, ClassBindingSlotProjection, ClassBindingStorage, LocalLocation,
+        };
+        let class = function.scope.class_bindings.as_ref()?;
+        let projection = ClassBindingProjection {
+            class_code: class.node.id,
+            namespace: LocalLocation(
+                *self
+                    .local_slots
+                    .get(&class.namespace_binding)
+                    .expect("class namespace has one allocated owner"),
+            ),
+            slots: class
+                .slots
+                .iter()
+                .map(|row| ClassBindingSlotProjection {
+                    slot: row.slot,
+                    storage: ClassBindingStorage::Cell(CellLocation::Owned(
+                        *self
+                            .owned_cell_slots
+                            .get(&row.binding)
+                            .expect("actual class cell registration"),
+                    )),
+                })
+                .collect(),
+        };
+        // Validation checks the actual lexical cell owners and namespace mapping.
+        // It does not compare the compiler's locals to native localsplus.
+        Some(projection)
+    }
+
+    fn native_class_access_name(
+        &self,
+        access: &soac_core::block_py::ClassBindingAccess,
+    ) -> (ResolvedName, Option<CellLoadBinding>) {
+        use soac_core::block_py::ClassBindingAccessSelection;
+        let class = self
+            .scope
+            .class_bindings
+            .as_ref()
+            .expect("class access scope");
+        let row = class
+            .slot_binding(access.source)
+            .expect("native source slot");
+        let native = &class.node.slots[access.source.index as usize];
+        let (location, binding) = match access.selection {
+            ClassBindingAccessSelection::RawSlot => (
+                NameLocation::local(*self.local_slots.get(row).expect("native raw local")),
+                None,
+            ),
+            ClassBindingAccessSelection::CellValue => (
+                NameLocation::owned_cell(*self.owned_cell_slots.get(row).expect("native raw cell")),
+                Some(CellLoadBinding {
+                    logical_name: native.name.clone().into(),
+                    kind: if native.kind.is_free() {
+                        CellBindingKind::Capture
+                    } else {
+                        CellBindingKind::Owner
+                    },
+                }),
+            ),
+            ClassBindingAccessSelection::NamespaceOrCell => panic!(
+                "namespace-or-cell access must be explicitly selected before physical binding"
+            ),
+        };
+        // Resolved body names identify the current carrier; source diagnostics
+        // use CellLoadBinding or the validated physical class projection.
+        (
+            ResolvedName {
+                id: row.to_owned().into(),
+                location,
+            },
+            binding,
+        )
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn canonical_class_binding_rejects_missing_original_cell_access_metadata() {
+    use soac_core::block_py::Meta;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // Keep this real supported FREE-access negative independent of deferred
+    // regional execution. The original regional source and its raw-slot facts
+    // remain in strict_interpreter_source's native-data fixture inventory.
+    let module = crate::test::strict_source::lower_verified(concat!(
+        "from __future__ import strict\n",
+        "def factory(value):\n",
+        "    class C:\n",
+        "        seen = value\n",
+        "    return C\n",
+    ))
+    .unwrap();
+    let scope = &module
+        .callable_defs
+        .iter()
+        .find(|function| function.scope.class_bindings.is_some())
+        .unwrap()
+        .scope;
+    let captures = HashMap::new();
+    let mut mapper = NameBindingMapper {
+        scope,
+        callee_make_function_captures: &captures,
+    };
+    let missing_cell: InstrUnresolved = Load::new("value").with_meta(Meta::synthetic()).into();
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| mapper.map_instr(missing_cell))).is_err(),
+        "a lost native cell access must not select the incoming same-name cell"
+    );
 }

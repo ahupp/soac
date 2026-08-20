@@ -1,0 +1,249 @@
+{
+  "unsealed_module_global_replacement_matches_cpython_module_attribute": {
+    "original_test": "test_unsealed_module_global_replacement_matches_cpython",
+    "parameters": {
+      "mutation": "module_attribute"
+    },
+    "source": "\ndef target(value):\n    return value + 1\n\n\ndef replacement(value):\n    return value + 10\n\n\ndef call(value):\n    return target(value)\n",
+    "source_sha256": "ac44e7e6dcc6158595c9ce687516a8feaa783f81a1a03f9f094189c50237d781",
+    "validation": "mutation = 'module_attribute'\nexpected = _observe_global_replacement(stock, mutation)\nassert expected == (3, 12)\nsoac = module\nactual = _observe_global_replacement(soac, mutation)\nassert actual == expected\n",
+    "required_functions": [
+      "target",
+      "replacement",
+      "call"
+    ]
+  },
+  "unsealed_module_global_replacement_matches_cpython_module_dictionary": {
+    "original_test": "test_unsealed_module_global_replacement_matches_cpython",
+    "parameters": {
+      "mutation": "module_dictionary"
+    },
+    "source": "\ndef target(value):\n    return value + 1\n\n\ndef replacement(value):\n    return value + 10\n\n\ndef call(value):\n    return target(value)\n",
+    "source_sha256": "ac44e7e6dcc6158595c9ce687516a8feaa783f81a1a03f9f094189c50237d781",
+    "validation": "mutation = 'module_dictionary'\nexpected = _observe_global_replacement(stock, mutation)\nassert expected == (3, 12)\nsoac = module\nactual = _observe_global_replacement(soac, mutation)\nassert actual == expected\n",
+    "required_functions": [
+      "target",
+      "replacement",
+      "call"
+    ]
+  },
+  "unsealed_module_global_replacement_matches_cpython_function_globals": {
+    "original_test": "test_unsealed_module_global_replacement_matches_cpython",
+    "parameters": {
+      "mutation": "function_globals"
+    },
+    "source": "\ndef target(value):\n    return value + 1\n\n\ndef replacement(value):\n    return value + 10\n\n\ndef call(value):\n    return target(value)\n",
+    "source_sha256": "ac44e7e6dcc6158595c9ce687516a8feaa783f81a1a03f9f094189c50237d781",
+    "validation": "mutation = 'function_globals'\nexpected = _observe_global_replacement(stock, mutation)\nassert expected == (3, 12)\nsoac = module\nactual = _observe_global_replacement(soac, mutation)\nassert actual == expected\n",
+    "required_functions": [
+      "target",
+      "replacement",
+      "call"
+    ]
+  },
+  "unsealed_module_global_replacement_matches_cpython_exec": {
+    "original_test": "test_unsealed_module_global_replacement_matches_cpython",
+    "parameters": {
+      "mutation": "exec"
+    },
+    "source": "\ndef target(value):\n    return value + 1\n\n\ndef replacement(value):\n    return value + 10\n\n\ndef call(value):\n    return target(value)\n",
+    "source_sha256": "ac44e7e6dcc6158595c9ce687516a8feaa783f81a1a03f9f094189c50237d781",
+    "validation": "mutation = 'exec'\nexpected = _observe_global_replacement(stock, mutation)\nassert expected == (3, 12)\nsoac = module\nactual = _observe_global_replacement(soac, mutation)\nassert actual == expected\n",
+    "required_functions": [
+      "target",
+      "replacement",
+      "call"
+    ]
+  },
+  "unsealed_module_global_replacement_matches_cpython_c_api": {
+    "original_test": "test_unsealed_module_global_replacement_matches_cpython",
+    "parameters": {
+      "mutation": "c_api"
+    },
+    "source": "\ndef target(value):\n    return value + 1\n\n\ndef replacement(value):\n    return value + 10\n\n\ndef call(value):\n    return target(value)\n",
+    "source_sha256": "ac44e7e6dcc6158595c9ce687516a8feaa783f81a1a03f9f094189c50237d781",
+    "validation": "mutation = 'c_api'\nexpected = _observe_global_replacement(stock, mutation)\nassert expected == (3, 12)\nsoac = module\nactual = _observe_global_replacement(soac, mutation)\nassert actual == expected\n",
+    "required_functions": [
+      "target",
+      "replacement",
+      "call"
+    ]
+  },
+  "late_module_global_shadows_builtin_like_cpython": {
+    "original_test": "test_late_module_global_shadows_builtin_like_cpython",
+    "parameters": {},
+    "source": "\ndef call(value):\n    return len(value)\n",
+    "source_sha256": "246404b61311f025a846017c96f4eff1356e9bb0d96c937939be33ae01c90dd7",
+    "validation": "expected = _observe_late_builtin_shadow(stock)\nassert expected == (3, 41)\nsoac = module\nactual = _observe_late_builtin_shadow(soac)\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "named_builtin_uses_its_live_captured_mapping_like_cpython": {
+    "original_test": "test_named_builtin_uses_its_live_captured_mapping_like_cpython",
+    "parameters": {},
+    "source": "\n__builtins__ = {\"len\": lambda value: 41}\n\n\ndef call(value):\n    return len(value)\n",
+    "source_sha256": "32eafb4f3ae047d3bcb10032b25d0675666d063ae394f1de1496df5b14f483ee",
+    "validation": "expected = _observe_captured_builtin_mutation(stock)\nassert expected == (41, 52)\nsoac = module\nactual = _observe_captured_builtin_mutation(soac)\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "globals_builtin_returns_its_own_module_dictionary_like_cpython": {
+    "original_test": "test_globals_builtin_returns_its_own_module_dictionary_like_cpython",
+    "parameters": {},
+    "source": "\ndef read_globals():\n    return globals()\n",
+    "source_sha256": "949c0658c7e6fd876978e16e37eedf39abc83cfebc8c5d68494cc756fb8bc17f",
+    "validation": "expected = stock.read_globals() is stock.__dict__\nassert expected is True\nsoac = module\nactual = soac.read_globals() is soac.__dict__\nassert actual is expected\n",
+    "required_functions": [
+      "read_globals"
+    ]
+  },
+  "prebound_globals_name_calls_the_existing_module_binding_like_cpython": {
+    "original_test": "test_prebound_globals_name_calls_the_existing_module_binding_like_cpython",
+    "parameters": {},
+    "source": "\ndef replacement():\n    return 41\n\n\nglobals = replacement\n\n\ndef call():\n    return globals()\n",
+    "source_sha256": "c4ddd039d09ce2d7fc3974323e10e3d677afcf5ca1362beacdf35422370b0a75",
+    "validation": "expected = stock.call()\nassert expected == 41\nsoac = module\nactual = soac.call()\nassert actual == expected\n",
+    "required_functions": [
+      "replacement",
+      "call"
+    ]
+  },
+  "known_builtin_uses_its_initial_captured_mapping_like_cpython": {
+    "original_test": "test_known_builtin_uses_its_initial_captured_mapping_like_cpython",
+    "parameters": {},
+    "source": "\n__builtins__ = {\"ord\": lambda value: 41}\n\n\ndef call(value):\n    return ord(value)\n",
+    "source_sha256": "977d0164b3e7bbeee273fc943f55d8e67cc336364fd16be1e65e6fd21daf0bee",
+    "validation": "assert stock.call.__builtins__ is stock.__dict__['__builtins__']\nexpected = stock.call('a')\nassert expected == 41\nsoac = module\nassert soac.call.__builtins__ is soac.__dict__['__builtins__']\nactual = soac.call('a')\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "scalar_builtin_argument_preserves_big_integer_intermediates_add": {
+    "original_test": "test_scalar_builtin_argument_preserves_big_integer_intermediates",
+    "parameters": {
+      "operation": "add",
+      "expression": "(9223372036854775807 + 1) - 9223372036854775807 - 1"
+    },
+    "source": "def call():\n    return chr((9223372036854775807 + 1) - 9223372036854775807 - 1)\n",
+    "source_sha256": "e2e0332211c00e4bca8fc1fa06d09de3db529f0d8f1525756d9e6c1cec5f5fac",
+    "validation": "operation = 'add'\nexpression = '(9223372036854775807 + 1) - 9223372036854775807 - 1'\nexpected = stock.call()\nassert expected == '\\x00'\nsoac = module\nactual = soac.call()\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "scalar_builtin_argument_preserves_big_integer_intermediates_subtract": {
+    "original_test": "test_scalar_builtin_argument_preserves_big_integer_intermediates",
+    "parameters": {
+      "operation": "subtract",
+      "expression": "((0 - 9223372036854775807) - 2) + 9223372036854775807 + 2"
+    },
+    "source": "def call():\n    return chr(((0 - 9223372036854775807) - 2) + 9223372036854775807 + 2)\n",
+    "source_sha256": "530a79bf1222f8c605607ffefd04de9b6185ee712baed579c263ae4291e81094",
+    "validation": "operation = 'subtract'\nexpression = '((0 - 9223372036854775807) - 2) + 9223372036854775807 + 2'\nexpected = stock.call()\nassert expected == '\\x00'\nsoac = module\nactual = soac.call()\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "scalar_builtin_argument_preserves_big_integer_intermediates_multiply": {
+    "original_test": "test_scalar_builtin_argument_preserves_big_integer_intermediates",
+    "parameters": {
+      "operation": "multiply",
+      "expression": "((4611686018427387904 * 2) - 9223372036854775807) - 1"
+    },
+    "source": "def call():\n    return chr(((4611686018427387904 * 2) - 9223372036854775807) - 1)\n",
+    "source_sha256": "d79ed3ac850ca1d51e2a51da9f1c9444ff960d1442fd56288f21447524b0bff6",
+    "validation": "operation = 'multiply'\nexpression = '((4611686018427387904 * 2) - 9223372036854775807) - 1'\nexpected = stock.call()\nassert expected == '\\x00'\nsoac = module\nactual = soac.call()\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "dynamic_scalar_builtin_argument_preserves_big_integer_intermediates_add": {
+    "original_test": "test_dynamic_scalar_builtin_argument_preserves_big_integer_intermediates",
+    "parameters": {
+      "operation": "add",
+      "expression": "(9223372036854775807 + ord(value)) - 9223372036854775807 - ord(value)",
+      "value": "\u0001"
+    },
+    "source": "def call(value):\n    return chr((9223372036854775807 + ord(value)) - 9223372036854775807 - ord(value))\n",
+    "source_sha256": "a96a651f92c3ac4279bbc01eefba3ba3b033df2ff823668c68862ca6c484b3f1",
+    "validation": "operation = 'add'\nexpression = '(9223372036854775807 + ord(value)) - 9223372036854775807 - ord(value)'\nvalue = '\\x01'\nexpected = stock.call(value)\nassert expected == '\\x00'\nsoac = module\nactual = soac.call(value)\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "dynamic_scalar_builtin_argument_preserves_big_integer_intermediates_subtract": {
+    "original_test": "test_dynamic_scalar_builtin_argument_preserves_big_integer_intermediates",
+    "parameters": {
+      "operation": "subtract",
+      "expression": "((0 - 9223372036854775807) - ord(value)) + 9223372036854775807 + ord(value)",
+      "value": "\u0002"
+    },
+    "source": "def call(value):\n    return chr(((0 - 9223372036854775807) - ord(value)) + 9223372036854775807 + ord(value))\n",
+    "source_sha256": "71b9ebcfac277d392c1bebfb415684da9131dd4229dd42cb4ec918b208007759",
+    "validation": "operation = 'subtract'\nexpression = '((0 - 9223372036854775807) - ord(value)) + 9223372036854775807 + ord(value)'\nvalue = '\\x02'\nexpected = stock.call(value)\nassert expected == '\\x00'\nsoac = module\nactual = soac.call(value)\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "dynamic_scalar_builtin_argument_preserves_big_integer_intermediates_multiply": {
+    "original_test": "test_dynamic_scalar_builtin_argument_preserves_big_integer_intermediates",
+    "parameters": {
+      "operation": "multiply",
+      "expression": "((4611686018427387904 * ord(value)) - 9223372036854775807) - 1",
+      "value": "\u0002"
+    },
+    "source": "def call(value):\n    return chr(((4611686018427387904 * ord(value)) - 9223372036854775807) - 1)\n",
+    "source_sha256": "505cd1904422faa0f401415f038375314f6c6486a170e1dd877618faff09c509",
+    "validation": "operation = 'multiply'\nexpression = '((4611686018427387904 * ord(value)) - 9223372036854775807) - 1'\nvalue = '\\x02'\nexpected = stock.call(value)\nassert expected == '\\x00'\nsoac = module\nactual = soac.call(value)\nassert actual == expected\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "loop_carried_integer_arithmetic_preserves_big_integer_results_add": {
+    "original_test": "test_loop_carried_integer_arithmetic_preserves_big_integer_results",
+    "parameters": {
+      "operation": "add",
+      "initial": 9223372036854775807,
+      "expression": "value + 1",
+      "expected": 9223372036854775808
+    },
+    "source": "def call(active):\n    value = 9223372036854775807\n    while active:\n        value = value + 1\n        active = False\n    return value\n",
+    "source_sha256": "77964d6d8662bc5dd2d87775c43078fb23528a63ffe84f61b6d226d2dab4842f",
+    "validation": "operation = 'add'\ninitial = 9223372036854775807\nexpression = 'value + 1'\nexpected = 9223372036854775808\nstock_result = stock.call(True)\nassert stock_result == expected\nsoac = module\nactual = soac.call(True)\nassert actual == stock_result\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "loop_carried_integer_arithmetic_preserves_big_integer_results_subtract": {
+    "original_test": "test_loop_carried_integer_arithmetic_preserves_big_integer_results",
+    "parameters": {
+      "operation": "subtract",
+      "initial": 0,
+      "expression": "(value - 9223372036854775807) - 2",
+      "expected": -9223372036854775809
+    },
+    "source": "def call(active):\n    value = 0\n    while active:\n        value = (value - 9223372036854775807) - 2\n        active = False\n    return value\n",
+    "source_sha256": "d18fbd15d1506709df1bd68a5be0a289ecc2a1e01ffbfc839141bb53a373f234",
+    "validation": "operation = 'subtract'\ninitial = 0\nexpression = '(value - 9223372036854775807) - 2'\nexpected = -9223372036854775809\nstock_result = stock.call(True)\nassert stock_result == expected\nsoac = module\nactual = soac.call(True)\nassert actual == stock_result\n",
+    "required_functions": [
+      "call"
+    ]
+  },
+  "loop_carried_integer_arithmetic_preserves_big_integer_results_multiply": {
+    "original_test": "test_loop_carried_integer_arithmetic_preserves_big_integer_results",
+    "parameters": {
+      "operation": "multiply",
+      "initial": 4611686018427387904,
+      "expression": "value * 2",
+      "expected": 9223372036854775808
+    },
+    "source": "def call(active):\n    value = 4611686018427387904\n    while active:\n        value = value * 2\n        active = False\n    return value\n",
+    "source_sha256": "a424f7595a57832d541f46cbf225e621784a7f0c83a3fda42d9e4aaf07477b4f",
+    "validation": "operation = 'multiply'\ninitial = 4611686018427387904\nexpression = 'value * 2'\nexpected = 9223372036854775808\nstock_result = stock.call(True)\nassert stock_result == expected\nsoac = module\nactual = soac.call(True)\nassert actual == stock_result\n",
+    "required_functions": [
+      "call"
+    ]
+  }
+}

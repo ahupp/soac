@@ -2,7 +2,7 @@ use super::compat::set_region_exc_param;
 use super::*;
 use crate::block_py::{
     AbruptKind, Block, BlockArg, BlockBuilder, BlockEdge, BlockLabel, BlockParamRole, BlockTerm,
-    Instr, Meta, Store, TermBranchTable, TermRaise, WithMeta,
+    Instr, Meta, RaiseDisposition, Store, TermBranchTable, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::ast_to_ast::context::Context;
@@ -15,6 +15,7 @@ fn expr_name(id: &str) -> ast::name::Name {
 #[derive(Debug, Clone)]
 pub(crate) struct TryPlan {
     pub except_exc_name: String,
+    pub finally_exc_name: Option<String>,
     pub finally_abrupt_kind_name: Option<String>,
     pub finally_abrupt_payload_name: Option<String>,
     pub finally_dispatch_label: Option<BlockLabel>,
@@ -30,6 +31,10 @@ pub(crate) fn build_try_plan(
     _needs_finally_return_flow: bool,
 ) -> TryPlan {
     let except_exc_name = name_gen.next_tmp_name("try_exc").to_string();
+    // An associated finally handles only an exception which escapes the try
+    // or its handlers. Reusing the except region would keep a caught error
+    // active on normal return/break/continue paths into the finally body.
+    let finally_exc_name = has_finally.then(|| name_gen.next_tmp_name("finally_exc").to_string());
     let finally_abrupt_kind_name = if has_finally {
         Some(name_gen.next_tmp_name("try_abrupt_kind").to_string())
     } else {
@@ -67,6 +72,7 @@ pub(crate) fn build_try_plan(
     };
     TryPlan {
         except_exc_name,
+        finally_exc_name,
         finally_abrupt_kind_name,
         finally_abrupt_payload_name,
         finally_dispatch_label,
@@ -128,7 +134,7 @@ where
 {
     let finally_label = if let Some(finally_body) = finally_body {
         let finally_region_start = blocks.len();
-        let finally_label = lower_sequence(
+        let finally_body_label = lower_sequence(
             &finally_body,
             RegionTargets {
                 normal_cont: try_plan.finally_cont_label(rest_entry),
@@ -137,15 +143,37 @@ where
             },
             blocks,
         );
+        // A distinct declaration entry records this finally's owned payload
+        // and enclosing handler prefix even when its first statement is a
+        // nested try/finally or its body has no executable statements.
+        let finally_label = name_gen.next_block_name();
+        let entry_params = vec![
+            crate::block_py::BlockParam {
+                name: try_plan
+                    .finally_abrupt_kind_name
+                    .clone()
+                    .expect("finally kind"),
+                role: BlockParamRole::AbruptKind,
+            },
+            crate::block_py::BlockParam {
+                name: try_plan
+                    .finally_abrupt_payload_name
+                    .clone()
+                    .expect("finally payload"),
+                role: BlockParamRole::AbruptPayload,
+            },
+        ];
+        blocks.push(Block::from_builder(
+            finally_label,
+            BlockBuilder::with_term(
+                Vec::new(),
+                Some(BlockTerm::Jump(BlockEdge::new(finally_body_label))),
+            ),
+            entry_params,
+            active_exc_target.clone().map(BlockEdge::new),
+            None,
+        ));
         let finally_region_end = blocks.len();
-        if let Some(finally_entry) = blocks.iter_mut().find(|block| block.label == finally_label) {
-            if let Some(kind_name) = try_plan.finally_abrupt_kind_name.as_ref() {
-                finally_entry.ensure_param(kind_name.clone(), BlockParamRole::AbruptKind);
-            }
-            if let Some(payload_name) = try_plan.finally_abrupt_payload_name.as_ref() {
-                finally_entry.ensure_param(payload_name.clone(), BlockParamRole::AbruptPayload);
-            }
-        }
         let finally_normal_entry = try_plan.finally_abrupt_kind_name.as_ref().map(|_| {
             let normal_label = name_gen.next_block_name();
             let mut args = Vec::new();
@@ -165,9 +193,13 @@ where
         });
         let finally_exception_entry = try_plan.finally_abrupt_kind_name.as_ref().map(|_| {
             let exception_label = name_gen.next_block_name();
+            let exception_name = try_plan
+                .finally_exc_name
+                .as_ref()
+                .expect("finally exception region");
             let args = vec![
                 BlockArg::AbruptKind(AbruptKind::Exception),
-                BlockArg::Name(try_plan.except_exc_name.clone()),
+                BlockArg::Name(exception_name.clone()),
             ];
             let mut block = Block::from_builder(
                 exception_label.clone(),
@@ -179,7 +211,7 @@ where
                 active_exc_target.clone().map(BlockEdge::new),
                 None,
             );
-            block.set_exception_param(try_plan.except_exc_name.clone());
+            block.set_exception_param(exception_name.clone());
             blocks.push(block);
             exception_label
         });
@@ -386,11 +418,38 @@ where
         );
     }
     if let Some(finally_region_range) = lowered_try.finally_region_range.as_ref() {
-        set_region_exc_param(
-            blocks,
-            finally_region_range,
-            try_plan.except_exc_name.as_str(),
-        );
+        let exception_name = try_plan
+            .finally_exc_name
+            .as_ref()
+            .expect("finally exception region");
+        set_region_exc_param(blocks, finally_region_range, exception_name.as_str());
+        let payload_name = try_plan
+            .finally_abrupt_payload_name
+            .as_ref()
+            .expect("finally payload");
+        let entry = lowered_try
+            .finally_label
+            .expect("finally declaration entry");
+        for block in &mut blocks[finally_region_range.clone()] {
+            if block.label != entry {
+                block.ensure_param(payload_name.clone(), BlockParamRole::EnclosingAbruptPayload);
+            }
+        }
+        for label in [
+            try_plan.finally_dispatch_label,
+            try_plan.finally_return_label,
+            try_plan.finally_raise_label,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let block = blocks
+                .iter_mut()
+                .find(|block| block.label == label)
+                .expect("finally dispatch block");
+            block.ensure_param(payload_name.clone(), BlockParamRole::EnclosingAbruptPayload);
+            block.set_exception_param(exception_name.clone());
+        }
     }
     emit_try_jump_entry(
         blocks,
@@ -497,6 +556,7 @@ pub(crate) fn emit_finally_abrupt_dispatch_blocks<E>(
                     name = payload_name
                 )),
             )),
+            disposition: RaiseDisposition::PropagateNormalized,
         }),
         active_exc_target.as_ref(),
     ));
@@ -566,7 +626,7 @@ pub(crate) fn block_references_label<E: Instr>(
                 &branch.default_label == label
                     || branch.targets.iter().any(|target| target == label)
             }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => false,
+            BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => false,
         }
     }
 

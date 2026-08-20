@@ -131,6 +131,42 @@ fn core_name_expr(name: &str) -> InstrUnresolved {
 }
 
 #[test]
+fn for_loop_shape_conversion_preserves_unwind_transport_context() {
+    use crate::block_py::{BlockContext, HandledExceptionContext};
+
+    for handled_exception in [
+        HandledExceptionContext::Regions,
+        HandledExceptionContext::Preserve,
+        HandledExceptionContext::Unwind,
+        HandledExceptionContext::Terminal,
+    ] {
+        let context = BlockContext {
+            handled_exception,
+            suspension_resume: (handled_exception == HandledExceptionContext::Preserve)
+                .then_some(BlockLabel::from_index(0)),
+        };
+        let block = Block::new_with_extra(
+            BlockLabel::from_index(0),
+            Vec::new(),
+            BlockTerm::Return(core_name_expr("result")),
+            vec![BlockParam {
+                name: "incoming_error".to_owned(),
+                role: BlockParamRole::Exception,
+            }],
+            None,
+            context,
+        );
+        let lowered = lower_structured_unresolved_core_blocks_to_bb_blocks(&[block]);
+        let [block] = lowered.as_slice() else {
+            panic!("shape conversion must preserve the one source block")
+        };
+        assert_eq!(block.extra, context,
+            "shape conversion must not turn trim-only transport into handler entry or lose other boundaries");
+        assert_eq!(block.exception_param(), Some("incoming_error"));
+    }
+}
+
+#[test]
 fn lower_structured_core_blocks_to_bb_blocks_handles_unlocated_names() {
     let blocks = vec![
         Block {
@@ -191,4 +227,56 @@ fn lower_structured_core_blocks_to_bb_blocks_handles_unlocated_names() {
         panic!("expected rewritten current-exception test");
     };
     assert_eq!(load.name.id_str(), "_dp_try_exc_0");
+}
+
+#[test]
+fn inline_fragment_preserves_its_cleanup_edge_and_fills_outer_fallback() {
+    use crate::block_py::{
+        BlockContext, BlockEdge, HandledExceptionContext, InstrWithAwaitAndYield,
+        InstrWithConstantNone,
+    };
+    use crate::passes::ruff_to_blockpy::{compat, InlineFragment};
+    let entry_label = BlockLabel::from_index(0);
+    let inner_label = BlockLabel::from_index(1);
+    let continuation = BlockLabel::from_index(2);
+    let outer_label = BlockLabel::from_index(3);
+    let entry = Block::new(
+        entry_label,
+        Vec::<InstrWithAwaitAndYield>::new(),
+        BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+        vec![],
+        Some(BlockEdge::new(inner_label)),
+    );
+    let inner = Block::new_with_extra(
+        inner_label,
+        Vec::new(),
+        BlockTerm::Return(InstrWithAwaitAndYield::constant_none()),
+        vec![],
+        None,
+        BlockContext {
+            handled_exception: HandledExceptionContext::Unwind,
+            ..Default::default()
+        },
+    );
+    let mut blocks = Vec::new();
+    compat::emit_inline_fragment_with_exc_target_and_expr(
+        &mut blocks,
+        InlineFragment::new(entry, vec![inner]),
+        continuation,
+        Some(&outer_label),
+    );
+    let entry = blocks
+        .iter()
+        .find(|block| block.label == entry_label)
+        .unwrap();
+    assert_eq!(entry.exc_edge.as_ref().unwrap().target, inner_label);
+    let inner = blocks
+        .iter()
+        .find(|block| block.label == inner_label)
+        .unwrap();
+    assert_eq!(inner.exc_edge.as_ref().unwrap().target, outer_label);
+    assert_eq!(
+        inner.extra.handled_exception,
+        HandledExceptionContext::Unwind
+    );
 }

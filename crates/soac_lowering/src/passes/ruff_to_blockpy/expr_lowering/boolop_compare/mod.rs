@@ -1,7 +1,7 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
 use crate::block_py::{
-    Block, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockTerm, Meta, Store,
-    TermIf, TermRaise, WithMeta,
+    Block, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockTerm, Meta,
+    RaiseDisposition, Store, TermIf, TermRaise, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::expr_lowering::fresh_setup_name;
 use crate::passes::ruff_to_blockpy::{
@@ -364,7 +364,7 @@ where
 #[derive(Clone, Copy)]
 enum BoolopTerminalKind {
     Return,
-    Raise,
+    Raise(RaiseDisposition),
 }
 
 fn terminal_term<E>(kind: BoolopTerminalKind, value: InstrRuff) -> BlockTerm<E>
@@ -373,8 +373,9 @@ where
 {
     match kind {
         BoolopTerminalKind::Return => BlockTerm::Return(E::from_lowered_expr(value)),
-        BoolopTerminalKind::Raise => BlockTerm::Raise(TermRaise {
+        BoolopTerminalKind::Raise(disposition) => BlockTerm::Raise(TermRaise {
             exc: Some(E::from_lowered_expr(value)),
+            disposition,
         }),
     }
 }
@@ -402,6 +403,7 @@ pub(crate) fn try_lower_boolop_raise_direct<L, E>(
     lowerer: &L,
     name_gen: &FunctionNameGen,
     bool_op: crate::block_py::ExprBoolOp<InstrRuff>,
+    disposition: RaiseDisposition,
     loop_ctx: Option<&LoopContext>,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
@@ -413,7 +415,7 @@ where
         name_gen,
         bool_op,
         loop_ctx,
-        BoolopTerminalKind::Raise,
+        BoolopTerminalKind::Raise(disposition),
     )
 }
 

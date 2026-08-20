@@ -135,6 +135,10 @@ fn load_or_lower_pre_optimization_module(
     let cache_target = options
         .pre_optimization_cache
         .as_ref()
+        // A writable serialized IR cache is not an authenticated executable.
+        // Until it has an independently authenticated IR/source binding, strict
+        // imports lower the freshly verified source through the normal passes.
+        .filter(|_| options.lowering.strict_facts.is_none())
         .map(|cache| {
             cache.target(
                 hash_module_source(source),
@@ -278,6 +282,251 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Compiler-only source/phase fixture, not checker or native admission.
+    fn prepare_suspended_owner_fixture(source: &str) -> BlockPyModule<BlockPyModuleShape> {
+        use soac_contracts::*;
+        let hash = Fingerprint::digest(b"suspended-owner-phase-test");
+        let policy = ResolvedStrictPolicy::default();
+        let environment = ArtifactEnvironment {
+            ty_revision: "d2620d7312875790b114d821721cddf253f66423".into(),
+            checker_source_fingerprint: hash,
+            exporter_revision: "suspended-owner-phase-test".into(),
+            python_version: PythonVersion {
+                major: 3,
+                minor: 15,
+            },
+            python_platform: "linux".into(),
+            cpython_abi_fingerprint: hash,
+            normalized_project_policy: hash,
+            resolved_typechecker_configuration: hash,
+            import_search_path: hash,
+            typeshed_fingerprint: hash,
+            installed_stub_fingerprint: hash,
+            installed_dependency_fingerprint: hash,
+            analysis: ConservativeAnalysis::default(),
+        };
+        let facts = ModuleTypeFacts::new(
+            "suspended_owner_phase",
+            source.as_bytes(),
+            SourceDialect::SoacStrict,
+            policy.clone(),
+        )
+        .unwrap();
+        let shard = encode_module_shard(&facts).unwrap();
+        let manifest = TypeArtifactManifest::new(
+            environment.clone(),
+            vec![ModuleArtifactIndex::from_shard(&shard).unwrap()],
+        )
+        .unwrap();
+        let key = ArtifactSigningKey::from_bytes(&[91; 32]);
+        let expected = ArtifactExpectations {
+            generation: manifest.generation,
+            environment,
+        };
+        let manifest = verify_manifest(
+            &sign_manifest(&manifest, &key).unwrap(),
+            &key.trust_anchor(),
+            &expected,
+        )
+        .unwrap();
+        let generation =
+            verify_complete_generation(manifest, |_| Ok(shard.bytes().to_vec())).unwrap();
+        let verified = generation
+            .manifest()
+            .verify_module(
+                "suspended_owner_phase",
+                source.as_bytes(),
+                &policy,
+                &[],
+                shard.bytes(),
+            )
+            .unwrap();
+        source_to_blockpy(
+            source,
+            ModuleNameGen::new(1),
+            SourceToBlockPyOptions {
+                lowering: soac_lowering::LoweringOptions {
+                    strict_facts: Some(std::sync::Arc::new(verified)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &SoacEnvConfig::default(),
+            &mut RecordingPassTracker::new(),
+        )
+        .expect("actual strict source ownership producer")
+    }
+
+    fn assert_suspended_owner_transfers_survive_state_lowering(body: &str) {
+        use soac_core::block_py::{
+            BlockTerm, NameLocation, PreservedLocation, PreservedSlotStorage,
+        };
+        use soac_ir_typed::InstrTyped;
+        use soac_opt::passes::{
+            ensure_typed_generator_resume_boundary_writebacks,
+            lower_typed_generator_resume_preserved_state_to_locals_and_collect_preserved_locals,
+        };
+        let source = format!("from __future__ import strict\n{body}");
+        let lowered = prepare_suspended_owner_fixture(&source);
+        let mut prepared = crate::typed_runtime::prepare_typed_v3_runtime_module(
+            &lowered,
+            &SoacEnvConfig::default(),
+        )
+        .unwrap();
+        let function = prepared
+            .module
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "values")
+            .unwrap();
+        let original_layout = function.public_storage_layout().unwrap().clone();
+        let outcome =
+            lower_typed_generator_resume_preserved_state_to_locals_and_collect_preserved_locals(
+                function,
+            );
+        assert_eq!(
+            outcome.stats.lowered_functions, 1,
+            "real resume-state rewrite must run"
+        );
+        assert_eq!(
+            function.public_storage_layout(),
+            Some(&original_layout),
+            "public suspended storage must not become resume-local addresses"
+        );
+        let promoted_source_slots = original_layout
+            .preserved_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.generator_control.is_none()
+                    && matches!(
+                        slot.storage,
+                        PreservedSlotStorage::PyObjectOrNull | PreservedSlotStorage::PyCellObject
+                    )
+            })
+            .map(|(index, _)| PreservedLocation(index as u32))
+            .filter(|slot| outcome.preserved_locals.contains_key(slot))
+            .collect::<Vec<_>>();
+        assert!(
+            !promoted_source_slots.is_empty(),
+            "fixture must move actual semantic owners"
+        );
+
+        for slot in &promoted_source_slots {
+            let active = &outcome.preserved_locals[slot];
+            let entry = function.entry_block();
+            let acquire = entry.body.iter().position(|instr| {
+                matches!(instr, InstrTyped::Store(store)
+                    if store.name == *active && matches!(store.value.as_ref(),
+                        InstrTyped::Load(load) if load.name.location == NameLocation::Preserved(*slot)))
+            }).expect("active owner is acquired from preserved state");
+            let retire = entry
+                .body
+                .iter()
+                .position(|instr| {
+                    matches!(instr, InstrTyped::Del(del)
+                    if del.quietly && del.name.location == NameLocation::Preserved(*slot))
+                })
+                .expect("entry must not leave a second preserved owner pin");
+            assert!(acquire < retire);
+            for block in &function.blocks {
+                if matches!(block.term, BlockTerm::Return(_)) {
+                    assert!(
+                        block.body.iter().any(|instr| {
+                            matches!(instr, InstrTyped::Store(store)
+                            if store.name.location == NameLocation::Preserved(*slot)
+                                && matches!(store.value.as_ref(),
+                                    InstrTyped::Load(load) if load.name == *active))
+                        }),
+                        "suspension must restore the current source owner"
+                    );
+                }
+            }
+        }
+
+        // Exercise the same late repair used after optimizer rewrites. Restore
+        // only missing suspension copies, without changing semantic cleanup.
+        assert_eq!(
+            ensure_typed_generator_resume_boundary_writebacks(function, &outcome.preserved_locals),
+            0
+        );
+        let repaired_slot = promoted_source_slots[0];
+        let mut removed = 0;
+        for block in &mut function.blocks {
+            if matches!(block.term, BlockTerm::Return(_)) {
+                block.body.retain(|instr| {
+                    let remove = matches!(instr, InstrTyped::Store(store)
+                        if store.name.location == NameLocation::Preserved(repaired_slot));
+                    removed += usize::from(remove);
+                    !remove
+                });
+            }
+        }
+        assert!(removed > 0);
+        assert_eq!(
+            ensure_typed_generator_resume_boundary_writebacks(function, &outcome.preserved_locals),
+            removed
+        );
+    }
+
+    #[test]
+    fn suspended_owner_transfers_survive_suspended_assignment_state_lowering() {
+        assert_suspended_owner_transfers_survive_state_lowering(concat!(
+            "def values(make, record, reject, key):\n",
+            "    try:\n",
+            "        first, reject().field = yield \"ready\"\n",
+            "    except AttributeError:\n",
+            "        record(\"handler\")\n",
+            "    del first\n",
+            "    record(\"after\")\n",
+            "    yield \"done\"\n",
+        ));
+    }
+
+    #[test]
+    fn suspended_owner_transfers_survive_error_injection_state_lowering() {
+        assert_suspended_owner_transfers_survive_state_lowering(concat!(
+            "def values(observe):\n",
+            "    try:\n",
+            "        yield \"ready\"\n",
+            "    except BaseException as error:\n",
+            "        observe(error)\n",
+        ));
+    }
+
+    #[test]
+    fn suspended_owner_transfers_survive_owned_cell_state_lowering() {
+        assert_suspended_owner_transfers_survive_state_lowering(concat!(
+            "def values(observe):\n",
+            "    def closure():\n",
+            "        return observe\n",
+            "    try:\n",
+            "        yield closure\n",
+            "    except BaseException as error:\n",
+            "        closure()(error)\n",
+        ));
+    }
+
+    #[test]
+    fn suspended_owner_transfers_survive_coroutine_state_lowering() {
+        assert_suspended_owner_transfers_survive_state_lowering(concat!(
+            "async def values(observe, pause):\n",
+            "    await pause()\n",
+            "    observe()\n",
+        ));
+    }
+
+    #[test]
+    fn suspended_owner_transfers_survive_async_generator_state_lowering() {
+        assert_suspended_owner_transfers_survive_state_lowering(concat!(
+            "async def values(observe):\n",
+            "    try:\n",
+            "        yield 1\n",
+            "    except BaseException as error:\n",
+            "        observe(error)\n",
+        ));
+    }
+
     fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
         InstrumentationConfig::from_env_config(config)
             .counters
@@ -318,8 +567,13 @@ mod tests {
     fn pre_optimization_cache_metadata_mismatch_rebuilds_and_replaces_cache() {
         let source = "def f():\n    return 1\n";
         let module_name = "cache_metadata_mismatch_test";
-        let cache_root = unique_temp_dir();
-        let cache_path = cache_root
+        let work_dir = unique_temp_dir();
+        let config = SoacEnvConfig::default().with_soac_work_dir(Some(work_dir.clone()));
+        let cache_root = config
+            .module_cache_root()
+            .expect("work directory enables the compiler cache");
+        let cache_path = work_dir
+            .join("modules")
             .join("project")
             .join(module_name)
             .join("mod.blockpy");
@@ -341,12 +595,12 @@ mod tests {
             source,
             ModuleNameGen::new(2),
             SourceToBlockPyOptions::default().with_pre_optimization_cache(
-                cache_root,
+                cache_root.clone(),
                 PythonModuleCacheSource::Project,
                 module_name,
                 "new-build",
             ),
-            &SoacEnvConfig::default(),
+            &config,
             &mut pass_tracker,
         ) {
             panic!(
@@ -357,6 +611,29 @@ mod tests {
         let replaced = load_blockpy_module_cache(cache_path.as_path())
             .expect("rebuilt cache should be readable");
         assert_eq!(replaced.metadata, expected_metadata);
+
+        // The ordinary compiler still reuses its cache under SOAC_WORK_DIR.
+        // Strict runtime imports deliberately bypass this unauthenticated IR.
+        let mut warm_tracker = RecordingPassTracker::new();
+        let warm_module = source_to_blockpy(
+            source,
+            ModuleNameGen::new(3),
+            SourceToBlockPyOptions::default().with_pre_optimization_cache(
+                cache_root,
+                PythonModuleCacheSource::Project,
+                module_name,
+                "new-build",
+            ),
+            &config,
+            &mut warm_tracker,
+        )
+        .expect("matching ordinary compiler cache should load");
+        assert_eq!(warm_module.module_name_gen.module_id(), 3);
+        assert!(
+            warm_tracker
+                .pass_timings()
+                .any(|timing| timing.name == "blockpy_cache_load")
+        );
     }
 
     #[test]

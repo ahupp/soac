@@ -1,12 +1,157 @@
 use crate::block_py::{
     compute_storage_layout_from_scope, Block, BlockArg, BlockEdge, BlockLabel, BlockParam,
-    BlockPyFunction, BlockPyModule, BlockTerm, ModuleShape, ScopeExprNode,
+    BlockPyFunction, BlockPyModule, BlockTerm, ConstantExpr, FunctionKind, InstrBlockPy,
+    ModuleShape, NameLocation, RuntimeName, ScopeExprNode,
 };
 
 pub(crate) fn validate_blockpy_module(
     module: &BlockPyModule<soac_ir_blockpy::BlockPyModuleShape>,
 ) -> Result<(), String> {
+    for function in &module.callable_defs {
+        validate_compiler_operand_operations(function)?;
+        match (
+            function.scope.class_bindings.as_ref(),
+            function
+                .storage_layout
+                .as_ref()
+                .and_then(|layout| layout.class_bindings.as_ref()),
+        ) {
+            (Some(source), Some(projection)) => projection
+                .validate(
+                    source,
+                    function.storage_layout.as_ref().expect("class layout"),
+                    &function.scope,
+                )
+                .map_err(|error| format!("class bindings {}: {error}", function.names.qualname))?,
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "class bindings {} lost their producer or physical projection",
+                    function.names.qualname
+                ))
+            }
+        }
+        if let Some(layout) = &function.storage_layout {
+            layout.validate_generator_roles()?;
+            layout.validate_block_parameter_roles()?;
+            layout.validate_block_parameter_declarations(
+                function.blocks.iter().flat_map(|block| &block.params),
+            )?;
+            if let Some(abi) = &layout.generator_resume_abi {
+                abi.validate(function.kind, function.body_params())?;
+            } else if function.kind != FunctionKind::Function {
+                return Err(format!(
+                    "generator-like executable {} lost its explicit resume ABI",
+                    function.names.qualname
+                ));
+            }
+        }
+        if let Some(layout) = &function.public_storage_layout {
+            layout.validate_generator_roles()?;
+            layout.validate_block_parameter_roles()?;
+        }
+        if function.kind == FunctionKind::AsyncGenerator {
+            for block in &function.blocks {
+                if let BlockTerm::GeneratorReturn(value) = &block.term {
+                    // Unlike generators and coroutines, an async generator cannot
+                    // carry a completion value. Constant lowering can hoist
+                    // the immutable runtime singleton; authenticate the actual
+                    // table entry, never the displayed name of its load.
+                    let is_none = match value {
+                        InstrBlockPy::Load(load) if load.cell_binding.is_none() => {
+                            match load.name.location {
+                                NameLocation::RuntimeName(RuntimeName::None) => true,
+                                NameLocation::Constant(index) => matches!(
+                                    module.module_constants.get(index as usize),
+                                    Some(ConstantExpr::RuntimeName(RuntimeName::None))
+                                ),
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !is_none {
+                        return Err(format!(
+                            "async generator completion at {}:{} requires the canonical None operand",
+                            function.names.qualname, block.label,
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(block) = function
+            .blocks
+            .iter()
+            .find(|block| block.extra.suspension_resume.is_some())
+        {
+            return Err(format!(
+                "unconsumed suspension ownership edge at {}:{}",
+                function.names.qualname, block.label,
+            ));
+        }
+    }
     validate_module(module)
+}
+
+fn validate_compiler_operand_operations(
+    function: &BlockPyFunction<soac_ir_blockpy::BlockPyModuleShape>,
+) -> Result<(), String> {
+    use crate::block_py::{ChildVisitable, Visit};
+    struct Validate<'a> {
+        function: &'a BlockPyFunction<soac_ir_blockpy::BlockPyModuleShape>,
+        error: Option<String>,
+    }
+    impl Visit<InstrBlockPy> for Validate<'_> {
+        fn visit_instr(&mut self, instr: &InstrBlockPy) {
+            if self.error.is_some() {
+                return;
+            }
+            instr.visit_children(self);
+            let result = match instr {
+                InstrBlockPy::TakeOperand(op) => self
+                    .function
+                    .storage_layout
+                    .as_ref()
+                    .ok_or_else(|| "operand take has no resolved layout".to_string())
+                    .and_then(|layout| op.validate_resolved(layout).map(|_| ())),
+                InstrBlockPy::ComprehensionInsert(op) => self
+                    .function
+                    .storage_layout
+                    .as_ref()
+                    .ok_or_else(|| "comprehension insertion has no resolved layout".to_string())
+                    .and_then(|layout| op.validate_resolved(layout).map(|_| ())),
+                InstrBlockPy::BuildCollection(op) => op.validate_shape(),
+                InstrBlockPy::CallArgumentOp(op) => self
+                    .function
+                    .storage_layout
+                    .as_ref()
+                    .ok_or_else(|| "CallArgumentOp has no resolved layout".to_string())
+                    .and_then(|layout| op.validate_resolved(layout).map(|_| ())),
+                InstrBlockPy::PreparedCall(op) => self
+                    .function
+                    .storage_layout
+                    .as_ref()
+                    .ok_or_else(|| "PreparedCall has no resolved layout".to_string())
+                    .and_then(|layout| op.validate_resolved(layout).map(|_| ())),
+                InstrBlockPy::IteratorStep(op) => self
+                    .function
+                    .storage_layout
+                    .as_ref()
+                    .ok_or_else(|| "IteratorStep has no resolved layout".to_string())
+                    .and_then(|layout| op.validate_resolved(layout).map(|_| ())),
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                self.error = Some(format!("{}: {error}", self.function.names.qualname));
+            }
+        }
+    }
+    let mut visitor = Validate {
+        function,
+        error: None,
+    };
+    visitor.visit_fn(function);
+    visitor.error.map_or(Ok(()), Err)
 }
 
 pub(crate) fn validate_module<P: ModuleShape>(module: &BlockPyModule<P>) -> Result<(), String>
@@ -35,6 +180,22 @@ where
     }
 
     for block in &function.blocks {
+        if let BlockTerm::Raise(raise) = &block.term {
+            raise
+                .validate_exception_operand()
+                .map_err(|error| format!("{error} at {qualname}:{}", block.label))?;
+        }
+        if matches!(block.term, BlockTerm::GeneratorReturn(_))
+            && !matches!(
+                function.kind,
+                FunctionKind::Generator | FunctionKind::Coroutine | FunctionKind::AsyncGenerator
+            )
+        {
+            return Err(format!(
+                "generator completion at {qualname}:{} requires a generator, coroutine, or async generator activation",
+                block.label
+            ));
+        }
         if let Some(exc_edge) = block.exc_edge.as_ref() {
             let target_block = lookup_known_block(
                 function,
@@ -104,7 +265,7 @@ where
                     "br_table default target",
                 )?;
             }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            BlockTerm::Raise(_) | BlockTerm::Return(_) | BlockTerm::GeneratorReturn(_) => {}
         }
     }
     Ok(())
@@ -165,6 +326,16 @@ where
         .len()
         .saturating_sub(explicit_args.len());
     for target_param in target_block.params.iter().take(explicit_start) {
+        // Implicit transport is by exact name. Nested handlers can have more
+        // than one EnclosingException parameter, and a surviving outer region
+        // can become the current Exception again after inner cleanup.
+        if source_block
+            .params
+            .iter()
+            .any(|source_param| source_param.name == target_param.name)
+        {
+            continue;
+        }
         let Some(source_same_role) = source_block
             .params
             .iter()

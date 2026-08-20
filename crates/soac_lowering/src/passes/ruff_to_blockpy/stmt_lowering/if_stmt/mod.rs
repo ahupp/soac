@@ -36,7 +36,7 @@ pub(crate) fn expand_if_chain(mut if_stmt: ast::StmtIf) -> Rewrite {
                     });
                 }
 
-                else_body = Some(vec![Stmt::If(nested_if)]);
+                else_body = Some([Stmt::If(nested_if)].into());
             }
             None => {
                 let mut body = clause.body;

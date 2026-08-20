@@ -3,7 +3,7 @@ use ruff_python_ast::{self as ast, Stmt};
 pub(crate) type Suite = ast::Suite;
 
 pub(crate) fn empty_suite() -> Suite {
-    vec![]
+    Suite::new()
 }
 
 pub(crate) fn split_docstring(body: &Suite) -> (Option<String>, Suite) {

@@ -1,11 +1,51 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import subprocess
-import sys
 import textwrap
+
+from scripts.strict_pyperformance_sources import strict_opt_in
+from tests._strict_integration import _VALIDATION_PRELUDE, create_strict_project
+
+
+_FUNCTION_WITNESS = """
+_native_function_id = ctypes.pythonapi.PyFunction_GetSoacFunctionId
+_native_function_id.argtypes = [ctypes.py_object]
+_native_function_id.restype = ctypes.c_uint64
+_native_seal_id = ctypes.pythonapi.PyFunction_GetSoacStrictId
+_native_seal_id.argtypes = [ctypes.py_object]
+_native_seal_id.restype = ctypes.c_uint64
+
+def _assert_selected_functions(module):
+    diagnostic = _soac_ext.strict_module_diagnostics(module)
+    assert diagnostic is not None, 'selected source executed as ordinary Python'
+    assert diagnostic['sealed'] is True
+    assert diagnostic['module_name'] == __EXPECTED_MODULE__
+    assert diagnostic['source_path'] == __EXPECTED_SOURCE__
+    assert diagnostic['artifact_generation'] == __EXPECTED_GENERATION__
+    assert diagnostic['initializer_entry_kind'] == 'entry_interpreter'
+    observed = []
+    for name in ('pair', 'nested', 'enumerate_pairs', 'zip_pairs', 'source_once', 'assign_targets', 'mutate_during_assignment', 'starred', 'with_pair', 'direct_runtime_unpack_fixed'):
+        function = _plain_function_witness(module, name)
+        assert metadata(function), name
+        actual_owner = owner(function)
+        assert actual_owner, name
+        function_id = _native_function_id(function)
+        seal_id = _native_seal_id(function)
+        # Sealing does not publish the optional unchecked direct-call ID.
+        assert function_id == 0 and seal_id > 0, (name, function_id, seal_id)
+        actual_entry = _soac_ext.strict_function_entry_kind(function)
+        assert actual_entry == 'checked_native', (name, actual_entry)
+        observed.append((name, actual_owner, function_id, seal_id))
+    return tuple(observed)
+
+def _assert_ordinary_functions(namespace):
+    for name in ('pair', 'nested', 'enumerate_pairs', 'zip_pairs', 'source_once', 'assign_targets', 'mutate_during_assignment', 'starred', 'with_pair', 'direct_runtime_unpack_fixed'):
+        function = namespace[name]
+        assert owner(function) is None and metadata(function) is None, name
+        assert _native_function_id(function) == 0, name
+        assert _native_seal_id(function) == 0, name
+"""
 
 
 def test_fixed_sequence_unpacking_is_a_cpython_language_operation(
@@ -72,6 +112,15 @@ def test_fixed_sequence_unpacking_is_a_cpython_language_operation(
         encoding="utf-8",
     )
 
+    # Preserve the exact ordinary source; authenticate only the separate copy.
+    relative = f"{module_name}.py"
+    original_source = (tmp_path / relative).read_bytes()
+    project = create_strict_project(
+        tmp_path / "strict-project",
+        {relative: strict_opt_in(original_source, relative)[0].decode()},
+        modules={module_name: relative},
+    )
+
     script = (
         textwrap.dedent(
             """
@@ -80,14 +129,16 @@ def test_fixed_sequence_unpacking_is_a_cpython_language_operation(
             import json
             import sys
 
-            sys.path.insert(0, MODULE_DIRECTORY_TOKEN)
             from soac import _soac_ext
-            from soac.import_hook import install
 
-            install()
             import soac.runtime as runtime
 
             helper_calls = []
+            for ordinary_helper in (runtime.unpack, runtime.unpack_fixed):
+                assert owner(ordinary_helper) is None
+                assert metadata(ordinary_helper) is None
+                assert _native_function_id(ordinary_helper) == 0
+                assert _native_seal_id(ordinary_helper) == 0
             original_unpack = runtime.unpack
             original_unpack_code = original_unpack.__code__
 
@@ -100,6 +151,7 @@ def test_fixed_sequence_unpacking_is_a_cpython_language_operation(
             runtime.unpack = tracked_unpack
             try:
                 import MODULE_NAME_TOKEN as module
+                source_owners = _assert_selected_functions(module)
                 helper_calls.clear()
 
                 results = {}
@@ -367,35 +419,30 @@ def test_fixed_sequence_unpacking_is_a_cpython_language_operation(
                 results["subclass_events"] = subclass_events
                 results["iterator_events"] = iterator.events
                 results["source_evaluations"] = evaluated
+                assert _assert_selected_functions(module) == source_owners
                 print(json.dumps(results))
             finally:
                 original_unpack.__code__ = original_unpack_code
                 runtime.unpack = original_unpack
             """
         )
-        .replace("MODULE_DIRECTORY_TOKEN", repr(str(tmp_path)))
         .replace("MODULE_NAME_TOKEN", module_name)
     )
 
-    base_env = dict(os.environ)
-    base_env.pop("SOAC_LOG", None)
-    base_env.update(
-        {
-            "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
-            "SOAC_WORK_DIR": str(tmp_path / "soac-work"),
-            "SOAC_COMPILE_MODE": "eager",
-            "SOAC_BACKGROUND_JIT": "0",
-        }
+    witness = (
+        _FUNCTION_WITNESS.replace("__EXPECTED_MODULE__", repr(module_name))
+        .replace("__EXPECTED_SOURCE__", repr(str(project.project / f"{module_name}.py")))
+        .replace("__EXPECTED_GENERATION__", repr(project.publication["generation"]))
     )
+    program = _VALIDATION_PRELUDE + witness + script
 
     for mode in ("profile", "apply"):
-        completed = subprocess.run(
-            [sys.executable, "-c", script],
-            check=False,
-            capture_output=True,
-            text=True,
-            env={**base_env, "SOAC_OPT_MODE": mode},
+        completed = project.run(
+            program,
+            opt_mode=mode,
+            extra_env={"SOAC_WORK_DIR": str(tmp_path / "soac-work")},
             timeout=90,
+            check=False,
         )
         assert completed.returncode == 0, (
             f"{mode} fixed unpack must preserve CPython language semantics",

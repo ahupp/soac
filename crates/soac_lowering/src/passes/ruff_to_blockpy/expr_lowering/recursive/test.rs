@@ -1,4 +1,4 @@
-use crate::block_py::{CallArgPositional, InstrWithAwaitAndYield, NameLike};
+use crate::block_py::{CallArgPositional, InstrWithAwaitAndYield, NameLike, UnresolvedName};
 use crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup;
 use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
 use crate::passes::ruff_to_blockpy::test_name_gen;
@@ -21,9 +21,17 @@ fn nested_boolop_in_call_argument_emits_setup_via_expr_lowering() {
     let InstrWithAwaitAndYield::Call(call) = lowered else {
         panic!("expected lowered call");
     };
-    assert!(
-        matches!(call.func.as_ref(), InstrWithAwaitAndYield::Load(load) if load.name.id_str() == "f")
-    );
+    let InstrWithAwaitAndYield::TakeOperand(callee) = call.func.as_ref() else {
+        panic!("callee evaluated before argument control flow must be consumed once");
+    };
+    assert!(fragment.entry.body.iter().any(|instr| {
+        matches!(instr, InstrWithAwaitAndYield::Store(store)
+            if matches!((&store.name, &callee.name),
+                (UnresolvedName::SourceName(left), UnresolvedName::SourceName(right))
+                    if left.as_str() == right.as_str())
+                && matches!(store.lifetime, crate::block_py::StoreLifetime::Operand { .. })
+                && matches!(store.value.as_ref(), InstrWithAwaitAndYield::Load(load) if load.name.id_str() == "f"))
+    }), "the exact callable must be acquired before the argument branch");
     assert!(matches!(
         call.args.first(),
         Some(CallArgPositional::Positional(InstrWithAwaitAndYield::Load(load)))
@@ -32,7 +40,7 @@ fn nested_boolop_in_call_argument_emits_setup_via_expr_lowering() {
 }
 
 #[test]
-fn direct_core_expr_lowering_materializes_make_function_operation() {
+fn helper_spelling_and_literal_id_do_not_authorize_function_construction() {
     let name_gen = test_name_gen();
     let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
     let lowered = lower_expr_into_with_setup(
@@ -46,9 +54,9 @@ fn direct_core_expr_lowering_materializes_make_function_operation() {
 
     assert!(
         out.finish().entry.body.is_empty(),
-        "make_function should not need setup"
+        "ordinary helper call should not need setup"
     );
-    assert!(matches!(lowered, InstrWithAwaitAndYield::MakeFunction(_)));
+    assert!(matches!(lowered, InstrWithAwaitAndYield::Call(_)));
 }
 
 #[test]
@@ -88,4 +96,67 @@ fn direct_core_expr_lowering_materializes_live_operation_helpers() {
             _ => panic!("unexpected lowered helper shape for {source}"),
         }
     }
+}
+
+#[test]
+fn ruff_setup_evaluates_callee_and_earlier_argument_before_later_branch() {
+    use crate::block_py::BlockTerm;
+    use std::collections::HashSet;
+
+    fn direct_call_name(expr: &InstrWithAwaitAndYield) -> Option<&str> {
+        let InstrWithAwaitAndYield::Call(call) = expr else {
+            return None;
+        };
+        let InstrWithAwaitAndYield::Load(load) = call.func.as_ref() else {
+            return None;
+        };
+        Some(load.name.id_str())
+    }
+
+    let name_gen = test_name_gen();
+    let mut out = BlockPyStmtBuilder::<InstrWithAwaitAndYield>::new(&name_gen);
+    lower_expr_into_with_setup(
+        crate::passes::ast_to_instr::from_ast_expr(py_expr!(
+            "make_callee()(first(), branch_left() if predicate() else branch_right())"
+        )),
+        &mut out,
+        None,
+    )
+    .expect("source expression lowers");
+    let fragment = out.finish();
+    let mut block = &fragment.entry;
+    let mut visited = HashSet::new();
+    let mut evaluations = Vec::new();
+    loop {
+        assert!(
+            visited.insert(block.label),
+            "prefix must reach its source branch"
+        );
+        for statement in &block.body {
+            if let InstrWithAwaitAndYield::Store(store) = statement {
+                if let Some(name) = direct_call_name(&store.value) {
+                    evaluations.push(name.to_owned());
+                }
+            }
+        }
+        match &block.term {
+            BlockTerm::Jump(edge) => {
+                block = fragment
+                    .deps
+                    .iter()
+                    .find(|candidate| candidate.label == edge.target)
+                    .expect("prefix jump targets a represented source block");
+            }
+            BlockTerm::IfTerm(branch) => {
+                evaluations.push(
+                    direct_call_name(&branch.test)
+                        .expect("the source predicate remains the branch test")
+                        .to_owned(),
+                );
+                break;
+            }
+            term => panic!("unexpected expression prefix terminator: {term:?}"),
+        }
+    }
+    assert_eq!(evaluations, vec!["make_callee", "first", "predicate"]);
 }

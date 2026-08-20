@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import shlex
+import subprocess
 import sys
+import sysconfig
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,11 +19,61 @@ if str(ROOT) not in sys.path:
 if str(PYTHON_SRC) not in sys.path:
     sys.path.insert(0, str(PYTHON_SRC))
 
-from tests import _integration
 import pytest
+
+from tests import _integration
 
 _MODULES_DIR = Path(__file__).resolve().parent / "integration_modules"
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+@pytest.fixture(scope="session")
+def function_create_watch_extension(tmp_path_factory) -> Path:
+    """Build the preserving C watcher once against this selected guest Python."""
+    source = ROOT / "tests" / "native" / "function_create_watch.c"
+    configured_source = sysconfig.get_config_var("abs_srcdir")
+    configured_build = sysconfig.get_config_var("abs_builddir")
+    linker = sysconfig.get_config_var("LDSHARED")
+    shared_flags = sysconfig.get_config_var("CCSHARED")
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    assert all((configured_source, configured_build, linker, shared_flags, suffix)), (
+        "CREATE fixture needs the selected native build's sysconfig, not host Python"
+    )
+    native_source = Path(configured_source).resolve(strict=True)
+    native_build = Path(configured_build).resolve(strict=True)
+    assert (native_build / "python").resolve(strict=True) == Path(
+        sys._base_executable
+    ).resolve(strict=True), "CREATE fixture sysconfig does not name the running native build"
+    for header in (
+        native_source / "Include" / "Python.h",
+        native_source / "Include" / "cpython" / "funcobject.h",
+        native_build / "pyconfig.h",
+    ):
+        assert header.is_file(), f"CREATE fixture selected native header is absent: {header}"
+    output = tmp_path_factory.mktemp("function-create-watch-native")
+    extension = output / f"_strict_function_create_watch{suffix}"
+    command = [
+        *shlex.split(linker),
+        *shlex.split(shared_flags),
+        "-O0",
+        "-g",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        f"-I{native_source / 'Include'}",
+        f"-I{native_build}",
+        str(source),
+        "-o",
+        str(extension),
+    ]
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False, timeout=120
+    )
+    log = output / "build.log"
+    log.write_text(shlex.join(command) + "\n" + result.stdout + result.stderr)
+    assert result.returncode == 0, f"CREATE fixture build failed: {log}\n{result.stderr}"
+    assert extension.is_file(), f"CREATE fixture compiler produced no extension: {log}"
+    return extension
 
 
 def _print_integration_failure_context(module_path: Path) -> None:
@@ -63,15 +116,6 @@ def pytest_addoption(parser):
     )
 
 
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "integration: mark a test as using integration modules"
-    )
-    config.addinivalue_line(
-        "markers", "slow: mark tests that are too expensive for default green runs"
-    )
-
-
 def _slow_tests_enabled(config) -> bool:
     if config.getoption("--run-slow"):
         return True
@@ -97,16 +141,6 @@ def pytest_collection_modifyitems(config, items):
         items[:] = selected
 
 
-def _is_unsupported_exception(exc: BaseException, longrepr_text: str | None = None) -> bool:
-    if isinstance(exc, NotImplementedError):
-        return "not supported" in str(exc)
-    if isinstance(exc, TypeError):
-        return str(exc) == "An asyncio.Future, a coroutine or an awaitable is required"
-    if longrepr_text and "not supported" in longrepr_text:
-        return True
-    return False
-
-
 @pytest.fixture
 def run_integration_module(tmp_path: Path):
     @contextmanager
@@ -129,15 +163,7 @@ def pytest_runtest_makereport(item, call):
     outcome = yield
     rep = outcome.get_result()
     setattr(item, f"rep_{rep.when}", rep)
-    if rep.failed:
-        longrepr_text = str(rep.longrepr) if rep.longrepr is not None else None
-        exc = call.excinfo.value if call.excinfo is not None else None
-        if (exc and _is_unsupported_exception(exc, longrepr_text)) or (
-            longrepr_text and "not supported" in longrepr_text
-        ):
-            rep.outcome = "skipped"
-            rep.wasxfail = f"unsupported: {exc or 'not supported'}"
-            rep.longrepr = None
+
 
 @pytest.fixture(autouse=True)
 def _integration_failure_context(request):

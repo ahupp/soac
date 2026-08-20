@@ -57,6 +57,12 @@ pub(crate) trait CurrentScopeNameTraversal: Transformer {
                 }
                 walk_stmt(self, stmt);
             }
+            Stmt::Match(match_stmt) => {
+                for case in &match_stmt.cases {
+                    collect_pattern_bound_names(&case.pattern, self.bound_names_mut());
+                }
+                walk_stmt(self, stmt);
+            }
             Stmt::Import(import_stmt) => {
                 for alias in &import_stmt.names {
                     self.record_bound_name(import_binding_name(alias));
@@ -113,11 +119,23 @@ pub(crate) trait CurrentScopeNameTraversal: Transformer {
                 collect_assigned_names(named.target.as_ref(), self.bound_names_mut());
                 self.visit_expr(named.value.as_mut());
             }
-            Expr::Lambda(_)
-            | Expr::Generator(_)
-            | Expr::ListComp(_)
-            | Expr::SetComp(_)
-            | Expr::DictComp(_) => {}
+            Expr::Lambda(lambda) => {
+                // Defaults execute in the containing scope; the parameter
+                // declarations and lambda body belong to the new callable.
+                if let Some(parameters) = &mut lambda.parameters {
+                    for parameter in parameters
+                        .posonlyargs
+                        .iter_mut()
+                        .chain(parameters.args.iter_mut())
+                        .chain(parameters.kwonlyargs.iter_mut())
+                    {
+                        if let Some(default) = &mut parameter.default {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+            }
+            Expr::Generator(_) | Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) => {}
             _ => walk_expr(self, expr),
         }
     }
@@ -150,14 +168,14 @@ impl Transformer for CurrentScopeNameCollector {
 }
 
 pub(crate) fn collect_loaded_names(stmts: &[Stmt]) -> HashSet<String> {
-    let mut body = stmts.to_vec();
+    let mut body = stmts.iter().cloned().collect();
     let mut collector = CurrentScopeNameCollector::default();
     collector.visit_body(&mut body);
     collector.loaded_names
 }
 
 pub(crate) fn collect_bound_names(stmts: &[Stmt]) -> HashSet<String> {
-    let mut body = stmts.to_vec();
+    let mut body = stmts.iter().cloned().collect();
     let mut collector = CurrentScopeNameCollector::default();
     collector.visit_body(&mut body);
     collector.bound_names
@@ -191,7 +209,7 @@ impl Transformer for ExplicitGlobalOrNonlocalCollector {
 
 #[cfg(test)]
 pub(crate) fn collect_explicit_global_or_nonlocal_names(stmts: &[Stmt]) -> HashSet<String> {
-    let mut body = stmts.to_vec();
+    let mut body = stmts.iter().cloned().collect();
     let mut collector = ExplicitGlobalOrNonlocalCollector::default();
     collector.visit_body(&mut body);
     collector.names
@@ -214,6 +232,50 @@ fn collect_assigned_names(target: &Expr, names: &mut HashSet<String>) {
         }
         Expr::Starred(starred) => collect_assigned_names(starred.value.as_ref(), names),
         _ => {}
+    }
+}
+
+fn collect_pattern_bound_names(pattern: &ast::Pattern, names: &mut HashSet<String>) {
+    // Pattern targets are identifiers, not Expr::Name(Store). Collect them
+    // before scope resolution; the ordinary walker still visits value/guard
+    // expressions without treating their names as assignments.
+    match pattern {
+        ast::Pattern::MatchAs(ast::PatternMatchAs { pattern, name, .. }) => {
+            if let Some(name) = name {
+                names.insert(name.as_str().to_owned());
+            }
+            if let Some(pattern) = pattern {
+                collect_pattern_bound_names(pattern, names);
+            }
+        }
+        ast::Pattern::MatchStar(ast::PatternMatchStar { name, .. }) => {
+            if let Some(name) = name {
+                names.insert(name.as_str().to_owned());
+            }
+        }
+        ast::Pattern::MatchMapping(ast::PatternMatchMapping { patterns, rest, .. }) => {
+            if let Some(name) = rest {
+                names.insert(name.as_str().to_owned());
+            }
+            for pattern in patterns {
+                collect_pattern_bound_names(pattern, names);
+            }
+        }
+        ast::Pattern::MatchSequence(ast::PatternMatchSequence { patterns, .. })
+        | ast::Pattern::MatchOr(ast::PatternMatchOr { patterns, .. }) => {
+            for pattern in patterns {
+                collect_pattern_bound_names(pattern, names);
+            }
+        }
+        ast::Pattern::MatchClass(ast::PatternMatchClass { arguments, .. }) => {
+            for pattern in &arguments.patterns {
+                collect_pattern_bound_names(pattern, names);
+            }
+            for keyword in &arguments.keywords {
+                collect_pattern_bound_names(&keyword.pattern, names);
+            }
+        }
+        ast::Pattern::MatchValue(_) | ast::Pattern::MatchSingleton(_) => {}
     }
 }
 

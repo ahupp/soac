@@ -1,0 +1,140 @@
+{
+  "transformed_closed_map_filter_pipeline_matches_stock": {
+    "original_test": "test_transformed_closed_map_filter_pipeline_matches_stock",
+    "source": "\ndef collect(source, convert, keep, count):\n    return tuple(\n        filter(\n            keep,\n            map(convert, (source(index) for index in range(count))),\n        )\n    )\n\ndef collect_list(convert, count):\n    return list(map(convert, (index for index in range(count))))\n\ndef collect_set(convert, count):\n    return set(map(convert, (index for index in range(count))))\n\ndef values(count):\n    for index in range(count):\n        yield index\n\ndef collect_named(convert, count):\n    return list(map(convert, values(count)))\n\ndef escaping_named(count):\n    return values(count)\n\ndef escaping(convert, count):\n    return map(convert, (index for index in range(count)))\n",
+    "source_sha256": "54f407fa47cf221da851a347015d561db223f0df0d11c783eb9094056b1f4406",
+    "validation": "def run(module):\n    events = []\n\n    def source(value):\n        events.append(('source', value))\n        return value\n\n    def convert(value):\n        events.append(('map', value))\n        return value * 3 + 1\n\n    def keep(value):\n        events.append(('filter', value))\n        return value % 2 == 0\n    result = module.collect(source, convert, keep, 5)\n    return (result, events)\nstock_result = run(stock)\ntransformed = module\nassert run(transformed) == stock_result\nlist_result = transformed.collect_list(lambda value: value + 1, 4)\nset_result = transformed.collect_set(lambda value: value & 1, 4)\nassert type(list_result) is list\nassert list_result == [1, 2, 3, 4]\nassert type(set_result) is set\nassert set_result == {0, 1}\nassert transformed.collect_named(lambda value: value + 1, 4) == [1, 2, 3, 4]\nescaped_named = transformed.escaping_named(2)\nassert type(escaped_named) is types.GeneratorType\nassert list(escaped_named) == [0, 1]\nassert type(transformed.escaping(lambda value: value, 2)) is map\n",
+    "required_functions": [
+      "collect",
+      "collect_list",
+      "collect_set",
+      "collect_named",
+      "escaping_named",
+      "escaping"
+    ],
+    "factory_functions": [
+      "values"
+    ]
+  },
+  "transformed_map_filter_stop_iteration_is_partial_completion": {
+    "original_test": "test_transformed_map_filter_stop_iteration_is_partial_completion",
+    "source": "\ndef mapped(callback):\n    return list(map(callback, (value for value in range(5))))\n\ndef filtered(predicate):\n    return tuple(filter(predicate, (value for value in range(5))))\n",
+    "source_sha256": "ad0d059bcc2d3e63570a3f0282c1a421f3856c8c38699d1f41568858a07666c2",
+    "validation": "def callback(value):\n    if value == 3:\n        raise StopIteration('map')\n    return value + 10\n\ndef predicate(value):\n    if value == 3:\n        raise StopIteration('filter')\n    return value % 2 == 0\nassert module.mapped(callback) == [10, 11, 12]\nassert module.filtered(predicate) == (0, 2)\n",
+    "required_functions": [
+      "mapped",
+      "filtered"
+    ],
+    "factory_functions": []
+  },
+  "transformed_callback_factory_stop_iteration_propagates": {
+    "original_test": "test_transformed_callback_factory_stop_iteration_propagates",
+    "source": "\ndef collect(make_callback):\n    return list(map(make_callback(), (value for value in range(4))))\n",
+    "source_sha256": "f06cc980ab4d5c8ce5d139f6992c6654a0ad7cac3ee40870e689fde4998d9c59",
+    "validation": "def run(module):\n    events = []\n\n    def make_callback():\n        events.append('factory')\n        raise StopIteration('factory')\n    with pytest.raises(StopIteration, match='factory'):\n        module.collect(make_callback)\n    return events\nexpected = run(stock)\ntransformed = module\nassert run(transformed) == expected == ['factory']\n",
+    "required_functions": [
+      "collect"
+    ],
+    "factory_functions": []
+  },
+  "transformed_multiple_pipeline_stop_iteration_is_isolated": {
+    "original_test": "test_transformed_multiple_pipeline_stop_iteration_is_isolated",
+    "source": "\ndef collect(first, second):\n    left = list(map(first, (value for value in range(4))))\n    right = tuple(map(second, (value for value in range(3))))\n    return left, right\n",
+    "source_sha256": "f165324de9dd12e8aac1b150b4acb00c4962a7d84262f12dfea58fb0e6ada4f9",
+    "validation": "def run(module):\n    events = []\n\n    def first(value):\n        events.append(('first', value))\n        if value == 2:\n            raise StopIteration('first')\n        return value + 10\n\n    def second(value):\n        events.append(('second', value))\n        return value + 20\n    return (module.collect(first, second), events)\nexpected = run(stock)\ntransformed = module\nassert run(transformed) == expected\n",
+    "required_functions": [
+      "collect"
+    ],
+    "factory_functions": []
+  },
+  "transformed_map_filter_other_exceptions_propagate_once": {
+    "original_test": "test_transformed_map_filter_other_exceptions_propagate_once",
+    "source": "\ndef mapped(callback):\n    return list(map(callback, (value for value in range(5))))\n\ndef filtered(predicate):\n    return list(filter(predicate, (value for value in range(5))))\n",
+    "source_sha256": "a79918f69ae766d669b0579bff39116dee5ebcf3e347834f14536134ea643c43",
+    "validation": "events = []\n\ndef fail(value):\n    events.append(value)\n    if value == 2:\n        raise ValueError('boom')\n    return value\nwith pytest.raises(ValueError, match='boom'):\n    module.mapped(fail)\nassert events == [0, 1, 2]\nevents.clear()\nwith pytest.raises(ValueError, match='boom'):\n    module.filtered(fail)\nassert events == [0, 1, 2]\n",
+    "required_functions": [
+      "mapped",
+      "filtered"
+    ],
+    "factory_functions": []
+  },
+  "transformed_filter_truth_stop_iteration_matches_stock": {
+    "original_test": "test_transformed_filter_truth_stop_iteration_matches_stock",
+    "source": "\ndef filtered_none(values):\n    return list(filter(None, (value for value in values)))\n\ndef filtered(predicate, values):\n    return tuple(filter(predicate, (value for value in values)))\n",
+    "source_sha256": "b7139e2a4e9acb0c13062052d7af3ff6105b9ae390991250901ea8aee1fd169b",
+    "validation": "values = [1, _BoolRaisesStopIteration(), 2]\n\ndef run(module):\n    events = []\n\n    def predicate(value):\n        events.append(value)\n        if value == 1:\n            return _BoolRaisesStopIteration()\n        return True\n    none_result = module.filtered_none(values)\n    predicate_result = module.filtered(predicate, [0, 1, 2])\n    return (none_result, predicate_result, events)\nexpected = run(stock)\ntransformed = module\nassert run(transformed) == expected\n",
+    "required_functions": [
+      "filtered_none",
+      "filtered"
+    ],
+    "factory_functions": []
+  },
+  "transformed_source_stop_iteration_still_uses_pep_479": {
+    "original_test": "test_transformed_source_stop_iteration_still_uses_pep_479",
+    "source": "\ndef collect(source):\n    return list(map(lambda value: value, (source(value) for value in range(4))))\n",
+    "source_sha256": "f4bd4f48c104a07ac711615219e6c4d62c04c612074e6b0abea62b30f334497b",
+    "validation": "def source_value(value):\n    if value == 2:\n        raise StopIteration('source')\n    return value\nwith pytest.raises(RuntimeError, match='generator raised StopIteration') as stock_error:\n    stock.collect(source_value)\ntransformed = module\nwith pytest.raises(RuntimeError, match='generator raised StopIteration') as transformed_error:\n    transformed.collect(source_value)\nfor error in (stock_error.value, transformed_error.value):\n    assert type(error) is RuntimeError\n    assert str(error) == 'generator raised StopIteration'\n    assert type(error.__cause__) is StopIteration\n    assert error.__cause__.args == ('source',)\n    assert str(error.__cause__) == 'source'\n    assert error.__context__ is error.__cause__\n    assert error.__suppress_context__ is True\n",
+    "required_functions": [
+      "collect"
+    ],
+    "factory_functions": []
+  },
+  "named_generator_pipeline_preserves_code_and_default_mutation": {
+    "original_test": "test_named_generator_pipeline_preserves_code_and_default_mutation",
+    "source": "\ndef values(limit=2):\n    for value in range(limit):\n        yield value\n\ndef replacement(limit=2):\n    for value in range(limit):\n        yield value + 100\n\ndef collect():\n    return list(map(lambda value: value, values()))\n",
+    "source_sha256": "880567d6cd394d9e19cb171bb5ac4c6315fd86da9a7cb32d2f016581d845f8f6",
+    "validation": "def run(module):\n    before = module.collect()\n    module.values.__defaults__ = (3,)\n    after_defaults = module.collect()\n    module.values.__code__ = module.replacement.__code__\n    after_code = module.collect()\n    return (before, after_defaults, after_code)\nexpected = run(stock)\ntransformed = module\nassert run(transformed) == expected\n",
+    "required_functions": [
+      "collect"
+    ],
+    "factory_functions": [
+      "values",
+      "replacement"
+    ]
+  },
+  "transformed_pep_479_generator_and_coroutine_boundaries_match_stock": {
+    "original_test": "test_transformed_pep_479_generator_and_coroutine_boundaries_match_stock",
+    "source": "\ndef leaking_generator():\n    if False:\n        yield None\n    raise StopIteration(\"generator-source\")\n\nasync def leaking_coroutine():\n    raise StopIteration(\"coroutine-source\")\n\ndef returned_generator():\n    if False:\n        yield None\n    return 17\n\ndef async_stop_generator():\n    if False:\n        yield None\n    raise StopAsyncIteration(\"generator-async-stop\")\n\nasync def async_stop_coroutine():\n    raise StopAsyncIteration(\"coroutine-async-stop\")\n\ndef throw_target():\n    yield \"ready\"\n",
+    "source_sha256": "471362bcd76a12387a807447b91d6d41ff345489b3be697c361e72b1d9f00c33",
+    "validation": "def exception_record(call):\n    try:\n        call()\n    except BaseException as error:\n        cause = error.__cause__\n        return (type(error), str(error), error.args, type(cause) if cause is not None else None, cause.args if cause is not None else None, error.__context__ is cause and cause is not None, error.__suppress_context__)\n    raise AssertionError('call did not raise')\n\ndef run(module):\n    returned = module.returned_generator()\n    try:\n        next(returned)\n    except StopIteration as error:\n        return_value = error.value\n    else:\n        raise AssertionError('returning generator did not finish')\n    thrown = module.throw_target()\n    assert next(thrown) == 'ready'\n    return (exception_record(lambda: next(module.leaking_generator())), exception_record(lambda: module.leaking_coroutine().send(None)), exception_record(lambda: next(module.async_stop_generator())), exception_record(lambda: module.async_stop_coroutine().send(None)), exception_record(lambda: thrown.throw(StopIteration('throw-source'))), return_value)\nexpected = run(stock)\ntransformed = module\nassert run(transformed) == expected\n",
+    "required_functions": [],
+    "factory_functions": [
+      "leaking_generator",
+      "leaking_coroutine",
+      "returned_generator",
+      "async_stop_generator",
+      "async_stop_coroutine",
+      "throw_target"
+    ]
+  },
+  "transformed_set_insertion_stop_iteration_is_not_exhaustion_hash": {
+    "original_test": "test_transformed_set_insertion_stop_iteration_is_not_exhaustion",
+    "source": "\ndef collect(factory):\n    return set(filter(lambda value: True, map(factory, (value for value in range(4)))))\n",
+    "source_sha256": "6efe7b2201b7dd28a2aba426898a476a5d3d3b844ae7552b9e03c17d4ad96140",
+    "validation": "fail_mode = 'hash'\ndef run(module):\n    events = []\n\n    def factory(value):\n        events.append(('map', value))\n        return _SetKey(value, events, fail_mode)\n    with pytest.raises(StopIteration, match=fail_mode):\n        module.collect(factory)\n    return events\nexpected_events = run(stock)\ntransformed = module\nassert run(transformed) == expected_events\n",
+    "required_functions": [
+      "collect"
+    ],
+    "factory_functions": []
+  },
+  "transformed_set_insertion_stop_iteration_is_not_exhaustion_eq": {
+    "original_test": "test_transformed_set_insertion_stop_iteration_is_not_exhaustion",
+    "source": "\ndef collect(factory):\n    return set(filter(lambda value: True, map(factory, (value for value in range(4)))))\n",
+    "source_sha256": "6efe7b2201b7dd28a2aba426898a476a5d3d3b844ae7552b9e03c17d4ad96140",
+    "validation": "fail_mode = 'eq'\ndef run(module):\n    events = []\n\n    def factory(value):\n        events.append(('map', value))\n        return _SetKey(value, events, fail_mode)\n    with pytest.raises(StopIteration, match=fail_mode):\n        module.collect(factory)\n    return events\nexpected_events = run(stock)\ntransformed = module\nassert run(transformed) == expected_events\n",
+    "required_functions": [
+      "collect"
+    ],
+    "factory_functions": []
+  },
+  "transformed_long_pipeline_preserves_eager_and_per_item_order": {
+    "original_test": "test_transformed_long_pipeline_preserves_eager_and_per_item_order",
+    "source": "\ndef collect(make_second, make_predicate, make_first, values):\n    return tuple(\n        map(\n            make_second(),\n            filter(\n                make_predicate(),\n                map(make_first(), (value for value in values)),\n            ),\n        )\n    )\n",
+    "source_sha256": "87c5206147fe26ae161d0423e5570185edd07217148c4c6334c8438a51ee49fb",
+    "validation": "def run(module):\n    events = []\n\n    def make_first():\n        events.append('make_first')\n\n        def first(value):\n            events.append(('first', value))\n            return value + 1\n        return first\n\n    def make_predicate():\n        events.append('make_predicate')\n\n        def predicate(value):\n            events.append(('predicate', value))\n            return value % 2 == 0\n        return predicate\n\n    def make_second():\n        events.append('make_second')\n\n        def second(value):\n            events.append(('second', value))\n            return value * 10\n        return second\n    values = _RecordingIterable(events, range(4))\n    result = module.collect(make_second, make_predicate, make_first, values)\n    return (result, events)\nexpected = run(stock)\nassert expected[1][:4] == ['make_second', 'make_predicate', 'make_first', 'iter']\ntransformed = module\nactual = run(transformed)\nassert type(actual[0]) is tuple\nassert actual == expected\n",
+    "required_functions": [
+      "collect"
+    ],
+    "factory_functions": []
+  }
+}

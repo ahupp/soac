@@ -1,15 +1,19 @@
-set shell := ["bash", "-euo", "pipefail", "-c"]
+# The launcher already loads the guest environment; don't rerun SSH bashrc
+# startup hooks (which can read unset PS1) when evaluating strict backticks.
+set shell := ["bash", "--norc", "-euo", "pipefail", "-c"]
 set positional-arguments
 
 repo_root := justfile_directory()
 work_dir := repo_root + "/work"
 logs_dir := work_dir + "/logs"
 benchmark_results_dir := work_dir + "/bench"
-pyperformance_results_dir := work_dir + "/pyperformance"
+pyperformance_results_dir := absolute_path(env_var_or_default("PYPERFORMANCE_RESULTS_DIR", work_dir + "/pyperformance"))
 benchmark_source_dir := repo_root + "/bench"
 pystone_source := benchmark_source_dir + "/pystone.py"
-cpython_bin := repo_root + "/vendor/cpython/python"
-cpython_lib_dir := repo_root + "/vendor/cpython"
+cpython_source_dir := absolute_path(env_var_or_default("CPYTHON_SOURCE_DIR", repo_root + "/vendor/cpython"))
+cpython_build_dir := `python3 scripts/cpython_environment.py build-dir`
+cpython_bin := absolute_path(env_var_or_default("CPYTHON_BIN", cpython_build_dir + "/python"))
+cpython_lib_dir := absolute_path(env_var_or_default("CPYTHON_LIB_DIR", cpython_build_dir))
 venv_dir := repo_root + "/.venv"
 uv_cache_dir := env_var_or_default("UV_CACHE_DIR", repo_root + "/.uv-cache")
 uv_tool_dir := env_var_or_default("UV_TOOL_DIR", repo_root + "/.uv/tools")
@@ -34,6 +38,8 @@ export BENCHMARK_RESULTS_DIR := benchmark_results_dir
 export PYPERFORMANCE_RESULTS_DIR := pyperformance_results_dir
 export BENCHMARK_SOURCE_DIR := benchmark_source_dir
 export PYSTONE_SOURCE := pystone_source
+export CPYTHON_SOURCE_DIR := cpython_source_dir
+export CPYTHON_BUILD_DIR := cpython_build_dir
 export CPYTHON_BIN := cpython_bin
 export CPYTHON_LIB_DIR := cpython_lib_dir
 export VENV_DIR := venv_dir
@@ -61,47 +67,78 @@ export LAST_BENCHMARK_COUNTERS := last_benchmark_counters
 [private]
 ensure-cpython-checkout:
   #!/usr/bin/env bash
-  if [[ ! -d "$REPO_ROOT/vendor/cpython" ]]; then
-    echo "cpython checkout not found at $REPO_ROOT/vendor/cpython" >&2
-    exit 1
-  fi
+  python3 "$REPO_ROOT/scripts/cpython_environment.py" check-source
+
+# Verify the committed offline checker submodule; this does not run analysis.
+ty-prepare *args:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  python3 "$REPO_ROOT/scripts/prepare_ty_toolchain.py" "$@"
+
+# Offline analysis only; this executable is never imported by SOAC's runtime.
+ty *args:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  python3 "$REPO_ROOT/scripts/run_ty.py" "$@"
+
+# Bootstrap-only source/build tooling tests; no selected native runtime needed.
+test-source-tooling *args:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  mkdir -p "$LOGS_DIR"
+  source_tooling_log="$(mktemp "$LOGS_DIR/source-tooling.XXXXXX.log")"
+  echo "Source-tooling log: $source_tooling_log"
+  uv run --no-project --python /usr/bin/python3 --with pytest==8.4.2 \
+    python -B -m pytest -q tests/test_cpython_patches.py \
+    tests/test_cpython_environment.py tests/test_ty_toolchain.py "$@" \
+    2>&1 | tee "$source_tooling_log"
 
 [private]
 ensure-shared-python: ensure-cpython
-  #!/usr/bin/env bash
-  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  if [[ "$("$CPYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("Py_ENABLE_SHARED") or 0)')" != "1" ]]; then
-    echo "vendored CPython at $CPYTHON_BIN is not built with --enable-shared; run 'just build-python'" >&2
-    exit 1
-  fi
 
-build-python: ensure-cpython-checkout
+# Development is nondebug shared CPython without the optimized PGO/LTO pass.
+# Stackref-debug is pydebug + explicit native StackRef checks, not benchmark-ready.
+build-python mode="optimized" *args='': ensure-cpython-checkout
   #!/usr/bin/env bash
-  set -euo pipefail
-  cd "$REPO_ROOT/vendor/cpython"
-  if [[ -f Makefile ]]; then
-    make clean
-  fi
-  LDFLAGS="-Wl,-rpath,'\$\$ORIGIN'" \
-  ./configure \
-    --enable-shared \
-    --enable-optimizations \
-    --with-lto \
-    CFLAGS_NODIST="-O3 -g -fno-omit-frame-pointer -fasynchronous-unwind-tables"
-  make -j"$(nproc)"
+  cpython_build_mode="${1#mode=}"
+  shift
+  python3 "$REPO_ROOT/scripts/cpython_environment.py" build --mode "$cpython_build_mode" "$@"
+
+# Verify the tracked native commit without applying patches or discarding edits.
+prepare-cpython *args: ensure-cpython-checkout
+  #!/usr/bin/env bash
+  python3 "$REPO_ROOT/scripts/prepare_cpython_source.py" "$@"
+
+# Verify committed cases or emit review files; never edit the live checkout.
+regenerate-cpython-cases *args:
+  #!/usr/bin/env bash
+  python3 "$REPO_ROOT/scripts/regenerate_cpython_cases.py" "$@"
+
+# Show the source pin, mount, interpreter build paths, and provenance check.
+cpython-info:
+  #!/usr/bin/env bash
+  python3 "$REPO_ROOT/scripts/cpython_environment.py" info
+
+# Persist a verified guest build for ordinary subsequent just commands.
+select-cpython-build build:
+  #!/usr/bin/env bash
+  env CPYTHON_BUILD_DIR="$1" CPYTHON_BIN="$1/python" CPYTHON_LIB_DIR="$1" \
+    python3 "$REPO_ROOT/scripts/cpython_environment.py" select-build
 
 [private]
 ensure-cpython: ensure-cpython-checkout
   #!/usr/bin/env bash
-  if [[ ! -x "$CPYTHON_BIN" ]]; then
-    echo "python not found in $CPYTHON_BIN" >&2
-    exit 1
-  fi
+  python3 "$REPO_ROOT/scripts/cpython_environment.py" check-runtime
+
+[private]
+ensure-optimized-cpython: ensure-cpython-checkout
+  #!/usr/bin/env bash
+  python3 "$REPO_ROOT/scripts/cpython_environment.py" check-runtime --require-mode optimized
 
 [private]
 ensure-venv:
   #!/usr/bin/env bash
-  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  if [[ ! -f "$VENV_DIR/bin/python" || ! -x "$VENV_DIR/bin/python" ]]; then
     echo "venv not found at $VENV_DIR; run 'just update-venv' first" >&2
       exit 1
   fi
@@ -120,8 +157,17 @@ uninstall-extension:
   fi
 
 [private]
+_cargo-target-dir:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+  cargo metadata --locked --no-deps --format-version 1 | \
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+
+[private]
 install-extension build="debug": ensure-venv ensure-cpython
   #!/usr/bin/env bash
+  set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   BUILD="{{build}}"
 
@@ -135,7 +181,7 @@ install-extension build="debug": ensure-venv ensure-cpython
   else
     PROFILE_DIR="debug"
   fi
-  ARTIFACT_DIR="$REPO_ROOT/target/$PROFILE_DIR"
+  ARTIFACT_DIR="$(just _cargo-target-dir)/$PROFILE_DIR"
 
   SOURCE_EXT="$ARTIFACT_DIR/lib_soac_ext.so"
   if [[ ! -f "$SOURCE_EXT" ]]; then
@@ -284,10 +330,7 @@ setup-dev-env:
     "$XDG_DATA_HOME" \
     "$XDG_RUNTIME_DIR"
 
-  if [[ ! -x "$CPYTHON_BIN" ]]; then
-    echo "python not found in $CPYTHON_BIN; run setup-dev-env in the parent checkout or build Python there first" >&2
-    exit 1
-  fi
+  just ensure-cpython
 
   if rustup run nightly rustc --version >/dev/null 2>&1; then
     echo "setup-dev-env: reusing installed nightly Rust toolchain"
@@ -306,6 +349,7 @@ setup-dev-env:
 
 update-venv: ensure-cpython
   #!/usr/bin/env bash
+  set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   rm -rf "$VENV_DIR"
   uv venv --python "$CPYTHON_BIN" "$VENV_DIR"
@@ -404,7 +448,7 @@ build-runtime-fast build="debug": ensure-venv-fast ensure-shared-python
       ;;
   esac
 
-  SOURCE_EXT="$REPO_ROOT/target/$PROFILE_DIR/lib_soac_ext.so"
+  SOURCE_EXT="$(just _cargo-target-dir)/$PROFILE_DIR/lib_soac_ext.so"
   SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
   EXT_SUFFIX="$("$VENV_DIR/bin/python" -c 'import importlib.machinery; print(importlib.machinery.EXTENSION_SUFFIXES[0])')"
   TARGET_EXT="$SITE_PACKAGES/_soac_ext$EXT_SUFFIX"
@@ -482,11 +526,11 @@ run-cpython-tests jobs="0" *args='': build-test-runtime ensure-cpython ensure-ve
   export SOURCE_DATE_EPOCH="$(date +%s)"
   VENV_SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
 
-  # Regrtest must run the vendored CPython interpreter from the source tree so
-  # stdlib modules resolve from vendor/cpython/Lib. The extension itself is
+  # Regrtest must run the selected CPython interpreter with its source stdlib.
+  # Build artifacts may be out-of-tree. The extension itself is
   # explicitly installed into the repo venv and added to PYTHONPATH below.
   PYTHON_BIN="$CPYTHON_BIN"
-  PYTHONPATH_PREFIX="$REPO_ROOT/vendor/cpython/Lib:$REPO_ROOT/soac_py/src:$VENV_SITE_PACKAGES:$REPO_ROOT"
+  PYTHONPATH_PREFIX="$CPYTHON_SOURCE_DIR/Lib:$REPO_ROOT/soac_py/src:$VENV_SITE_PACKAGES:$REPO_ROOT"
   SKIP_ARGS=()
   while IFS= read -r skip_id; do
     [ -n "$skip_id" ] && SKIP_ARGS+=(-x "$skip_id")
@@ -498,10 +542,10 @@ run-cpython-tests jobs="0" *args='': build-test-runtime ensure-cpython ensure-ve
     "$REPO_ROOT/scripts/collect_cpython_skip_ids.sh"
   )
 
-  find "$REPO_ROOT/vendor/cpython" -name '*.pyc' -delete
+  find "$CPYTHON_SOURCE_DIR" -name '*.pyc' -delete
 
   (
-    cd "$REPO_ROOT/vendor/cpython"
+    cd "$CPYTHON_SOURCE_DIR"
 
     TEST_CMD=(
       "$PYTHON_BIN"
@@ -539,7 +583,7 @@ docs-build: docs-install
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  npm run docs:build
+  ASTRO_TELEMETRY_DISABLED=1 npm run docs:build
 
 docs-serve port="8001":
   #!/usr/bin/env bash
@@ -933,14 +977,15 @@ capture-test-stacks root_pid out="":
 
   {
     printf 'SOAC test stack capture\n'
-    printf 'timestamp_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'timestamp_pacific=%s\n' "$(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')"
     printf 'root_pid=%s\n' "$ROOT_PID"
     printf 'pids=%s\n' "${pids[*]}"
     printf '\n'
   } >"$OUT"
 
   GDB_TIMEOUT="${STACK_GDB_TIMEOUT:-20s}"
-  PYTHON_GDB="$REPO_ROOT/vendor/cpython/python-gdb.py"
+  # Works for out-of-tree builds without relying on GDB's auto-load policy.
+  PYTHON_GDB="$CPYTHON_SOURCE_DIR/Tools/gdb/libpython.py"
   capture_failures=0
 
   for pid in "${pids[@]}"; do
@@ -1007,7 +1052,7 @@ py *args='': build-test-runtime
   cd "$REPO_ROOT"
 
   # Authoritative ad-hoc transformed-runtime Python entrypoint.
-  # Prefer this over invoking `.venv/bin/python` or `vendor/cpython/python`
+  # Prefer this over invoking `.venv/bin/python` or `CPYTHON_BIN`
   # directly when you need the built extension/import-hook path.
   set -- {{args}}
   "$VENV_DIR/bin/python" "$@"
@@ -1447,7 +1492,7 @@ nqueens-slice-perf mode slice queen_count loops="10" work_dir="" output_prefix="
   echo "DSO and symbol report: $REPORT_DSO_SYMBOLS"
   echo "callgraph report: $REPORT_CALLGRAPH"
 
-cpython *args='':
+cpython *args='': ensure-cpython
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
@@ -1455,10 +1500,11 @@ cpython *args='':
   # Raw CPython entrypoint for debugging vendored-CPython behavior without
   # relying on the transformed-runtime environment from `just py`.
   set -- {{args}}
-  "$REPO_ROOT/vendor/cpython/python" "$@"
+  "$CPYTHON_BIN" "$@"
 
 fmt-rust *packages='':
   #!/usr/bin/env bash
+  set -euo pipefail
   cd "$REPO_ROOT"
   set -- {{packages}}
   if [[ "$#" -eq 0 ]]; then
@@ -1468,13 +1514,30 @@ fmt-rust *packages='':
   fi
 
   cargo_args=()
+  format_raw_runtime=0
+  format_offline_checker=0
   for package in "$@"; do
-    cargo_args+=(--package "$package")
+    if [[ "$package" == soac_jit_runtime ]]; then
+      format_raw_runtime=1
+    elif [[ "$package" == soac_ty ]]; then
+      format_offline_checker=1
+    else
+      cargo_args+=(--package "$package")
+    fi
   done
-  cargo fmt "${cargo_args[@]}"
+  if [[ "${#cargo_args[@]}" -gt 0 ]]; then
+    cargo fmt "${cargo_args[@]}"
+  fi
+  if [[ "$format_raw_runtime" -eq 1 ]]; then
+    cargo fmt --manifest-path crates/soac_jit_runtime/Cargo.toml
+  fi
+  if [[ "$format_offline_checker" -eq 1 ]]; then
+    cargo fmt --manifest-path tools/ty/Cargo.toml --package soac_ty
+  fi
 
 fmt-rust-check *packages='':
   #!/usr/bin/env bash
+  set -euo pipefail
   cd "$REPO_ROOT"
   set -- {{packages}}
   if [[ "$#" -eq 0 ]]; then
@@ -1484,10 +1547,34 @@ fmt-rust-check *packages='':
   fi
 
   cargo_args=()
+  format_raw_runtime=0
+  format_offline_checker=0
   for package in "$@"; do
-    cargo_args+=(--package "$package")
+    if [[ "$package" == soac_jit_runtime ]]; then
+      format_raw_runtime=1
+    elif [[ "$package" == soac_ty ]]; then
+      format_offline_checker=1
+    else
+      cargo_args+=(--package "$package")
+    fi
   done
-  cargo fmt --check "${cargo_args[@]}"
+  if [[ "${#cargo_args[@]}" -gt 0 ]]; then
+    cargo fmt --check "${cargo_args[@]}"
+  fi
+  if [[ "$format_raw_runtime" -eq 1 ]]; then
+    cargo fmt --check --manifest-path crates/soac_jit_runtime/Cargo.toml
+  fi
+  if [[ "$format_offline_checker" -eq 1 ]]; then
+    cargo fmt --check --manifest-path tools/ty/Cargo.toml --package soac_ty
+  fi
+
+# The raw CLIF input crate is deliberately outside Cargo's runtime workspace.
+test-jit-runtime *args:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+  cargo test --manifest-path crates/soac_jit_runtime/Cargo.toml \
+    --target-dir work/target-jit-runtime "$@"
 
 fmt-markdown:
   #!/usr/bin/env bash
@@ -1523,7 +1610,9 @@ _test-all-test-phase:
     fi
   }
 
-  run_serial_step() {
+  # A phase may temporarily disable errexit for its logging pipeline, but
+  # must not re-enable it in the caller that collects all three outcomes.
+  run_serial_step() (
     local label="$1"
     local log_path="$2"
     local status_path="$3"
@@ -1550,28 +1639,39 @@ _test-all-test-phase:
       echo "[diet-python test-all] step failed: $label (exit $status)" >&2
     fi
     return "$status"
-  }
+  )
 
   overall_status=0
   test_log_dir="$(mktemp -d)"
   cargo_test_log="$test_log_dir/cargo-test.log"
+  raw_runtime_test_log="$test_log_dir/raw-runtime-test.log"
   pytest_log="$test_log_dir/pytest.log"
   cargo_test_status_file="$test_log_dir/cargo-test.status"
+  raw_runtime_test_status_file="$test_log_dir/raw-runtime-test.status"
   pytest_status_file="$test_log_dir/pytest.status"
 
   # Some soac_jit tests share CPython process state and JIT finalization state.
-  # Keep the Rust harness serial here so the full gate is deterministic. Pytest
+  # Keep the Rust harness serial here so the full gate is deterministic. Limit
+  # compiler jobs too: simultaneous large debug-test links exceed the 12 GiB
+  # Lima VM's memory even though the test harness itself runs serially. Pytest
   # imports a symlink to target/debug/lib_soac_ext.so, so running it while cargo
-  # relinks test artifacts can load a mismatched extension.
+  # relinks test artifacts can load a mismatched extension. Attempt every Rust
+  # test target so an early crate failure does not hide later diagnostics.
   set +e
-  run_serial_step cargo-test "$cargo_test_log" "$cargo_test_status_file" cargo_test_s cargo test -- --test-threads=1
+  run_serial_step cargo-test "$cargo_test_log" "$cargo_test_status_file" cargo_test_s cargo test --no-fail-fast --jobs 1 -- --test-threads=1
   cargo_test_status=$?
+  run_serial_step raw-runtime-test "$raw_runtime_test_log" "$raw_runtime_test_status_file" raw_runtime_test_s just test-jit-runtime -- --test-threads=1
+  raw_runtime_test_status=$?
   run_serial_step pytest "$pytest_log" "$pytest_status_file" pytest_s just _pytest-run tests/
   pytest_status=$?
   set -e
 
   if [ "$cargo_test_status" -ne 0 ]; then
     overall_status="$cargo_test_status"
+  fi
+
+  if [ "$raw_runtime_test_status" -ne 0 ] && [ "$overall_status" -eq 0 ]; then
+    overall_status="$raw_runtime_test_status"
   fi
 
   if [ "$pytest_status" -ne 0 ]; then
@@ -1616,7 +1716,7 @@ _call-target-specializations-from-dump dump_path:
   cd "$REPO_ROOT"
   cargo run --release -p soac_inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
-benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-extension "release")
+benchmark-verify loops="100000" counters_dir="": ensure-optimized-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -1649,7 +1749,7 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
   echo "verification counters: $COUNTERS_DIR/verify.bin"
   echo "SOAC events log: $COUNTERS_DIR/events.jsonl"
 
-benchmark-warm loops="8000000": (update-venv-offline) (build-extension "release")
+benchmark-warm loops="8000000": ensure-optimized-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -1683,7 +1783,7 @@ benchmark-warm loops="8000000": (update-venv-offline) (build-extension "release"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); benchtime, loops_per_ns = pystone.pystones(loops); print(benchtime, int(loops_per_ns * 1e9), "loops/s")'
 
-pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensure-shared-python
+pyperformance mode="soac" output="" benchmarks="" *args='': ensure-optimized-cpython ensure-shared-python
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -1707,6 +1807,8 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     just build-runtime-fast release
   else
     just ensure-venv-fast
+    unset SOAC_PYPERFORMANCE_ENABLE SOAC_PYPERFORMANCE_DRIVER
+    unset SOAC_PYPERFORMANCE_EXEC_WRAPPED SOAC_PYPERFORMANCE_STRICT_BUNDLE
   fi
 
   mkdir -p "$PYPERFORMANCE_RESULTS_DIR"
@@ -1740,11 +1842,15 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
     export PYTHONPATH="$REPO_ROOT/scripts/pyperformance_soac_sitecustomize:$REPO_ROOT/soac_py/src:$VENV_SITE_PACKAGES${PYTHONPATH:+:$PYTHONPATH}"
     export SOAC_PYPERFORMANCE_ENABLE=1
     export SOAC_PYPERFORMANCE_DRIVER=1
+    "$VENV_DIR/bin/python" "$REPO_ROOT/scripts/run_ty.py" --debug-build -- --help \
+      > "${OUTPUT%.json}.ty-build.log" 2>&1
+    export SOAC_PYPERFORMANCE_CHECKER="$REPO_ROOT/work/target-ty/debug/soac-ty"
     if [[ -z "${SOAC_WORK_DIR:-}" ]]; then
       export SOAC_WORK_DIR="${OUTPUT%.json}.soac-work"
     elif [[ "$SOAC_WORK_DIR" != /* ]]; then
       export SOAC_WORK_DIR="$REPO_ROOT/$SOAC_WORK_DIR"
     fi
+    export SOAC_PYPERFORMANCE_WORK_ROOT="$SOAC_WORK_DIR"
     export SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}"
     export SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}"
     export SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}"
@@ -1756,6 +1862,10 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       PYTHONPATH
       RUST_BACKTRACE
       SOAC_PYPERFORMANCE_ENABLE
+      SOAC_PYPERFORMANCE_STRICT_BUNDLE
+      SOAC_PYPERFORMANCE_WORK_ROOT
+      HOME
+      XDG_CONFIG_HOME
       SOAC_WORK_DIR
       SOAC_OPT_MODE
       SOAC_OPT_RUNTIME_PIPELINE
@@ -1764,7 +1874,6 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       SOAC_JIT_COMPILE_WORKERS
       SOAC_JIT_EMIT_REFCOUNTS
       SOAC_ENABLE_PROFILED_COLD_BLOCKS
-      SOAC_PRECOMPILED_LIBRARY
       SOAC_MODULE_ENABLED
       SOAC_LOG
       SOAC_COMPILE_MODE
@@ -1847,14 +1956,15 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       echo "SOAC work dir: $SOAC_WORK_DIR"
       echo "SOAC opt mode: ${SOAC_OPT_MODE:-none}"
       echo "SOAC compile mode: ${SOAC_COMPILE_MODE:-eager}"
-      find "$SOAC_WORK_DIR" -name pyperformance-worker-timing.jsonl -delete
+      find "$SOAC_WORK_DIR" -name pyperformance-worker-timing.jsonl -delete || return "$?"
     fi
+    local run_status=0
     (
-      cd "$PYPERFORMANCE_RESULTS_DIR"
+      cd "$PYPERFORMANCE_RESULTS_DIR" || exit "$?"
       "$VENV_DIR/bin/python" \
         "$REPO_ROOT/scripts/run_pyperformance_cached.py" \
         "${run_args[@]}"
-    )
+    ) || run_status=$?
     if [[ -f "$run_output" ]]; then
       echo "pyperformance result: $run_output"
     else
@@ -1864,8 +1974,11 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
       "$CPYTHON_BIN" \
         "$REPO_ROOT/scripts/summarize_pyperformance_worker_timing.py" \
         "$SOAC_WORK_DIR" \
-        "${pass_label:-run}"
+        "${pass_label:-run}" || {
+          if ((run_status == 0)); then run_status=1; fi
+        }
     fi
+    return "$run_status"
   }
 
   if [[ "$MODE" == "stock" ]]; then
@@ -1892,14 +2005,21 @@ pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensur
   find "$SOAC_WORK_DIR" -mindepth 2 -name jit-code-summary.jsonl -delete
   find "$SOAC_WORK_DIR" -mindepth 2 -name jit-bb-map.jsonl -delete
 
-  run_pyperformance_once "$PROFILE_OUTPUT" "profile" "profile" "${pyperformance_profile_args[@]}"
+  profile_status=0
+  run_pyperformance_once "$PROFILE_OUTPUT" "profile" "profile" "${pyperformance_profile_args[@]}" || profile_status=$?
   if ! find "$SOAC_WORK_DIR" -name profile.bin -print -quit | grep -q .; then
     echo "SOAC profile pass did not write any profile.bin under $SOAC_WORK_DIR" >&2
+    profile_status=1
+  fi
+  # Preserve the fixed driver selection and each profile failure while allowing
+  # successful drivers to produce their independent apply measurements.
+  apply_status=0
+  run_pyperformance_once "$OUTPUT" "apply" "apply" "${pyperformance_apply_args[@]}" || apply_status=$?
+  if ((profile_status != 0 || apply_status != 0)); then
     exit 1
   fi
-  run_pyperformance_once "$OUTPUT" "apply" "apply" "${pyperformance_apply_args[@]}"
 
-pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure-cpython ensure-shared-python
+pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure-optimized-cpython ensure-shared-python
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -1952,7 +2072,6 @@ pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure
     list_args+=("--benchmarks=$BENCHMARK_SELECTOR")
   fi
   "$VENV_DIR/bin/pyperformance" "${list_args[@]}" > "$RESULT_DIR/requested-benchmarks.txt"
-  printf 'round\torder\tmode\toutput\n' > "$RESULT_DIR/run-order.tsv"
 
   echo "pyperformance comparison directory: $RESULT_DIR"
   echo "pyperformance benchmark selector: ${BENCHMARK_SELECTOR:-all}"
@@ -1961,32 +2080,13 @@ pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure
     echo "previous SOAC benchmark result: $BASELINE_JSON"
   fi
 
-  for ((round = 1; round <= ROUNDS; round++)); do
-    printf -v round_label '%02d' "$round"
-    if ((round % 2 == 1)); then
-      run_modes=(stock soac)
-    else
-      run_modes=(soac stock)
-    fi
-
-    for order in "${!run_modes[@]}"; do
-      mode="${run_modes[$order]}"
-      output="$RESULT_DIR/round-$round_label-$mode.json"
-      printf '%s\t%s\t%s\t%s\n' \
-        "$round_label" "$((order + 1))" "$mode" "$output" \
-        >> "$RESULT_DIR/run-order.tsv"
-      env -u SOAC_WORK_DIR -u SOAC_OPT_MODE \
-        just pyperformance "$mode" "$output" "$BENCHMARK_SELECTOR" "$@"
-    done
-  done
-
-  summary_args=("$RESULT_DIR" --json-out "$RESULT_DIR/summary.json")
+  summary_args=("$RESULT_DIR" --run-rounds "$ROUNDS" --benchmarks "${BENCHMARK_SELECTOR:-all}" --json-out "$RESULT_DIR/summary.json")
   if [[ -n "$BASELINE_JSON" ]]; then
     summary_args+=(--baseline "$BASELINE")
   fi
   "$VENV_DIR/bin/python" \
     "$REPO_ROOT/scripts/summarize_pyperformance_comparison.py" \
-    "${summary_args[@]}" | tee "$RESULT_DIR/summary.txt"
+    "${summary_args[@]}" --pyperformance-args "$@"
 
   "$VENV_DIR/bin/pyperformance" compare \
     "$RESULT_DIR/stock.json" "$RESULT_DIR/soac.json" -O table \
@@ -2000,7 +2100,7 @@ pyperformance-compare benchmarks="chaos" rounds="3" baseline="" *args='': ensure
 
   echo "pyperformance comparison summary: $RESULT_DIR/summary.json"
 
-pyperformance-deep-profile-from-profile result benchmark *args='': (build-runtime-fast "release")
+pyperformance-deep-profile-from-profile result benchmark *args='': ensure-optimized-cpython (build-runtime-fast "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -2060,7 +2160,6 @@ pyperformance-deep-profile-from-profile result benchmark *args='': (build-runtim
 
   REPO_SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
   BENCHMARK_SITE_PACKAGES="$("$WORKER_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
-  BENCHMARK_ROOT="$("$CPYTHON_BIN" -c 'import pathlib, sys; script = pathlib.Path(sys.argv[1]).resolve(); print(next(parent for parent in script.parents if parent.name == "benchmarks"))' "$WORKER_BENCHMARK_SCRIPT")"
   PYTHONPATH_PREFIX="$REPO_ROOT/soac_py/src:$REPO_SITE_PACKAGES:$BENCHMARK_SITE_PACKAGES"
   PERF_FREQUENCY="${PERF_FREQUENCY:-999}"
   PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,65528}"
@@ -2115,9 +2214,13 @@ pyperformance-deep-profile-from-profile result benchmark *args='': (build-runtim
   echo "report callgraph: $REPORT_CALLGRAPH"
 
   rm -f "$READY_FILE"
-  env \
+  env -u SOAC_PYPERFORMANCE_DRIVER -u SOAC_PYPERFORMANCE_EXEC_WRAPPED \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="$REPO_ROOT/scripts/pyperformance_soac_sitecustomize:$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" \
+    SOAC_PYPERFORMANCE_ENABLE=1 \
+    SOAC_PYPERFORMANCE_STRICT_BUNDLE="$WORKER_STRICT_BUNDLE" \
+    SOAC_PYPERFORMANCE_WORK_ROOT="$SOAC_WORK_ROOT" \
+    PYPERFORMANCE_RUNID="soac-replay-$WORKER_BENCHMARK_NAME" \
     SOAC_PYPERFORMANCE_MEASURE_READY_FILE="$READY_FILE" \
     SOAC_WORK_DIR="$WORKER_WORK_DIR" \
     SOAC_OPT_MODE=apply \
@@ -2125,10 +2228,9 @@ pyperformance-deep-profile-from-profile result benchmark *args='': (build-runtim
     SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}" \
     SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}" \
     SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}" \
-    SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$BENCHMARK_ROOT}" \
     "$WORKER_PYTHON" \
     -u \
-    -m soac.import_hook \
+    -X "soac_strict_config=$WORKER_STRICT_DEPLOYMENT" \
     "$WORKER_BENCHMARK_SCRIPT" \
     "${WORKER_STABLE_ARGS[@]}" \
     --worker \
@@ -2279,7 +2381,7 @@ pyperformance-deep-profile-from-profile result benchmark *args='': (build-runtim
   echo "finished"
   echo "view speedscope: just view-speedscope ${VIEW_SPEEDSCOPE_PROFILE@Q}"
 
-benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
+benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/bench" result_mode="one-off": ensure-optimized-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -2497,7 +2599,7 @@ _benchmark-export-specialized-artifacts result_dir:
   done < "$CLIF_DIR/functions.tsv"
 
 [private]
-_benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-cpython
+_benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-optimized-cpython
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -2534,7 +2636,7 @@ _benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-cpython
   cp -f "$PERF_INJECTED_SOURCE" "$RESULT_DIR/perf.injected.data"
 
 [private]
-_benchmark-add-deep-profile-artifacts result_dir perf_loops="10000000": ensure-cpython
+_benchmark-add-deep-profile-artifacts result_dir perf_loops="10000000": ensure-optimized-cpython
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
@@ -2557,7 +2659,7 @@ _benchmark-add-deep-profile-artifacts result_dir perf_loops="10000000": ensure-c
   just _benchmark-run-specialized-perf "$RESULT_DIR" "{{perf_loops}}"
   cargo run -q -p soac_inspector --bin annotate_cranelift_perf -- "$RESULT_DIR"
 
-benchmark-deep-profile-from-profile result_dir verify_loops="100000" perf_loops="10000000": (update-venv-offline) (build-extension "release")
+benchmark-deep-profile-from-profile result_dir verify_loops="100000" perf_loops="10000000": ensure-optimized-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
@@ -2587,7 +2689,7 @@ benchmark-deep-profile-from-profile result_dir verify_loops="100000" perf_loops=
     echo "deep profile result: $RESULT_DIR"
   } 2>&1 | tee "$REPORT"
 
-benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="work/bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
+benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="work/bench" result_mode="one-off": ensure-optimized-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"

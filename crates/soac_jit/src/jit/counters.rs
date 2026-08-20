@@ -8,10 +8,9 @@ use cranelift_module::{DataId, FuncId};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::ModuleShape;
 use soac_core::block_py::{
-    BlockPyFunction, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite,
-    DeoptEntrySource, InstrId, RuntimeFunctionId,
+    BlockPyFunction, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite, InstrId,
+    RuntimeFunctionId,
 };
-use soac_opt::passes::LocalEnvResumePoint;
 use std::collections::HashMap;
 
 use super::backend::define_prepared_function;
@@ -22,7 +21,6 @@ use super::imports::{
     DP_JIT_DECREF_IMPORT, DP_JIT_INCREF_IMPORT, ImportSpec, ModuleFuncImports,
     SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT,
 };
-use super::planning::PlannedJitDeoptResumeFunction;
 use super::symbols::scoped_jit_symbol;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -314,46 +312,6 @@ pub(super) fn collect_runtime_branch_counter_refs_by_kind(
         }
     }
     refs
-}
-
-fn deopt_entry_source_for_resume_point(point: LocalEnvResumePoint) -> DeoptEntrySource {
-    match point {
-        LocalEnvResumePoint::BlockEntry { block, .. } => {
-            DeoptEntrySource::BlockEntry { block_label: block }
-        }
-        LocalEnvResumePoint::BeforeInstr { key } => DeoptEntrySource::BeforeInstr {
-            instr_id: key.instr_id,
-        },
-        LocalEnvResumePoint::BeforeTerm { block, .. } => {
-            DeoptEntrySource::BeforeTerm { block_label: block }
-        }
-    }
-}
-
-pub(super) fn collect_deopt_entry_counter_ids_by_kind(
-    counter_defs: &[CounterDef],
-    function_id: RuntimeFunctionId,
-    kind: &str,
-    deopt_resume_plan: &PlannedJitDeoptResumeFunction,
-) -> HashMap<usize, CounterId> {
-    counter_defs
-        .iter()
-        .filter_map(|counter| match &counter.site {
-            CounterSite::DeoptEntry {
-                function_id: counter_function_id,
-                source,
-            } if counter.kind == kind && *counter_function_id == function_id => {
-                let ordinal = deopt_resume_plan
-                    .deopt_points
-                    .iter()
-                    .find(|point| deopt_entry_source_for_resume_point(point.point) == *source)?
-                    .id
-                    .ordinal;
-                Some((ordinal, counter.id))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 pub(super) fn build_counted_runtime_refcount_helper(

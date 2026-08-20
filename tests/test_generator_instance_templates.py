@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import subprocess
-import sys
 import textwrap
 
+from scripts.strict_pyperformance_sources import strict_opt_in
+from tests._strict_integration import _VALIDATION_PRELUDE, create_strict_project
 
-def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
+
+def test_source_generator_instances_preserve_identity_mutations_and_ordinary_observers(
     tmp_path: Path,
 ) -> None:
     source = textwrap.dedent(
@@ -33,6 +33,19 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
     for module_name in module_names.values():
         (tmp_path / f"{module_name}.py").write_text(source, encoding="utf-8")
 
+    selected = {
+        name: f"{name}.py"
+        for name in (module_names["canonical"], module_names["prepatched"])
+    }
+    project = create_strict_project(
+        tmp_path / "strict-project",
+        {
+            path: strict_opt_in(source.encode(), path)[0].decode()
+            for path in selected.values()
+        },
+        modules=selected,
+    )
+
     script = textwrap.dedent(
         """
         import gc
@@ -40,16 +53,70 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
         import json
         import sys
         import weakref
+        import types
+        from tests._integration import stock_module
+        from soac import _soac_ext
+        import soac.runtime as runtime
 
-        sys.path.insert(0, __FIXTURE_PATH__)
-        stock = importlib.import_module(__STOCK_MODULE__)
+        # Exit the ordinary-loader context before selected imports. The held
+        # ordinary module still owns the complete original source functions.
+        with stock_module(Path(__FIXTURE_PATH__), __STOCK_MODULE__, __SOURCE__) as stock:
+            for name in ("plain", "captured", "observed"):
+                assert owner(vars(stock)[name]) is None
+                assert metadata(vars(stock)[name]) is None
 
-        from soac.import_hook import install
-
-        install()
+        expected_paths = __SELECTED_PATHS__
         canonical = importlib.import_module(__CANONICAL_MODULE__)
         prepatched = importlib.import_module(__PREPATCHED_MODULE__)
-        import soac.runtime as runtime
+
+        def assert_selected(module):
+            diagnostic = _soac_ext.strict_module_diagnostics(module)
+            assert diagnostic is not None, "source executed without strict ownership"
+            assert diagnostic["sealed"] is True
+            assert diagnostic["backend"] == "soac"
+            assert diagnostic["module_name"] == module.__name__
+            assert diagnostic["source_path"] == expected_paths[module.__name__]
+            assert diagnostic["artifact_generation"] == __GENERATION__
+            assert diagnostic["initializer_entry_kind"] == "entry_interpreter"
+            witnesses = []
+            for name in ("plain", "captured", "observed"):
+                function = vars(module)[name]
+                assert owner(function) and metadata(function), name
+                actual_entry = _soac_ext.strict_function_entry_kind(function)
+                assert actual_entry == "checked_native", (name, actual_entry)
+                witnesses.append((name, id(function), owner(function)))
+            return tuple(witnesses)
+
+        selected_owners = {
+            module.__name__: assert_selected(module)
+            for module in (canonical, prepatched)
+        }
+        valid_capsule = ctypes.pythonapi.PyCapsule_IsValid
+        valid_capsule.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        valid_capsule.restype = ctypes.c_int
+        matches_owner = ctypes.pythonapi.PyGen_MatchesSoacOwner
+        matches_owner.argtypes = [ctypes.py_object, ctypes.py_object]
+        matches_owner.restype = ctypes.c_int
+
+        def source_capsule(generator, function):
+            assert type(generator) is types.GeneratorType
+            (code,) = (
+                value for value in function.__code__.co_consts
+                if type(value) is types.CodeType and value.co_name == "<genexpr>"
+            )
+            assert generator.gi_code is code
+            (capsule,) = (
+                value for value in gc.get_referents(generator)
+                if valid_capsule(value, b"soac.PreservedState")
+            )
+            assert gc.is_tracked(capsule)
+            assert matches_owner(generator, capsule) == 1
+            return capsule
+
+        def native_plain(module, values):
+            generator = module.plain(values)
+            source_capsule(generator, module.plain)
+            return generator
 
         def generator_metadata(module):
             plain = module.plain((3, 4))
@@ -68,11 +135,14 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
                 "plain_name": plain.__name__,
                 "plain_qualname": plain.__qualname__,
             }
+            if module is not stock:
+                source_capsule(plain, module.plain)
+                source_capsule(captured, module.captured)
             assert list(plain) == [3, 4]
             assert list(captured) == [11, 12]
             return metadata
 
-        metadata = {
+        observed_metadata = {
             "stock": generator_metadata(stock),
             "soac": generator_metadata(canonical),
         }
@@ -82,6 +152,10 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
             second = module.captured(10, (1, 2))
             assert first is not second
             assert first.gi_code is second.gi_code
+            if module is not stock:
+                assert source_capsule(first, module.captured) is not source_capsule(
+                    second, module.captured
+                )
             assert (next(first), next(second), next(first), next(second)) == (
                 4,
                 11,
@@ -140,25 +214,27 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
             assert reference() is None
             assert finalized == ["released"], finalized
 
-            if hasattr(first, "_resume_function"):
-                first_resume = first._resume_function
-                second_resume = second._resume_function
-                first_cell = first_resume.__closure__[
-                    first_resume.__code__.co_freevars.index("offset")
-                ]
-                second_cell = second_resume.__closure__[
-                    second_resume.__code__.co_freevars.index("offset")
-                ]
-                assert first_cell is not second_cell
-                assert (first_cell.cell_contents, second_cell.cell_contents) == (
-                    3,
-                    10,
-                )
-
         assert_generator_semantics(stock)
         assert_generator_semantics(canonical)
 
         original_helper = runtime.make_generator_instance
+
+        def ordinary_resume_control(*args):
+            raise AssertionError("ordinary construction control must not resume")
+
+        def ordinary_generator_control():
+            # Real ordinary factory entry; no source metadata or native permit
+            # is installed on this callback, and the wrapper is never resumed.
+            assert owner(ordinary_resume_control) is None
+            assert metadata(ordinary_resume_control) is None
+            generator = runtime.make_generator_instance(
+                ordinary_resume_control, 0, "ordinary_generator_control",
+                "ordinary_generator_control", (None, 0), (0, 1), 0, 1, (),
+            )
+            assert type(generator) is runtime.ClosureGenerator
+            assert generator._resume_function is ordinary_resume_control
+            return generator
+
         prepatched_calls = []
 
         def replacement_helper(*args):
@@ -167,27 +243,34 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
 
         runtime.make_generator_instance = replacement_helper
         try:
-            assert list(prepatched.plain((20,))) == [20]
+            for value in (20, 21):
+                ordinary = ordinary_generator_control()
+                del ordinary
+                assert list(native_plain(prepatched, (value,))) == [value]
         finally:
             runtime.make_generator_instance = original_helper
-        assert len(prepatched_calls) == 1, prepatched_calls
-
-        # Each transformed module caches the first runtime helper it resolves.
-        assert list(prepatched.plain((21,))) == [21]
+        # The ordinary public helper observes its current binding; source
+        # generators have a distinct native owner, not a cached wrapper factory.
+        ordinary = ordinary_generator_control()
+        del ordinary
+        assert list(native_plain(prepatched, (21,))) == [21]
         assert len(prepatched_calls) == 2, prepatched_calls
 
         original_preserved = runtime.make_preserved_state
         preserved_calls = []
 
-        def replacement_preserved(values, kinds):
+        def replacement_preserved(values, kinds, operand_slots):
             assert isinstance(values, tuple), values
             assert isinstance(kinds, tuple), kinds
+            assert isinstance(operand_slots, tuple), operand_slots
             preserved_calls.append((len(values), len(kinds)))
-            return original_preserved(values, kinds)
+            return original_preserved(values, kinds, operand_slots)
 
         runtime.make_preserved_state = replacement_preserved
         try:
-            assert list(canonical.plain((30,))) == [30]
+            ordinary = ordinary_generator_control()
+            del ordinary
+            assert list(native_plain(canonical, (30,))) == [30]
         finally:
             runtime.make_preserved_state = original_preserved
         assert len(preserved_calls) == 1, preserved_calls
@@ -202,7 +285,9 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
 
         runtime.getattr = replacement_getattr
         try:
-            assert list(canonical.plain((31,))) == [31]
+            ordinary = ordinary_generator_control()
+            del ordinary
+            assert list(native_plain(canonical, (31,))) == [31]
         finally:
             runtime.getattr = original_getattr
         assert len(getattr_calls) == 1, getattr_calls
@@ -219,9 +304,10 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
 
         runtime.ClosureGenerator = ReplacementGenerator
         try:
-            replacement = canonical.plain((32,))
+            replacement = ordinary_generator_control()
             assert type(replacement) is ReplacementGenerator
-            assert list(replacement) == [32]
+            assert list(native_plain(canonical, (32,))) == [32]
+            del replacement
         finally:
             runtime.ClosureGenerator = original_generator_class
         assert len(class_constructions) == 1, class_constructions
@@ -248,21 +334,22 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
                 monitoring_callback,
             )
 
-            # Local events do not increment CPython's global monitoring version.
-            # Exercise this before profiling or globally enabled monitoring.
+            # Keep both ordinary code-local and global monitoring controls.
             monitoring.set_local_events(
                 tool_id,
                 helper_code,
                 monitoring.events.PY_START,
             )
-            assert list(canonical.plain((40,))) == [40]
+            ordinary = ordinary_generator_control()
+            del ordinary
             monitoring.set_local_events(tool_id, helper_code, 0)
             assert observed_monitoring["local"], observed_monitoring
 
             monitoring_phase = "global"
             monitoring.set_events(tool_id, monitoring.events.PY_START)
             try:
-                assert list(canonical.plain((41,))) == [41]
+                ordinary = ordinary_generator_control()
+                del ordinary
             finally:
                 monitoring.set_events(tool_id, 0)
             assert observed_monitoring["global"], observed_monitoring
@@ -275,6 +362,8 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
                 None,
             )
             monitoring.free_tool_id(tool_id)
+        assert list(canonical.plain((40,))) == [40]
+        assert list(canonical.plain((41,))) == [41]
 
         profile_events = []
 
@@ -284,10 +373,12 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
 
         sys.setprofile(profile)
         try:
-            assert list(canonical.plain((50,))) == [50]
+            ordinary = ordinary_generator_control()
+            del ordinary
         finally:
             sys.setprofile(None)
         assert profile_events, profile_events
+        assert list(canonical.plain((50,))) == [50]
 
         trace_events = []
 
@@ -298,15 +389,20 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
 
         sys.settrace(trace)
         try:
-            assert list(canonical.plain((51,))) == [51]
+            ordinary = ordinary_generator_control()
+            del ordinary
         finally:
             sys.settrace(None)
         assert trace_events, trace_events
+        assert list(canonical.plain((51,))) == [51]
+
+        for module in (canonical, prepatched):
+            assert assert_selected(module) == selected_owners[module.__name__]
 
         print(
             json.dumps(
                 {
-                    "metadata": metadata,
+                    "metadata": observed_metadata,
                     "prepatched_calls": len(prepatched_calls),
                     "preserved_calls": len(preserved_calls),
                     "getattr_calls": len(getattr_calls),
@@ -324,30 +420,23 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
         .replace("__STOCK_MODULE__", repr(module_names["stock"]))
         .replace("__CANONICAL_MODULE__", repr(module_names["canonical"]))
         .replace("__PREPATCHED_MODULE__", repr(module_names["prepatched"]))
+        .replace("__SOURCE__", repr(source))
+        .replace("__SELECTED_PATHS__", repr({
+            name: str(project.project / path) for name, path in selected.items()
+        }))
+        .replace("__GENERATION__", repr(project.publication["generation"]))
     )
 
     event_log = tmp_path / "generator-instance-events.jsonl"
-    env = dict(os.environ)
-    env.update(
-        {
-            "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
+    completed = project.run(
+        _VALIDATION_PRELUDE + script,
+        opt_mode="apply",
+        extra_env={
             "SOAC_WORK_DIR": str(tmp_path / "soac-work"),
-            "SOAC_OPT_MODE": "apply",
-            "SOAC_COMPILE_MODE": "eager",
-            "SOAC_BACKGROUND_JIT": "0",
-            "SOAC_LOG": (
-                "soac_generator_direct_state=debug;"
-                f"json={event_log}"
-            ),
-        }
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
+            "SOAC_LOG": f"soac_generator_preserved_layout=info;json={event_log}",
+        },
         timeout=60,
+        check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     result = json.loads(completed.stdout.splitlines()[-1])
@@ -376,13 +465,12 @@ def test_source_generator_instances_preserve_identity_and_observable_fallbacks(
     assert result["profile_events"] > 0, result
     assert result["trace_events"] > 0, result
 
-    direct_events = [
+    layout_events = [
         event
         for line in event_log.read_text(encoding="utf-8").splitlines()
-        if (event := json.loads(line))["target"] == "soac_generator_direct_state"
+        if (event := json.loads(line))["target"] == "soac_generator_preserved_layout"
     ]
     assert any(
-        event.get("path") == "direct"
-        and event.get("temporary_python_tuples") == 0
-        for event in direct_events
-    ), direct_events
+        event.get("qualname") == "plain.<locals>.<genexpr>"
+        for event in layout_events
+    ), layout_events

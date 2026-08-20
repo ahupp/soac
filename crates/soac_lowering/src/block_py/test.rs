@@ -200,11 +200,11 @@ fn storage_layout_semantics_collects_structured_cell_ref_logical_names() {
         public_scope: None,
         blocks: vec![Block {
             label: BlockLabel::from_index(0),
-            body: vec![CellRefForName::new("captured".to_string()).into()],
+            body: vec![CellRefForName::new("captured".to_string(), None).into()],
             term: BlockTerm::Return(InstrUnresolved::constant_none()),
             params: Vec::new(),
             exc_edge: None,
-            extra: (),
+            extra: Default::default(),
         }],
         doc: None,
         public_storage_layout: None,

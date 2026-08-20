@@ -1,6 +1,6 @@
 use soac_core::block_py::{
-    BinOpKind, Block, BlockLabel, BlockPyFunction, BlockTerm, HasSemanticInstrId, InstrId, Load,
-    ResolvedName, TermIf, UnaryOpKind,
+    BinOpKind, Block, BlockLabel, BlockPyFunction, BlockTerm, CellLoadBinding, HasSemanticInstrId,
+    InstrId, Load, ResolvedName, TermIf, UnaryOpKind,
 };
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::plan_v3::RegionId;
@@ -36,6 +36,7 @@ pub struct ExtractedValueId(pub u32);
 pub enum ExtractedValueKind {
     LoadName {
         name: ResolvedName,
+        cell_binding: Option<CellLoadBinding>,
     },
     Binary {
         op: BinOpKind,
@@ -220,10 +221,33 @@ fn instr_codegen_kind(instr: &InstrBlockPy) -> &'static str {
         InstrBlockPy::Load(_) => "Load",
         InstrBlockPy::Store(_) => "Store",
         InstrBlockPy::Del(_) => "Del",
+        InstrBlockPy::TakeOperand(_) => "TakeOperand",
+        InstrBlockPy::ComprehensionInsert(_) => "ComprehensionInsert",
+        InstrBlockPy::BuildCollection(_) => "BuildCollection",
+        InstrBlockPy::CallArgumentOp(_) => "CallArgumentOp",
+        InstrBlockPy::PreparedCall(_) => "PreparedCall",
+        InstrBlockPy::IteratorStep(_) => "IteratorStep",
         InstrBlockPy::MakeCell(_) => "MakeCell",
+        InstrBlockPy::NewAnnotationSet(_) => "NewAnnotationSet",
+        InstrBlockPy::SetupAnnotations(_) => "SetupAnnotations",
+        InstrBlockPy::ConstructTypeParameterScope(_) => "ConstructTypeParameterScope",
+        InstrBlockPy::SubscriptGeneric(_) => "SubscriptGeneric",
+        InstrBlockPy::SetFunctionTypeParameters(_) => "SetFunctionTypeParameters",
+        InstrBlockPy::CreateTypeAlias(_) => "CreateTypeAlias",
+        InstrBlockPy::CreateTypeParameter(_) => "CreateTypeParameter",
+        InstrBlockPy::SetTypeParameterDefault(_) => "SetTypeParameterDefault",
+        InstrBlockPy::CheckAnnotationFormat(_) => "CheckAnnotationFormat",
+        InstrBlockPy::RecordAnnotation(_) => "RecordAnnotation",
         InstrBlockPy::IncrementCounter(_) => "IncrementCounter",
         InstrBlockPy::CellRef(_) => "CellRef",
         InstrBlockPy::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
+        InstrBlockPy::ConstructClass(_) => "ConstructClass",
+        InstrBlockPy::PrepareClassDecorator(_) => "PrepareClassDecorator",
+        InstrBlockPy::ApplyClassDecorator(_) => "ApplyClassDecorator",
+        InstrBlockPy::DiscardClassDecorator(_) => "DiscardClassDecorator",
+        InstrBlockPy::DiscardClassConstructionCaptures(_) => "DiscardClassConstructionCaptures",
+        InstrBlockPy::CompleteFunctionDefinition(_) => "CompleteFunctionDefinition",
+        InstrBlockPy::ApplyFunctionDescriptor(_) => "ApplyFunctionDescriptor",
     }
 }
 
@@ -261,6 +285,12 @@ fn extract_block_term_region_v3(
             return Err(RegionExtractionError::UnsupportedTerm {
                 block: block.label,
                 term: "Raise",
+            });
+        }
+        BlockTerm::GeneratorReturn(_) => {
+            return Err(RegionExtractionError::UnsupportedTerm {
+                block: block.label,
+                term: "GeneratorReturn",
             });
         }
     };
@@ -393,6 +423,32 @@ impl RegionBuilder {
                     kind: "MakeFunctionWithClosure",
                 })
             }
+            InstrBlockPy::ConstructClass(_) => Err(RegionExtractionError::UnsupportedInstr {
+                source: instr.try_semantic_instr_id(),
+                kind: "ConstructClass",
+            }),
+            InstrBlockPy::TakeOperand(_)
+            | InstrBlockPy::ComprehensionInsert(_)
+            | InstrBlockPy::BuildCollection(_)
+            | InstrBlockPy::CallArgumentOp(_)
+            | InstrBlockPy::PreparedCall(_)
+            | InstrBlockPy::IteratorStep(_)
+            | InstrBlockPy::PrepareClassDecorator(_)
+            | InstrBlockPy::DiscardClassDecorator(_)
+            | InstrBlockPy::DiscardClassConstructionCaptures(_)
+            | InstrBlockPy::ApplyClassDecorator(_)
+            | InstrBlockPy::NewAnnotationSet(_)
+            | InstrBlockPy::SetupAnnotations(_)
+            | InstrBlockPy::ConstructTypeParameterScope(_)
+            | InstrBlockPy::SubscriptGeneric(_)
+            | InstrBlockPy::SetFunctionTypeParameters(_)
+            | InstrBlockPy::CreateTypeAlias(_)
+            | InstrBlockPy::CreateTypeParameter(_)
+            | InstrBlockPy::SetTypeParameterDefault(_)
+            | InstrBlockPy::CompleteFunctionDefinition(_)
+            | InstrBlockPy::ApplyFunctionDescriptor(_)
+            | InstrBlockPy::CheckAnnotationFormat(_)
+            | InstrBlockPy::RecordAnnotation(_) => Err(unsupported_instr_error(instr)),
         }
     }
 
@@ -405,6 +461,7 @@ impl RegionBuilder {
             source,
             ExtractedValueKind::LoadName {
                 name: load.name.clone(),
+                cell_binding: load.cell_binding.clone(),
             },
         )
     }

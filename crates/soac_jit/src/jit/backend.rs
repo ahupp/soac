@@ -28,6 +28,7 @@ use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, soac_jit_make_function_with_closure,
 };
 use crate::soac_jit_resume_generator;
+use crate::strict_class::{CONSTRUCT_CLASS_SYMBOL, soac_jit_construct_class};
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir;
 use cranelift_codegen::isa::TargetIsa;
@@ -100,6 +101,78 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL,
         soac_jit_make_function_with_closure as *const u8,
+    );
+    builder.symbol(
+        CONSTRUCT_CLASS_SYMBOL,
+        soac_jit_construct_class as *const u8,
+    );
+    builder.symbol(
+        crate::strict_class_decorator::PREPARE_CLASS_DECORATOR_SYMBOL,
+        crate::strict_class_decorator::prepare_class_decorator as *const u8,
+    );
+    builder.symbol(
+        crate::strict_class_decorator::PREPARE_CLASS_DECORATOR_UNPACKED_SYMBOL,
+        crate::strict_class_decorator::prepare_class_decorator_unpacked as *const u8,
+    );
+    builder.symbol(
+        crate::strict_class_decorator::APPLY_CLASS_DECORATOR_SYMBOL,
+        crate::strict_class_decorator::apply_class_decorator as *const u8,
+    );
+    builder.symbol(
+        crate::strict_class_decorator::DISCARD_CLASS_DECORATOR_SYMBOL,
+        crate::strict_class_decorator::discard_class_decorator as *const u8,
+    );
+    builder.symbol(
+        crate::strict_function::DISCARD_CLASS_CONSTRUCTION_CAPTURES_SYMBOL,
+        crate::strict_function::discard_class_construction_captures as *const u8,
+    );
+    builder.symbol(
+        crate::strict_function::COMPLETE_FUNCTION_DEFINITION_SYMBOL,
+        crate::strict_function::soac_jit_complete_function_definition as *const u8,
+    );
+    builder.symbol(
+        crate::strict_descriptor::APPLY_FUNCTION_DESCRIPTOR_SYMBOL,
+        crate::strict_descriptor::apply_function_descriptor as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::NEW_ANNOTATION_SET_SYMBOL,
+        crate::strict_annotation::new_annotation_set as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::SETUP_ANNOTATIONS_SYMBOL,
+        crate::strict_annotation::setup_annotations as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::CREATE_TYPE_ALIAS_SYMBOL,
+        crate::strict_annotation::create_type_alias as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::CONSTRUCT_TYPE_PARAMETER_SCOPE_SYMBOL,
+        crate::strict_annotation::construct_type_parameter_scope as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::SUBSCRIPT_GENERIC_SYMBOL,
+        crate::strict_annotation::subscript_generic as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::SET_FUNCTION_TYPE_PARAMETERS_SYMBOL,
+        crate::strict_annotation::set_function_type_parameters as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::CREATE_TYPE_PARAMETER_SYMBOL,
+        crate::strict_annotation::create_type_parameter as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::SET_TYPE_PARAMETER_DEFAULT_SYMBOL,
+        crate::strict_annotation::set_type_parameter_default as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::RECORD_ANNOTATION_SYMBOL,
+        crate::strict_annotation::record_annotation as *const u8,
+    );
+    builder.symbol(
+        crate::strict_annotation::CHECK_ANNOTATION_FORMAT_SYMBOL,
+        crate::strict_annotation::check_annotation_format as *const u8,
     );
     builder.symbol(
         SOAC_JIT_RESUME_GENERATOR_SYMBOL,

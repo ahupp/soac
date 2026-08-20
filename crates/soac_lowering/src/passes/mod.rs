@@ -1,6 +1,8 @@
+use crate::block_py::{BuildCollection, CallArgumentOp, IteratorStep, PreparedCall};
 pub(crate) mod ast_symbol_analysis;
 pub(crate) mod ast_to_ast;
 pub(crate) mod ast_to_instr;
+pub(crate) mod block_parameter_roles;
 pub(crate) mod blockpy_expr_simplify;
 pub(crate) mod blockpy_generators;
 pub(crate) mod blockpy_to_bb;
@@ -8,20 +10,26 @@ pub(crate) mod core_await_lower;
 pub(crate) mod global_index;
 pub(crate) mod name_binding;
 pub(crate) mod ruff_to_blockpy;
+pub(crate) mod strict_construction;
 
 use crate::block_py::{
-    runtime_name_load, Await, BinOp, Call, CallArgKeyword, CallArgPositional, CellRef,
-    CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral,
-    ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString,
+    runtime_name_load, ApplyClassDecorator, ApplyFunctionDescriptor, Await, BinOp, Call,
+    CallArgKeyword, CallArgPositional, CellRef, CellRefForName, CheckAnnotationFormat,
+    ChildVisitable, CompleteFunctionDefinition, ComprehensionInsert, ConstructTypeParameterScope,
+    CreateTypeAlias, CreateTypeParameter, Del, DelItem, DiscardClassConstructionCaptures,
+    DiscardClassDecorator, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral,
+    ExprCompare, ExprDict, ExprDictComp, ExprDictItem, ExprEllipsisLiteral, ExprFString,
     ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName,
     ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred,
     ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, Instr,
     InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure,
-    MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign,
-    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
-    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, Tuple, UnaryOp, UnresolvedName,
+    MapInstr, Mappable, Meta, ModuleShape, NameLike, NewAnnotationSet, PrepareClassDecorator,
+    RecordAnnotation, ResolvedName, SetAttr, SetFunctionTypeParameters, SetItem,
+    SetTypeParameterDefault, SetupAnnotations, StmtAnnAssign, StmtAssert, StmtAssign,
+    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
+    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, SubscriptGeneric, TakeOperand, TryMapInstr, Tuple, UnaryOp, UnresolvedName,
     WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
@@ -43,7 +51,17 @@ pub(crate) enum InstrRuff {
     UnaryOp(UnaryOp<Self>),
     ExprLambda(ExprLambda<Self>),
     ExprIf(ExprIf<Self>),
-    ExprDict(ExprDict),
+    ExprDict(ExprDict<Self>),
+    TakeOperand(TakeOperand<Self>),
+    Store(Store<Self>),
+    Del(Del<Self>),
+    MakeCell(MakeCell<Self>),
+    CellRefForName(CellRefForName),
+    ComprehensionInsert(ComprehensionInsert<Self>),
+    BuildCollection(BuildCollection<Self>),
+    CallArgumentOp(CallArgumentOp<Self>),
+    PreparedCall(PreparedCall<Self>),
+    IteratorStep(IteratorStep<Self>),
     ExprSet(ExprSet<Self>),
     ExprListComp(ExprListComp<Self>),
     ExprSetComp(ExprSetComp<Self>),
@@ -116,7 +134,7 @@ pub(crate) struct RuffModuleShape;
 impl ModuleShape for RuffModuleShape {
     type Instr = InstrRuff;
     type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
+    type BlockExtra = soac_core::block_py::BlockContext;
 }
 
 /// Core BlockPy after syntax-level control flow has been lowered to blocks.
@@ -141,13 +159,44 @@ pub(crate) enum InstrWithAwaitAndYield {
     Load(Load<Self>),
     Store(Store<Self>),
     Del(Del<Self>),
+    TakeOperand(TakeOperand<Self>),
+    ComprehensionInsert(ComprehensionInsert<Self>),
+    BuildCollection(BuildCollection<Self>),
+    CallArgumentOp(CallArgumentOp<Self>),
+    PreparedCall(PreparedCall<Self>),
+    IteratorStep(IteratorStep<Self>),
     MakeCell(MakeCell<Self>),
+    NewAnnotationSet(NewAnnotationSet<Self>),
+    SetupAnnotations(SetupAnnotations<Self>),
+    ConstructTypeParameterScope(ConstructTypeParameterScope<Self>),
+    SubscriptGeneric(SubscriptGeneric<Self>),
+    SetFunctionTypeParameters(SetFunctionTypeParameters<Self>),
+    CreateTypeAlias(CreateTypeAlias<Self>),
+    CreateTypeParameter(CreateTypeParameter<Self>),
+    SetTypeParameterDefault(SetTypeParameterDefault<Self>),
+    CheckAnnotationFormat(CheckAnnotationFormat<Self>),
+    RecordAnnotation(RecordAnnotation<Self>),
     CellRefForName(CellRefForName),
     CellRef(CellRef),
     MakeFunction(MakeFunction<Self>),
+    CompleteFunctionDefinition(CompleteFunctionDefinition<Self>),
+    ApplyFunctionDescriptor(ApplyFunctionDescriptor<Self>),
+    PrepareClassDecorator(PrepareClassDecorator<Self>),
+    ApplyClassDecorator(ApplyClassDecorator<Self>),
+    DiscardClassDecorator(DiscardClassDecorator<Self>),
+    DiscardClassConstructionCaptures(DiscardClassConstructionCaptures<Self>),
     Await(Await<Self>),
     Yield(Yield<Self>),
     YieldFrom(YieldFrom<Self>),
+}
+
+impl soac_core::block_py::TakeOperandInstruction for InstrWithAwaitAndYield {
+    fn as_take_operand(&self) -> Option<&TakeOperand<Self>> {
+        match self {
+            Self::TakeOperand(op) => Some(op),
+            _ => None,
+        }
+    }
 }
 
 impl Instr for InstrWithAwaitAndYield {
@@ -168,7 +217,7 @@ pub(crate) struct CoreModuleShapeWithAwaitAndYield;
 impl ModuleShape for CoreModuleShapeWithAwaitAndYield {
     type Instr = InstrWithAwaitAndYield;
     type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
+    type BlockExtra = soac_core::block_py::BlockContext;
 }
 
 /// Core BlockPy after `await` has been rewritten but generator yields remain.
@@ -193,12 +242,43 @@ pub(crate) enum InstrWithYield {
     Load(Load<Self>),
     Store(Store<Self>),
     Del(Del<Self>),
+    TakeOperand(TakeOperand<Self>),
+    ComprehensionInsert(ComprehensionInsert<Self>),
+    BuildCollection(BuildCollection<Self>),
+    CallArgumentOp(CallArgumentOp<Self>),
+    PreparedCall(PreparedCall<Self>),
+    IteratorStep(IteratorStep<Self>),
     MakeCell(MakeCell<Self>),
+    NewAnnotationSet(NewAnnotationSet<Self>),
+    SetupAnnotations(SetupAnnotations<Self>),
+    ConstructTypeParameterScope(ConstructTypeParameterScope<Self>),
+    SubscriptGeneric(SubscriptGeneric<Self>),
+    SetFunctionTypeParameters(SetFunctionTypeParameters<Self>),
+    CreateTypeAlias(CreateTypeAlias<Self>),
+    CreateTypeParameter(CreateTypeParameter<Self>),
+    SetTypeParameterDefault(SetTypeParameterDefault<Self>),
+    CheckAnnotationFormat(CheckAnnotationFormat<Self>),
+    RecordAnnotation(RecordAnnotation<Self>),
     CellRefForName(CellRefForName),
     CellRef(CellRef),
     MakeFunction(MakeFunction<Self>),
+    CompleteFunctionDefinition(CompleteFunctionDefinition<Self>),
+    ApplyFunctionDescriptor(ApplyFunctionDescriptor<Self>),
+    PrepareClassDecorator(PrepareClassDecorator<Self>),
+    ApplyClassDecorator(ApplyClassDecorator<Self>),
+    DiscardClassDecorator(DiscardClassDecorator<Self>),
+    DiscardClassConstructionCaptures(DiscardClassConstructionCaptures<Self>),
     Yield(Yield<Self>),
     YieldFrom(YieldFrom<Self>),
+}
+
+impl soac_core::block_py::TakeOperandInstruction for InstrWithYield {
+    fn as_take_operand(&self) -> Option<&TakeOperand<Self>> {
+        match self {
+            Self::TakeOperand(op) => Some(op),
+            _ => None,
+        }
+    }
 }
 
 impl Instr for InstrWithYield {
@@ -219,7 +299,7 @@ pub(crate) struct CoreModuleShapeWithYield;
 impl ModuleShape for CoreModuleShapeWithYield {
     type Instr = InstrWithYield;
     type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
+    type BlockExtra = soac_core::block_py::BlockContext;
 }
 
 /// Core BlockPy after generator/coroutine yield lowering.
@@ -245,11 +325,42 @@ pub(crate) enum InstrLow<N: NameLike> {
     Load(Load<Self>),
     Store(Store<Self>),
     Del(Del<Self>),
+    TakeOperand(TakeOperand<Self>),
+    ComprehensionInsert(ComprehensionInsert<Self>),
+    BuildCollection(BuildCollection<Self>),
+    CallArgumentOp(CallArgumentOp<Self>),
+    PreparedCall(PreparedCall<Self>),
+    IteratorStep(IteratorStep<Self>),
     MakeCell(MakeCell<Self>),
+    NewAnnotationSet(NewAnnotationSet<Self>),
+    SetupAnnotations(SetupAnnotations<Self>),
+    ConstructTypeParameterScope(ConstructTypeParameterScope<Self>),
+    SubscriptGeneric(SubscriptGeneric<Self>),
+    SetFunctionTypeParameters(SetFunctionTypeParameters<Self>),
+    CreateTypeAlias(CreateTypeAlias<Self>),
+    CreateTypeParameter(CreateTypeParameter<Self>),
+    SetTypeParameterDefault(SetTypeParameterDefault<Self>),
+    CheckAnnotationFormat(CheckAnnotationFormat<Self>),
+    RecordAnnotation(RecordAnnotation<Self>),
     CellRefForName(CellRefForName),
     CellRef(CellRef),
     MakeFunction(MakeFunction<Self>),
     MakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
+    CompleteFunctionDefinition(CompleteFunctionDefinition<Self>),
+    ApplyFunctionDescriptor(ApplyFunctionDescriptor<Self>),
+    PrepareClassDecorator(PrepareClassDecorator<Self>),
+    ApplyClassDecorator(ApplyClassDecorator<Self>),
+    DiscardClassDecorator(DiscardClassDecorator<Self>),
+    DiscardClassConstructionCaptures(DiscardClassConstructionCaptures<Self>),
+}
+
+impl<N: NameLike> soac_core::block_py::TakeOperandInstruction for InstrLow<N> {
+    fn as_take_operand(&self) -> Option<&TakeOperand<Self>> {
+        match self {
+            Self::TakeOperand(op) => Some(op),
+            _ => None,
+        }
+    }
 }
 
 impl<N: NameLike> Instr for InstrLow<N> {
@@ -272,7 +383,7 @@ pub(crate) struct CoreModuleShape;
 impl ModuleShape for CoreModuleShape {
     type Instr = InstrUnresolved;
     type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
+    type BlockExtra = soac_core::block_py::BlockContext;
 }
 
 /// BlockPy after name binding has resolved source names to storage locations.
@@ -313,9 +424,40 @@ pub enum InstrResolved {
     Load(#[rkyv(omit_bounds)] Load<Self>),
     Store(#[rkyv(omit_bounds)] Store<Self>),
     Del(#[rkyv(omit_bounds)] Del<Self>),
+    TakeOperand(#[rkyv(omit_bounds)] TakeOperand<Self>),
+    ComprehensionInsert(#[rkyv(omit_bounds)] ComprehensionInsert<Self>),
+    BuildCollection(#[rkyv(omit_bounds)] BuildCollection<Self>),
+    CallArgumentOp(#[rkyv(omit_bounds)] CallArgumentOp<Self>),
+    PreparedCall(#[rkyv(omit_bounds)] PreparedCall<Self>),
+    IteratorStep(#[rkyv(omit_bounds)] IteratorStep<Self>),
     MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
+    NewAnnotationSet(#[rkyv(omit_bounds)] NewAnnotationSet<Self>),
+    SetupAnnotations(#[rkyv(omit_bounds)] SetupAnnotations<Self>),
+    ConstructTypeParameterScope(#[rkyv(omit_bounds)] ConstructTypeParameterScope<Self>),
+    SubscriptGeneric(#[rkyv(omit_bounds)] SubscriptGeneric<Self>),
+    SetFunctionTypeParameters(#[rkyv(omit_bounds)] SetFunctionTypeParameters<Self>),
+    CreateTypeAlias(#[rkyv(omit_bounds)] CreateTypeAlias<Self>),
+    CreateTypeParameter(#[rkyv(omit_bounds)] CreateTypeParameter<Self>),
+    SetTypeParameterDefault(#[rkyv(omit_bounds)] SetTypeParameterDefault<Self>),
+    CheckAnnotationFormat(#[rkyv(omit_bounds)] CheckAnnotationFormat<Self>),
+    RecordAnnotation(#[rkyv(omit_bounds)] RecordAnnotation<Self>),
     CellRef(CellRef),
     MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
+    CompleteFunctionDefinition(#[rkyv(omit_bounds)] CompleteFunctionDefinition<Self>),
+    ApplyFunctionDescriptor(#[rkyv(omit_bounds)] ApplyFunctionDescriptor<Self>),
+    PrepareClassDecorator(#[rkyv(omit_bounds)] PrepareClassDecorator<Self>),
+    ApplyClassDecorator(#[rkyv(omit_bounds)] ApplyClassDecorator<Self>),
+    DiscardClassDecorator(#[rkyv(omit_bounds)] DiscardClassDecorator<Self>),
+    DiscardClassConstructionCaptures(#[rkyv(omit_bounds)] DiscardClassConstructionCaptures<Self>),
+}
+
+impl soac_core::block_py::TakeOperandInstruction for InstrResolved {
+    fn as_take_operand(&self) -> Option<&TakeOperand<Self>> {
+        match self {
+            Self::TakeOperand(op) => Some(op),
+            _ => None,
+        }
+    }
 }
 
 impl Instr for InstrResolved {
@@ -336,7 +478,7 @@ pub(crate) struct ResolvedStorageModuleShape;
 impl ModuleShape for ResolvedStorageModuleShape {
     type Instr = InstrResolved;
     type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
+    type BlockExtra = soac_core::block_py::BlockContext;
 }
 
 #[cfg(test)]

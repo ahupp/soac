@@ -1,17 +1,38 @@
+pub use self::build_collection::{BuildCollection, BuildCollectionKind};
+pub use self::call_arguments::{
+    CallArgumentOp, CallArgumentOpKind, PreparedCall, call_has_owned_operand_inputs,
+};
+pub use self::class_bindings::{
+    CLASS_BINDINGS_SCHEMA_VERSION, ClassBindingAccess, ClassBindingAccessContext,
+    ClassBindingAccessSelection, ClassBindingCapture, ClassBindingCaptureCreation,
+    ClassBindingCodeNode, ClassBindingExport, ClassBindingExportKind, ClassBindingInitialValue,
+    ClassBindingInitializer, ClassBindingPhase, ClassBindingProjection, ClassBindingRecipe,
+    ClassBindingScope, ClassBindingSlotBinding, ClassBindingSlotId, ClassBindingSlotProjection,
+    ClassBindingStorage, NativeCodeId, NativeCompileScopeKind, NativeLocalsPlusKind,
+    NativeLocalsPlusSlot, NativeSymbolScopeKind,
+};
 pub use self::constant_expr::ConstantExpr;
 pub use self::instr::{
-    Await, BinOp, BinOpKind, Call, CallDirect, CalleeFunctionId, CellRef, CellRefForName, Del,
-    DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
-    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
-    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
-    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
-    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, Load, MakeCell, MakeFunction,
-    MakeFunctionWithClosure, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
+    ApplyClassDecorator, ApplyFunctionDescriptor, Await, BinOp, BinOpKind, Call, CallDirect,
+    CalleeFunctionId, CellLoadBinding, CellRef, CellRefForName, CheckAnnotationFormat,
+    CompleteFunctionDefinition, ComprehensionInsert, ComprehensionInsertKind, ConstructClass,
+    ConstructTypeParameterScope, CreateTypeAlias, CreateTypeParameter, Del, DelItem,
+    DiscardClassConstructionCaptures, DiscardClassDecorator, ExprAttribute, ExprBoolOp,
+    ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprDictItem,
+    ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
+    ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
+    ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
+    FrameNamespace, GetAttr, GetItem, Load, MakeCell, MakeFunction, MakeFunctionWithClosure,
+    NewAnnotationSet, PrepareClassDecorator, RecordAnnotation, SetAttr, SetFunctionTypeParameters,
+    SetItem, SetTypeParameterDefault, SetupAnnotations, StmtAnnAssign, StmtAssert, StmtAssign,
     StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
     StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
     StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
-    StmtWith, Store, Tuple, UnaryOp, UnaryOpKind, Yield, YieldFrom,
+    StmtWith, Store, StoreLifetime, StorePurpose, SubscriptGeneric, TakeOperand,
+    TakeOperandInstruction, Tuple, TypeParameterKind, UnaryOp, UnaryOpKind, Yield, YieldFrom,
+    visit_operand_takes, visit_term_operand_takes,
 };
+pub use self::iteration::IteratorStep;
 pub use self::literal::{
     BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
     StringLiteral,
@@ -28,10 +49,14 @@ pub use self::meta::{
 };
 pub use self::param_specs::{Param, ParamDefaultSource, ParamKind, ParamSpec};
 pub use self::scope::{
-    BindingKind, BindingPurpose, BindingTarget, CallableScopeInfo, CallableScopeKind,
-    CellBindingKind, CellCaptureBinding, ClassBodyFallback, ClosureInit, ClosureSlot,
-    EffectiveBinding, PreservedSlot, PreservedSlotStorage, StorageLayout,
-    derive_effective_binding_for_name,
+    AnnotationProviderKind, AnnotationProviderScope, BindingKind, BindingPurpose, BindingTarget,
+    CallableScopeInfo, CallableScopeKind, CellBindingKind, CellCaptureBinding,
+    CellCaptureProjection, ClassBodyFallback, ClassConstructionScope, ClosureInit, ClosureSlot,
+    EffectiveBinding, FunctionDefaultsProjection, GeneratorControlRole, GeneratorResumeAbi,
+    GeneratorResumeParamBinding, GeneratorResumeParamRole, LexicalCaptureProjection,
+    LexicalCellBinding, LexicalCellCapture, OperandLocation, PreservedSlot, PreservedSlotStorage,
+    PrivateLexicalScope, ResolvedBlockParameterRole, StorageLayout, TypeParameterScope,
+    TypeParameterScopeInput, TypeParameterScopeInputKind, derive_effective_binding_for_name,
 };
 #[allow(unused_imports)]
 pub use self::visit::{
@@ -45,10 +70,14 @@ use ruff_python_ast::{self as ast};
 use std::fmt;
 use std::fmt::Write;
 
+mod build_collection;
+mod call_arguments;
+mod class_bindings;
 mod constant_expr;
 mod counters;
 mod instr;
 mod instr_macro;
+mod iteration;
 pub mod literal;
 mod map;
 mod meta;
@@ -56,19 +85,24 @@ mod name_gen;
 mod param_specs;
 mod pretty;
 mod scope;
+mod strict;
 mod visit;
 pub use counters::{
     CounterBranch, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite,
     DeoptEntrySource, IncrementCounter,
 };
 pub use name_gen::{
-    BlockLabel, FunctionNameGen, LocalFunctionId, ModuleContentId, ModuleNameGen,
-    PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName,
-    SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
+    BlockLabel, FunctionNameGen, LocalFunctionId, ModuleNameGen, PersistentFunctionId,
+    RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName, SerializedFunctionId,
+    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
 };
 pub use pretty::{
     BlockPyFormat, PrettyConfig, PrettyMode, PrettyPrint, PrettyPrinter, bb_expr_text,
     blockpy_module_to_string,
+};
+pub use soac_contracts::ModuleContentId;
+pub use strict::{
+    CallableSourceOrigin, CallableSourceRole, GeneratorExpressionCode, StrictModuleSource,
 };
 
 pub fn is_internal_symbol(name: &str) -> bool {
@@ -132,7 +166,22 @@ macro_rules! define_runtime_names {
     };
 }
 
+/// How an already-authorized native resume delivers its exceptional input.
+/// Ordinary is used only by the retained unmanaged helper lane. Native
+/// delegation is resolved before re-entering the body, so a delivered delegate
+/// error must enter its existing call-error edge without a second throw/close.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratorResumeDelivery {
+    Ordinary = 0,
+    DirectRaise = 1,
+    YieldFromException = 2,
+}
+
 define_runtime_names! {
+    GeneratorResumeDelivery => "generator_resume_delivery",
+    InjectGeneratorResumeException => "inject_generator_resume_exception",
+    AsyncGenWrapYield => "async_gen_wrap_yield",
     Pep479Exception => "pep_479_exception",
     SoacFilterIterator => "__soac_filter_iterator",
     SoacMapIterator => "__soac_map_iterator",
@@ -354,7 +403,6 @@ define_runtime_names! {
     AsynccontextmanagerGetAexit => "asynccontextmanager_get_aexit",
     AsynccontextmanagerExit => "asynccontextmanager_exit",
     IterRange => "IterRange",
-    AsyncGenComplete => "AsyncGenComplete",
     ClosureGenerator => "ClosureGenerator",
     Coroutine => "Coroutine",
     ClosureAsyncGenerator => "ClosureAsyncGenerator",
@@ -363,6 +411,14 @@ define_runtime_names! {
     DynamicCallee => "__dp_dynamic_callee",
     MakeGeneratorInstance => "make_generator_instance",
     UnpackFixed => "unpack_fixed",
+}
+
+impl RuntimeName {
+    /// Compiler-owned operations, not lookups of replaceable Python helpers.
+    /// Keep their identity through binding and expression linearization.
+    pub fn is_language_intrinsic(self) -> bool {
+        matches!(self, Self::Globals | Self::UnpackFixed)
+    }
 }
 
 #[derive(
@@ -409,6 +465,9 @@ pub enum CellLocation {
     Preserved(u32),
     Closure(u32),
     CapturedSource(u32),
+    /// A compiler-only original cell in the active call's private environment.
+    /// It is never an index in the public native closure tuple.
+    Private(u32),
 }
 
 impl CellLocation {
@@ -417,7 +476,8 @@ impl CellLocation {
             Self::Owned(slot)
             | Self::Preserved(slot)
             | Self::Closure(slot)
-            | Self::CapturedSource(slot) => slot,
+            | Self::CapturedSource(slot)
+            | Self::Private(slot) => slot,
         }
     }
 
@@ -810,8 +870,53 @@ impl Default for FunctionExecutionMode {
     }
 }
 
+/// Resolved handler behavior, preserved through every BlockPy representation.
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum HandledExceptionContext {
+    #[default]
+    Regions,
+    /// Synthetic resume dispatch does not leave the suspended source handler.
+    Preserve,
+    /// Compiler-owned unwind work trims existing handlers to the listed
+    /// prefix, but neither enters a handler nor consumes the pending raise.
+    Unwind,
+    /// Saved-local cleanup runs after the suspended activation has detached.
+    /// An escaping raise preserves the existing error; GeneratorReturn carries
+    /// a completion value until the remaining frame roots have been released.
+    Terminal,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct BlockContext {
+    pub handled_exception: HandledExceptionContext,
+    /// Analysis-only successor of an actual yielding Return. The target is the
+    /// final resume-dispatch wrapper, whose reads reload preserved state before
+    /// entering the source continuation. Resolved transport ownership consumes
+    /// and clears this edge before optimization; it is not an emitted CFG jump.
+    pub suspension_resume: Option<BlockLabel>,
+}
+
+pub trait HasBlockContext {
+    fn block_context(&self) -> BlockContext;
+    fn set_block_context(&mut self, context: BlockContext);
+}
+
+impl HasBlockContext for BlockContext {
+    fn block_context(&self) -> BlockContext {
+        *self
+    }
+
+    fn set_block_context(&mut self, context: BlockContext) {
+        *self = context;
+    }
+}
+
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct Block<I: Instr, E = ()> {
+pub struct Block<I: Instr, E = BlockContext> {
     pub label: BlockLabel,
     pub body: Vec<I>,
     pub term: BlockTerm<I>,
@@ -840,7 +945,7 @@ impl<I: Instr> Block<I> {
             term,
             params,
             exc_edge,
-            extra: (),
+            extra: BlockContext::default(),
         }
     }
 }
@@ -919,6 +1024,46 @@ impl<I: Instr, E> Block<I, E> {
             .map(|param| param.name.as_str())
     }
 
+    /// Lexically active handled regions, ordered outermost to innermost.
+    /// Outer regions are added after recursive lowering of their children.
+    pub fn handled_exception_params(&self) -> impl Iterator<Item = &BlockParam>
+    where
+        E: HasBlockContext,
+    {
+        let terminal =
+            self.extra.block_context().handled_exception == HandledExceptionContext::Terminal;
+        self.params
+            .iter()
+            .rev()
+            .filter(|param| param.role == BlockParamRole::EnclosingException)
+            .chain(
+                self.params
+                    .iter()
+                    .filter(|param| param.role == BlockParamRole::Exception),
+            )
+            .filter(move |_| !terminal)
+    }
+
+    /// Pending finally payloads, outermost first. The primary role declares
+    /// the owning entry; enclosing roles carry that owner's exact extent.
+    pub fn pending_abrupt_payload_params(&self) -> impl Iterator<Item = &BlockParam>
+    where
+        E: HasBlockContext,
+    {
+        let terminal =
+            self.extra.block_context().handled_exception == HandledExceptionContext::Terminal;
+        self.params
+            .iter()
+            .rev()
+            .filter(|param| param.role == BlockParamRole::EnclosingAbruptPayload)
+            .chain(
+                self.params
+                    .iter()
+                    .filter(|param| param.role == BlockParamRole::AbruptPayload),
+            )
+            .filter(move |_| !terminal)
+    }
+
     pub fn param_names(&self) -> impl Iterator<Item = &str> {
         self.params.iter().map(|param| param.name.as_str())
     }
@@ -928,14 +1073,25 @@ impl<I: Instr, E> Block<I, E> {
     }
 
     pub fn bb_params(&self) -> impl Iterator<Item = &BlockParam> {
-        [
-            BlockParamRole::Value,
-            BlockParamRole::Exception,
-            BlockParamRole::AbruptKind,
-            BlockParamRole::AbruptPayload,
-        ]
-        .into_iter()
-        .flat_map(|role| self.params.iter().filter(move |param| param.role == role))
+        self.params
+            .iter()
+            .filter(|param| {
+                matches!(
+                    param.role,
+                    BlockParamRole::Value | BlockParamRole::GeneratorResume(_)
+                )
+            })
+            .chain(
+                [
+                    BlockParamRole::EnclosingException,
+                    BlockParamRole::Exception,
+                    BlockParamRole::EnclosingAbruptPayload,
+                    BlockParamRole::AbruptKind,
+                    BlockParamRole::AbruptPayload,
+                ]
+                .into_iter()
+                .flat_map(|role| self.params.iter().filter(move |param| param.role == role)),
+            )
     }
 
     pub fn bb_param_names(&self) -> impl Iterator<Item = &str> {
@@ -951,6 +1107,7 @@ impl<I: Instr, E> Block<I, E> {
 pub struct BlockPyModule<P: ModuleShape> {
     #[rkyv(with = rkyv::with::Skip)]
     pub module_name_gen: ModuleNameGen,
+    pub strict_source: Option<StrictModuleSource>,
     pub global_names: Vec<String>,
     pub callable_defs: Vec<BlockPyFunction<P>>,
     pub module_constants: Vec<P::ModuleConstant>,
@@ -1250,7 +1407,7 @@ impl<P: ModuleShape> BlockPyFunction<P> {
 pub trait ModuleShape: Clone + fmt::Debug {
     type Instr: Instr;
     type ModuleConstant: Clone + fmt::Debug;
-    type BlockExtra: Clone + Default + fmt::Debug;
+    type BlockExtra: Clone + Default + fmt::Debug + HasBlockContext;
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -1327,6 +1484,11 @@ pub enum BlockTerm<I: Instr> {
     BranchTable(TermBranchTable<I>),
     Raise(TermRaise<I>),
     Return(I),
+    /// Complete a lowered generator or coroutine, carrying its evaluated
+    /// return value. Unlike a yielded `Return`, this closes the activation;
+    /// unlike a source `Raise`, it constructs StopIteration only after the
+    /// activation's handled state and frame-owned values have been released.
+    GeneratorReturn(I),
 }
 
 impl<I: Instr> BlockTerm<I> {
@@ -1378,7 +1540,7 @@ impl<I: Instr> BlockTerm<I> {
                 }
                 replaced
             }
-            Self::Raise(_) | Self::Return(_) => false,
+            Self::Raise(_) | Self::Return(_) | Self::GeneratorReturn(_) => false,
         }
     }
 }
@@ -1397,9 +1559,38 @@ pub struct TermBranchTable<I: Instr> {
     pub default_label: BlockLabel,
 }
 
+/// Source raise semantics are independent of a block's handled-scope lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum RaiseDisposition {
+    /// Apply Python raise normalization and the active handled context.
+    Source,
+    /// Propagate an already-normalized exception without adding a new context.
+    /// Requires an explicit Some(exc) operand; None is source bare-raise syntax.
+    PropagateNormalized,
+    /// Restore an already-normalized error produced by a source operation.
+    /// Its propagation/handler semantics remain distinct from a forwarding edge.
+    SourceNormalized,
+}
+
+impl RaiseDisposition {
+    pub const fn is_normalized(self) -> bool {
+        !matches!(self, Self::Source)
+    }
+}
+
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TermRaise<I: Instr> {
     pub exc: Option<I>,
+    pub disposition: RaiseDisposition,
+}
+
+impl<I: Instr> TermRaise<I> {
+    pub fn validate_exception_operand(&self) -> Result<(), String> {
+        if self.disposition.is_normalized() && self.exc.is_none() {
+            return Err("normalized propagation requires an explicit exception operand".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -1438,12 +1629,22 @@ pub enum AbruptKind {
     Continue,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum BlockParamRole {
     Value,
+    /// An explicit private resume ABI value, never selected from its spelling.
+    GeneratorResume(GeneratorResumeParamRole),
+    /// A surrounding handler whose current value must be restored after an
+    /// inner handler exits. This is not the newly raised exception operand.
+    EnclosingException,
     Exception,
     AbruptKind,
+    /// Declaration of a finally entry's owned pending return/exception value.
     AbruptPayload,
+    /// The value remains pending throughout this part of its finally body.
+    EnclosingAbruptPayload,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

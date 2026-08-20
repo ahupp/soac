@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import ast
 import json
-import os
 from pathlib import Path
-import subprocess
-import sys
 import textwrap
+
+from scripts.strict_pyperformance_sources import strict_opt_in
+from tests._strict_integration import (
+    _VALIDATION_PRELUDE,
+    assert_strict_source_rejected,
+    create_strict_project,
+)
 
 
 _MODULE_SOURCE = """
@@ -62,8 +67,24 @@ def unrelated(value):
 """
 
 
+def _selected_interop_source() -> str:
+    """A separate counterpart, not admission of the invalid original module."""
+    source = textwrap.dedent(_MODULE_SOURCE)
+    functions = ast.parse(source).body
+    assert all(isinstance(node, ast.FunctionDef) for node in functions)
+    rejected = [node for node in functions if node.name == "wrong_keyword"]
+    assert len(rejected) == 1
+    # Preserve the exact original function bodies. The full original is checked
+    # for rejection below and remains the ordinary binding-error control.
+    return "\n\n".join(
+        ast.get_source_segment(source, node)
+        for node in functions
+        if node.name != "wrong_keyword"
+    ) + "\n"
+
+
 def _run_guarded_generator_worker(
-    tmp_path: Path, module_name: str, work_dir: Path, mode: str
+    project, tmp_path: Path, module_name: str, work_dir: Path, mode: str
 ) -> dict:
     script = textwrap.dedent(
         """
@@ -78,19 +99,61 @@ def _run_guarded_generator_worker(
         module_name = __MODULE_NAME__
         root = __MODULE_ROOT__
         source = open(root + "/" + module_name + ".py", encoding="utf-8").read()
-        stock_globals = {
-            "__name__": "stock_guarded_generator_control",
-            "__builtins__": builtins.__dict__,
-        }
-        exec(compile(source, "<stock-guarded-generator-control>", "exec"), stock_globals)
-
-        sys.path.insert(0, root)
+        from tests._integration import stock_module
         from soac import _soac_ext
-        from soac.import_hook import install
-
-        install()
-        module = importlib.import_module(module_name)
         import soac.runtime as runtime
+
+        with stock_module(Path(root), "stock_guarded_generator_control", source) as stock:
+            stock_globals = vars(stock)
+            for name, function in stock_globals.items():
+                if type(function) is types.FunctionType:
+                    assert owner(function) is None and metadata(function) is None, name
+
+        module = importlib.import_module(module_name)
+
+        def assert_selected():
+            diagnostic = _soac_ext.strict_module_diagnostics(module)
+            assert diagnostic is not None, "counter subject has no strict source owner"
+            assert diagnostic["sealed"] is True
+            assert diagnostic["backend"] == "soac"
+            assert diagnostic["module_name"] == module_name
+            assert diagnostic["source_path"] == __SELECTED_SOURCE__
+            assert diagnostic["artifact_generation"] == __GENERATION__
+            assert diagnostic["initializer_entry_kind"] == "entry_interpreter"
+            witnesses = []
+            for name in (
+                "consume_any", "consume_all", "consume_filtered", "consume_captured",
+                "consume_iterator", "consume_dynamic", "make_generator",
+                "make_captured", "raise_error", "consume_error", "increment", "unrelated",
+            ):
+                function = vars(module)[name]
+                assert owner(function) and metadata(function), name
+                actual_entry = _soac_ext.strict_function_entry_kind(function)
+                assert actual_entry == "checked_native", (name, actual_entry)
+                witnesses.append((name, id(function), owner(function)))
+            return tuple(witnesses)
+
+        selected_owners = assert_selected()
+        valid_capsule = ctypes.pythonapi.PyCapsule_IsValid
+        valid_capsule.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        valid_capsule.restype = ctypes.c_int
+        matches_owner = ctypes.pythonapi.PyGen_MatchesSoacOwner
+        matches_owner.argtypes = [ctypes.py_object, ctypes.py_object]
+        matches_owner.restype = ctypes.c_int
+
+        def source_capsule(generator, function):
+            assert type(generator) is types.GeneratorType
+            (code,) = (
+                value for value in function.__code__.co_consts
+                if type(value) is types.CodeType and value.co_name == "<genexpr>"
+            )
+            assert generator.gi_code is code
+            (capsule,) = (
+                value for value in gc.get_referents(generator)
+                if valid_capsule(value, b"soac.PreservedState")
+            )
+            assert gc.is_tracked(capsule) and matches_owner(generator, capsule) == 1
+            return capsule
 
         watched = {"stock": [], "soac": []}
         watcher_errors = []
@@ -161,6 +224,7 @@ def _run_guarded_generator_worker(
 
             return {"outcomes": outcomes, "checks": cancellation_checks}
 
+        native_resume = runtime.resume_generator
         try:
             assert stock_globals["consume_any"]((0, 1, 2)) is True
             assert stock_globals["consume_all"]((1, 1, 0)) is False
@@ -184,9 +248,11 @@ def _run_guarded_generator_worker(
             first = module.make_captured(marker, (marker,))
             second_marker = object()
             second = module.make_captured(second_marker, (second_marker,))
+            assert source_capsule(first, module.make_captured) is not source_capsule(
+                second, module.make_captured
+            )
             assert next(first) is True
             assert next(second) is True
-            assert first._resume_function is not second._resume_function
 
             stock_exhaustion = observe_empty_cancellation(
                 lambda: stock_globals["consume_any"](()),
@@ -248,7 +314,12 @@ def _run_guarded_generator_worker(
             # object until the surrounding activation is released.
             assert lifetime_events.count(("drop", True)) <= 1, lifetime_events
 
-            for actual in (module.wrong_keyword, stock_globals["wrong_keyword"]):
+            # The original invalid builtin call is ordinary interoperability,
+            # not an admitted source function with its checker error hidden.
+            for actual in (
+                stock_globals["wrong_keyword"],
+                lambda values: module.consume_dynamic(stock_globals["wrong_keyword"], values),
+            ):
                 outcome = record_outcome(lambda: actual((1,)))
                 assert outcome["error"] == "TypeError", outcome
             for error in (ValueError("body error"), GeneratorExit("closing")):
@@ -287,13 +358,50 @@ def _run_guarded_generator_worker(
             ), shadow_calls
             assert shadow_calls == [("any", (0, 1)), ("all", (1, 0))]
 
-            module.any = shadow_any
+            # Preserve the original ordinary append/delete control. A first
+            # appended selected-module binding is final and cannot be removed.
+            stock.any = shadow_any
             try:
-                module_shadow = module.consume_dynamic(module.any, (2, 3))
+                module_shadow = stock.consume_dynamic(stock.any, (2, 3))
             finally:
-                del module.any
+                del stock.any
             assert module_shadow == "shadow-any", shadow_calls
 
+            def ordinary_wrapper(values):
+                # Exercise the actual mutable Python wrapper, not source resume.
+                iterator = iter(values)
+
+                def resume(wrapper, state, sent, raised):
+                    if raised is not runtime.NO_DEFAULT:
+                        wrapper._preserved_values = runtime.make_preserved_state(
+                            (None, 1), (0, 1), (),
+                        )
+                        raise raised
+                    try:
+                        return next(iterator)
+                    except BaseException:
+                        wrapper._preserved_values = runtime.make_preserved_state(
+                            (None, 1), (0, 1), (),
+                        )
+                        raise
+
+                assert owner(resume) is None and metadata(resume) is None
+                wrapper = runtime.make_generator_instance(
+                    resume, 0, "ordinary_wrapper_control", "ordinary_wrapper_control",
+                    (None, 0), (0, 1), 0, 1, (),
+                )
+                assert type(wrapper) is runtime.ClosureGenerator
+                assert wrapper._resume_function is resume
+                return wrapper
+
+            def ordinary_resume_dispatch(resume, wrapper, state, sent, raised):
+                # A deliberately ordinary mutable dependency. It exercises
+                # ClosureGenerator's real Python protocol without forging JIT
+                # metadata, source authority or a native resume permit.
+                assert owner(resume) is None and metadata(resume) is None
+                return resume(wrapper, state, sent, raised)
+
+            runtime.resume_generator = ordinary_resume_dispatch
             helper_calls = []
             original_closed = runtime._is_generator_closed
 
@@ -303,7 +411,7 @@ def _run_guarded_generator_worker(
 
             runtime._is_generator_closed = observed_closed
             try:
-                assert module.consume_any((True,)) is True
+                assert original_any(ordinary_wrapper((True,))) is True
             finally:
                 runtime._is_generator_closed = original_closed
             assert helper_calls, helper_calls
@@ -316,7 +424,7 @@ def _run_guarded_generator_worker(
 
             runtime.resume_generator = observed_resume
             try:
-                assert module.consume_any((True,)) is True
+                assert original_any(ordinary_wrapper((True,))) is True
             finally:
                 runtime.resume_generator = original_resume
             assert "resume" in helper_calls, helper_calls
@@ -329,13 +437,36 @@ def _run_guarded_generator_worker(
 
             runtime._reraise_control_flow = observed_reraise
             try:
-                assert module.consume_any(()) is False
+                assert original_any(ordinary_wrapper(())) is False
             finally:
                 runtime._reraise_control_flow = original_reraise
             assert "StopIteration" in helper_calls, helper_calls
 
+            def ordinary_resume_control(*arguments):
+                raise AssertionError("closed ordinary wrapper must never resume")
+
+            def ordinary_helper_control():
+                # These are direct ordinary Python calls. Observers must not
+                # select a SOAC fallback merely to expose equivalent events.
+                assert stock_globals["consume_any"]((0, 1)) is True
+                wrapper = runtime.make_generator_instance(
+                    ordinary_resume_control, 0, "ordinary_closed_control",
+                    "ordinary_closed_control", (None, 1), (0, 1), 0, 1, (),
+                )
+                assert type(wrapper) is runtime.ClosureGenerator
+                assert iter(wrapper) is wrapper
+                assert original_closed(wrapper) is True
+                assert next(wrapper, "closed") == "closed"
+                marker = StopIteration("ordinary helper error")
+                try:
+                    original_reraise(marker)
+                except StopIteration as error:
+                    assert error is marker
+                else:
+                    raise AssertionError("ordinary helper lost its exception")
+
             monitored_codes = [
-                module.consume_any.__code__,
+                stock_globals["consume_any"].__code__,
                 runtime.ClosureGenerator.__iter__.__code__,
                 runtime.ClosureGenerator.__next__.__code__,
                 runtime.ClosureGenerator.send.__code__,
@@ -364,13 +495,14 @@ def _run_guarded_generator_worker(
                         tool_id, code, monitoring.events.PY_START
                     )
                     try:
-                        assert module.consume_any(()) is False
+                        ordinary_helper_control()
                     finally:
                         monitoring.set_local_events(tool_id, code, 0)
+                    assert code.co_qualname in monitor_events, monitor_events
 
                 monitoring.set_events(tool_id, monitoring.events.PY_START)
                 try:
-                    assert module.consume_any((0, 1)) is True
+                    ordinary_helper_control()
                 finally:
                     monitoring.set_events(tool_id, 0)
             finally:
@@ -379,6 +511,8 @@ def _run_guarded_generator_worker(
                     monitoring.set_local_events(tool_id, code, 0)
                 monitoring.register_callback(tool_id, monitoring.events.PY_START, None)
                 monitoring.free_tool_id(tool_id)
+            assert module.consume_any(()) is False
+            assert module.consume_any((0, 1)) is True
 
             observed_calls = {"trace": [], "profile": []}
 
@@ -393,9 +527,13 @@ def _run_guarded_generator_worker(
 
             sys.settrace(tracer)
             try:
-                assert module.consume_any((0, 1)) is True
+                ordinary_helper_control()
             finally:
                 sys.settrace(None)
+            assert {"__next__", "send", "<genexpr>"} <= set(
+                observed_calls["trace"]
+            ), observed_calls
+            assert module.consume_any((0, 1)) is True
 
             def profiler(frame, event, argument):
                 if event == "call" and frame.f_code.co_name in {"__next__", "send"}:
@@ -403,9 +541,13 @@ def _run_guarded_generator_worker(
 
             sys.setprofile(profiler)
             try:
-                assert module.consume_all((1, 0)) is False
+                ordinary_helper_control()
             finally:
                 sys.setprofile(None)
+            assert {"__next__", "send"} <= set(
+                observed_calls["profile"]
+            ), observed_calls
+            assert module.consume_all((1, 0)) is False
             previous_force = _soac_ext.force_entry_interpreter_for_tests(True)
             try:
                 forced_exhaustion = observe_empty_cancellation(
@@ -419,7 +561,11 @@ def _run_guarded_generator_worker(
                 {"result": False, "error": None},
                 {"result": True, "error": None},
             ], forced_exhaustion
-            assert forced_exhaustion["checks"], forced_exhaustion
+            # The native source protocol consumes terminal StopIteration in
+            # either source backend; it must not consult cancellation hooks.
+            assert forced_exhaustion["checks"] == stock_exhaustion["checks"] == [], (
+                forced_exhaustion, stock_exhaustion
+            )
 
             generator_class = runtime.ClosureGenerator
             original_iter = generator_class.__iter__
@@ -431,7 +577,7 @@ def _run_guarded_generator_worker(
 
             generator_class.__iter__ = replacement_iter
             try:
-                assert module.consume_any((1,)) is True
+                assert original_any(ordinary_wrapper((1,))) is True
             finally:
                 generator_class.__iter__ = original_iter
             assert class_events == ["iter"], class_events
@@ -444,7 +590,7 @@ def _run_guarded_generator_worker(
 
             generator_class.__next__ = replacement_next
             try:
-                assert module.consume_all((1, 0)) is False
+                assert original_all(ordinary_wrapper((1, 0))) is False
             finally:
                 generator_class.__next__ = original_next
             assert class_events.count("next") == 2, class_events
@@ -457,7 +603,7 @@ def _run_guarded_generator_worker(
 
             generator_class.send = replacement_send
             try:
-                assert module.consume_any((0, 1)) is True
+                assert original_any(ordinary_wrapper((0, 1))) is True
             finally:
                 generator_class.send = original_send
             assert class_events.count("send") == 2, class_events
@@ -474,9 +620,9 @@ def _run_guarded_generator_worker(
 
             try:
                 before = class_events.count("send")
-                assert module.consume_any(
+                assert original_any(ordinary_wrapper(
                     (MutatingTruth(False), MutatingTruth(True))
-                ) is True
+                )) is True
             finally:
                 generator_class.send = original_send
             assert class_events.count("send") == before + 1, class_events
@@ -488,7 +634,7 @@ def _run_guarded_generator_worker(
 
             runtime.ClosureGenerator = ReplacementGenerator
             try:
-                assert module.consume_any((1,)) is True
+                assert original_any(ordinary_wrapper((1,))) is True
             finally:
                 runtime.ClosureGenerator = generator_class
             assert "replacement-generator" in class_events, class_events
@@ -511,7 +657,7 @@ def _run_guarded_generator_worker(
             original_send_code = original_send.__code__
             try:
                 original_send.__code__ = replacement_send_code.__code__
-                assert module.consume_any((1,)) is True
+                assert original_any(ordinary_wrapper((1,))) is True
             finally:
                 original_send.__code__ = original_send_code
                 code_events = list(builtins._soac_generator_code_calls)
@@ -519,9 +665,9 @@ def _run_guarded_generator_worker(
                 del builtins._soac_generator_original_send
             assert code_events == ["send-code"], code_events
 
-            short_generator = module.make_generator((True,))
+            short_generator = ordinary_wrapper((True,))
             short_generator._preserved_values = _soac_ext.make_preserved_state(
-                (), ()
+                (), (), ()
             )
             short_outcome = record_outcome(
                 lambda: module.consume_iterator(short_generator)
@@ -534,7 +680,7 @@ def _run_guarded_generator_worker(
 
             mutation_events = []
             owner_holder = []
-            replacement_generator = module.make_generator((False,))
+            replacement_generator = ordinary_wrapper((False,))
             original_no_default = runtime.NO_DEFAULT
 
             class ReplaceActiveGeneratorState:
@@ -554,7 +700,7 @@ def _run_guarded_generator_worker(
                     return True
 
             owner_holder.append(
-                module.make_generator(ReplaceActiveGeneratorState())
+                ordinary_wrapper(ReplaceActiveGeneratorState())
             )
             try:
                 assert module.consume_iterator(owner_holder[0]) is True
@@ -579,7 +725,7 @@ def _run_guarded_generator_worker(
 
             try:
                 promoted_outcome = record_outcome(
-                    lambda: module.consume_any(PromoteGlobalsThenRaise())
+                    lambda: module.consume_iterator(ordinary_wrapper(PromoteGlobalsThenRaise()))
                 )
             finally:
                 runtime._reraise_control_flow = original_reraise
@@ -593,8 +739,30 @@ def _run_guarded_generator_worker(
             assert mutation_events[-1] == ("current-helper", "ValueError"), (
                 mutation_events
             )
+            runtime.resume_generator = native_resume
+            # Append only after the original unshadowed workload is complete.
+            # Do not revoke a newly final binding merely to reset the fixture.
+            from soac import StrictMutationError
+            module.any = shadow_any
+            assert module.consume_dynamic(module.any, (2, 3)) == "shadow-any"
+            assert module.consume_any((2, 3)) == "shadow-any"
+            try:
+                del module.any
+            except StrictMutationError:
+                pass
+            else:
+                raise AssertionError("selected appended binding accepted deletion")
+            try:
+                module.any = shadow_all
+            except StrictMutationError:
+                pass
+            else:
+                raise AssertionError("selected appended binding accepted replacement")
+            assert module.any is shadow_any and vars(module)["any"] is shadow_any
+            assert assert_selected() == selected_owners
             assert not watcher_errors, watcher_errors
         finally:
+            runtime.resume_generator = native_resume
             assert clear_watcher(watcher_id) == 0
 
         print(
@@ -619,22 +787,15 @@ def _run_guarded_generator_worker(
         script.replace("__MODULE_NAME__", repr(module_name))
         .replace("__MODULE_ROOT__", repr(str(tmp_path)))
         .replace("__MODE__", repr(mode))
+        .replace("__SELECTED_SOURCE__", repr(str(project.project / f"{module_name}.py")))
+        .replace("__GENERATION__", repr(project.publication["generation"]))
     )
-    environment = {
-        **os.environ,
-        "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
-        "SOAC_WORK_DIR": str(work_dir),
-        "SOAC_OPT_MODE": mode,
-        "SOAC_COMPILE_MODE": "eager",
-        "SOAC_BACKGROUND_JIT": "0",
-    }
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
+    completed = project.run(
+        _VALIDATION_PRELUDE + script,
+        opt_mode=mode,
+        extra_env={"SOAC_WORK_DIR": str(work_dir)},
         timeout=90,
+        check=False,
     )
     assert completed.returncode == 0, (
         f"{mode} transformed generator-consumer subprocess failed:\n"
@@ -643,16 +804,30 @@ def _run_guarded_generator_worker(
     return json.loads(completed.stdout.splitlines()[-1])
 
 
-def test_generator_any_all_match_cpython_exhaustion_and_observable_fallbacks(
+def test_generator_any_all_preserve_exhaustion_mutations_and_ordinary_observers(
     tmp_path: Path,
 ) -> None:
     module_name = "guarded_generator_builtin_consumption_case"
     (tmp_path / f"{module_name}.py").write_text(
         textwrap.dedent(_MODULE_SOURCE), encoding="utf-8"
     )
+    relative = f"{module_name}.py"
+    # Keep the complete invalid original as a real checker rejection. A
+    # different diagnostic must not stand in for this positional-only error.
+    assert_strict_source_rejected(
+        tmp_path / "original-rejection",
+        strict_opt_in(textwrap.dedent(_MODULE_SOURCE).encode(), relative)[0].decode(),
+        module_name=module_name,
+        diagnostic="positional-only-parameter-as-kwarg",
+    )
+    project = create_strict_project(
+        tmp_path / "strict-counterpart",
+        {relative: strict_opt_in(_selected_interop_source().encode(), relative)[0].decode()},
+        modules={module_name: relative},
+    )
     work_dir = tmp_path / "soac-work"
     results = {
-        mode: _run_guarded_generator_worker(tmp_path, module_name, work_dir, mode)
+        mode: _run_guarded_generator_worker(project, tmp_path, module_name, work_dir, mode)
         for mode in ("profile", "verify", "apply")
     }
 

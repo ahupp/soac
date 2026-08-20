@@ -29,10 +29,10 @@ fn tracked_core_blockpy_with_await_and_yield(
 
 fn lower_test_module_plan(
     context: &Context,
-    mut module: Vec<Stmt>,
+    mut module: ruff_python_ast::Suite,
 ) -> BlockPyModule<CoreModuleShapeWithAwaitAndYield> {
     crate::passes::ast_to_ast::simplify::flatten(&mut module);
-    let mut semantic_state = SemanticAstState::from_ruff(&mut module);
+    let mut semantic_state = SemanticAstState::from_ruff(&mut module, context.source_names());
     if !module.iter().any(
             |stmt| matches!(stmt, Stmt::FunctionDef(func) if func.name.id.as_str() == "_dp_module_init"),
         ) {
@@ -60,6 +60,36 @@ fn function_stores_make_function(
             )
         })
     })
+}
+
+#[test]
+fn function_definition_sites_not_lookalike_calls_authorize_make_function() {
+    let source = concat!(
+        "def real():\n",
+        "    return 1\n",
+        "fake = __soac__.make_function(7, 'function', (), (), None)\n",
+    );
+    let context = Context::new(source);
+    let module = lower_test_module_plan(&context, parse_module(source).unwrap().into_syntax().body);
+    let root = module
+        .callable_defs
+        .iter()
+        .find(|function| function.names.bind_name == "_dp_module_init")
+        .expect("module entry");
+    assert!(function_stores_make_function(root, "real"));
+    assert!(!function_stores_make_function(root, "fake"));
+    let fake = root
+        .blocks
+        .iter()
+        .flat_map(|block| &block.body)
+        .find_map(|stmt| match stmt {
+            InstrWithAwaitAndYield::Store(store) if store.name.id_str() == "fake" => {
+                Some(&store.value)
+            }
+            _ => None,
+        })
+        .expect("ordinary fake binding still exists");
+    assert!(matches!(fake.as_ref(), InstrWithAwaitAndYield::Call(call) if call.args.len() == 5));
 }
 
 fn is_soac_attr_call(expr: &Expr, expected_attr: &str) -> bool {
@@ -112,6 +142,7 @@ fn callable_semantic_info_uses_logical_storage_for_cell_captures() {
         vec![crate::block_py::CellCaptureBinding {
             logical_name: "x".to_string(),
             source_name: "_dp_cell_x".to_string(),
+            projection: crate::block_py::CellCaptureProjection::CellReference,
         }]
     );
     assert_eq!(
@@ -152,6 +183,7 @@ fn callable_semantic_info_uses_synthetic_classcell_capture_source() {
         vec![crate::block_py::CellCaptureBinding {
             logical_name: "__class__".to_string(),
             source_name: "_dp_classcell".to_string(),
+            projection: crate::block_py::CellCaptureProjection::CellReference,
         }]
     );
     assert_eq!(
@@ -171,7 +203,8 @@ fn recursive_local_function_bindings_are_cell_owned_in_parent_scope() {
     );
     let context = Context::new(source);
     let mut module = parse_module(source).unwrap().into_syntax().body;
-    let semantic_state = SemanticAstState::from_ruff(&mut module);
+    let source_names = crate::passes::ast_to_ast::SourceNameCatalog::from_original(&mut module);
+    let semantic_state = SemanticAstState::from_ruff(&mut module, &source_names);
     let Stmt::FunctionDef(outer) = &mut module[0] else {
         panic!("expected outer function");
     };
@@ -191,10 +224,12 @@ fn recursive_local_function_bindings_are_cell_owned_in_parent_scope() {
                 Some(outer),
                 &outer.body,
             ),
+            public_scope: None,
             hoisted_to_parent: Vec::new(),
         }],
         callable_defs: Vec::new(),
         pending_annotation_helpers: Vec::new(),
+        pending_type_parameter_scopes: Vec::new(),
         lower_function_to_blockpy: try_lower_function_to_core_blockpy_bundle,
     };
     let nested_stmt = &mut outer
@@ -413,7 +448,8 @@ fn callable_semantic_info_resolves_implicit_global_loads_in_body() {
         "    return inner\n",
     );
     let mut module = parse_module(source).unwrap().into_syntax().body;
-    let semantic_state = SemanticAstState::from_ruff(&mut module);
+    let source_names = crate::passes::ast_to_ast::SourceNameCatalog::from_original(&mut module);
+    let semantic_state = SemanticAstState::from_ruff(&mut module, &source_names);
     let Stmt::FunctionDef(outer) = &module[0] else {
         panic!("expected outer function");
     };

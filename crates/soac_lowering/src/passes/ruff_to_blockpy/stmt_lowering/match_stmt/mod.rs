@@ -14,7 +14,7 @@ enum PatternTest {
 }
 
 fn body_to_vec(body: Suite) -> Vec<Stmt> {
-    body
+    body.into()
 }
 
 fn fold_exprs(exprs: Vec<Expr>, op: ast::BoolOp) -> Expr {

@@ -17,16 +17,35 @@ for _ in range(80):
 
 # soac: verify-counters
 [
+    # Source identity is profile evidence, not permission for an unchecked body.
     {
         "function": "caller",
-        "kind": "call_direct_targets",
+        "kind": "call_hot_targets",
         "observed_value": "present",
         "min": 1,
     },
     {
         "function": "caller",
+        "kind": "call_hot_targets",
+        "observed_value": 0,
+        "equals": 0,
+    },
+    {
+        "function": "caller",
+        "kind": "call_direct_targets",
+        "observed_value": "present",
+        "equals": 0,
+    },
+    {
+        "function": "caller",
         "kind": "call_direct",
         "branch": "hit",
-        "min": 1,
+        "equals": 0,
+    },
+    {
+        "function": "caller",
+        "kind": "call_direct",
+        "branch": "fallback",
+        "equals": 0,
     },
 ]

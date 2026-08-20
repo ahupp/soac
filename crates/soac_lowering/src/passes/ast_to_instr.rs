@@ -10,8 +10,8 @@ trait InstrRuffAstExt: Sized {
         O: WithMeta + Into<Self>;
 
     fn none_expr_with_meta(meta: Meta) -> Self;
-    fn from_ast_suite(body: Vec<ast::Stmt>) -> Vec<Self>;
-    fn into_ast_suite(body: Vec<Self>) -> Vec<ast::Stmt>;
+    fn from_ast_suite(body: ast::Suite) -> Vec<Self>;
+    fn into_ast_suite(body: Vec<Self>) -> ast::Suite;
     fn normalize_if_orelse(elif_else_clauses: Vec<ast::ElifElseClause>) -> Vec<Self>;
     fn denormalize_if_orelse(orelse: Vec<Self>) -> Vec<ast::ElifElseClause>;
     fn into_ast_expr(self) -> ast::Expr;
@@ -39,11 +39,11 @@ impl InstrRuffAstExt for InstrRuff {
         ExprNoneLiteral::new().with_meta(meta).into()
     }
 
-    fn from_ast_suite(body: Vec<ast::Stmt>) -> Vec<Self> {
+    fn from_ast_suite(body: ast::Suite) -> Vec<Self> {
         body.into_iter().map(Self::from_ast_stmt).collect()
     }
 
-    fn into_ast_suite(body: Vec<Self>) -> Vec<ast::Stmt> {
+    fn into_ast_suite(body: Vec<Self>) -> ast::Suite {
         body.into_iter().map(Self::into_ast_stmt).collect()
     }
 
@@ -98,7 +98,7 @@ impl InstrRuffAstExt for InstrRuff {
                     range: Default::default(),
                     node_index: ast::AtomicNodeIndex::default(),
                     test: None,
-                    body,
+                    body: body.into(),
                 }]
             }
         }
@@ -152,8 +152,25 @@ impl InstrRuffAstExt for InstrRuff {
             Self::ExprDict(node) => ast::Expr::Dict(ast::ExprDict {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
-                items: node.items,
+                items: node
+                    .items
+                    .into_iter()
+                    .map(|item| ast::DictItem {
+                        key: item.key.map(Self::into_ast_expr),
+                        value: item.value.into_ast_expr(),
+                    })
+                    .collect(),
             }),
+            Self::TakeOperand(_)
+            | Self::Store(_)
+            | Self::CellRefForName(_)
+            | Self::ComprehensionInsert(_)
+            | Self::BuildCollection(_)
+            | Self::CallArgumentOp(_)
+            | Self::PreparedCall(_)
+            | Self::IteratorStep(_) => {
+                panic!("compiler operation must remain in the lowering IR, not a source AST")
+            }
             Self::ExprSet(node) => ast::Expr::Set(ast::ExprSet {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
@@ -179,7 +196,7 @@ impl InstrRuffAstExt for InstrRuff {
             Self::ExprDictComp(node) => ast::Expr::DictComp(ast::ExprDictComp {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
-                key: Box::new(node.key.into_ast_expr()),
+                key: Some(Box::new(node.key.into_ast_expr())),
                 value: Box::new(node.value.into_ast_expr()),
                 generators: node.generators,
             }),
@@ -217,50 +234,55 @@ impl InstrRuffAstExt for InstrRuff {
                     .collect::<Vec<_>>()
                     .into(),
             }),
-            Self::Call(node) => ast::Expr::Call(ast::ExprCall {
-                range: node.meta().range,
-                node_index: node.meta().node_index,
-                func: Box::new(node.func.into_ast_expr()),
-                arguments: ast::Arguments {
-                    range: Default::default(),
-                    node_index: ast::AtomicNodeIndex::default(),
-                    args: node
-                        .args
-                        .into_iter()
-                        .map(|arg| match arg {
-                            CallArgPositional::Positional(expr) => expr.into_ast_expr(),
-                            CallArgPositional::Starred(expr) => {
-                                ast::Expr::Starred(ast::ExprStarred {
-                                    range: expr.meta().range,
-                                    node_index: expr.meta().node_index,
-                                    value: Box::new(expr.into_ast_expr()),
-                                    ctx: ast::ExprContext::Load,
-                                })
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .into(),
-                    keywords: node
-                        .keywords
-                        .into_iter()
-                        .map(|keyword| match keyword {
-                            CallArgKeyword::Named { arg, value } => ast::Keyword {
-                                range: value.meta().range,
-                                node_index: value.meta().node_index,
-                                arg: Some(arg.into_ast_identifier(value.meta().range)),
-                                value: value.into_ast_expr(),
-                            },
-                            CallArgKeyword::Starred(value) => ast::Keyword {
-                                range: value.meta().range,
-                                node_index: value.meta().node_index,
-                                arg: None,
-                                value: value.into_ast_expr(),
-                            },
-                        })
-                        .collect::<Vec<_>>()
-                        .into(),
-                },
-            }),
+            Self::Call(node) => {
+                let range = node.meta().range;
+                ast::Expr::Call(ast::ExprCall {
+                    range_start: range.start(),
+                    node_index: node.meta().node_index,
+                    func: Box::new(node.func.into_ast_expr()),
+                    arguments: ast::Arguments {
+                        // Ruff derives the call's end from its arguments. The IR
+                        // retains the whole call range, not a separate paren span.
+                        range,
+                        node_index: ast::AtomicNodeIndex::default(),
+                        args: node
+                            .args
+                            .into_iter()
+                            .map(|arg| match arg {
+                                CallArgPositional::Positional(expr) => expr.into_ast_expr(),
+                                CallArgPositional::Starred(expr) => {
+                                    ast::Expr::Starred(ast::ExprStarred {
+                                        range: expr.meta().range,
+                                        node_index: expr.meta().node_index,
+                                        value: Box::new(expr.into_ast_expr()),
+                                        ctx: ast::ExprContext::Load,
+                                    })
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .into(),
+                        keywords: node
+                            .keywords
+                            .into_iter()
+                            .map(|keyword| match keyword {
+                                CallArgKeyword::Named { arg, value } => ast::Keyword {
+                                    range: value.meta().range,
+                                    node_index: value.meta().node_index,
+                                    arg: Some(arg.into_ast_identifier(value.meta().range)),
+                                    value: value.into_ast_expr(),
+                                },
+                                CallArgKeyword::Starred(value) => ast::Keyword {
+                                    range: value.meta().range,
+                                    node_index: value.meta().node_index,
+                                    arg: None,
+                                    value: value.into_ast_expr(),
+                                },
+                            })
+                            .collect::<Vec<_>>()
+                            .into(),
+                    },
+                })
+            }
             Self::ExprFString(node) => ast::Expr::FString(ast::ExprFString {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
@@ -435,7 +457,18 @@ impl InstrRuffAstExt for InstrRuff {
             }
             ast::Expr::Dict(node) => {
                 let meta = node.meta();
-                Self::wrap_ast_expr(meta, ExprDict::new(node.items))
+                Self::wrap_ast_expr(
+                    meta,
+                    ExprDict::new(
+                        node.items
+                            .into_iter()
+                            .map(|item| ExprDictItem {
+                                key: item.key.map(Self::from_ast_expr),
+                                value: Self::from_ast_expr(item.value),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                )
             }
             ast::Expr::Set(node) => {
                 let meta = node.meta();
@@ -468,7 +501,9 @@ impl InstrRuffAstExt for InstrRuff {
                 Self::wrap_ast_expr(
                     meta,
                     ExprDictComp::new(
-                        Self::from_ast_expr(*node.key),
+                        Self::from_ast_expr(*node.key.expect(
+                            "dict unpacking comprehensions must be rejected by source preflight",
+                        )),
                         Self::from_ast_expr(*node.value),
                         node.generators,
                     ),
@@ -533,7 +568,6 @@ impl InstrRuffAstExt for InstrRuff {
                             .collect::<Vec<_>>(),
                         node.arguments
                             .keywords
-                            .into_vec()
                             .into_iter()
                             .map(|keyword| {
                                 CallArgKeyword::from_ast_keyword_with(keyword, Self::from_ast_expr)
@@ -832,10 +866,18 @@ impl InstrRuffAstExt for InstrRuff {
                 )
             }
             ast::Stmt::Import(node) => {
+                assert!(
+                    !node.is_lazy,
+                    "lazy imports must be rejected by source preflight"
+                );
                 let meta = node.meta();
                 Self::wrap_ast_stmt(meta, StmtImport::new(node.names))
             }
             ast::Stmt::ImportFrom(node) => {
+                assert!(
+                    !node.is_lazy,
+                    "lazy imports must be rejected by source preflight"
+                );
                 let meta = node.meta();
                 Self::wrap_ast_stmt(
                     meta,
@@ -879,7 +921,7 @@ impl InstrRuffAstExt for InstrRuff {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
                 is_async: node.is_async,
-                decorator_list: node.decorator_list,
+                decorator_list: node.decorator_list.into(),
                 name: node.name,
                 type_params: node.type_params,
                 parameters: node.parameters,
@@ -889,7 +931,7 @@ impl InstrRuffAstExt for InstrRuff {
             Self::StmtClassDef(node) => ast::Stmt::ClassDef(ast::StmtClassDef {
                 range: node.meta().range,
                 node_index: node.meta().node_index,
-                decorator_list: node.decorator_list,
+                decorator_list: node.decorator_list.into(),
                 name: node.name,
                 type_params: node.type_params,
                 arguments: node.arguments,
@@ -991,11 +1033,13 @@ impl InstrRuffAstExt for InstrRuff {
                 msg: node.msg.map(|expr| Box::new(expr.into_ast_expr())),
             }),
             Self::StmtImport(node) => ast::Stmt::Import(ast::StmtImport {
+                is_lazy: false,
                 range: node.meta().range,
                 node_index: node.meta().node_index,
                 names: node.names,
             }),
             Self::StmtImportFrom(node) => ast::Stmt::ImportFrom(ast::StmtImportFrom {
+                is_lazy: false,
                 range: node.meta().range,
                 node_index: node.meta().node_index,
                 module: node.module,

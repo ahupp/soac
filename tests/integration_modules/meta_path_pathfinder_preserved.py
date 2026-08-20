@@ -8,9 +8,9 @@ from soac import import_hook
 
 
 def import_with_filtered_meta_path() -> bool:
-    import_hook.install()
     original_meta_path = list(sys.meta_path)
     try:
+        import_hook.install()
         sys.meta_path[:] = [
             item for item in sys.meta_path if item.__module__.startswith("_frozen_importlib")
         ]

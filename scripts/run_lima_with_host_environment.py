@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Run a Lima guest command with narrowly forwarded host installer settings."""
+"""Run a Lima guest command with narrowly forwarded host installer settings.
+
+Stdin carries the environment transport and is exhausted before the guest
+command. Use a guest script file or python -c, not a host heredoc to python -.
+"""
 
 from __future__ import annotations
 
@@ -116,6 +120,8 @@ def launch_guest(
     arguments = [
         "limactl",
         "shell",
+        "--workdir",
+        workdir,
         instance,
         "--",
         "python3",
