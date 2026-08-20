@@ -33,8 +33,6 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
 
 
             class Box(OriginalBase):
-                __static_attributes__ = ()
-
                 def __init__(self, payload):
                     self.marker = "box"
                     self.payload = payload
@@ -45,8 +43,6 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
 
 
             class ObservedBox(Box):
-                __static_attributes__ = ()
-
                 def __getattribute__(self, name):
                     if name == "payload":
                         EVENTS.append("subclass:get")
@@ -91,8 +87,6 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
 
 
             class InheritedBase:
-                __static_attributes__ = ()
-
                 def __init__(self, value):
                     self.lineage = value
 
@@ -101,12 +95,10 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
 
 
             class InheritedLeft(InheritedBase):
-                __static_attributes__ = ()
+                pass
 
 
             class InheritedRight(InheritedBase):
-                __static_attributes__ = ()
-
                 def __init__(self, value):
                     self.padding = "right"
                     InheritedBase.__init__(self, value)
@@ -422,6 +414,7 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
 
     positive_reads = {
         "read_other": 64,
+        "read_ambiguous": 64,
         "Consumer.consume": 32,
         "read_compound": 32,
         nested_consumer: 64,
@@ -467,7 +460,7 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
     payload_owners = {
         (owner, index) for owner, key, index in type_keys if key == "payload"
     }
-    assert payload_owners == {("Box", 1)}, (
+    assert payload_owners == {("Box", 2)}, (
         "the positive payload must have exactly one profiled owner/index",
         payload_owners,
         type_keys,
@@ -483,7 +476,6 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
     assert ("Unanchored", "unanchored", 0) in type_keys, type_keys
 
     expected_generic_controls = {
-        "read_ambiguous": 64,
         "read_generated": 32,
         "read_unanchored": 32,
         "read_slot": 32,
@@ -492,7 +484,7 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
     for qualname, count in expected_generic_controls.items():
         rows = branch_rows(profile_records, qualname, "generic_getattr")
         assert any(value >= count for _, value in rows), (
-            "Profile must expose every ambiguous/cold/unanchored/slot control",
+            "Profile must expose every cold/unanchored/generated/slot control",
             qualname,
             count,
             rows,
@@ -537,7 +529,7 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
     for qualname in expected_generic_controls:
         hits = branch_rows(verify_records, qualname, "indexed_hit")
         assert all(count == 0 for _, count in hits), (
-            "ambiguous, cold, missing-anchor, generated, and slot sites must "
+            "cold, missing-anchor, generated, and slot sites must "
             "retain the original generic access",
             qualname,
             hits,
@@ -554,7 +546,7 @@ def test_hot_nonself_split_fields_reuse_unique_constructor_owner_cells(
     ), (
         "hot non-self object reads/stores, unrelated-method arguments, "
         "compound receivers, and nested eager comprehension fields must "
-        "reuse the unique existing Box.payload constructor cell with "
+        "reuse their existing exact-owner constructor cells with "
         "original-source indexed-hit counters",
         {
             "expected_hits": required_hits,

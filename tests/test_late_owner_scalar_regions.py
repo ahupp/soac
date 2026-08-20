@@ -29,8 +29,6 @@ def test_late_owner_cells_preserve_nonself_exact_int_field_regions(
 
 
             class WorkState:
-                __static_attributes__ = ()
-
                 def __init__(self, count):
                     self.marker = "ready"
                     self.count = count

@@ -602,7 +602,7 @@ fn late_bound_split_owner_nonself_field_plans(
     module_name: &str,
 ) -> Vec<LateBoundOwnerFieldSpecializationPlan> {
     const MAX_NONSELF_FIELDS_PER_FUNCTION: usize = 8;
-    const MAX_UNIFORM_NONSELF_OWNERS_PER_FIELD: usize = 5;
+    const MAX_POLYMORPHIC_NONSELF_OWNERS_PER_FIELD: usize = 5;
 
     let mut layouts_by_source = HashMap::new();
     for field in &function.indexed_fields {
@@ -617,7 +617,7 @@ fn late_bound_split_owner_nonself_field_plans(
         .map(|plan| plan.source)
         .collect::<HashSet<_>>();
     let mut unique_candidates = Vec::new();
-    let mut uniform_candidates = Vec::new();
+    let mut polymorphic_candidates = Vec::new();
 
     for fields in layouts_by_source.values() {
         let Some(field) = fields.first().copied() else {
@@ -633,11 +633,10 @@ fn late_bound_split_owner_nonself_field_plans(
 
         if fields.len() > 1
             && (field.access != IndexedFieldAccessKind::Load
-                || fields.len() > MAX_UNIFORM_NONSELF_OWNERS_PER_FIELD
+                || fields.len() > MAX_POLYMORPHIC_NONSELF_OWNERS_PER_FIELD
                 || fields.iter().any(|candidate| {
                     candidate.owner_type.module_name != module_name
                         || candidate.attr_name != field.attr_name
-                        || candidate.expected_index != field.expected_index
                 }))
         {
             continue;
@@ -676,7 +675,7 @@ fn late_bound_split_owner_nonself_field_plans(
                     "profiled unique-owner field reuses an existing split-field late-binding guard cell"
                         .to_string()
                 } else {
-                    "profiled uniform-index field reuses independently guarded exact-owner split-field cells"
+                    "profiled polymorphic field reuses independently guarded exact-owner split-field cells"
                         .to_string()
                 },
             });
@@ -692,7 +691,7 @@ fn late_bound_split_owner_nonself_field_plans(
             ));
         } else {
             plans.sort_by_key(|plan| (plan.owner_type.qualname.clone(), plan.cell_index));
-            uniform_candidates.push((hot_count, field.source, field.access, plans));
+            polymorphic_candidates.push((hot_count, field.source, field.access, plans));
         }
     }
 
@@ -701,16 +700,16 @@ fn late_bound_split_owner_nonself_field_plans(
     unique_candidates.truncate(MAX_NONSELF_FIELDS_PER_FUNCTION);
 
     let remaining_sources = MAX_NONSELF_FIELDS_PER_FUNCTION - unique_candidates.len();
-    uniform_candidates.sort_by_key(|(hot_count, source, access, _)| {
+    polymorphic_candidates.sort_by_key(|(hot_count, source, access, _)| {
         (std::cmp::Reverse(*hot_count), *source, *access)
     });
-    uniform_candidates.truncate(remaining_sources);
+    polymorphic_candidates.truncate(remaining_sources);
 
     unique_candidates
         .into_iter()
         .map(|(_, plan)| plan)
         .chain(
-            uniform_candidates
+            polymorphic_candidates
                 .into_iter()
                 .flat_map(|(_, _, _, plans)| plans),
         )
@@ -3721,7 +3720,6 @@ def capped_uniform(owner):
 
         for name in [
             "write_uniform",
-            "read_mixed",
             "read_foreign",
             "read_unanchored",
             "read_overflow",
@@ -3732,6 +3730,24 @@ def capped_uniform(owner):
                 "{name} must preserve its original generic operation"
             );
         }
+        let mixed = &planned("read_mixed").late_bound_owner_fields;
+        let mixed_owners = mixed
+            .iter()
+            .map(|plan| {
+                assert_eq!(plan.source, fields_by_function["read_mixed"][0].0);
+                assert_eq!(plan.access, IndexedFieldAccessKind::Load);
+                assert_eq!(plan.attr_name, "mixed");
+                let LateBoundOwnerFieldStorage::SplitDict { expected_index } = plan.storage else {
+                    panic!("mixed non-self owners must retain their exact split-dict indices");
+                };
+                (plan.owner_type.qualname.as_str(), expected_index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mixed_owners,
+            vec![("MixedLeft", 0), ("MixedRight", 1)],
+            "both existing exact-owner guards must retain their independently profiled indices"
+        );
         for name in ["read_unique", "write_unique"] {
             assert_eq!(
                 planned(name).late_bound_owner_fields.len(),
@@ -4077,7 +4093,6 @@ def scalar_other(record):
 
         for name in [
             "cold_other",
-            "ambiguous_other",
             "cross_module_other",
             "slotted_other",
             "unanchored_other",
@@ -4087,6 +4102,24 @@ def scalar_other(record):
                 "{name} must retain generic attribute access"
             );
         }
+        let mixed = &planned("ambiguous_other").late_bound_owner_fields;
+        let mixed_owners = mixed
+            .iter()
+            .map(|plan| {
+                assert_eq!(plan.source, fields_by_function["ambiguous_other"][0].0);
+                assert_eq!(plan.access, IndexedFieldAccessKind::Load);
+                assert_eq!(plan.attr_name, "shared");
+                let LateBoundOwnerFieldStorage::SplitDict { expected_index } = plan.storage else {
+                    panic!("mixed non-self owners must retain their exact split-dict indices");
+                };
+                (plan.owner_type.qualname.as_str(), expected_index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mixed_owners,
+            vec![("Left", 0), ("Right", 1)],
+            "both profiled non-self owners must reuse their existing guard cells and indices"
+        );
 
         let scalar = &planned("scalar_other").late_bound_owner_fields;
         assert_eq!(scalar.len(), 1);

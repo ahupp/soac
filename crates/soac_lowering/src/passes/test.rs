@@ -46,6 +46,7 @@ fn rewrite_ast_to_ast_for_testing(source: &str) -> (Context, Suite, SemanticAstS
     let mut body = module.body;
     rewrite_future_annotations::rewrite(&mut body).expect("future annotation rewrite");
     let context = Context::new(source);
+    rewrite_class_def::record_class_static_attributes(&context, &mut body);
     rewrite_class_def::private::rewrite_private_names(&context, &mut body);
     rewrite_stmt::annotation::rewrite_ann_assign_to_dunder_annotate(&context, &mut body);
     rewrite_with_pass(&context, None, Some(&ScopedHelperExprPass), &mut body);
@@ -3291,8 +3292,15 @@ def outer(scale):
     let pc = preserved_slot_by_name(&layout.preserved_slots, "_dp_pc");
     assert_eq!(pc.storage_name, "_dp_cell__dp_pc");
     assert_eq!(pc.init, ClosureInit::RuntimePcUnstarted);
-    let deleted_eval = preserved_slot_by_name(&layout.preserved_slots, "_dp_eval_7");
-    assert_eq!(deleted_eval.storage_name, "_dp_cell__dp_eval_7");
+    let deleted_eval = layout
+        .preserved_slots
+        .iter()
+        .find(|slot| slot.logical_name.starts_with("_dp_eval_"))
+        .unwrap_or_else(|| panic!("missing preserved evaluation slot in {layout:?}"));
+    assert_eq!(
+        deleted_eval.storage_name,
+        format!("_dp_cell_{}", deleted_eval.logical_name)
+    );
     assert_eq!(deleted_eval.init, ClosureInit::Deferred);
     assert_eq!(deleted_eval.storage, PreservedSlotStorage::PyObjectOrNull);
 }

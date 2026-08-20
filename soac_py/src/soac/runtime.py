@@ -507,7 +507,6 @@ def create_class(
     kwds,
     requires_class_cell,
     firstlineno=None,
-    static_attributes=(),
 ):
     resolved_bases = _types.resolve_bases(bases)
     meta, ns, meta_kwds = _types.prepare_class(name, resolved_bases, kwds)
@@ -520,8 +519,6 @@ def create_class(
     namespace_fn(ns, class_cell)
     if "__firstlineno__" not in ns and firstlineno is not None:
         ns["__firstlineno__"] = firstlineno
-    if "__static_attributes__" not in ns:
-        ns["__static_attributes__"] = static_attributes
 
     if resolved_bases is not bases and "__orig_bases__" not in ns:
         ns["__orig_bases__"] = bases

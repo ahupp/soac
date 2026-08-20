@@ -5,20 +5,238 @@ pub(crate) mod private;
 use crate::passes::ast_to_ast::body::{empty_suite, split_docstring};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::expr_utils::make_tuple;
+use crate::passes::ast_to_ast::semantic::{SemanticBindingKind, SemanticScope};
 use crate::template::{py_expr, py_stmt, py_stmt_typed};
+use crate::transformer::{walk_expr, walk_stmt, Transformer};
 use ruff_python_ast::{
-    self as ast, Expr, Stmt, TypeParam, TypeParamParamSpec, TypeParamTypeVar, TypeParamTypeVarTuple,
+    self as ast, Expr, ExprContext, Stmt, TypeParam, TypeParamParamSpec, TypeParamTypeVar,
+    TypeParamTypeVarTuple,
 };
 use ruff_text_size::TextRange;
 
+use std::collections::{BTreeSet, HashMap};
 use std::mem::take;
+
+#[derive(Clone, Copy)]
+enum StaticAttributeCompilerScope {
+    Module,
+    Class(TextRange),
+    Function,
+}
+
+struct StaticAttributeCollector {
+    scopes: Vec<StaticAttributeCompilerScope>,
+    attributes: HashMap<TextRange, BTreeSet<String>>,
+}
+
+impl StaticAttributeCollector {
+    fn new() -> Self {
+        Self {
+            scopes: vec![StaticAttributeCompilerScope::Module],
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn record_attribute(&mut self, attribute: &ast::ExprAttribute) {
+        if !matches!(attribute.ctx, ExprContext::Store)
+            || !matches!(
+                attribute.value.as_ref(),
+                Expr::Name(name) if name.id.as_str() == "self"
+            )
+        {
+            return;
+        }
+
+        let class_range = self.scopes.iter().rev().skip(1).find_map(|scope| {
+            if let StaticAttributeCompilerScope::Class(range) = scope {
+                Some(*range)
+            } else {
+                None
+            }
+        });
+        if let Some(class_range) = class_range {
+            self.attributes
+                .get_mut(&class_range)
+                .expect("an active class must have a static-attribute entry")
+                .insert(attribute.attr.id.to_string());
+        }
+    }
+
+    fn visit_unrecorded_assignment_target(&mut self, target: &mut Expr) {
+        match target {
+            Expr::Attribute(attribute) => self.visit_expr(attribute.value.as_mut()),
+            Expr::Subscript(subscript) => {
+                self.visit_expr(subscript.value.as_mut());
+                self.visit_expr(subscript.slice.as_mut());
+            }
+            Expr::Name(_) => {}
+            other => self.visit_expr(other),
+        }
+    }
+}
+
+impl Transformer for StaticAttributeCollector {
+    fn visit_stmt(&mut self, stmt: &mut Stmt) {
+        match stmt {
+            Stmt::ClassDef(class) => {
+                for decorator in &mut class.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+                if let Some(type_params) = class.type_params.as_mut() {
+                    self.visit_type_params(type_params);
+                }
+                if let Some(arguments) = class.arguments.as_mut() {
+                    self.visit_arguments(arguments);
+                }
+
+                let previous = self.attributes.insert(class.range, BTreeSet::new());
+                assert!(
+                    previous.is_none(),
+                    "duplicate class source range while collecting static attributes: {:?}",
+                    class.range
+                );
+                self.scopes
+                    .push(StaticAttributeCompilerScope::Class(class.range));
+                self.visit_body(&mut class.body);
+                self.scopes.pop();
+            }
+            Stmt::FunctionDef(function) => {
+                for decorator in &mut function.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+                if let Some(type_params) = function.type_params.as_mut() {
+                    self.visit_type_params(type_params);
+                }
+                self.visit_parameters(function.parameters.as_mut());
+                if let Some(returns) = function.returns.as_mut() {
+                    self.visit_annotation(returns);
+                }
+
+                self.scopes.push(StaticAttributeCompilerScope::Function);
+                self.visit_body(&mut function.body);
+                self.scopes.pop();
+            }
+            Stmt::AugAssign(assignment) => {
+                // CPython emits augmented attribute stores directly rather than
+                // visiting the Store-context attribute expression.
+                self.visit_unrecorded_assignment_target(assignment.target.as_mut());
+                self.visit_expr(assignment.value.as_mut());
+            }
+            Stmt::AnnAssign(assignment) => {
+                if let Some(value) = assignment.value.as_mut() {
+                    self.visit_expr(value);
+                    self.visit_expr(assignment.target.as_mut());
+                } else {
+                    self.visit_unrecorded_assignment_target(assignment.target.as_mut());
+                }
+
+                if assignment.simple
+                    && matches!(assignment.target.as_ref(), Expr::Name(_))
+                    && matches!(
+                        self.scopes.last(),
+                        Some(
+                            StaticAttributeCompilerScope::Module
+                                | StaticAttributeCompilerScope::Class(_)
+                        )
+                    )
+                {
+                    self.visit_annotation(assignment.annotation.as_mut());
+                }
+            }
+            other => walk_stmt(self, other),
+        }
+    }
+
+    fn visit_annotation(&mut self, expr: &mut Expr) {
+        self.scopes.push(StaticAttributeCompilerScope::Function);
+        self.visit_expr(expr);
+        self.scopes.pop();
+    }
+
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        match expr {
+            Expr::Attribute(attribute) => {
+                self.record_attribute(attribute);
+                self.visit_expr(attribute.value.as_mut());
+            }
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = lambda.parameters.as_mut() {
+                    self.visit_parameters(parameters);
+                }
+                self.scopes.push(StaticAttributeCompilerScope::Function);
+                self.visit_expr(lambda.body.as_mut());
+                self.scopes.pop();
+            }
+            Expr::Generator(generator) => {
+                let Some((first, remaining)) = generator.generators.split_first_mut() else {
+                    return;
+                };
+                // The outermost iterable belongs to the enclosing compiler
+                // unit; the generator target and body belong to its own unit.
+                self.visit_expr(&mut first.iter);
+                self.scopes.push(StaticAttributeCompilerScope::Function);
+                self.visit_expr(&mut first.target);
+                for condition in &mut first.ifs {
+                    self.visit_expr(condition);
+                }
+                for comprehension in remaining {
+                    self.visit_comprehension(comprehension);
+                }
+                self.visit_expr(generator.elt.as_mut());
+                self.scopes.pop();
+            }
+            other => walk_expr(self, other),
+        }
+    }
+}
+
+pub(crate) fn record_class_static_attributes(context: &Context, body: &mut ast::Suite) {
+    let mut collector = StaticAttributeCollector::new();
+    collector.visit_body(body);
+    for (class_range, attributes) in collector.attributes {
+        context.record_class_static_attributes(class_range, attributes.into_iter().collect());
+    }
+}
 
 fn class_def_to_create_class_fn<'a>(
     context: &Context,
     class_def: &mut ast::StmtClassDef,
     class_qualname: String,
     needs_class_cell: bool,
+    class_scope: &SemanticScope,
+    captures_outer_static_attributes: bool,
 ) -> (ast::StmtFunctionDef, ast::StmtFunctionDef, Expr, Expr) {
+    let static_attributes = context
+        .class_static_attributes(class_def.range)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing original static-attribute evidence for class {} at {:?}",
+                class_def.name.id, class_def.range
+            )
+        });
+    let static_attributes = make_tuple(
+        static_attributes
+            .into_iter()
+            .map(|attribute| py_expr!("{attribute:literal}", attribute = attribute.as_str()))
+            .collect(),
+    );
+    let static_attribute_store = match class_scope.binding_in_current_scope("__static_attributes__")
+    {
+        Some(SemanticBindingKind::Global | SemanticBindingKind::Nonlocal) => py_stmt!(
+            "__static_attributes__ = {attributes:expr}",
+            attributes = static_attributes
+        ),
+        None if captures_outer_static_attributes => py_stmt!(
+            "__static_attributes__ = {attributes:expr}",
+            attributes = static_attributes
+        ),
+        Some(SemanticBindingKind::Local) | None => py_stmt!(
+            "_dp_class_ns[{name:literal}] = {attributes:expr}",
+            name = "__static_attributes__",
+            attributes = static_attributes
+        ),
+    };
+
     let ast::StmtClassDef {
         name,
         body,
@@ -135,13 +353,15 @@ def _dp_class_ns_{class_name:id}(_dp_class_ns, _dp_classcell_arg):
     {type_param_bindings:stmt}
     {type_param_statements:stmt}
     {ns_body:stmt}
-    {type_param_cleanup:stmt}"#,
+    {type_param_cleanup:stmt}
+    {static_attribute_store:stmt}"#,
         class_name = class_name.as_str(),
         class_qualname = class_qualname.as_str(),
         ns_body = body,
         type_param_statements = type_param_statements,
         type_param_bindings = type_param_bindings.clone(),
         type_param_cleanup = type_param_cleanup,
+        static_attribute_store = static_attribute_store,
     );
 
     let define_class_fn: ast::StmtFunctionDef = py_stmt_typed!(
@@ -155,8 +375,7 @@ def _dp_define_class_{class_name:id}(_dp_class_ns_fn, _dp_class_ns_outer, _dp_cl
       _dp_class_bases, 
       _dp_prepare_dict,
       {requires_class_cell:literal},
-      {firstlineno:literal},
-      ()
+      {firstlineno:literal}
     )
 "#,
         class_name = class_name.as_str(),

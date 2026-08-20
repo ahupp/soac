@@ -1,14 +1,16 @@
 use std::mem::take;
 
-use ruff_python_ast::Stmt;
+use ruff_python_ast::{Expr, Stmt};
 
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::rewrite_class_def::{class_def_to_create_class_fn, method};
 use crate::passes::ast_to_ast::rewrite_stmt;
-use crate::passes::ast_to_ast::semantic::{SemanticAstState, SemanticScope, SemanticScopeKind};
+use crate::passes::ast_to_ast::semantic::{
+    SemanticAstState, SemanticBindingKind, SemanticScope, SemanticScopeKind,
+};
 use crate::template::{py_expr, py_stmt};
-use crate::transformer::{walk_stmt, Transformer};
+use crate::transformer::{walk_expr, walk_stmt, Transformer};
 
 pub(crate) fn rewrite_class_body_scopes(
     context: &Context,
@@ -24,6 +26,104 @@ struct ClassBodyScopeRewriter<'a> {
     scope: SemanticScope,
     semantic_state: &'a mut SemanticAstState,
     hoisted_class_defs: Vec<Stmt>,
+}
+
+struct StaticAttributeClosureCaptureFinder<'a> {
+    scope: SemanticScope,
+    semantic_state: &'a SemanticAstState,
+    captured: bool,
+}
+
+impl Transformer for StaticAttributeClosureCaptureFinder<'_> {
+    fn visit_stmt(&mut self, stmt: &mut Stmt) {
+        if self.captured {
+            return;
+        }
+
+        match stmt {
+            Stmt::FunctionDef(function) => {
+                let Some(child_scope) = self.scope.child_scope_for_function(function) else {
+                    return;
+                };
+                match child_scope.binding_in_current_scope("__static_attributes__") {
+                    Some(SemanticBindingKind::Nonlocal) => self.captured = true,
+                    Some(SemanticBindingKind::Global | SemanticBindingKind::Local) => {}
+                    None => {
+                        let previous = std::mem::replace(&mut self.scope, child_scope);
+                        self.visit_body(&mut function.body);
+                        self.scope = previous;
+                    }
+                }
+            }
+            Stmt::ClassDef(class) => {
+                let Some(child_scope) = self.scope.child_scope_for_class(class) else {
+                    return;
+                };
+                if matches!(
+                    child_scope.binding_in_current_scope("__static_attributes__"),
+                    Some(SemanticBindingKind::Nonlocal)
+                ) {
+                    self.captured = true;
+                    return;
+                }
+
+                // Class locals do not hide an enclosing function cell from
+                // methods, so continue through nested class scopes.
+                let previous = std::mem::replace(&mut self.scope, child_scope);
+                self.visit_body(&mut class.body);
+                self.scope = previous;
+            }
+            other => walk_stmt(self, other),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        if self.captured {
+            return;
+        }
+
+        let Expr::Lambda(lambda) = expr else {
+            walk_expr(self, expr);
+            return;
+        };
+        let Some(child_scope) = self.semantic_state.lambda_scope(lambda) else {
+            return;
+        };
+        match child_scope.binding_in_current_scope("__static_attributes__") {
+            Some(SemanticBindingKind::Nonlocal) => self.captured = true,
+            Some(SemanticBindingKind::Global | SemanticBindingKind::Local) => {}
+            None => {
+                let previous = std::mem::replace(&mut self.scope, child_scope);
+                self.visit_expr(lambda.body.as_mut());
+                self.scope = previous;
+            }
+        }
+    }
+}
+
+fn class_descendants_capture_static_attribute_cell(
+    scope: &SemanticScope,
+    semantic_state: &SemanticAstState,
+    body: &mut Suite,
+) -> bool {
+    if scope
+        .binding_in_current_scope("__static_attributes__")
+        .is_some()
+        || !matches!(
+            scope.resolved_load_binding("__static_attributes__"),
+            SemanticBindingKind::Nonlocal
+        )
+    {
+        return false;
+    }
+
+    let mut finder = StaticAttributeClosureCaptureFinder {
+        scope: scope.clone(),
+        semantic_state,
+        captured: false,
+    };
+    finder.visit_body(body);
+    finder.captured
 }
 
 impl<'a> ClassBodyScopeRewriter<'a> {
@@ -84,6 +184,11 @@ impl<'a> ClassBodyScopeRewriter<'a> {
             .scope
             .child_scope_for_class(&class_def)
             .expect("no child scope for class");
+        let captures_outer_static_attributes = class_descendants_capture_static_attribute_cell(
+            &class_scope,
+            self.semantic_state,
+            &mut class_def.body,
+        );
 
         let mut class_rewriter =
             ClassBodyScopeRewriter::new(self.context, class_scope.clone(), self.semantic_state);
@@ -96,6 +201,8 @@ impl<'a> ClassBodyScopeRewriter<'a> {
                 &mut class_def,
                 class_scope.qualname().to_string(),
                 needs_class_cell,
+                &class_scope,
+                captures_outer_static_attributes,
             );
         self.semantic_state
             .register_function_scope_override(&class_ns_def, class_scope.clone());

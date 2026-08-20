@@ -130,6 +130,10 @@ impl PrettyPrint for AstToAstPassResult {
 }
 
 fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPassResult {
+    // CPython records static attributes from the original compiler scopes and
+    // unmangled attribute names, before later AST rewrites can change either.
+    rewrite_class_def::record_class_static_attributes(context, &mut module);
+
     // Rewrite names like "__foo" in class bodies to "_<class_name>__foo"
     rewrite_class_def::private::rewrite_private_names(context, &mut module);
 

@@ -45,12 +45,10 @@ def test_eager_late_bound_slot_and_split_fields_preserve_python_semantics(
 
 
             class UnseededRecord:
-                __static_attributes__ = ()
-
-                def __init__(self, first, middle, mark):
-                    self.first = first
-                    self.middle = middle
-                    self.mark = mark
+                def __init__(instance, first, middle, mark):
+                    instance.first = first
+                    instance.middle = middle
+                    instance.mark = mark
 
                 def read(self):
                     return self.first, self.middle, self.mark
@@ -129,6 +127,7 @@ def test_eager_late_bound_slot_and_split_fields_preserve_python_semantics(
             assert record.read() == value
             assert module.exercise(point, record, value) == value * 2
 
+        assert module.UnseededRecord.__static_attributes__ == ()
         for value in range(16):
             fresh = module.UnseededRecord(value, value + 1, value + 2)
             module.UnseededRecord.__init__(fresh, value, value + 1, value + 2)

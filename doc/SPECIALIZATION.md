@@ -583,6 +583,23 @@ Single-definition immutable local string constants are propagated without
 name-based heuristics. Staticmethods/decorated methods, dynamic local classes,
 inherited slots, unresolved owners, and cross-module operations are rejected.
 
+CPython finishes each class body by storing a sorted
+`__static_attributes__` tuple collected from lexical literal-`self` attribute
+stores. Type creation can insert those names into `ht_cached_keys` before
+SOAC's post-creation split-key watcher is installed, so the watcher alone
+cannot report their original indices. Profile-mode registration reads the
+actual preexisting split-key entries, remembers their exact table identity
+and a weak owner in the existing profile-type registry, and merges matching
+entries into that module's type-key snapshot without duplicating later watcher
+events. An owner is replayed only after exact inline-instance allocation
+decreases its saved `dk_usable + dk_nentries`; inserting another key leaves
+that sum unchanged, so never-instantiated base classes cannot manufacture
+exact-owner evidence. Owner module/qualified-name metadata is obtained without
+invoking custom metaclass attribute hooks. Classes with 29 or more preseeded
+keys can have `dk_usable <= 1`, preventing that allocation signal; they
+conservatively miss the specialization rather than receiving speculative
+owner evidence.
+
 The explicit public APIs are
 `soac_opt::pipeline_v3::late_bound_owner_field_site_catalog`,
 `soac_ir_typed::plan_v3::{LateBoundOwnerFieldSpecializationPlan,
@@ -616,12 +633,13 @@ non-null current slot. Split fields additionally require an unmaterialized
 dictionary, valid inline storage, and a current owner `ht_cached_keys` table
 of split kind whose expected index is below both inline capacity and
 `dk_nentries`; the current shared-key entry must be the exact expected
-interned attribute-name object. Loads also require a present value. Because
-late-bound classes are intentionally not primed, an absent or mismatched
-shared key falls back to the original generic store so CPython can register a
-constructor's first insertion before later direct accesses. Type/property/hook
-mutations, owner death or redefinition,
-slot deletion, dictionary materialization/promotion, and invalid layouts
+interned attribute-name object. Loads also require a present value. SOAC does
+not separately prime late-bound classes: CPython may have already preseeded
+lexical literal-`self` fields, while an absent or mismatched shared key still
+falls back to the original generic store so CPython can register a genuinely
+unseeded constructor's first insertion before later direct accesses.
+Type/property/hook mutations, owner death or redefinition, slot deletion,
+dictionary materialization/promotion, and invalid layouts
 immediately take the original generic `PyObject_GetAttr` /
 `PyObject_SetAttr` path. There is no timer, process-global guard table, or
 strong reference extending owner lifetime.
@@ -633,8 +651,61 @@ handling. Verify mode preserves original-source indexed-hit/fallback counters,
 and the strengthened Profile→Verify→Apply regression covers slot/split
 reads and writes, subclasses, deleted/reinserted fields, materialized/promoted
 dictionaries, property replacement, finalizer ordering, weak class lifetime,
-and unseeded constructor first insertion with `__static_attributes__ = ()`.
-The live shared-key guard also restores actual release Apply correctness for
+and genuinely unseeded constructor first insertion. The unseeded fixture uses
+`def __init__(instance, ...)` and `instance.field = value`: CPython records
+only receivers spelled literally `self`. An explicit
+`__static_attributes__ = ()` does not suppress preseeding because the compiler
+overwrites that class-body value with its final inferred tuple.
+
+For the subsequent CPython class-static-attribute compatibility update, the
+focused stock/transformed class and existing owner-field regressions pass
+**24 / 24**, and the broader transformed regression selection passes
+**55 / 55 in 99.38 seconds**. Independent real structured regressions prove
+both the original-class lowering tail and production-watcher snapshot
+RED-to-GREEN; the latter also proves callback-free metadata handling with a
+raising custom metaclass, real exact-owner instantiation, and exclusion of a
+watched but never-instantiated owner. The uniform-polymorphic fixture retains
+its strict unequal-owner-index assertion: renaming an otherwise unused field
+to `_padding` makes CPython's sorted static layout place `MixedRight.mixed`
+at index 1 while `MixedLeft.mixed` remains at index 0. Full serial Rust suites
+pass **372 lowering**, **580 JIT**, **214 optimizer**, and **54 typed-IR**
+tests. An unrelated lowering test's previous `_dp_eval_7` assumption was
+replaced with assertions on the preserved slot's semantic role, storage
+relation, deferred initialization, and nullable-object representation. An
+independently reproduced, preexisting general class lambda-default lookup bug
+remains outside this static-attribute change. Combined
+`cargo check -p soac_lowering -p soac_jit --tests` and package-scoped
+`just fmt-rust-check soac_lowering soac_jit` also pass. Release smoke and
+normally sampled comparisons complete **8 / 8**. A VM restart changes the
+guest kernel from **6.8.0-137 to 6.8.0-138**, correctly invalidating the
+old previous-revision comparison; independently repeated same-kernel
+parent/candidate comparisons then complete **4 / 4** across three
+order-alternating rounds. Their stock scores are **0.556493x** and
+**0.540177x**, with official previous SOAC **0.974443x**.
+
+The compatibility change has a real, disclosed cost: CPython's sorted class
+keys move `WorkerTaskRec.count` from index **1 to 0**, `Packet.ident` from
+**1 to 2**, and `Packet.link` from **0 to 4**, while their other observed
+owners retain indices **1**, **1**, and **0**, respectively. Actual profile
+evidence preserves all **11 owners / 51 keys** and all **662 benchmark
+counter rows**; the existing uniform-only non-self planner nevertheless
+rejects each newly mixed-index polymorphic group. Consequently all three
+stock-paired `richards` rounds regress: **0.940916x**, with **95% interval
+0.918484-0.965860**. `chaos` and `deltablue` are neutral; an apparent
+`comprehensions` regression has byte-identical generated code and unchanged
+profile indices, so it is not proven causal. Across **120 actual Apply
+workers**, native bytes fall **56,982,240 -> 56,797,080** and machine
+blocks **3,727,500 -> 3,716,400** because useful owner guards disappear;
+typed coverage remains **2,265 blocks / 183 functions** and hidden code
+remains **777,240 bytes**. Existing mechanical JIT code already has a safe
+separate-index-per-owner path; restoring its planner eligibility is required
+without undoing CPython layout correctness. The bounded mixed-index guards
+are subsequently restored and the authoritative combined full correctness
+gate passes **1,259 nodeids / 101 batches / 8 workers / 0 failures**.
+Full **97-variant / 1.10x** acceptance remains unmet.
+
+For the earlier retained owner-field optimization, the live shared-key guard
+also restores actual release Apply correctness for
 `deltablue` and `richards`; their single-shot cold-JIT timings are not
 steady-state throughput evidence. Normally sampled fixed-eight and repeated
 five-workload median geometric improvements are **1.040x** and **1.066x**;
@@ -731,11 +802,14 @@ ordinary receiver fields outside a method's first `self` parameter.
 Existing Profile `generic_getattr` / getter evidence must record at least
 **eight observations**. A unique concrete same-module owner supports
 existing guarded loads or stores. A polymorphic load is additionally
-eligible only when its complete profile identifies **two through five
-distinct exact same-module owners**, every owner has an existing matching
-constructor anchor, and all owners prove the same attribute and split-field
-index. Foreign owners, missing anchors, mixed indices, owner counts above
-five, and polymorphic stores remain on the original generic operation.
+eligible when its complete profile identifies **two through five distinct
+exact same-module owners**, every owner has an existing matching
+constructor anchor, and all owners prove the same attribute. Each owner may
+have its own proven split-field index: the existing mechanical JIT checks
+that owner's exact live weakref/type-version, matching current split key,
+valid inline values, and precise field index before using its value.
+Foreign owners, missing anchors, owner counts above five, and polymorphic
+stores remain on the original generic operation.
 
 The optimizer reuses the minimum existing matching constructor-cell index
 for the exact owner, attribute, `SplitDict` storage index, original
@@ -760,7 +834,64 @@ validated exact owner and existing cell. For a complete same-index
 polymorphic load, every existing weak-owner/type-version guard remains
 independent, then successful owners converge through one matched-owner
 Cranelift block parameter into **one shared live split-key guard and one
-inline-values field probe** before the original generic fallback.
+inline-values field probe** before the original generic fallback. For
+owners with different indices, the preexisting per-owner branch instead
+checks each exact owner's own live split key and inline-values slot; no
+index is borrowed from a different owner, no extra receiver evaluation is
+introduced, and every miss reaches the unchanged generic Python operation.
+
+Correct CPython class static-attribute sorting converts real five-owner
+`richards` `.link` layouts from uniform index **0** into four task owners
+at **0** and `Packet` at **4**; `.ident` similarly becomes **1 / 2**, and
+two task-record `.count` owners become **1 / 0**. The new optimizer change
+removes only its former equal-index admission check and truthfully renames
+stale uniform-only bookkeeping; the existing **eight-observation** minimum,
+**five-owner** maximum, **eight-source** limit, same-module owner and
+existing-anchor proof, load-only polymorphism, and all ordinary mutation /
+descriptor / fallback guards are unchanged. Two independent
+whole-production optimizer regressions genuinely change from **2 failed**
+to **2 passed / 212 filtered / 0.04 seconds**. Two real transformed
+Profile→Verify→Apply mixed-index regressions likewise change from **2
+failed** at **0 versus at least 64 source indexed hits** to GREEN; the
+existing inherited unequal-index/hook/descriptor/MRO guardrail also passes,
+for **3 / 3 in 6.16 seconds**. Complete serial Rust suites pass **54 typed
+IR**, **580 JIT**, **372 lowering**, and **214 optimizer** tests. A broader
+transformed selection passes **34 / 34 across 13 files in 19.24 seconds**,
+including static classes, owner cells, method dispatch, descriptors, slots,
+inherited owners, and both new mixed-index hits; package-scoped Rust
+formatting and its check also pass, as does combined
+`cargo check -p soac_opt -p soac_jit --tests` in **9.22 seconds**.
+
+The clean three-round same-kernel mixed-index candidate improves fixed-four
+stock score from the class-correct intermediate **0.540177x** to
+**0.559687x**, official previous SOAC **1.057288x**. Actual 30-worker
+stock-adjusted `deltablue` **0.9948x (95% 0.9747-1.0258)** and `richards`
+**1.0098x (95% 0.9815-1.0523)** are neutral; byte-identical `chaos` and
+an apparent `comprehensions` gain expose environmental noise. Compared with
+the integrated pre-class-correction parent, stock score changes
+**0.556493x -> 0.559687x**, but stock-paired `richards` remains adversely
+affected at **0.9502x (95% 0.9241-0.9896)**; do not claim full recovery.
+Native code grows **18,932,360 -> 19,124,400 bytes (+1.014%)** and machine
+blocks **1,238,800 -> 1,250,920 (+0.978%)**, with typed coverage unchanged
+at **2,265 blocks / 183 functions**. All **120 measured Apply PIDs / 5,490
+direct bodies / 5,160 visible default-direct adapters** preserve their
+source identities; **483,840 visible adapter bytes** are included in native
+totals, while binary JIT-dump inspection proves **777,240 true hidden
+vectorcall bytes** remain unchanged. Three-round ordinary native bytes
+change **56,797,080 -> 57,373,200**, and ordinary-plus-hidden bytes
+**57,574,320 -> 58,150,440**.
+
+The authoritative full `just test-all` gate is **GREEN**:
+**1,259 transformed nodeids / 101 batches / 8 workers / 101 PASS / 0
+failures**, including **20 class-static nodes** and both mixed-owner
+integrations. Rust passes **54 typed IR**, **580 JIT**, **372 lowering**,
+**214 optimizer**, and **8 PyO3** tests; evidence is
+`work/logs/class-static-mixed-owner-test-all.log`. Debug runtime setup
+takes **24.716 seconds**, Cargo tests **81.230 seconds**, inner / outer
+pytest **78.940 / 78.954 seconds**, and total test phase **160.193
+seconds**; the 28-node counter shard takes **78.22 seconds**. The combined
+candidate is validated and retained, but complete **97-variant / 1.10x**
+acceptance remains unmet; no landing is claimed.
 
 For the original unique-owner-only implementation, a genuine structured
 production-path regression turns RED-to-GREEN,

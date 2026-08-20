@@ -1,5 +1,8 @@
+use crate::pass_tracker::LoweringPassTrackerExt;
 use crate::passes::ast_to_ast::body::Suite;
 use crate::template::py_stmt;
+use crate::transformer::{walk_stmt, Transformer};
+use ruff_python_ast::{self as ast, Expr, Stmt};
 use soac_core::block_py::{BlockTerm, ChildVisitable, FunctionExecutionMode, PrettyPrint, Visit};
 use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
 use soac_ir_blockpy::{
@@ -125,6 +128,96 @@ fn class_lowering_adds_constructor_entry_function() {
         constructor_entry.blocks[0].term,
         BlockTerm::Return(InstrBlockPy::Call(_))
     ));
+}
+
+#[test]
+fn class_namespace_helper_finishes_with_original_sorted_static_attribute_store() {
+    let source = concat!(
+        "class Subject:\n",
+        "    marker: int = 1\n",
+        "    def method(self):\n",
+        "        self.zeta = 1\n",
+        "        self.__private = 2\n",
+        "        self.alpha = 3\n",
+    );
+    let lowered = crate::lower_python_to_blockpy_for_testing(source)
+        .expect("class static-attribute source should lower");
+    let mut module = lowered
+        .pass_tracker
+        .pass_ast_to_ast()
+        .expect("the production ast-to-ast pass should be tracked");
+
+    #[derive(Default)]
+    struct ClassNamespaceTailProbe {
+        helper_count: usize,
+        static_attribute_names: Option<Vec<String>>,
+    }
+
+    impl Transformer for ClassNamespaceTailProbe {
+        fn visit_stmt(&mut self, stmt: &mut Stmt) {
+            if let Stmt::FunctionDef(function) = stmt {
+                if function.name.id.as_str() != "_dp_class_ns_Subject" {
+                    walk_stmt(self, stmt);
+                    return;
+                }
+                self.helper_count += 1;
+                let Some(Stmt::Assign(ast::StmtAssign { targets, value, .. })) =
+                    function.body.last()
+                else {
+                    return;
+                };
+                let [Expr::Subscript(ast::ExprSubscript {
+                    value: namespace,
+                    slice,
+                    ..
+                })] = targets.as_slice()
+                else {
+                    return;
+                };
+                if !matches!(
+                    namespace.as_ref(),
+                    Expr::Name(name) if name.id.as_str() == "_dp_class_ns"
+                ) || !matches!(
+                    slice.as_ref(),
+                    Expr::StringLiteral(name)
+                        if name.value.to_string() == "__static_attributes__"
+                ) {
+                    return;
+                }
+                let Expr::Tuple(attributes) = value.as_ref() else {
+                    return;
+                };
+                let names = attributes
+                    .elts
+                    .iter()
+                    .map(|attribute| match attribute {
+                        Expr::StringLiteral(attribute) => attribute.value.to_string(),
+                        other => panic!("static attribute must be a string literal: {other:?}"),
+                    })
+                    .collect::<Vec<_>>();
+                self.static_attribute_names = Some(names);
+                return;
+            }
+            walk_stmt(self, stmt);
+        }
+    }
+
+    let mut probe = ClassNamespaceTailProbe::default();
+    probe.visit_body(&mut module.body);
+    assert_eq!(
+        probe.helper_count, 1,
+        "the class helper must be emitted once"
+    );
+    assert_eq!(
+        probe.static_attribute_names,
+        Some(vec![
+            "__private".to_string(),
+            "alpha".to_string(),
+            "zeta".to_string(),
+        ]),
+        "the real production class namespace helper must end with the sorted, unmangled \
+         compiler-inferred attribute tuple, after any generated annotation helper"
+    );
 }
 
 #[derive(Default)]

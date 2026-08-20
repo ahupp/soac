@@ -55,7 +55,7 @@ class MixedLeft:
 
 class MixedRight:
     def __init__(self, value):
-        self.padding = None
+        self._padding = None
         self.mixed = value
 
 
@@ -450,9 +450,15 @@ def test_uniform_polymorphic_nonself_fields_reuse_each_exact_owner_guard(
     assert any(count >= 32 for _, count in unique), unique
     inherited = _field_rows(verified, "Base.read_self", "indexed_hit")
     assert any(count >= 128 for _, count in inherited), inherited
+    mixed_hits = _field_rows(verified, "read_mixed", "indexed_hit")
+    assert any(count >= 64 for _, count in mixed_hits), (
+        "mixed-index non-self reads must retain both independently guarded "
+        "exact owners and record their original-source indexed hits",
+        mixed_hits,
+    )
 
     for qualname in (
-        "read_mixed", "read_overflow", "read_slotted", "read_unanchored",
+        "read_overflow", "read_slotted", "read_unanchored",
         "read_cold", "write_uniform",
     ):
         hits = _field_rows(verified, qualname, "indexed_hit")
@@ -463,7 +469,9 @@ def test_uniform_polymorphic_nonself_fields_reuse_each_exact_owner_guard(
         for line in (work_dir / "jit-code-summary.jsonl").read_text().splitlines()
         if line.strip()
     ]
-    for qualname in ("read_uniform", "Consumer.read", "read_unique", "Base.read_self"):
+    for qualname in (
+        "read_uniform", "Consumer.read", "read_mixed", "read_unique", "Base.read_self"
+    ):
         assert any(
             row.get("entry_kind") == "direct_function_body"
             and row.get("function_qualname") == qualname

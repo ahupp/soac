@@ -93,6 +93,10 @@ fn semantic_state_keeps_class_helper_scope_overrides_transformable() {
     );
     let context = Context::new(source);
     let mut module = parse_module(source).unwrap().into_syntax().body;
+    crate::passes::ast_to_ast::rewrite_class_def::record_class_static_attributes(
+        &context,
+        &mut module,
+    );
     let mut semantic_state = SemanticAstState::from_ruff(&mut module);
     rewrite_class_body_scopes(&context, &mut semantic_state, &mut module);
 }

@@ -901,3 +901,228 @@ seconds**; the known counter-dump batch takes **93.80 seconds**.
   classes—and all existing mutable-runtime guards remain mandatory.
 - Next action: integrate the fully validated retained change, then
   continue toward the unmeasured full-suite stock **1.10x** objective.
+
+## Attempt 3: recover polymorphic non-self fields with distinct owner indices
+
+- Status: **TWO GENUINE WHOLE-PRODUCTION STRUCTURED AND TWO REAL
+  TRANSFORMED MIXED-INDEX REDS GREEN; THREE FOCUSED TRANSFORMED
+  GUARDRAILS, FOUR COMPLETE RUST SUITES, AND BROAD TRANSFORMED SELECTION
+  PASS; CLEAN THREE-ROUND PERFORMANCE RECORDED; AUTHORITATIVE FULL GATE
+  GREEN; VALIDATED CANDIDATE RETAINED**.
+  Attempts 1 and 2, their retained
+  decisions, genuine RED-to-GREEN evidence, historical adverse results, and
+  full correctness gates remain unchanged above.
+- Pacific selection date: **2026-08-20 PDT**.
+- Current compatibility baseline: the CPython-correct class-layout candidate
+  `lwyqsqsm`, fresh same-kernel fixed-four artifact
+  `work/pyperformance/comparison-20260820-091112-iaT71z/summary.json`.
+  That candidate is a required user-visible correctness repair, not a license
+  to restore the earlier incorrect class layouts. Its authoritative full
+  correctness gate remains pending.
+- General-purpose hypothesis: independently guarded exact concrete Python
+  classes may store one attribute at distinct shared-dictionary indices. A
+  complete, bounded, Profile-proven same-module owner set remains safe to
+  specialize when each existing exact-owner cell proves its **own** live
+  split index. Uniform indices are a profitable shared-probe case, not a
+  semantic requirement for guarded polymorphic reads. This extends the
+  existing non-self field strategy; it is not a new strategy or a
+  benchmark-specific rule.
+- Causal real-profile evidence: corrected CPython lexical static-attribute
+  sorting preserves every existing **11 concrete owners / 51 type keys** and
+  all **662 `__main__` Profile counter rows**. It changes
+  `IdleTaskRec.count` / `WorkerTaskRec.count` from **`1 / 1`** to
+  **`1 / 0`**, task/packet `.ident` from five owners all **`1`** to four
+  exact task owners **`1`** plus `Packet` **`2`**, and task/packet `.link`
+  from five owners all **`0`** to four exact task owners **`0`** plus
+  `Packet` **`4`**. Do not omit the unrelated but actually observed
+  `Packet` owner. The preexisting owner evidence is split across
+  `soac.runtime` **`4 owners / 32 keys`** and `__main__`
+  **`7 owners / 19 keys`**, which the normal production evidence store
+  already merges.
+- Important unchanged observations include `WorkTask.fn`
+  **13 field sites / 121,718 generic observations**,
+  `Packet.append_to` **4 / 81,416**, `Task.qpkt` **8 / 371,936**, and
+  `Task.runTask` **11 / 627,240**. The existing
+  `late_bound_split_owner_nonself_field_plans` helper in
+  `crates/soac_opt/src/pipeline_v3.rs` rejects a complete owner group when
+  any `candidate.expected_index != field.expected_index`. Existing
+  `emit_typed_late_bound_owner_getattr` in
+  `crates/soac_jit/src/jit/mod.rs` already distinguishes the optimized
+  same-index shared-probe case from the safe per-owner-index fallback branch;
+  each branch retains its exact weak-owner, live type-version, current
+  split-key identity/name/index, valid inline-values, and original generic
+  fallback guards. No new JIT runtime path, owner cell, hidden trampoline,
+  mutable global, ABI field, helper, or public API is expected.
+- The real class-correct baseline runs **three order-alternating
+  same-kernel rounds / four workloads / 120 actual measured Apply workers**.
+  Its stock geometric score is **`0.5401772590486644x`** and its previous
+  pre-correction SOAC score **`0.9744429326747311x`**. Repeated `richards`
+  is **`21.672169 -> 22.405269 ms`**, raw **`0.958229x`**
+  (**95% `0.939852-0.979582`**) and stock-paired **`0.940916x`**
+  (**95% `0.918484-0.965860`**); all three paired rounds regress.
+  Candidate recovery comparisons must use fresh profile evidence from this
+  same-kernel class-correct baseline rather than the pre-correction
+  revision. Fixed-four typed IR is **`2,265 blocks / 183 functions`**;
+  all three baseline rounds emit **`56,797,080 native bytes /
+  3,716,400 machine blocks / 777,240 hidden trampoline bytes`**.
+- Predicted profitability risk: admitting mixed owners can add a separate
+  exact-owner/key/value guard chain for each class. `deltablue`
+  `Strength.stronger` / `Strength.weaker` repeatedly inspect
+  `s1.strength` / `s2.strength`; if the global profiled `.strength` owner
+  group becomes newly eligible, extra non-self guard code can harm that hot
+  path despite recovering `richards`. `comprehensions` was an unchanged-code
+  negative control during the class correction and must not be cited as a
+  causal regression without new emitted-body evidence. Inspect actual
+  source-level selected plans, typed sidecars, per-function emitted bytes,
+  and clean stock-paired `chaos`, `comprehensions`, `deltablue`, and
+  `richards` before retaining the extension.
+- Actual production shape: the sole semantic change removes the
+  `candidate.expected_index != field.expected_index` rejection from the
+  existing optimizer helper. Stale uniform-only local, candidate-cap, and
+  plan-reason names are renamed truthfully to polymorphic terminology;
+  they do not change eligibility. Preserve its minimum **eight** Profile
+  observations, complete **two-to-five** distinct exact same-module owners,
+  matching attribute/access, one existing constructor anchor per owner,
+  deterministic ordering, maximum **eight** additional non-self source sites
+  per function, scalar/self/inherited/unique-owner precedence, and rejection
+  of foreign owners, missing anchors, polymorphic stores, slots, cold sites,
+  and unsupported owner groups. Continue to use the existing shared probe
+  when all selected indices match; otherwise mechanically reuse the already
+  implemented independently guarded per-owner-index branch.
+- Genuine unchanged-production transformed RED: two existing real
+  Profile -> Verify -> Apply integrations are first strengthened to require
+  safe mixed-owner source hits. The layout-uniform regression's
+  `read_mixed` records actual **`0` indexed hits instead of at least `64`**;
+  the older non-self regression's `read_ambiguous` independently records
+  actual **`0` instead of at least `64`**. Both expected concrete owners,
+  their different split-key indices, and prior semantic controls are real;
+  the frozen production planner still rejects the groups. The focused
+  unchanged-production run genuinely reports **`2 failed in 4.45 seconds`**
+  at the two intended specialization assertions, not a setup error or
+  CPython-visible behavior mismatch. Restaging from the prior release
+  benchmark unexpectedly rebuilds the unchanged debug extension for
+  **`21.50 seconds`**; this is workflow-only overhead, not benchmark or
+  test-runtime evidence.
+- Independent genuine unchanged-production structured RED: focused
+  `cargo test -p soac_opt hot_nonself_ -- --nocapture` reports exactly
+  **`2 failed / 212 filtered / 0.04 seconds`**. The actual complete
+  production lowering/Profile/optimizer path selects no mixed owner plans:
+  actual **`[]`** versus expected
+  **`[(MixedLeft, 0), (MixedRight, 1)]`** for the existing polymorphic
+  regression, and independently actual **`[]`** versus expected
+  **`[(Left, 0), (Right, 1)]`** for the older non-self regression. These
+  are genuine typed whole-production decision failures before implementation,
+  independent of the two real transformed
+  **`2 failed / 4.45 seconds`** indexed-hit REDs. Preserve genuine
+  same-index shared-probe, foreign/incomplete/>5 owner, cold/store,
+  descriptor/hook/class-mutation, deleted/promoted dictionary, finalizer,
+  single-evaluation, and untouched-fallback controls. After the one-line
+  semantic eligibility correction, the same exact complete-production
+  optimizer selection independently changes from
+  **`2 failed / 212 filtered / 0.04 seconds`** to
+  **`2 passed / 212 filtered / 0.04 seconds`**, with both actual mixed-index
+  owner sets selected. The preceding **`11.21-second`** Rust rebuild is
+  workflow-only overhead, not test execution or benchmark evidence.
+- Independent real transformed RED-to-GREEN: the same frozen
+  `read_mixed` and `read_ambiguous` cases first genuinely fail with **`0`
+  indexed hits instead of at least `64`** each, then both pass with at least
+  **`64` actual source-specific indexed hits** after the optimizer-only
+  change. The existing inherited unequal-index / custom hook / descriptor /
+  MRO guardrail also passes unchanged. The combined real
+  Profile -> Verify -> Apply selection is **GREEN `3 / 3 in 6.16
+  seconds`**, independently complementing structured optimizer
+  **`2 passed / 212 filtered / 0.04 seconds`**. A preceding
+  **`21.91-second`** unchanged debug-extension rebuild is workflow-only
+  overhead, not benchmark or test-runtime evidence.
+- Broader independently verified correctness: complete serial Rust suites
+  pass **typed IR `54 / 54`**, **JIT `580 / 580`**,
+  **lowering `372 / 372`**, and **optimizer `214 / 214`**. A real
+  transformed **`34 / 34`** regression selection across **13 files** passes
+  in **`19.24 seconds`**, including class static-attribute semantics,
+  owner cells, profiled method dispatch, descriptors, object slots,
+  inherited owners, and both newly restored mixed-index source hits.
+  Package-scoped Rust formatting and its check pass; combined
+  `cargo check -p soac_opt -p soac_jit --tests` passes in
+  **`9.22 seconds`**. The authoritative full transformed and Rust
+  correctness gate subsequently passes.
+- Release smoke `comparison-20260820-102008-vOpSf8` completes **4 / 4**,
+  with the expected **`2,265 typed blocks / 183 functions`**. It uses only
+  one measured worker/value per workload; comparing it with the normally
+  trained class baseline produces misleading `comprehensions`
+  **`0.279586x`**, `deltablue` **`0.650070x`**, and geometric
+  **`0.663412x`**. Reject all smoke throughput claims: different profile
+  training also changes unrelated emitted bodies. Its useful structural
+  observation is that both `Strength.stronger` and `Strength.weaker` grow
+  from **`716 bytes / 45 blocks`** to **`3,256 bytes / 228 blocks`**;
+  the anticipated separate-owner guard cost is real.
+- Normally sampled `comparison-20260820-102120-8vVISD` completes **4 / 4**
+  and reports stock **`0.5688287175126115x`** / previous class-correct
+  SOAC **`1.046069203512862x`**. Actual same-mode `chaos` bodies are
+  byte-identical; `comprehensions` changes only an unrelated annotation
+  lambda by **`384 bytes`**. `deltablue` grows
+  `Strength.stronger` **`2,540 bytes`**, `Strength.weaker`
+  **`2,540 bytes`**, and `Planner.incremental_remove`
+  **`2,168 bytes`**. The previously lost mixed-owner guards return to
+  `WorkTask.fn` **`+2,664 bytes`**, `Richards.run` **`+2,624`**,
+  `Packet.append_to` **`+2,188`**, `Task.runTask` **`+1,272`**,
+  `Task.qpkt` **`+1,184`**, `schedule` **`+1,064`**, and
+  `IdleTask.fn` **`+960`**. Single-round timings are not definitive.
+- Clean same-kernel `comparison-20260820-102351-dmaMsN` completes
+  **4 / 4** across **three order-alternating rounds / 120 measured Apply
+  PIDs**. Stock geometric score improves from class-only
+  **`0.5401772590486644x`** to **`0.5596865226885351x`**; official previous
+  SOAC is **`1.0572879104903203x`**. Per-benchmark previous means are
+  `chaos` **`1.053337x`**, `comprehensions` **`1.094981x`**,
+  `deltablue` **`1.038808x`**, and `richards` **`1.042951x`**. The
+  30-worker round-stratified `deltablue` comparison is raw
+  **`1.0270x`** (**95% `1.0129-1.0544`**) but stock-paired only
+  **`0.9948x`** (**95% `0.9747-1.0258`**); `richards` is raw
+  **`1.0573x`** (**95% `1.0253-1.0950`**) but stock-paired only
+  **`1.0098x`** (**95% `0.9815-1.0523`**). Both stock-adjusted affected
+  workloads are therefore **NEUTRAL**, not established causal speedups.
+  Unchanged-code `chaos` and `comprehensions`, including an apparent
+  stock-paired comprehension **`1.0553x`**, expose ambient timing drift;
+  do not credit them to mixed-index guards.
+- The combined class-correctness plus mixed-index change is also compared
+  with fresh integrated `main` artifact
+  `comparison-20260820-090642-20GRdt`: stock score
+  **`0.5564929785348224x -> 0.5596865226885351x`**, raw median SOAC
+  geometric ratio **`1.0302667322x`**. Stock-paired `deltablue`
+  **`1.0015x`** is neutral, while stock-paired `richards`
+  **`0.9502x`** (**95% `0.9241-0.9896`**) remains adversely affected
+  despite a raw **`1.0131x`** interval crossing parity. Disclose this
+  unresolved paired regression rather than claiming complete recovery or
+  treating a slightly better stock geometric score as full-suite progress.
+- Median-per-round generated native code grows from the class-correct
+  baseline **`18,932,360 -> 19,124,400 bytes`** (**`+1.0143%`**), and
+  machine blocks grow **`1,238,800 -> 1,250,920`** (**`+0.978%`**).
+  Across three rounds, ordinary native emission changes
+  **`56,797,080 -> 57,373,200 bytes`** (**`+576,120`**) while all
+  **120 actual Apply PIDs / 5,490 direct bodies / 5,160 default-direct
+  adapters** preserve their source identities. The **`483,840 visible
+  adapter bytes`** are already included in native totals. Binary parsing
+  separately proves **`777,240 true hidden vectorcall trampoline bytes`**
+  remain identical across parent, class-only, and mixed-index candidates;
+  ordinary-plus-hidden totals change **`57,574,320 -> 58,150,440` bytes**.
+  Final repeated `chaos` and `comprehensions` bodies are byte-identical.
+  Typed coverage remains **`2,265 blocks / 183 functions`**,
+  pre-optimization BlockPy **`8,285,072 bytes`**, and project-module
+  coverage only `__main__` plus `soac.runtime`; no standard-library or
+  third-party dependency hot path is transformed.
+- Authoritative final combined `just test-all` gate: **GREEN**, recorded
+  in `work/logs/class-static-mixed-owner-test-all.log`: **1,259 transformed
+  Python nodeids / 101 isolated batches / 8 workers / 101 PASS / 0
+  failures**, including all **20 class-static cases** and both mixed-index
+  integrations. Rust passes **54 typed IR**, **580 JIT in 15.02 seconds**,
+  **372 lowering in 0.51 seconds**, **214 optimizer in 0.57 seconds**,
+  and **8 PyO3 in 0.10 seconds**. Debug runtime setup takes
+  **24.716 seconds**, Cargo tests **81.230 seconds**, inner / outer pytest
+  **78.940 / 78.954 seconds**, and total test phase **160.193 seconds**;
+  the existing 28-node counter shard takes **78.22 seconds**. Retain the
+  validated correctness and safe mixed-index guards, while preserving the
+  disclosed parent-relative paired `richards` regression; do not claim the
+  change is landed.
+- Full-suite completion: only **8 of 97** acceptance benchmark variants
+  have ever been compared, and no transformed standard-library or
+  third-party hot module is demonstrated. The full-suite **`1.10x`** goal,
+  full benchmark inventory and acceptance verdict remain **UNMET**.

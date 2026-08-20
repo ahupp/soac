@@ -19,8 +19,6 @@ def test_inherited_split_fields_use_exact_profiled_concrete_owner_guards(
 
 
             class DeltaBase:
-                __static_attributes__ = ()
-
                 def __init__(self, value):
                     self.direction = True
                     self.value = value
@@ -38,23 +36,17 @@ def test_inherited_split_fields_use_exact_profiled_concrete_owner_guards(
 
 
             class DeltaLeft(DeltaBase):
-                __static_attributes__ = ()
-
                 def __init__(self, value):
                     DeltaBase.__init__(self, value)
 
 
             class DeltaRight(DeltaBase):
-                __static_attributes__ = ()
-
                 def __init__(self, value):
                     self.padding = "first"
                     DeltaBase.__init__(self, value)
 
 
             class StateBase:
-                __static_attributes__ = ()
-
                 def __init__(self):
                     self.packet_pending = False
                     self.task_waiting = True
@@ -77,8 +69,6 @@ def test_inherited_split_fields_use_exact_profiled_concrete_owner_guards(
 
 
             class StateRoot(StateBase):
-                __static_attributes__ = ()
-
                 def __init__(self, marker):
                     self.marker = marker
                     self.ident = marker
@@ -88,36 +78,26 @@ def test_inherited_split_fields_use_exact_profiled_concrete_owner_guards(
 
 
             class StateAlpha(StateRoot):
-                __static_attributes__ = ()
-
                 def __init__(self, marker):
                     StateRoot.__init__(self, marker)
 
 
             class StateBeta(StateRoot):
-                __static_attributes__ = ()
-
                 def __init__(self, marker):
                     StateRoot.__init__(self, marker)
 
 
             class StateGamma(StateRoot):
-                __static_attributes__ = ()
-
                 def __init__(self, marker):
                     StateRoot.__init__(self, marker)
 
 
             class StateDelta(StateRoot):
-                __static_attributes__ = ()
-
                 def __init__(self, marker):
                     StateRoot.__init__(self, marker)
 
 
             class ObservedLeft(DeltaLeft):
-                __static_attributes__ = ()
-
                 def __getattribute__(self, name):
                     if name == "value":
                         EVENTS.append("observed:get")
@@ -130,8 +110,6 @@ def test_inherited_split_fields_use_exact_profiled_concrete_owner_guards(
 
 
             class ReplacementDeltaBase:
-                __static_attributes__ = ()
-
                 def read(self):
                     EVENTS.append("replacement:read")
                     return self.value + 900
@@ -536,7 +514,7 @@ def test_inherited_split_fields_use_exact_profiled_concrete_owner_guards(
         owner_indexes["StateBase"][name]
         for name in ("packet_pending", "task_waiting", "task_holding")
     )
-    assert exact_state_layout == (0, 1, 2), owner_indexes
+    assert exact_state_layout == (0, 2, 1), owner_indexes
 
     state_layouts = {
         owner: tuple(

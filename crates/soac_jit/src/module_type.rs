@@ -742,7 +742,7 @@ impl SharedModuleState {
         if !key_layout_counter_enabled() {
             return (Vec::new(), Vec::new());
         }
-        snapshot_type_key_layout_events()
+        snapshot_type_key_layout_events(self.module_name.as_str())
     }
 
     pub fn append_counter_dump_file(&self, path: &Path) -> Result<(), String> {
@@ -1422,7 +1422,7 @@ pub unsafe fn watch_split_keys_for_type(type_obj: *mut ffi::PyObject) -> Result<
         return Err(());
     }
     if unsafe { _PyDict_WatchSplitKeysForType(type_obj) } == 0 {
-        return Ok(());
+        return unsafe { record_preseeded_split_key_layout(type_obj) };
     }
     if unsafe { ffi::PyErr_ExceptionMatches(ffi::PyExc_TypeError) } != 0 {
         unsafe { ffi::PyErr_Clear() };
@@ -1431,16 +1431,144 @@ pub unsafe fn watch_split_keys_for_type(type_obj: *mut ffi::PyObject) -> Result<
     Err(())
 }
 
+#[repr(C)]
+struct RawPyDictKeysObjectForProfile {
+    dk_refcnt: ffi::Py_ssize_t,
+    dk_log2_size: u8,
+    dk_log2_index_bytes: u8,
+    dk_kind: u8,
+    dk_version: u32,
+    dk_usable: ffi::Py_ssize_t,
+    dk_nentries: ffi::Py_ssize_t,
+}
+
+#[repr(C)]
+struct RawPyDictUnicodeEntryForProfile {
+    me_key: *mut ffi::PyObject,
+    me_value: *mut ffi::PyObject,
+}
+
+struct PreseededTypeKeyLayout {
+    owner_weakref: Py<PyAny>,
+    cached_keys: usize,
+    initial_capacity: usize,
+    entries: Vec<(String, u32)>,
+}
+
+unsafe fn record_preseeded_split_key_layout(type_obj: *mut ffi::PyObject) -> Result<(), ()> {
+    const DICT_KEYS_SPLIT: u8 = 2;
+    const SHARED_KEYS_MAX_SIZE: usize = 30;
+
+    if cfg!(Py_GIL_DISABLED) || unsafe { ffi::PyType_Check(type_obj) } == 0 {
+        return Ok(());
+    }
+    let owner_type = type_obj.cast::<ffi::PyTypeObject>();
+    if unsafe { (*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE } == 0 {
+        return Ok(());
+    }
+
+    let keys = unsafe {
+        (*owner_type.cast::<ffi::PyHeapTypeObject>())
+            .ht_cached_keys
+            .cast::<RawPyDictKeysObjectForProfile>()
+    };
+    if keys.is_null() || unsafe { (*keys).dk_kind } != DICT_KEYS_SPLIT {
+        return Ok(());
+    }
+
+    let Ok(nentries) = usize::try_from(unsafe { (*keys).dk_nentries }) else {
+        return Ok(());
+    };
+    if nentries == 0 || nentries > SHARED_KEYS_MAX_SIZE {
+        return Ok(());
+    }
+    let Ok(usable) = usize::try_from(unsafe { (*keys).dk_usable }) else {
+        return Ok(());
+    };
+    let Some(initial_capacity) = usable.checked_add(nentries) else {
+        return Ok(());
+    };
+    if initial_capacity > SHARED_KEYS_MAX_SIZE {
+        return Ok(());
+    }
+    let Some(bucket_count) = 1usize.checked_shl(u32::from(unsafe { (*keys).dk_log2_size })) else {
+        return Ok(());
+    };
+    let Some(index_bytes) = 1usize.checked_shl(u32::from(unsafe { (*keys).dk_log2_index_bytes }))
+    else {
+        return Ok(());
+    };
+    if nentries > bucket_count || index_bytes < bucket_count {
+        return Ok(());
+    }
+    let Some(entries_offset) =
+        std::mem::size_of::<RawPyDictKeysObjectForProfile>().checked_add(index_bytes)
+    else {
+        return Ok(());
+    };
+    let entries = unsafe {
+        keys.cast::<u8>()
+            .add(entries_offset)
+            .cast::<RawPyDictUnicodeEntryForProfile>()
+    };
+    let py = unsafe { Python::assume_attached() };
+    let mut existing = Vec::with_capacity(nentries);
+    for index in 0..nentries {
+        let key = unsafe { (*entries.add(index)).me_key };
+        if key.is_null() || unsafe { ffi::PyUnicode_CheckExact(key) } == 0 {
+            continue;
+        }
+        let key = match unsafe { Bound::<PyAny>::from_borrowed_ptr(py, key) }.extract::<String>() {
+            Ok(key) => key,
+            Err(error) => {
+                error.restore(py);
+                return Err(());
+            }
+        };
+        existing.push((key, index as u32));
+    }
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    let owner_weakref = unsafe { crate::PyWeakref_NewRef(type_obj, ptr::null_mut()) };
+    if owner_weakref.is_null() {
+        return Err(());
+    }
+    let owner_weakref = unsafe { Bound::<PyAny>::from_owned_ptr(py, owner_weakref) }.unbind();
+    let mut registry = profile_type_registry().lock().map_err(|_| {
+        unsafe {
+            ffi::PyErr_SetString(
+                ffi::PyExc_RuntimeError,
+                c"profile type registry lock was poisoned".as_ptr(),
+            )
+        };
+    })?;
+    registry.preseeded_layouts.push(PreseededTypeKeyLayout {
+        owner_weakref,
+        cached_keys: keys as usize,
+        initial_capacity,
+        entries: existing,
+    });
+    Ok(())
+}
+
 #[derive(Default)]
 struct ProfileTypeRegistry {
     by_type: HashMap<usize, u64>,
     entries_by_id: HashMap<u64, CounterDumpTypeKey>,
+    preseeded_layouts: Vec<PreseededTypeKeyLayout>,
 }
 
 impl ProfileTypeRegistry {
     fn id_for_type(&mut self, owner_ptr: usize, key: CounterDumpTypeKey) -> PyResult<u64> {
         if let Some(type_id) = self.by_type.get(&owner_ptr).copied() {
-            return Ok(type_id);
+            if self.entries_by_id.get(&type_id) == Some(&key) {
+                return Ok(type_id);
+            }
+            // Watched owners are weakly held, so a later heap type can reuse
+            // the same address after the original class has been collected.
+            self.by_type.remove(&owner_ptr);
         }
         let type_id = stable_profile_type_id(&key);
         if let Some(existing) = self.entries_by_id.get(&type_id)
@@ -1492,7 +1620,9 @@ fn profile_type_registry() -> &'static Mutex<ProfileTypeRegistry> {
     PROFILE_TYPE_REGISTRY.get_or_init(|| Mutex::new(ProfileTypeRegistry::default()))
 }
 
-fn snapshot_type_key_layout_events() -> (
+fn snapshot_type_key_layout_events(
+    module_name: &str,
+) -> (
     Vec<CounterDumpTypeKeyLayout>,
     Vec<CounterDumpTypeTableEntry>,
 ) {
@@ -1504,11 +1634,12 @@ fn snapshot_type_key_layout_events() -> (
 
     let py = unsafe { Python::assume_attached() };
     let events = unsafe { Bound::from_owned_ptr(py, events) };
-    snapshot_type_key_layout_events_bound(events.as_any()).unwrap_or_default()
+    snapshot_type_key_layout_events_bound(events.as_any(), module_name).unwrap_or_default()
 }
 
 fn snapshot_type_key_layout_events_bound(
     events: &Bound<'_, PyAny>,
+    module_name: &str,
 ) -> PyResult<(
     Vec<CounterDumpTypeKeyLayout>,
     Vec<CounterDumpTypeTableEntry>,
@@ -1516,6 +1647,7 @@ fn snapshot_type_key_layout_events_bound(
     let events = events.cast::<PyList>()?;
     let mut out = Vec::new();
     let mut used_type_ids = HashSet::new();
+    let mut observed_layouts = HashSet::new();
     for event in events.iter() {
         let event = event.cast::<PyTuple>()?;
         let owner = event.get_item(0)?;
@@ -1532,17 +1664,137 @@ fn snapshot_type_key_layout_events_bound(
                 .map_err(|_| PyRuntimeError::new_err("profile type registry lock was poisoned"))?;
             registry.id_for_type(owner_ptr, type_key)?
         };
-        used_type_ids.insert(owner_type_id);
-        out.push(CounterDumpTypeKeyLayout {
-            owner_type_id,
-            key,
-            index,
-        });
+        if observed_layouts.insert((owner_type_id, key.clone(), index)) {
+            used_type_ids.insert(owner_type_id);
+            out.push(CounterDumpTypeKeyLayout {
+                owner_type_id,
+                key,
+                index,
+            });
+        }
     }
-    let type_table = profile_type_registry()
+
+    let py = events.py();
+    let preseeded_layouts = {
+        let registry = profile_type_registry()
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("profile type registry lock was poisoned"))?;
+        registry
+            .preseeded_layouts
+            .iter()
+            .map(|layout| {
+                (
+                    layout.owner_weakref.clone_ref(py),
+                    layout.cached_keys,
+                    layout.initial_capacity,
+                    layout.entries.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut stale_weakrefs = HashSet::new();
+    for (owner_weakref, expected_keys, initial_capacity, entries) in preseeded_layouts {
+        let mut owner_ptr = ptr::null_mut();
+        match unsafe { crate::PyWeakref_GetRef(owner_weakref.as_ptr(), &mut owner_ptr) } {
+            1 => {}
+            0 => {
+                stale_weakrefs.insert(owner_weakref.as_ptr() as usize);
+                continue;
+            }
+            _ => return Err(PyErr::fetch(py)),
+        }
+
+        let owner = unsafe { Bound::<PyAny>::from_owned_ptr(py, owner_ptr) };
+        let owner_type = owner.as_ptr().cast::<ffi::PyTypeObject>();
+        let current_keys = unsafe {
+            (*owner_type.cast::<ffi::PyHeapTypeObject>())
+                .ht_cached_keys
+                .cast::<RawPyDictKeysObjectForProfile>()
+        };
+        if current_keys.is_null()
+            || current_keys as usize != expected_keys
+            || unsafe { (*current_keys).dk_kind } != 2
+        {
+            continue;
+        }
+        let (Ok(current_usable), Ok(current_nentries)) = (
+            usize::try_from(unsafe { (*current_keys).dk_usable }),
+            usize::try_from(unsafe { (*current_keys).dk_nentries }),
+        ) else {
+            continue;
+        };
+        let Some(current_capacity) = current_usable.checked_add(current_nentries) else {
+            continue;
+        };
+        // Adding a split key increments nentries and decrements usable, but
+        // initializing an exact-owner instance decrements only usable. This
+        // distinguishes classes that were actually instantiated from abstract
+        // base classes whose compiler merely preseeded their cached keys.
+        if current_capacity >= initial_capacity {
+            continue;
+        }
+        let owner_dict = unsafe { (*owner_type).tp_dict };
+        if owner_dict.is_null() {
+            continue;
+        }
+        let owner_module = unsafe { ffi::PyDict_GetItemString(owner_dict, c"__module__".as_ptr()) };
+        if owner_module.is_null() || unsafe { ffi::PyUnicode_CheckExact(owner_module) } == 0 {
+            continue;
+        }
+        let owner_module =
+            unsafe { Bound::<PyAny>::from_borrowed_ptr(py, owner_module) }.extract::<String>()?;
+        if owner_module != module_name {
+            continue;
+        }
+        let owner_qualname = unsafe { ffi::PyType_GetQualName(owner_type) };
+        if owner_qualname.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let owner_qualname = unsafe { Bound::<PyAny>::from_owned_ptr(py, owner_qualname) };
+        if unsafe { ffi::PyUnicode_CheckExact(owner_qualname.as_ptr()) } == 0 {
+            continue;
+        }
+        let type_key = CounterDumpTypeKey {
+            module_name: owner_module,
+            qualname: owner_qualname.extract()?,
+        };
+        let owner_type_id = {
+            let mut registry = profile_type_registry()
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("profile type registry lock was poisoned"))?;
+            registry.id_for_type(owner.as_ptr() as usize, type_key)?
+        };
+        for (key, index) in entries {
+            if observed_layouts.insert((owner_type_id, key.clone(), index)) {
+                used_type_ids.insert(owner_type_id);
+                out.push(CounterDumpTypeKeyLayout {
+                    owner_type_id,
+                    key,
+                    index,
+                });
+            }
+        }
+    }
+
+    let mut registry = profile_type_registry()
         .lock()
-        .map_err(|_| PyRuntimeError::new_err("profile type registry lock was poisoned"))?
-        .entries_for_ids(&used_type_ids);
+        .map_err(|_| PyRuntimeError::new_err("profile type registry lock was poisoned"))?;
+    let mut stale_layouts = Vec::new();
+    if !stale_weakrefs.is_empty() {
+        let layouts = std::mem::take(&mut registry.preseeded_layouts);
+        for layout in layouts {
+            if stale_weakrefs.contains(&(layout.owner_weakref.as_ptr() as usize)) {
+                stale_layouts.push(layout);
+            } else {
+                registry.preseeded_layouts.push(layout);
+            }
+        }
+    }
+    let type_table = registry.entries_for_ids(&used_type_ids);
+    drop(registry);
+    // A DECREF can run arbitrary Python code, so release removed weakrefs
+    // only after dropping the registry lock.
+    drop(stale_layouts);
     Ok((out, type_table))
 }
 
@@ -2421,8 +2673,9 @@ events = [(Point, 'x', 0), (Point, 'y', 1)]
             )
             .expect("test module should execute");
             let events = module.getattr("events").expect("events should exist");
-            let (layouts, type_table) = snapshot_type_key_layout_events_bound(events.as_any())
-                .expect("type key layout events should snapshot");
+            let (layouts, type_table) =
+                snapshot_type_key_layout_events_bound(events.as_any(), "type_event_test")
+                    .expect("type key layout events should snapshot");
 
             assert_eq!(layouts.len(), 2);
             let owner_type_id = layouts[0].owner_type_id;
@@ -2442,6 +2695,80 @@ events = [(Point, 'x', 0), (Point, 'y', 1)]
             assert_eq!(type_table[0].type_id, owner_type_id);
             assert_eq!(type_table[0].key.module_name, "type_event_test");
             assert_eq!(type_table[0].key.qualname, "Point");
+        });
+    }
+
+    #[test]
+    fn watched_preseeded_split_keys_are_present_in_profile_snapshot() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "watched_preseeded_split_keys_are_present_in_profile_snapshot",
+        ) {
+            return;
+        }
+
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        unsafe { std::env::set_var("SOAC_OPT_MODE", "profile") };
+        crate::initialize_test_python();
+
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c"
+class MetadataBlockingMeta(type):
+    def __getattribute__(cls, name):
+        if name in ('__module__', '__qualname__'):
+            raise AssertionError('profiling must not call metaclass attribute hooks')
+        return type.__getattribute__(cls, name)
+
+class Point(metaclass=MetadataBlockingMeta):
+    def populate(self):
+        self.zeta = 1
+        self.alpha = 2
+
+class Uninstantiated:
+    def populate(self):
+        self.abstract_only = 1
+",
+                c"preseeded_type_events.py",
+                c"preseeded_type_event_test",
+            )
+            .expect("test module should execute");
+            let owner = module.getattr("Point").expect("owner should exist");
+            let uninstantiated = module
+                .getattr("Uninstantiated")
+                .expect("uninstantiated owner should exist");
+            unsafe { watch_split_keys_for_type(owner.as_ptr()) }
+                .expect("production watcher should accept a heap type");
+            unsafe { watch_split_keys_for_type(uninstantiated.as_ptr()) }
+                .expect("production watcher should accept an uninstantiated heap type");
+            owner.call0().expect("owner should instantiate");
+
+            let (layouts, type_table) =
+                snapshot_type_key_layout_events("preseeded_type_event_test");
+            let owner_entry = type_table
+                .iter()
+                .find(|entry| {
+                    entry.key.module_name == "preseeded_type_event_test"
+                        && entry.key.qualname == "Point"
+                })
+                .expect("profile snapshot must retain the preseeded owner type");
+            let owner_layouts = layouts
+                .into_iter()
+                .filter(|layout| layout.owner_type_id == owner_entry.type_id)
+                .map(|layout| (layout.key, layout.index))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                owner_layouts,
+                [("alpha".to_string(), 0), ("zeta".to_string(), 1)]
+            );
+            assert!(
+                !type_table
+                    .iter()
+                    .any(|entry| entry.key.qualname == "Uninstantiated"),
+                "uninstantiated classes must not manufacture exact-owner profile evidence"
+            );
         });
     }
 

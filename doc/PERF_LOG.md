@@ -1780,3 +1780,7 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
 ## 2026-08-19 - Direct guarded inherited methods after CPython lookup
 
 - `srxzvruu`: guard resolved inherited descriptors and reuse native-stack recursion checks; targeted stock `0.56131x` / previous `1.02702x`; `deltablue` `2.305 → 2.077 ms` (`1.10976x`), `richards` `21.821 → 20.933 ms` (`1.04243x`); stock-paired `chaos` neutral; full-suite stock `1.10x` unmet.
+
+## 2026-08-20 - Restore CPython class layout and mixed owner guards
+
+- `lwyqsqsm`: restore CPython class-tail/key layout and independently guarded mixed-index owner fields; repeated stock `0.559687x` versus parent `0.556493x`, previous SOAC `1.03027x` (class-only `0.97444x`, mixed recovery `1.05729x`); parent-relative paired `richards` remains `0.9502x`; native `18,932,360 → 19,124,400 B`; full correctness gate passes; full-suite stock `1.10x` unmet.

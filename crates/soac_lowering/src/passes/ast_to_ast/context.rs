@@ -1,9 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::passes::ast_to_ast::scope_helpers::ScopeKind;
 
 use crate::namegen::fresh_name;
+use ruff_text_size::TextRange;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScopeFrame {
@@ -42,6 +43,7 @@ pub(crate) struct Context {
     scope_stack: RefCell<Vec<ScopeFrame>>,
     value_forwarding_local_stack: RefCell<Vec<HashSet<String>>>,
     no_raise_local_stack: RefCell<Vec<HashSet<String>>>,
+    class_static_attributes: RefCell<HashMap<TextRange, Vec<String>>>,
 }
 
 impl Context {
@@ -51,7 +53,30 @@ impl Context {
             scope_stack: RefCell::new(vec![ScopeFrame::module()]),
             value_forwarding_local_stack: RefCell::new(vec![HashSet::new()]),
             no_raise_local_stack: RefCell::new(vec![HashSet::new()]),
+            class_static_attributes: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn record_class_static_attributes(
+        &self,
+        class_range: TextRange,
+        attributes: Vec<String>,
+    ) {
+        let previous = self
+            .class_static_attributes
+            .borrow_mut()
+            .insert(class_range, attributes);
+        assert!(
+            previous.is_none(),
+            "class static attributes were already recorded for source range {class_range:?}"
+        );
+    }
+
+    pub(crate) fn class_static_attributes(&self, class_range: TextRange) -> Option<Vec<String>> {
+        self.class_static_attributes
+            .borrow()
+            .get(&class_range)
+            .cloned()
     }
 
     pub(crate) fn line_number_at(&self, offset: usize) -> usize {
