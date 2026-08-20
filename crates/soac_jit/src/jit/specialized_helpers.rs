@@ -221,6 +221,55 @@ enum GuardedGeneratorBuiltin {
     All,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VectorcallCallableKind {
+    GenericOnly,
+    ExactBuiltinNext,
+    ExactBuiltinGeneratorConsumer,
+    ExactPythonTwoArgs,
+}
+
+unsafe fn vectorcall_callable_kind(
+    callable: ObjPtr,
+    args: ObjPtr,
+    nargsf: ObjPtr,
+    kwnames: ObjPtr,
+) -> VectorcallCallableKind {
+    if !kwnames.is_null() || args.is_null() || callable.is_null() {
+        return VectorcallCallableKind::GenericOnly;
+    }
+    let nargs = ffi::PyVectorcall_NARGS(nargsf as usize);
+    if nargs != 1 && nargs != 2 {
+        return VectorcallCallableKind::GenericOnly;
+    }
+    let callable_type = (*callable.cast::<ffi::PyObject>()).ob_type;
+    if callable_type == ptr::addr_of_mut!(PyFunction_Type) {
+        if nargs == 2 {
+            VectorcallCallableKind::ExactPythonTwoArgs
+        } else {
+            VectorcallCallableKind::GenericOnly
+        }
+    } else if callable_type != ptr::addr_of_mut!(ffi::PyCFunction_Type) {
+        VectorcallCallableKind::GenericOnly
+    } else {
+        let method = (*callable.cast::<ffi::PyCFunctionObject>()).m_ml;
+        if method.is_null() || (*method).ml_name.is_null() {
+            return VectorcallCallableKind::GenericOnly;
+        }
+        let name = (*method).ml_name;
+        if (*method).ml_flags == ffi::METH_FASTCALL
+            && *name == b'n'
+            && CStr::from_ptr(name) == c"next"
+        {
+            VectorcallCallableKind::ExactBuiltinNext
+        } else if (*method).ml_flags == ffi::METH_O && nargs == 1 && *name == b'a' {
+            VectorcallCallableKind::ExactBuiltinGeneratorConsumer
+        } else {
+            VectorcallCallableKind::GenericOnly
+        }
+    }
+}
+
 unsafe fn guarded_generator_builtin_kind(
     callable: ObjPtr,
     args: ObjPtr,
@@ -270,26 +319,27 @@ unsafe extern "C" fn py_vectorcall_hook(
         );
         return ptr::null_mut();
     }
-    if kwnames.is_null() && !args.is_null() {
-        let nargs = ffi::PyVectorcall_NARGS(nargsf as usize);
-        if nargs == 1 || nargs == 2 {
+    match vectorcall_callable_kind(callable, args, nargsf, kwnames) {
+        VectorcallCallableKind::ExactBuiltinNext => {
             if let Some(result) = fast_builtin_next_range_iter(callable, args, nargsf, kwnames) {
                 return result;
             }
-            if nargs == 2 {
-                if let Some(result) =
-                    fast_runtime_stop_iteration_match(callable, args, nargsf, kwnames)
-                {
-                    return result;
-                }
-            } else if let Some(kind) =
-                guarded_generator_builtin_kind(callable, args, nargsf, kwnames)
+        }
+        VectorcallCallableKind::ExactBuiltinGeneratorConsumer => {
+            if let Some(kind) = guarded_generator_builtin_kind(callable, args, nargsf, kwnames)
                 && let Some(result) =
                     fast_guarded_generator_builtin_consumption(callable, args, kind)
             {
                 return result;
             }
         }
+        VectorcallCallableKind::ExactPythonTwoArgs => {
+            if let Some(result) = fast_runtime_stop_iteration_match(callable, args, nargsf, kwnames)
+            {
+                return result;
+            }
+        }
+        VectorcallCallableKind::GenericOnly => {}
     }
     ffi::_PyObject_VectorcallTstate(
         tstate as *mut ffi::PyThreadState,
@@ -392,23 +442,239 @@ fn canonical_generator_consumers_use_the_actual_vectorcall_dispatch() {
     );
 }
 
-unsafe fn cached_builtin_next() -> *mut ffi::PyObject {
-    static BUILTIN_NEXT: OnceLock<usize> = OnceLock::new();
-    *BUILTIN_NEXT.get_or_init(|| {
-        let builtins = ffi::PyEval_GetBuiltins();
-        if builtins.is_null() {
-            return 0;
+#[cfg(test)]
+#[test]
+fn vectorcall_callable_kind_partitions_exact_cpython_callables() {
+    use pyo3::prelude::*;
+
+    unsafe extern "C" fn eager_like_identity(
+        _owner: *mut ffi::PyObject,
+        argument: *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject {
+        unsafe { ffi::Py_INCREF(argument) };
+        argument
+    }
+
+    let _guard = crate::python_runtime_test_lock().lock().unwrap();
+    crate::initialize_test_python();
+    Python::attach(|py| unsafe {
+        let builtins = py.import("builtins").expect("builtins should import");
+        let next = builtins.getattr("next").expect("builtin next should exist");
+        let any = builtins.getattr("any").expect("builtin any should exist");
+        let all = builtins.getattr("all").expect("builtin all should exist");
+        let len = builtins.getattr("len").expect("builtin len should exist");
+        let iter = builtins.getattr("iter").expect("builtin iter should exist");
+        let mut eager_definition = ffi::PyMethodDef {
+            ml_name: c"<eager comprehension>".as_ptr(),
+            ml_meth: ffi::PyMethodDefPointer {
+                PyCFunction: eager_like_identity,
+            },
+            ml_flags: ffi::METH_O,
+            ml_doc: ptr::null(),
+        };
+        let eager = ffi::PyCFunction_NewEx(
+            ptr::addr_of_mut!(eager_definition),
+            ffi::Py_None(),
+            ptr::null_mut(),
+        );
+        assert!(
+            !eager.is_null(),
+            "an actual eager-shaped C callable should exist"
+        );
+        let eager = Bound::<PyAny>::from_owned_ptr(py, eager);
+        let one_arg = py
+            .eval(c"lambda value: value", None, None)
+            .expect("one-argument Python function should exist");
+        let two_args = py
+            .eval(c"lambda first, second: first", None, None)
+            .expect("two-argument Python function should exist");
+        let bound_method = py
+            .eval(
+                c"type('Owner', (), {'method': lambda self, value: value})().method",
+                None,
+                None,
+            )
+            .expect("bound Python method should exist");
+        let arguments = [ffi::Py_None(), ffi::Py_None()];
+        let argument_ptr = arguments.as_ptr().cast::<c_void>().cast_mut();
+        let no_keywords = ptr::null_mut();
+
+        assert_eq!(
+            vectorcall_callable_kind(
+                one_arg.as_ptr().cast(),
+                argument_ptr,
+                1usize as ObjPtr,
+                no_keywords,
+            ),
+            VectorcallCallableKind::GenericOnly,
+            "ordinary exact Python one-argument calls cannot select a C-builtin fast path"
+        );
+        assert_eq!(
+            vectorcall_callable_kind(
+                bound_method.as_ptr().cast(),
+                argument_ptr,
+                1usize as ObjPtr,
+                no_keywords,
+            ),
+            VectorcallCallableKind::GenericOnly,
+            "bound Python methods cannot select any builtin or exception matcher"
+        );
+        assert_eq!(
+            vectorcall_callable_kind(
+                two_args.as_ptr().cast(),
+                argument_ptr,
+                2usize as ObjPtr,
+                no_keywords,
+            ),
+            VectorcallCallableKind::ExactPythonTwoArgs,
+            "exact two-argument Python functions retain the StopIteration matcher"
+        );
+        for callable in [&any, &all] {
+            assert_eq!(
+                vectorcall_callable_kind(
+                    callable.as_ptr().cast(),
+                    argument_ptr,
+                    1usize as ObjPtr,
+                    no_keywords,
+                ),
+                VectorcallCallableKind::ExactBuiltinGeneratorConsumer,
+                "exact any/all C builtins retain guarded generator consumption"
+            );
         }
-        let next = ffi::PyDict_GetItemString(builtins, c"next".as_ptr());
-        if next.is_null() {
-            if !ffi::PyErr_Occurred().is_null() {
-                ffi::PyErr_Clear();
-            }
-            return 0;
+        assert_eq!(
+            vectorcall_callable_kind(
+                next.as_ptr().cast(),
+                argument_ptr,
+                1usize as ObjPtr,
+                no_keywords,
+            ),
+            VectorcallCallableKind::ExactBuiltinNext,
+            "one-argument builtin next retains its range-iterator specialization"
+        );
+        for callable in [&eager, &len, &iter] {
+            assert_eq!(
+                vectorcall_callable_kind(
+                    callable.as_ptr().cast(),
+                    argument_ptr,
+                    1usize as ObjPtr,
+                    no_keywords,
+                ),
+                VectorcallCallableKind::GenericOnly,
+                "eager, len, and iter C callables cannot select next or any/all"
+            );
         }
+        assert_eq!(
+            vectorcall_callable_kind(
+                next.as_ptr().cast(),
+                argument_ptr,
+                2usize as ObjPtr,
+                no_keywords,
+            ),
+            VectorcallCallableKind::ExactBuiltinNext,
+            "two-argument builtin next retains its default-value specialization"
+        );
+        assert_eq!(
+            vectorcall_callable_kind(
+                next.as_ptr().cast(),
+                argument_ptr,
+                (1usize | ffi::PY_VECTORCALL_ARGUMENTS_OFFSET) as ObjPtr,
+                no_keywords,
+            ),
+            VectorcallCallableKind::ExactBuiltinNext,
+            "CPython's arguments-offset flag must not change positional arity"
+        );
+        assert_eq!(
+            vectorcall_callable_kind(
+                next.as_ptr().cast(),
+                argument_ptr,
+                1usize as ObjPtr,
+                ffi::Py_None().cast(),
+            ),
+            VectorcallCallableKind::GenericOnly,
+            "keyword calls retain ordinary CPython dispatch"
+        );
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn vectorcall_callable_kind_rejects_rebound_next_without_poisoning_cache() {
+    use pyo3::prelude::*;
+
+    let _guard = crate::python_runtime_test_lock().lock().unwrap();
+    crate::initialize_test_python();
+    Python::attach(|py| unsafe {
+        let builtins = py.import("builtins").expect("builtins should import");
+        let original = builtins.getattr("next").expect("builtin next should exist");
+        let replacement = builtins.getattr("len").expect("builtin len should exist");
+        let dictionary = ffi::PyModule_GetDict(builtins.as_ptr());
+        assert!(
+            !dictionary.is_null(),
+            "builtins must have a live dictionary"
+        );
+        let cache = OnceLock::new();
+
+        assert_eq!(
+            ffi::PyDict_SetItemString(dictionary, c"next".as_ptr(), replacement.as_ptr()),
+            0,
+            "temporarily replacing builtin next should succeed"
+        );
+        let observed = cached_builtin_next_with(&cache);
+        let cached_replacement = cache.get().copied();
+        assert_eq!(
+            ffi::PyDict_SetItemString(dictionary, c"next".as_ptr(), original.as_ptr()),
+            0,
+            "the canonical builtin next must be restored before any assertion"
+        );
+        if cached_replacement == Some(replacement.as_ptr() as usize) {
+            ffi::Py_DECREF(replacement.as_ptr());
+        }
+
+        assert!(
+            observed.is_null(),
+            "a rebound builtin next must not turn another C callable into next"
+        );
+        assert!(
+            cache.get().is_none(),
+            "invalid builtin bindings must not permanently initialize the next cache"
+        );
+
+        let restored = cached_builtin_next_with(&cache);
+        assert_eq!(restored, original.as_ptr());
+        assert_eq!(cache.get().copied(), Some(original.as_ptr() as usize));
+        ffi::Py_DECREF(restored);
+    });
+}
+
+unsafe fn cached_builtin_next_with(cache: &OnceLock<usize>) -> *mut ffi::PyObject {
+    if let Some(&cached) = cache.get() {
+        return cached as *mut ffi::PyObject;
+    }
+    let builtins = ffi::PyEval_GetBuiltins();
+    if builtins.is_null() {
+        return ptr::null_mut();
+    }
+    let next = ffi::PyDict_GetItemString(builtins, c"next".as_ptr());
+    if next.is_null() {
+        if !ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_Clear();
+        }
+        return ptr::null_mut();
+    }
+    if !stop_iteration_exact_builtin(next, c"next", builtins)
+        || (*(*next.cast::<ffi::PyCFunctionObject>()).m_ml).ml_flags != ffi::METH_FASTCALL
+    {
+        return ptr::null_mut();
+    }
+    *cache.get_or_init(|| {
         ffi::Py_INCREF(next);
         next as usize
     }) as *mut ffi::PyObject
+}
+
+unsafe fn cached_builtin_next() -> *mut ffi::PyObject {
+    static BUILTIN_NEXT: OnceLock<usize> = OnceLock::new();
+    cached_builtin_next_with(&BUILTIN_NEXT)
 }
 
 unsafe fn fast_builtin_next_range_iter(
@@ -1397,6 +1663,7 @@ unsafe fn consume_guarded_generator_builtin(
     ffi::PyBool_FromLong((kind == GuardedGeneratorBuiltin::All) as libc::c_long)
 }
 
+#[inline(never)]
 unsafe fn fast_guarded_generator_builtin_consumption(
     callable: ObjPtr,
     args: ObjPtr,

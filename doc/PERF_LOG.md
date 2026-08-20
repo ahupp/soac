@@ -1772,3 +1772,7 @@ and inconclusive strategy history in `doc/optimization-attempts/` instead.
   `richards` `1.0847x` (`23.626 ms` to `21.780 ms`); ordinary native
   remains `54,686,760 B`, hidden trampolines grow `746,520 B` to
   `777,240 B`. Full-suite stock `1.10x` remains unmet.
+
+## 2026-08-19 - Partition vectorcall callable kinds and validate builtin next
+
+- `wmyqzzsr`: fix rebound-`next` CPython `TypeError` mismatch and partition exact callable metadata; fixed-eight stock `0.655558x` / noisy previous `0.985063x`; repeated stock `0.535804x` / previous `1.013271x`, `chaos` `40.004 → 38.939 ms` (`1.05058x` stock-paired); generated native and hidden code unchanged.

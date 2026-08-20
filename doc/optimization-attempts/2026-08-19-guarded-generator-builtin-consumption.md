@@ -4,7 +4,8 @@ title: "Guarded Generator Builtin Consumption"
 
 # Guarded generator builtin consumption
 
-- Status: **IN PROGRESS; TWO INDEPENDENT GENUINE UNCHANGED-PRODUCTION
+- Status: **SAME-STRATEGY ATTEMPT 2 IN PROGRESS; HISTORICAL ATTEMPT 1
+  LANDED / RETAIN; TWO INDEPENDENT GENUINE UNCHANGED-PRODUCTION
   STOCK-VS-SOAC SEMANTIC AND EXPORTED-VECTORCALL STRUCTURED REDS
   CONFIRMED; EXACT TWO-FILE IMPLEMENTATION COMPILES; BOTH ACTUAL
   STOCK-PARITY INTEGRATION AND EXPORTED-VECTORCALL REGRESSION
@@ -24,6 +25,39 @@ title: "Guarded Generator Builtin Consumption"
   AND RECOVERS RICHARDS; MATCHED ZERO-LOSS PROFILES COMPLETE;
   LANDED CANDIDATE / RETAIN; AUTHORITATIVE FULL GATE PASSES
   1,229 PYTHON NODEIDS / 92 BATCHES AND ALL RUST SUITES**.
+- Current Attempt 2: **source-backed callable-kind selector partition;
+  simplified unchanged-production real stock / Profile → Verify → Apply
+  integration GREEN 1 passed / 3.59 seconds; earlier larger Verify
+  exit -11 remains UNKNOWN and discarded; genuine fresh-process
+  existing-exported-vectorcall builtin-next rebinding CPython mismatch
+  CONFIRMED, stock TypeError versus SOAC integer 0; formal real
+  fresh-subprocess pytest semantic RED 1 failed / 0.06 seconds;
+  production-used exact-Python callable classifier RED and isolated
+  fresh-OnceLock noncanonical-cache RED both VERIFIED; one-file canonical
+  callable-kind / retryable exact-next implementation SAVED, formatted,
+  and independently reviewed; both actual structured RED → GREEN
+  2 passed / 575 filtered; both final real transformed/cache Python
+  regressions GREEN 2 / 2 in 3.35 seconds, including genuine CPython
+  semantic RED → GREEN; retained StopIteration / guarded-generator
+  controls GREEN 6 / 6; full JIT 577 / optimizer 214 / typed IR 54 GREEN;
+  broad transformed matrix GREEN 24 / 24 in 49.03 seconds; combined
+  optimizer/JIT test-target and scoped package-format checks GREEN;
+  first release smoke 8 / 8 native invariant; first fixed-eight stock
+  0.6437736503135402x / previous 0.9491163878989439x, all workloads
+  slower; release hook stack total 816 → 1,216 bytes; FIRST CALLABLE-KIND
+  CANDIDATE REJECTED AS-IS; same-file exact-C method-flags/name
+  partition and non-inlined consumer refinement SAVED; genuine
+  real-CPython eager-callable production-classifier refinement RED →
+  GREEN 2 / 2; refined actual transformed/cache/retained controls GREEN
+  8 / 8 in 14.58 seconds; fresh JIT 577 / optimizer 214 / typed IR 54 /
+  broad transformed 24 in 45.69 seconds GREEN; final combined check /
+  scoped format check GREEN; refined release hook frame 848 versus
+  rejected 1,216 bytes; clean repeated target stock 0.5358039397819471x
+  / previous 1.0132710404047143x, chaos paired 1.050575x; genuine
+  builtin-next CPython fix plus paired chaos gain / other workloads
+  neutral; authoritative full gate GREEN 1,237 Python nodeids / 99
+  isolated batches / all Rust suites: FULLY VALIDATED RETAIN LANDING
+  CANDIDATE**.
 - Pacific date: **2026-08-19 PDT**.
 - Baseline revision: integrated `main` change **`wnlnpkrp`**, commit
   **`2bb19f4f`**.
@@ -953,3 +987,447 @@ title: "Guarded Generator Builtin Consumption"
   **ccef62b6** as though it were current baseline **2bb19f4f**. Decide
   preserve the historical first-gate failure and durable existing-test
   correction. The complete-suite **1.10x stock** target remains unmet.
+
+## Attempt 2: callable-kind partition of existing vectorcall selectors
+
+- Chronology: reopen the **same guarded-generator selector strategy**
+  after its original implementation and argument-shape refinement were
+  independently validated, retained, and integrated. Preserve all
+  Attempt 1 semantics, rejected measurements, final gains, and historical
+  gate evidence above. This new iteration addresses residual dispatch
+  overhead in the **same** existing `py_vectorcall_hook`; it does not
+  reopen the original generator-consumption compatibility defect.
+- Integrated baseline: current `main` change **`yknrqtlm`**, commit
+  **`5dc5f9aa`**. Proposed candidate change **`wmyqzzsr`**, initially
+  observed at mutable working commit **`2199c2c6`**; later snapshots can
+  change that commit identity.
+- Fresh retained lossless profiles identify **disjoint hook self time**:
+  `deltablue` **6.1782%**, `richards` **5.7537%**, and
+  `comprehensions` **1.8623%**. In current `richards`, the nearest child
+  of that hook is necessary bound-method vectorcall for **54.428581%**
+  of weighted samples and exact source-function trampolines for other
+  samples; in `comprehensions`, guarded generator consumption alone
+  accounts for **20.487751%** and eager comprehension dispatch for
+  **27.929109%**. These child shares contain required execution, overlap
+  with outer call ancestry, and **must not be added to hook self time or
+  treated as removable speedup**. The bounded hypothesis is only that
+  existing selectors waste work when the callable's exact kind makes
+  their result impossible.
+- Retained fixed-eight release smoke is
+  **`work/pyperformance/comparison-20260819-201043-WFkwCD`**: ordinary
+  source-native **2,238,412 bytes / 147,769 blocks**, hidden trampolines
+  **38,108 bytes**, **397 total JIT source rows including adapters / 204
+  actual direct-function-body rows**, and **2,866 typed blocks / 204
+  functions**. Debug-single timing is not performance evidence.
+- Retained normally sampled fixed-eight comparison is
+  **`work/pyperformance/comparison-20260819-201359-gbo734`**, official
+  stock **0.6694448241941483x**. Its **80 Apply workers / 3,970 total
+  JIT source rows including adapters / 2,040 direct-function-body
+  rows** contain exactly **23,159,960 ordinary native bytes / 1,524,970
+  machine blocks / 381,080 hidden trampoline bytes**, with **2,866 typed
+  blocks / 204 functions**.
+- Retained clean three-round targeted comparison is
+  **`work/pyperformance/comparison-20260819-201901-6RB1cs`**, official
+  stock **0.525149227454957x**. Its **120 Apply workers / 10,650 total
+  JIT source rows including adapters / 5,490 direct-function-body rows**
+  contain exactly **54,686,760 ordinary native bytes / 3,596,430 machine
+  blocks / 777,240 hidden trampoline bytes**, with **2,265 typed blocks /
+  183 functions**. Baseline targeted medians are `deltablue`
+  **2.318359 ms**, `richards` **21.780125 ms**, and `chaos`
+  **40.003514 ms**. The full pyperformance-suite stock **1.10x** goal
+  remains unmet and unmeasured.
+- Proposed runtime implementation is **exactly one existing production
+  file**: `crates/soac_jit/src/jit/specialized_helpers.rs`. Preserve the
+  existing live-thread-state/null error check and existing null-keyword,
+  nonnull-arguments, and one-/two-argument partition. For a proven
+  nonnull callable, cheaply classify its exact existing CPython
+  `ob_type`; `PyFunction_Type`, `PyMethod_Type`, and `PyCFunction_Type`
+  are already available in this file.
+- Independent source inspection additionally finds an existing
+  first-initialization hazard in `cached_builtin_next`: its process-wide
+  `OnceLock` lazily snapshots the current `builtins["next"]` and keeps
+  that object without proving it is the canonical builtin `next`. A
+  rebound exact C builtin such as `len` can therefore become the cached
+  candidate; the proposed callable-kind partition may shift which call
+  first initializes that cache.
+- A genuine unchanged-production **fresh-process user-visible CPython
+  mismatch is now independently CONFIRMED** through the actual existing
+  exported `dp_jit_py_vectorcall` path: rebind `builtins.next = len`,
+  then invoke `len(iter(range(3)))`. Stock CPython correctly raises
+  **`TypeError`**; SOAC's existing unvalidated `OnceLock` instead caches
+  the rebound `len` as though it were canonical `next`, enters the
+  range-iterator fast path, and incorrectly returns integer **`0`**, with
+  explicit observed marker **`SOAC_WRONG_NEXT_RESULT 0`**. This is
+  actual fresh-subprocess repo-native behavior evidence, not merely a
+  hypothetical source risk.
+- The formal unchanged-production semantic regression
+  **`test_rebound_builtin_next_does_not_change_another_builtin`** now
+  independently fails **1 test in 0.06 seconds**. A fresh real Python
+  subprocess reaches the actual existing exported
+  `dp_jit_py_vectorcall` path after `builtins.next = len`; stock
+  **`TypeError`** and SOAC's incorrect integer **`0`** produce the
+  intended genuine user-visible CPython **RED**. The frozen regression
+  additionally requires restoration and rebinding controls after the
+  eventual correction; those are not claimed GREEN before
+  implementation.
+- An independent real-CPython **production-consumed callable-kind
+  classifier structural RED** is now verified before any functional
+  implementation. A real exact Python function called with one argument
+  currently selects **`ExactBuiltinOneArg`** instead of required
+  **`GenericOnly`**; this is the actual production selector decision,
+  not a fake classifier, rendered IR, or changed Python result.
+- A third independent **production-used fresh-cache structural RED** is
+  also verified: a fresh local `OnceLock` accepts rebound builtin
+  **`len`** as though it were canonical `next`. An initial combined Rust
+  run's second failure arose from shared Python test-mutex poisoning and
+  is explicitly **not counted** as a genuine independent RED; the
+  subsequent isolated fresh-cache rerun exposes the real intended
+  noncanonical-cache failure. Thus all **three** real semantic /
+  callable-kind / fresh-cache REDs precede functional correction.
+- The subsequent **final implementation is saved in exactly the same one
+  existing production file**,
+  `crates/soac_jit/src/jit/specialized_helpers.rs`, and independently
+  host-source-reviewed. Its production-used exact callable / positional
+  arity classifier selects exact Python **two arguments** only for the
+  existing runtime `StopIteration` matcher, exact C **one argument** for
+  existing `next` and canonical `any` / `all`, and exact C **two
+  arguments** for existing `next(iterator, default)`. Exact Python
+  one-argument functions, bound methods, custom callables, keywords,
+  invalid shapes, and every other kind skip impossible probes and use the
+  original live CPython fallback. Existing thread-state/null checks,
+  original `nargsf` offset flags, keyword tuple, ownership, mutation,
+  callbacks, and errors remain unchanged.
+- Its existing `next` cache now verifies the **exact `PyCFunction`
+  identity class**, immutable C method name **`next`**, owning exact
+  builtins module and its current dictionary, and exact
+  **`METH_FASTCALL`** flags before initializing the same preexisting
+  `OnceLock`. Missing, invalid, or rebound `builtins.next` leave that
+  lock empty, take the original generic fallback, and perform **no
+  INCREF**; later restoration can retry successfully and only a valid
+  canonical value is cached. No runtime helper, public API, global state,
+  typed IR, or generated source/native-body shape is added.
+- Both genuine production-used real-CPython structured regressions now
+  independently turn **RED → GREEN together: 2 passed / 575 filtered**.
+  Exact callable types / argument shapes select their proper partitions,
+  and fresh `OnceLock` initialization rejects rebound `len` while
+  retaining retry after canonical restoration. The runtime package was
+  scoped-formatted **before** candidate transformed pytest.
+- Both final new real Python regressions now independently pass
+  **2 / 2 in 3.35 seconds**. The genuine unchanged-production
+  user-visible cache regression turns **RED → GREEN**: rebound
+  `builtins.next = len` again produces stock-matching `TypeError`,
+  canonical restoration initializes the retryable cache correctly, and
+  a later rebound does not misclassify an unrelated builtin. The second
+  actual stock / **Profile → Verify → Apply** compatibility regression
+  preserves exact Python functions, bound methods, custom callables,
+  exact C `next` / default / `len`, canonical `any` / `all` source
+  generators, keyword fallback, profile counters, and native rows.
+- Explicit retained transformed `StopIteration` mutations / observer
+  controls and existing guarded-generator `any` / `all` consumption now
+  pass **6 / 6**, preserving the original same-strategy optimizations.
+  Fresh complete Rust libraries independently pass JIT **577 / 577**,
+  optimizer **214 / 214**, and typed IR **54 / 54**. The broad actual
+  transformed compatibility matrix passes **24 / 24 in 49.03 seconds**;
+  combined **`cargo check -p soac_opt -p soac_jit --tests`** and scoped
+  **`just fmt-rust-check soac_jit`** also pass. The first release smoke
+  and normally sampled comparison are complete, with the latter rejecting
+  this performance shape. At this historical first-candidate checkpoint,
+  refined implementation / validation, clean repeated comparisons,
+  matched causal native profiles, and the authoritative full correctness
+  gate were **PENDING**; subsequent refinement evidence appears below.
+- First callable-kind release debug-single smoke, artifact prefix
+  **`comparison-20260819-210628`**, completes all **8 actual measured
+  Apply PIDs**. Every **397 total JIT source rows including adapters /
+  204 actual direct-function-body rows** matches the retained revision;
+  ordinary native output remains exactly **2,238,412 bytes / 147,769
+  machine blocks**, and hidden trampolines remain exactly **38,108
+  bytes**. Cold debug-single timing is **INVALID** as throughput
+  evidence.
+- The first normally sampled eight-workload candidate,
+  **`work/pyperformance/comparison-20260819-210810-icWMdh`**, versus
+  retained **`work/pyperformance/comparison-20260819-201359-gbo734`**,
+  falls to official stock **0.6437736503135402x**, versus retained
+  **0.6694448241941483x**; official previous-SOAC comparison is
+  **0.9491163878989439x**. All **80 measured Apply PIDs / 3,970 total
+  JIT source rows including adapters / 2,040 actual direct-function-body
+  rows** retain exact source identities, ordinary body bytes, and machine
+  blocks: **23,159,960 ordinary native bytes / 1,524,970 blocks**,
+  **381,080 hidden trampoline bytes**, and **2,866 typed blocks / 204
+  functions**, with **40,526 structured events / zero errors**. All eight
+  worker-median speedup estimates worsen. `chaos` rises **39.5965 →
+  41.435 ms**, raw **0.955635x**, 95% CI **[0.91289, 0.98767]**, paired
+  **0.976189x**; `comprehensions` rises **42.501 → 44.603 µs**, raw
+  **0.952869x**, paired **0.968524x**; `deltablue` rises **2.27527 →
+  2.43243 ms**, raw **0.935389x**, 95% CI **[0.90212, 0.97881]**, paired
+  **0.970926x**; and `richards` rises **22.4035 → 22.7932 ms**, raw
+  **0.982899x**, paired **0.982115x**. No repeated targeted comparison
+  was run for this rejected shape.
+- Actual release AArch64 `py_vectorcall_hook` disassembly identifies a
+  plausible replacement-cost mechanism despite unchanged generated JIT
+  output: retained **736-byte stack allocation + 80 bytes of saved
+  registers = 816 bytes**, versus candidate **1,120-byte allocation + 96
+  saved bytes = 1,216 bytes**. This is **+384 allocated bytes / +400
+  total bytes**, approximately **49% total stack growth**. Heavy existing
+  guarded-generator consumption is newly inlined into the ordinary hook,
+  while cached-next lookup becomes an out-of-line call. The genuine
+  canonical builtin-next correctness fix remains valuable, but this
+  first callable-kind implementation is **REJECTED AS-IS**; preserve the
+  fix while refining dispatch inlining / stack shape within the same
+  strategy before remeasurement.
+- The approved **saved same-strategy refinement** remains within
+  existing `crates/soac_jit/src/jit/specialized_helpers.rs`: gate
+  masked positional arity earlier, then inspect the actual exact C
+  `PyCFunction` method definition's `m_ml` flags and immutable name.
+  Only exact **`METH_FASTCALL` + name `next`** can enter the existing
+  canonical one-/two-argument `next` selector; exact **`METH_O` + names
+  starting `a`** may proceed to existing canonical `any` / `all`
+  identity/consumption checks **without touching the `next` cache**.
+  Compiler-created **`<eager
+  comprehension>`**, `len`, `iter`, and unrelated exact C functions must
+  bypass impossible builtin candidates and retain unchanged live CPython
+  fallback. Preserve the exact-Python two-argument `StopIteration`
+  matcher, original flags/keywords/ownership semantics, and the genuine
+  validated/retryable canonical builtin-next correctness fix.
+- The saved refinement marks the existing heavy guarded-generator
+  consumer **`#[inline(never)]`**, intending to restore its previous
+  standalone release helper instead of inlining large cold machinery
+  into every `py_vectorcall_hook` activation. Later independent release
+  disassembly confirms standalone-consumer restoration and frame
+  recovery as recorded below.
+- A fourth **genuine production-used structured refinement RED** is now
+  independently verified on the unchanged first-candidate classifier:
+  pinned real CPython **`PyCFunction_NewEx`** constructs an exact C
+  eager-style callable with **`ml_name = "<eager comprehension>"`** and
+  **`METH_O`** flags. The actual production-consumed classifier
+  incorrectly returns **`ExactBuiltinOneArg`**, although this non-builtin
+  callable requires **`GenericOnly`**; the focused Rust run genuinely
+  fails **1 test / 576 filtered**. The same test includes subsequent
+  exact `len` **`METH_O`** and `iter` **`METH_FASTCALL`** controls; the
+  historical RED's first eager-callable failure occurred before those
+  controls were independently reached.
+- The refined actual production-consumed structured regressions now turn
+  genuinely **RED → GREEN: 2 / 2**. Real exact CPython C callables for
+  eager **`<eager comprehension>`**, `len`, and `iter` all correctly
+  select **`GenericOnly`**. The four remaining route families are exact
+  canonical `next` with one/two arguments, canonical `any` / `all`
+  without next-cache initialization, exact Python two-argument
+  `StopIteration` matching, and unchanged generic CPython fallback.
+  Early masked arity, immutable method flags/full `next` name, and the
+  existing consumer's **`#[inline(never)]`** preserve the saved genuine
+  validated/retryable builtin-next correctness fix. Package-scoped
+  formatting completed **before** refined candidate pytest.
+- Final refined actual semantic / stock versus **Profile → Verify →
+  Apply** / retained `StopIteration` matcher and guarded `any` / `all`
+  integration controls independently pass **8 / 8 in 14.58 seconds**.
+  Fresh full Rust libraries pass JIT **577 / 577**, optimizer **214 /
+  214**, and typed IR **54 / 54**; broad transformed compatibility again
+  passes **24 / 24 in 45.69 seconds**, and scoped package formatting is
+  complete. Fresh final **`cargo check -p soac_opt -p soac_jit --tests`**
+  and **`just fmt-rust-check soac_jit`** both independently pass.
+- Refined release smoke, artifact prefix
+  **`comparison-20260819-212319`**, completes all **8 actual Apply
+  workers / 397 total JIT source rows including adapters / 204 actual
+  direct-function-body rows** with exact retained ordinary native
+  **2,238,412 bytes / 147,769 machine blocks** and hidden trampolines
+  **38,108 bytes**. Debug-single smoke timing is not throughput
+  evidence. Independent actual AArch64 `py_vectorcall_hook` release
+  disassembly measures retained **816 bytes (736 allocated + 80 saved)**,
+  rejected first candidate **1,216 bytes (1,120 + 96)**, and refined
+  candidate **848 bytes (752 + 96)**. The heavy existing guarded consumer
+  is restored as a standalone symbol and cached-`next` access is
+  reinlined; the refined frame is **32 bytes above retained / 368 bytes
+  below the rejected candidate**.
+- Refined normally sampled fixed-eight comparison, artifact prefix
+  **`comparison-20260819-212444`**, versus retained
+  **`comparison-20260819-201359-gbo734`** reports official stock
+  **0.6555584208465822x** and previous-SOAC **0.9850631879265838x**.
+  Three huge `deltablue` worker outliers contaminate that official
+  previous-SOAC figure; robust worker-median ratios are `chaos`
+  **0.991714x**, `comprehensions` **1.000107x**, `deltablue`
+  **1.004255x**, and `richards` **1.004683x**. All **80 actual Apply
+  workers / 3,970 total JIT source rows including adapters / 2,040
+  direct-function-body rows** retain exactly **23,159,960 ordinary
+  native bytes / 1,524,970 machine blocks / 381,080 hidden trampoline
+  bytes**; fixed-eight comparisons therefore require the clean repeated
+  target for adjudication.
+- Definitive clean three-round targeted comparison, artifact prefix
+  **`comparison-20260819-212748`**, versus retained
+  **`comparison-20260819-201901-6RB1cs`**, reports official stock
+  **0.5358039397819471x** versus retained **0.525149227454957x**, with
+  official previous-SOAC **1.0132710404047143x**. Across **30 measured
+  workers / three independent rounds per workload**, `chaos` improves
+  **40.003514 → 38.9389 ms**, raw **1.027341x**, 95% interval
+  **[0.98765, 1.04542]**, and stock-paired **1.050575x [1.00704,
+  1.06769]**, with raw improvement in **all three rounds**; only the
+  paired interval establishes a significant gain. `comprehensions`
+  remains neutral, **42.6434 → 42.8007 µs**, raw **0.996325x [0.97735,
+  1.01250]**, paired **1.012721x [0.99243, 1.02994]**; `deltablue`
+  remains neutral, **2.318359 → 2.30527 ms**, raw **1.005678x [0.98765,
+  1.03203]**, paired **1.008781x [0.98564, 1.03888]**; and `richards`
+  remains neutral, **21.780125 → 21.8213 ms**, raw **0.998112x
+  [0.98426, 1.02334]**, paired **0.994283x [0.97720, 1.01641]**. All
+  **120 actual measured Apply workers / 10,650 total JIT source rows
+  including adapters / 5,490 direct-function-body rows** retain exactly
+  **54,686,760 ordinary native bytes / 3,596,430 machine blocks /
+  777,240 hidden trampoline bytes / 2,265 typed blocks / 183 functions**,
+  with **100,206 structured events / zero errors**.
+- Matched zero-loss native profiles show workload-specific, not universal,
+  helper-self effects: `richards` **226 → 228 samples** decreases
+  **5.753704% → 4.385509% (−1.368195 percentage points)**; `deltablue`
+  **178 → 160 samples** remains neutral at **6.178208% → 6.25%**; and
+  `comprehensions` **537 → 545 samples** increases **1.862341% →
+  3.672922% (+1.810581 percentage points)** despite neutral throughput.
+  New `strlen` self contributes **0.366491 percentage points**. Restored
+  standalone-consumer and nested eager frames overlap; do not sum
+  inclusive ancestry or present the sample-limited helper differences as
+  proof of universal gains.
+- Refined verdict: **FULLY VALIDATED RETAIN LANDING CANDIDATE** because
+  it fixes the genuine stock-visible builtin-next `TypeError` mismatch,
+  shows significant stock-paired three-round `chaos` improvement, and
+  keeps the other repeated workloads statistically neutral with exact
+  generated-native invariance. The authoritative full **`just test-all`**
+  correctness gate subsequently passes as recorded below. This is not a
+  claim of an already landed change, universal speedup, or the still-
+  unmet full-suite stock **1.10x** goal.
+- Final authoritative **`just test-all`** correctness gate is **GREEN**;
+  see **`work/logs/vectorcall-callable-kind-test-all.log`**. Exactly
+  **1,237 transformed Python nodeids / 99 isolated file batches / eight
+  workers** complete **99 PASS / zero failures**. Rust suites pass JIT
+  **577 / 577 in 14.65 seconds**, optimizer **214 / 214 in 0.56
+  seconds**, typed IR **54 / 54**, lowering **371 / 371 in 0.47
+  seconds**, and PyO3 extension **8 / 8 in 0.11 seconds**. Runtime build
+  takes **1.680 seconds**, the Cargo phase **56.927 seconds**, pytest
+  **74.331 seconds inner / 74.345 seconds outer**, and the total full
+  test phase **131.284 seconds**. The new callable-kind / genuine cache
+  compatibility integration's **two nodeids pass in 3.89 seconds**; the
+  known **28-node counter shard takes 73.83 seconds**. Final state is
+  **FULLY VALIDATED RETAIN LANDING CANDIDATE**, not already landed.
+- Preserve all existing C-builtin selectors: exact `builtins.next` with
+  one or two positional arguments; exact canonical `any` / `all` with
+  one positional argument and the existing complete guarded-generator
+  ownership, callback, monitoring, and fallback semantics. Preserve the
+  existing runtime `StopIteration` matcher **only** for eligible exact
+  Python functions with exactly two positional arguments; skipping it
+  for all Python functions would silently discard a retained
+  optimization. Exact bound Python methods cannot match any of those
+  existing selectors; ordinary Python functions with one argument cannot
+  match either builtin selector; unrelated callable kinds likewise must
+  avoid impossible selector probes.
+- On every ordinary, mutable, keyword, custom-callable, subclass, invalid,
+  or unsupported case, use the **unchanged original**
+  `_PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames)`
+  fallback. Preserve the exact original `nargsf` offset bit, live thread
+  state, current callable/vectorcall mutation, `__call__`, descriptor /
+  bound-method behavior, callbacks, monitoring, profiler/tracing,
+  exception propagation, reference ownership, and finalization. Do not
+  invoke an assumed direct vectorcall function pointer, cache mutable
+  callable data, or introduce a process-global state, exported runtime
+  helper, public API, IR concept, or generated source/native-body change.
+  First release smoke and normal fixed-eight measurements independently
+  verify exact ordinary-source and hidden-trampoline native-byte
+  invariance; the compiled runtime hook's own stack / inlining shape
+  nevertheless changes substantially and is outside those generated-JIT
+  byte totals.
+- The initial, larger unchanged-production integration fixture reached a
+  passing Profile subprocess but its Verify subprocess exited **-11**,
+  even after vectorcall-pointer mutation, tracing, and finalizer controls
+  were removed. That fixture was discarded; its cause remains
+  **UNKNOWN** and has not been attributed to the proposed candidate, a
+  null vectorcall pointer, or any confirmed user-visible CPython
+  mismatch. Production source was unchanged at that historical
+  baseline-only checkpoint.
+- The subsequent simplified real transformed integration,
+  **`tests/test_vectorcall_callable_kind_partition.py`**, now
+  independently passes **1 test in 3.59 seconds** on unchanged
+  production. Actual stock plus separate **Profile → Verify → Apply**
+  processes preserve exact Python one- and two-argument functions,
+  bound methods, custom callable objects, exact C `next` with and
+  without a default, ordinary builtin `len`, canonical `any` / `all`
+  source generator expressions, and keyword fallback. Actual profile
+  counters and generated source/native-body rows prove transformed
+  execution. This existing comprehensive baseline is compatibility
+  **GREEN** but does **not** cover the now-confirmed fresh-cache builtin
+  rebinding bug. The separate formal fresh-subprocess cache regression
+  genuinely fails **1 / 0.06 seconds** on historical unchanged
+  production. The saved one-file implementation now passes both focused
+  structured regressions and both final transformed/cache regressions
+  **2 / 2 in 3.35 seconds**, correcting the real CPython-visible bug.
+  The callable-kind performance partition alone claims no separate
+  semantic bug.
+- Three independent genuine pre-implementation regressions are now
+  established: **(1)** actual fresh-subprocess exported-runtime semantic
+  RED **1 failed / 0.06 seconds**, **(2)** real exact Python one-argument
+  production classifier **`ExactBuiltinOneArg != GenericOnly`**, and
+  **(3)** isolated production-used fresh `OnceLock` incorrectly accepts
+  rebound `len`. The poisoned combined-run secondary failure is not
+  counted; the isolated cache rerun is the valid third RED. Both
+  production-wired structured regressions then turn genuinely **GREEN
+  together: 2 passed / 575 filtered**, after scoped formatting, and both
+  final real Python regressions pass **2 / 2 in 3.35 seconds**, turning
+  the genuine CPython semantic cache RED GREEN. Explicit retained
+  `StopIteration` / guarded-generator controls pass **6 / 6**; fresh
+  complete JIT **577 / 577**, optimizer **214 / 214**, and typed IR
+  **54 / 54** also pass. Broad transformed compatibility passes
+  **24 / 24 in 49.03 seconds**; combined optimizer/JIT test-target
+  checking and scoped package-format check are also **GREEN**. First
+  release smoke is native-invariant **8 / 8**; the completed normal
+  fixed-eight comparison rejects the first candidate, official stock
+  **0.6437736503135402x** / previous **0.9491163878989439x**. Refined
+  structured decisions pass **2 / 2**; actual transformed / semantic /
+  retained controls pass **8 / 8 in 14.58 seconds**; fresh complete JIT
+  **577 / 577**, optimizer **214 / 214**, typed IR **54 / 54**, and broad
+  transformed compatibility **24 / 24 in 45.69 seconds** pass; fresh
+  final combined optimizer/JIT test-target and scoped format checks also
+  pass. Refined release frame is **848 bytes** versus rejected
+  **1,216 bytes**; smoke and normal native bytes remain invariant; clean
+  repeated target reports stock **0.5358039397819471x** / previous
+  **1.0132710404047143x**, with paired `chaos` **1.050575x [1.00704,
+  1.06769]** and other workloads neutral. Matched zero-loss profiles
+  disclose both richards helper reduction and comprehensions helper
+  increase. The authoritative full correctness gate passes exactly
+  **1,237 Python nodeids / 99 batches / eight workers / zero failures**
+  plus JIT **577**, optimizer **214**, typed IR **54**, lowering **371**,
+  and PyO3 **8**; refined status is **FULLY VALIDATED RETAIN LANDING
+  CANDIDATE**.
+- Attempt 2 verdict: **FIRST CALLABLE-KIND CANDIDATE REJECTED AS-IS;
+  one-file callable-kind partition, integrated baselines and disjoint
+  lossless hook self evidence
+  recorded; historical larger fixture Verify exit -11 UNKNOWN and
+  discarded; simplified actual unchanged-production stock /
+  Profile → Verify → Apply compatibility GREEN 1 passed / 3.59 seconds;
+  existing unvalidated lazy builtin-next cache causes a CONFIRMED real
+  fresh-process CPython behavior bug, rebound len(range_iterator) stock
+  TypeError versus SOAC wrong integer 0; formal actual exported-runtime
+  fresh-subprocess pytest semantic RED VERIFIED 1 failed / 0.06 seconds;
+  real production classifier structural RED ExactBuiltinOneArg versus
+  GenericOnly VERIFIED; isolated production-used fresh-cache structural
+  RED accepts noncanonical len VERIFIED; combined-run mutex-poison
+  secondary failure not counted; final same-one-file exact callable-kind
+  partition / canonical retryable-next cache SAVED, scoped-formatted,
+  and independently reviewed; both real structured RED → GREEN together
+  2 passed / 575 filtered; both final real stock / transformed / cache
+  regressions GREEN 2 / 2 in 3.35 seconds, including genuine user-visible
+  cache TypeError RED → GREEN; explicit retained StopIteration /
+  guarded-generator controls GREEN 6 / 6; fresh full JIT 577 / optimizer
+  214 / typed IR 54 GREEN; broad transformed matrix GREEN 24 / 24 in
+  49.03 seconds; combined optimizer/JIT test-target and scoped-format
+  checks GREEN; first smoke native-invariant but normal fixed-eight
+  previous-SOAC 0.9491163878989439x with all workloads slower and
+  approximately 49% larger release hook stack; preserve genuine builtin-
+  next CPython correctness fix while refining same-file exact-C method
+  flags/names and moving heavy consumption out of line; genuine
+  production-consumed real-CPython eager-callable refinement RED → GREEN
+  2 / 2; refined actual transformed / semantic / retained controls GREEN
+  8 / 8 in 14.58 seconds; fresh full JIT 577 / optimizer 214 / typed IR
+  54 / transformed matrix 24 in 45.69 seconds GREEN; fresh final combined
+  check / scoped format check GREEN; refined release frame 848 versus
+  rejected 1,216 bytes; smoke / normal / three-round target preserve all
+  ordinary and hidden native bytes; definitive target stock
+  0.5358039397819471x / previous 1.0132710404047143x, chaos paired
+  1.050575x [1.00704, 1.06769] and other workloads neutral; matched
+  zero-loss profiles include richards −1.368195pp and comprehensions
+  +1.810581pp helper self; genuine CPython next-cache correction plus
+  paired chaos improvement justify retention; authoritative full gate
+  GREEN 1,237 transformed nodeids / 99 batches / all Rust suites in
+  131.284 seconds: FULLY VALIDATED RETAIN LANDING CANDIDATE; no already-
+  landed / universal gain / full-suite 1.10x claim**.

@@ -1260,6 +1260,97 @@ optimization is **LANDED CANDIDATE / RETAIN**; the fixed-eight stock
 score **0.6326613107877241x** remains below the full-suite **1.10x
 stock** goal.
 
+A later same-strategy callable-kind refinement changes exactly the
+existing `crates/soac_jit/src/jit/specialized_helpers.rs` production
+file. The actual exported-vectorcall path first masks positional arity
+and rejects shapes other than **one or two** arguments, then partitions
+exact callable metadata into four existing route families: exact Python
+functions with **two** arguments retain only the `StopIteration`
+matcher; exact C functions with **`METH_FASTCALL` and the full immutable
+name `next`** may reach canonical `next(iterator[, default])`; exact C
+functions with **`METH_O` and an `a`-prefixed name** may reach canonical
+one-argument `any` / `all` without initializing the `next` cache; all
+other shapes use the original live CPython
+`_PyObject_VectorcallTstate` fallback. Compiler-created exact C
+`<eager comprehension>`, builtin `len` / `iter`, bound methods,
+ordinary one-argument Python functions, custom callables, keywords, and
+unsupported arities therefore skip impossible selectors. The existing
+heavy guarded-generator consumer is **`#[inline(never)]`**, protecting
+the ordinary vectorcall-hook frame from its cold machinery: actual
+AArch64 release frames are **816 bytes retained / 1,216 bytes rejected
+first candidate / 848 bytes refined**, with standalone consumer restored
+and `next` reinlined. Original thread-state/null
+behavior, vectorcall offset flags, keyword handling, callable mutation,
+source-generator ownership, callbacks, monitoring, exceptions, and
+finalizers remain intact.
+
+The same refinement fixes an independently proven existing CPython
+compatibility bug: a fresh process with `builtins.next = len` previously
+cached `len` as though it were canonical `next`, making
+`len(iter(range(3)))` incorrectly return **0** instead of raising stock
+**`TypeError`**. Existing cache initialization now accepts only an exact
+`PyCFunction` with immutable C method name **`next`**, exact
+**`METH_FASTCALL`**, and the owning exact builtins module / its current
+dictionary. Missing or replaced values leave the existing `OnceLock`
+uninitialized, perform no INCREF, and use ordinary CPython dispatch;
+restoring canonical `next` retries successfully. No runtime helper,
+public API, mutable global, typed-IR operation, or generated source /
+native-body change is introduced.
+
+Three genuine unchanged-behavior REDs establish the user-visible cache
+bug, actual callable classifier gap, and fresh-cache canonicalization
+failure; a later actual-production structured RED constructs a real
+exact C `<eager comprehension>` and exposes its impossible builtin
+selection. Final refined production-consumed structured regressions
+turn RED-to-GREEN **2 / 2**, including eager / `len` / `iter` exclusion.
+Actual fresh-cache semantics, stock versus transformed
+**Profile → Verify → Apply**, retained `StopIteration` mutation /
+observer controls, and guarded `any` / `all` pass **8 / 8 in 14.58
+seconds**, including the genuine CPython `TypeError` correction. Fresh
+complete Rust JIT **577 / 577**, optimizer **214 / 214**, and typed IR
+**54 / 54** pass; broad actual transformed compatibility passes
+**24 / 24 in 45.69 seconds**. Package formatting is complete, and fresh
+final **`cargo check -p soac_opt -p soac_jit --tests`** plus scoped
+**`just fmt-rust-check soac_jit`** both pass. Refined smoke preserves
+**397 total JIT source rows / 204 direct-function-body rows**, exactly
+**2,238,412 native bytes / 147,769 machine blocks / 38,108 hidden
+trampoline bytes**. Fixed-eight stock is **0.6555584208465822x**, with
+outlier-contaminated official previous **0.9850631879265838x**; robust
+`chaos`, comprehensions, deltablue, and richards estimates are near
+neutral. Its **80 Apply workers / 3,970 total JIT source rows including
+adapters / 2,040 direct-function-body rows** retain **23,159,960 native
+bytes / 1,524,970 machine blocks / 381,080 hidden trampoline bytes**.
+
+The clean three-round target reports stock **0.5358039397819471x**
+versus retained **0.525149227454957x**, previous-SOAC
+**1.0132710404047143x**. `chaos` improves **40.003514 → 38.9389 ms**,
+raw **1.027341x [0.98765, 1.04542]** and significantly stock-paired
+**1.050575x [1.00704, 1.06769]**; comprehensions, deltablue, and
+richards remain statistically neutral. All **120 measured Apply
+workers / 10,650 total JIT source rows including adapters / 5,490
+direct-function-body rows** retain **54,686,760 native bytes / 3,596,430
+machine blocks / 777,240 hidden trampoline bytes / 2,265 typed blocks /
+183 functions**, with **zero errors**. Matched zero-loss profiles show
+richards helper self **5.753704% → 4.385509%**, neutral deltablue
+**6.178208% → 6.25%**, and increased comprehensions helper self
+**1.862341% → 3.672922%** despite neutral throughput; nested frames
+must not be summed. The authoritative full **`just test-all`** gate
+passes; see **`work/logs/vectorcall-callable-kind-test-all.log`**.
+Exactly **1,237 transformed Python nodeids / 99 isolated batches / eight
+workers** complete **99 PASS / zero failures**. Rust JIT passes **577 /
+577 in 14.65 seconds**, optimizer **214 / 214 in 0.56 seconds**, typed
+IR **54 / 54**, lowering **371 / 371 in 0.47 seconds**, and PyO3
+extension **8 / 8 in 0.11 seconds**. Runtime build takes **1.680
+seconds**, Cargo **56.927 seconds**, pytest **74.331 seconds inner /
+74.345 seconds outer**, and the complete test phase **131.284 seconds**;
+the two new integration nodeids pass in **3.89 seconds**, while the
+28-node counter shard takes **73.83 seconds**. Status is **FULLY
+VALIDATED RETAIN LANDING CANDIDATE**, justified by the genuine
+CPython-visible `next` correctness fix plus paired `chaos` improvement
+without significant repeated regressions. Full-suite stock **1.10x**
+remains unmet, and no universal speedup or already-landed status is
+claimed.
+
 ### Template-Aware Function Registration
 
 Source-backed function instantiation already owns an immutable
