@@ -1021,6 +1021,10 @@ fn codegen_expr_runtime_helper(
         .or_else(|| {
             codegen_expr_helper_name(expr, ctx.module_constants)
                 .and_then(RuntimeHelperId::from_runtime_symbol)
+                .filter(|helper| {
+                    *helper != RuntimeHelperId::Globals
+                        || codegen_expr_static_runtime_name(expr, ctx.module_constants).is_some()
+                })
         })
 }
 
@@ -1047,6 +1051,10 @@ fn typed_expr_runtime_helper(expr: &InstrTyped, ctx: &JitEmitCtx<'_>) -> Option<
         .or_else(|| {
             typed_expr_helper_name(expr, ctx.module_constants)
                 .and_then(RuntimeHelperId::from_runtime_symbol)
+                .filter(|helper| {
+                    *helper != RuntimeHelperId::Globals
+                        || typed_expr_static_runtime_name(expr, ctx.module_constants).is_some()
+                })
         })
 }
 

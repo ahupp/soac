@@ -1073,6 +1073,66 @@ def f(value):
 }
 
 #[test]
+fn name_binding_prebound_builtin_globals_remains_a_live_module_global() {
+    let source = r#"
+def replacement():
+    return 41
+
+globals = replacement
+
+def call():
+    return globals()
+"#;
+
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("name binding pass should be tracked");
+    let call = function_by_name(&bb_module, "call");
+    assert!(
+        resolved_function_uses_global(call, "globals"),
+        "an explicitly bound source globals must stay a dynamic global, not become a compiler intrinsic: {call:?}"
+    );
+}
+
+#[test]
+fn name_binding_prebound_builtin_mapping_preserves_live_names_and_frame_safeguards() {
+    let source = r#"
+__builtins__ = {"ord": lambda value: 41}
+
+def call(value):
+    return ord(value)
+
+def read_locals():
+    return locals()
+
+def evaluate(value):
+    return eval(value)
+
+def execute(value):
+    return exec(value)
+"#;
+
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("name binding pass should be tracked");
+    let call = function_by_name(&bb_module, "call");
+    assert!(
+        !module_constant_runtime_name(&bb_module, "ord"),
+        "an explicitly supplied builtins mapping must not freeze ord into a runtime constant"
+    );
+    assert!(
+        resolved_function_uses_global(call, "ord"),
+        "ord must resolve through the function's actual captured builtins mapping: {call:?}"
+    );
+    for name in ["locals", "eval", "exec"] {
+        assert!(
+            module_constant_runtime_name(&bb_module, name),
+            "frame-sensitive {name} must retain its explicit unsupported-runtime safeguard"
+        );
+    }
+}
+
+#[test]
 fn unsound_name_binding_keeps_assigned_or_declared_builtin_names_global() {
     let source = r#"
 len = lambda value: 42

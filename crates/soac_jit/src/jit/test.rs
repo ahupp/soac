@@ -25924,6 +25924,40 @@ class Point:
     }
 
     #[test]
+    fn specialized_jit_prebound_builtin_globals_is_not_a_runtime_intrinsic() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let function = with_single_test_block(
+            test_function_in_module(&module_name_gen, "call"),
+            vec![],
+            ret_term(op_expr(Call::new(
+                name_expr(test_global_name("globals")),
+                vec![],
+                vec![],
+            ))),
+        );
+        let mut module = test_module(module_name_gen, vec![function.clone()]);
+        module.global_names = vec!["globals".to_string()];
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let blocks = [1usize as ObjPtr];
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+
+        let generic_call_helpers = import_user_names_for_symbols(
+            &built,
+            &[
+                DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
+                DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+            ],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
+            1,
+            "an actual mutable global named globals must call its loaded value; source spelling cannot authenticate the compiler intrinsic"
+        );
+    }
+
+    #[test]
     fn render_specialized_jit_leaves_rare_profiled_blocks_hot_by_default() {
         let blocks = [1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr];
         let mut function = test_function();

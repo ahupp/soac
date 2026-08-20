@@ -808,20 +808,6 @@ impl MapInstr<InstrUnresolved, InstrUnresolved> for NameBindingMapper<'_> {
             InstrUnresolved::Literal(literal) => InstrUnresolved::Literal(literal),
             InstrUnresolved::MakeFunction(op) => self.materialize_make_function_expr(op.meta(), op),
             InstrUnresolved::Call(call)
-                if call.args.is_empty()
-                    && call.keywords.is_empty()
-                    && raw_load_name(call.func.as_ref())
-                        .as_ref()
-                        .is_some_and(|name| {
-                            name == "globals"
-                                && self.scope.resolved_load_binding_kind("globals")
-                                    == BindingKind::Global
-                        }) =>
-            {
-                let meta = call.meta();
-                globals_expr(meta.node_index, meta.range)
-            },
-            InstrUnresolved::Call(call)
                 if call.keywords.is_empty()
                     && call.args.len() == 3
                     && raw_load_name(call.func.as_ref())
@@ -2797,6 +2783,8 @@ impl UnsoundBuiltinRuntimeNameRewriter<'_> {
         if !name.location.is_global_name()
             || self.declared_global_names.contains(name.id.as_str())
             || !is_unsound_runtime_builtin_candidate(name.id.as_str())
+            || (self.declared_global_names.contains("__builtins__")
+                && !matches!(name.id.as_str(), "globals" | "locals" | "eval" | "exec"))
         {
             return;
         }

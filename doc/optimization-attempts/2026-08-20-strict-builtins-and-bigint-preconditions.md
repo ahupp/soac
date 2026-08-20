@@ -1,14 +1,16 @@
 # Strict-module builtin resolution and bigint correctness preconditions
 
 - Date: August 20, 2026 PDT
-- Status: Correctness prerequisites retained; corrected full gate passed.
+- Status: Initial correctness prerequisites and both additional out-of-policy corrections retained; the new authoritative full gate passed.
 - Strategy: Restore demonstrated CPython behavior before introducing authenticated strict modules or pursuing strict-only performance claims.
 
 ## Goal and hypothesis
 
 Strict-module optimization requires an explicitly authenticated strict capability; ordinary Python modules must retain CPython-visible global mutation, builtin resolution, arbitrary-precision integer arithmetic, and existing fail-closed behavior for unsupported frame-sensitive operations. The repository currently has **no authenticated strict-module capability** and therefore **no valid strict-mode benchmark result**. Existing ordinary-SOAC performance comparisons do not establish progress toward the current strict-only objective.
 
-The concrete hypothesis was that ordinary-source `len` was incorrectly frozen as an SOAC runtime constant, while scalar-demand arithmetic incorrectly raised `OverflowError` when an intermediate escaped signed 64-bit range despite the mathematically correct final Python result fitting. Restoring live `len` resolution and boxing integer arithmetic whenever an entire expression cannot be proven safe should correct these genuine CPython divergences without weakening existing compatibility boundaries.
+The initial concrete hypothesis was that ordinary-source `len` was frozen as an SOAC runtime constant, while scalar-demand arithmetic incorrectly raised `OverflowError` when an intermediate escaped signed 64-bit range despite the mathematically correct final Python result fitting. The retained initial correction restores live `len` resolution and boxes integer arithmetic whenever an entire expression cannot be proven safe.
+
+The user has subsequently clarified two **explicitly approved compatibility exceptions**: indexed fast stores may intentionally omit dictionary-watcher notifications, and known builtin snapshots may intentionally ignore ordinary module-global shadows introduced later. Neither exception is a correctness defect for this strategy, and preserving those fast paths is mandatory. The follow-on hypothesis concerns only behavior outside both exceptions: module globals already explicitly bound before a call, and custom builtins mappings already captured when a function is created.
 
 ## Baseline and genuine RED evidence
 
@@ -28,6 +30,21 @@ Two ordinary builtin-resolution cases genuinely failed:
 Three genuine arbitrary-precision regressions independently failed for addition, subtraction, and multiplication: their signed-64-bit intermediates raised SOAC `OverflowError`, while the matched vendored CPython evaluated each complete expression and returned `chr(0) == "\\x00"`.
 
 The earlier `builtin_dynamic_global_shadow` integration case was already marked expected-failure for both transformed SOAC and entry-interpreter modes, confirming that the incorrect behavior was preexisting rather than introduced by this attempt.
+
+## Follow-on genuine RED: already-bound globals and captured builtins
+
+After the initial corrected full gate, two additional matched stock-versus-SOAC integration cases genuinely failed:
+
+1. For an already initialized module containing `globals = replacement`, where `replacement()` returns `41`, CPython calls the existing module binding and returns **41**. SOAC instead treats the source spelling as its compiler-owned `globals()` intrinsic and returns the **module dictionary**.
+2. For `__builtins__ = {"ord": lambda value: 41}` established before function creation, CPython resolves `ord` through that already-captured custom mapping and returns **41**. SOAC instead snapshots its ordinary builtin implementation and returns **97** for `ord("a")`.
+
+These are not later introductions of an undeclared ordinary builtin shadow, and neither case relies on dictionary watchers. Both matched Python regressions went **RED before the production correction and GREEN afterward**.
+
+The retained correction removes the source-spelling-only `globals()` rewrite, allowing an already declared module binding to stay an ordinary global. Authenticated compiler-generated `RuntimeName::Globals` operations retain their dedicated behavior. Both legacy and typed JIT helper classifiers now recognize `Globals` only from an authenticated runtime name, runtime-name module constant, or existing validated helper facts; a mutable source global named `globals` is no longer intrinsically trusted.
+
+Known-builtin snapshots are disabled only within a module explicitly declaring its own `__builtins__` mapping, so source names such as `ord` resolve through the function's already-captured mapping. Normal modules retain their existing builtin snapshots and specialized `ord` primitive. Frame-sensitive `globals`, `locals`, `eval`, and `exec` keep their explicit runtime safeguards, and compiler-owned intrinsics remain unaffected. User-approved watcher-free indexed stores and later-undeclared builtin-shadow shortcuts remain unchanged.
+
+Two structured lowering regressions and one structured JIT provenance regression also went **RED before correction and GREEN afterward**. The new authoritative full gate subsequently **PASSED** with **1,360 Rust tests** and **1,329 transformed Python nodeids across 104 passing isolated batches**.
 
 ## Rejected iteration: disable all frozen builtin rewrites
 
@@ -86,6 +103,15 @@ The first failed gate spent 85.073 seconds in pytest and 170.963 seconds in its 
 - Scoped formatting and package checks: passed.
 - Corrected final full `just test-all` gate: **PASSED** with **1,357 Rust tests across 71 test groups**, and **1,327 transformed Python nodeids across 104 passing batches / eight workers / zero failed batches**.
 - Corrected full-gate timings: build **1.492 s**, Cargo tests **62.201 s**, pytest **81.258 s** internally / **81.279 s** externally, total test phase **143.493 s**.
+- Follow-on already-bound module `globals`: **genuine RED**, stock **41** versus SOAC **module dictionary**, then **GREEN** with SOAC **41**.
+- Follow-on initially captured custom builtin `ord`: **genuine RED**, stock **41** versus SOAC **97**, then **GREEN** with SOAC **41**.
+- Follow-on structured lowering provenance regressions: **two RED, then two GREEN**.
+- Follow-on structured JIT global-versus-intrinsic provenance regression: **one RED, then one GREEN**.
+- Follow-on broad transformed Python validation: **33 passed**, including canonical `globals()`, frame-sensitive safeguards, class/import/bootstrap behavior, captured mappings, and thread coverage.
+- Follow-on full Rust suites: `soac_lowering` **374 passed**, `soac_opt` **214 passed**, and `soac_jit` **587 passed**.
+- Follow-on scoped formatting check and JIT package check including tests: passed.
+- Follow-on new full `just test-all` gate: **PASSED** with **1,360 Rust tests across 71 test groups**, and **1,329 transformed Python nodeids across 104 passing batches / eight workers / zero failed batches**. The earlier **1,357 Rust / 1,327 Python** gate remains the separately recorded historical validation of the initial implementation.
+- Follow-on full-gate timings: build **1.474 s**, Cargo tests **73.813 s**, pytest **77.895 s** internally / **77.908 s** externally, total test phase **151.733 s**.
 
 ## Benchmark, transformation, and native-code evidence
 
@@ -101,17 +127,18 @@ Conservatively boxing loop-carried integers may affect performance, but that con
 
 ## Remaining limitations and verdict
 
-Approximately **145 other ordinary builtin names** remain on the preexisting frozen-runtime candidate list. Direct `globals()` retains its existing special lowering, including unresolved late-shadow and alias-identity limitations. Comprehensive ordinary builtin correctness requires dynamically resolving the actual callable, authenticating genuine compiler-owned intrinsics, preserving explicit failures only for actual canonical frame-sensitive builtins, and updating the existing specialization assumptions without forgeable source spellings.
+Approximately **145 other ordinary builtin names** remain on the preexisting frozen-runtime candidate list. Known-builtin snapshots that ignore later ordinary global shadows, and watcher-free indexed fast stores, are explicitly approved compatibility behavior and remain intact. The demonstrated follow-on defects were narrower: direct `globals()` ignored an already declared module binding, and ordinary builtin snapshots ignored a custom builtins mapping already bound at function creation. Both now pass matched stock-versus-SOAC regressions while preserving compiler-intrinsic provenance and the existing explicit frame-sensitive failure boundary. Their new full-suite gate also passed.
 
 The relevant user-owned `doc/SPECIALIZATION.md` update remains pending and is deliberately outside this document-only lease. An authenticated strict capability, strict-only transformation evidence, and a valid strict benchmark all remain outstanding despite the corrected full gate passing.
 
-**Verdict:** Retain the narrowly verified CPython-correct `len`, bigint, and coherent scalar-planning prerequisites; the corrected full gate passed. Reject the blanket builtin rewrite removal. Do not claim strict-module support, suite-wide optimization progress, a valid strict benchmark, or attainment of the 10%-over-stock goal.
+**Verdict:** Retain the full-gate-verified `len`, bigint, and coherent scalar-planning prerequisites and the full-gate-verified corrections for already-bound `globals` and initially captured custom builtins. Preserve explicitly approved watcher-free and ordinary builtin-snapshot fast paths; reject blanket builtin rewrite removal. The follow-on full `just test-all` gate **PASSED**. Do not claim strict-module support, suite-wide optimization progress, a valid strict benchmark, or attainment of the 10%-over-stock goal.
 
 ## Transferable lessons
 
 - Match stock and transformed behavior before inferring optimization safety from ordinary-source builtin names.
 - Distinguish the first genuine failure from shared-mutex poisoning cascades during broad Rust validation.
 - Preserve actual compiler provenance; source spelling alone cannot authenticate an intrinsic.
+- Distinguish explicitly approved later-shadow and watcher omissions from genuinely incorrect behavior for already-bound globals or preexisting captured builtin mappings.
 - Frame-sensitive builtins require callable-identity-aware dispatch or an explicit unsupported boundary.
 - Use machine integers only where the complete Python arithmetic path, including intermediates, is proven safe.
 - Keep scalar representation planning and native emission aligned on the same validated integer-range facts; focused suites alone did not expose their cross-pass mismatch.

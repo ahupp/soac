@@ -39,6 +39,26 @@ def read_globals():
     return globals()
 """
 
+_PREBOUND_GLOBALS_SOURCE = """
+def replacement():
+    return 41
+
+
+globals = replacement
+
+
+def call():
+    return globals()
+"""
+
+_PREBOUND_CAPTURED_BUILTIN_SOURCE = """
+__builtins__ = {"ord": lambda value: 41}
+
+
+def call(value):
+    return ord(value)
+"""
+
 
 def _configure_transformed_runtime(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -147,6 +167,42 @@ def test_globals_builtin_returns_its_own_module_dictionary_like_cpython(
         actual = soac.read_globals() is soac.__dict__
 
     assert actual is expected
+
+
+def test_prebound_globals_name_calls_the_existing_module_binding_like_cpython(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_transformed_runtime(monkeypatch, tmp_path)
+
+    with stock_module(tmp_path, "stock_prebound_globals", _PREBOUND_GLOBALS_SOURCE) as stock:
+        expected = stock.call()
+    assert expected == 41
+
+    with soac_module(tmp_path, "soac_prebound_globals", _PREBOUND_GLOBALS_SOURCE) as soac:
+        actual = soac.call()
+
+    assert actual == expected
+
+
+def test_known_builtin_uses_its_initial_captured_mapping_like_cpython(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_transformed_runtime(monkeypatch, tmp_path)
+
+    with stock_module(
+        tmp_path, "stock_prebound_captured_builtin", _PREBOUND_CAPTURED_BUILTIN_SOURCE
+    ) as stock:
+        assert stock.call.__builtins__ is stock.__dict__["__builtins__"]
+        expected = stock.call("a")
+    assert expected == 41
+
+    with soac_module(
+        tmp_path, "soac_prebound_captured_builtin", _PREBOUND_CAPTURED_BUILTIN_SOURCE
+    ) as soac:
+        assert soac.call.__builtins__ is soac.__dict__["__builtins__"]
+        actual = soac.call("a")
+
+    assert actual == expected
 
 
 @pytest.mark.parametrize(
