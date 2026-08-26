@@ -21,6 +21,37 @@ globals, never as writes into a sealed module. The global exception-text-based
 failure-to-xfail hook is removed. Legacy in-process strict modes now fail before
 source execution; they are not renamed into passing stock variants.
 
+## Explicit observation xfails — 2026-08-26 (PDT)
+
+Keep reviewed SOAC frame inspection, traceback-shape and exact implicit-finalizer
+order expectations as explicit per-case `xfail`s. Do not classify a failure by
+its filename or exception text. Ordinary CPython observations, exception
+propagation/chaining, explicit callback order, ownership safety, complete cleanup
+and installed contracts remain normal gating tests. Split mixed tests before
+marking only the excluded observation.
+
+The five frame-only delimiter programs retain their original stock controls.
+Their ten SOAC/entry variants are collected with explanatory `xfail(run=False)`
+marks instead of silently omitted. These legacy variants have no authenticated
+strict-admission path; their non-running xfails are documented exclusions, not
+observed runtime failures or proof of admission. The frame-free capture, walrus
+and exception-cleanup companions continue to run normally. Existing traceback
+and locals-inspection controls that execute ordinary CPython stay unmarked.
+
+The isolated rebind/delete finalizer-order probes run against real authenticated
+SOAC and entry fixtures. Source/type ownership, entry witnesses, subprocess
+success, data shape, explicit callbacks and exactly-once eventual cleanup must
+pass first. Only the final comparison against the original CPython event order
+raises the narrowly typed exception allowed by their xfail mark. An incidental
+match reports XPASS (`strict=False`); it does not establish an exact-order
+guarantee. Existing semantic and stock cleanup tests remain unchanged.
+
+The focused verification reports 36 passes, ten non-running frame xfails and
+two finalizer-order XPASS outcomes (`work/logs/excluded-observation-focused-v1.json`
+and its JUnit XML). Native/runtime identity postchecks pass. The collection
+regression first reproduced the silently omitted cases before the marks were
+added. No full-suite rerun was performed for this test-policy change.
+
 ## Runner and first checkpoint
 
 Use `tests._strict_integration.create_strict_project` with explicit selected

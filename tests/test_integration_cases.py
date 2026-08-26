@@ -19,16 +19,17 @@ from tests._strict_integration import (
 )
 
 MODULES_DIR = Path(__file__).resolve().parent / "integration_modules"
-# Preserve complete ordinary programs/tails for excluded function-frame
-# observations. Frame-free capture, walrus and exception-handler companions
-# live in test_strict_call_context.py; these are not expected runtime failures.
-ORDINARY_FRAME_INSPECTION_CASES = frozenset({
-    "yield_from_stack_names",
-    "dir_filters",
-    "locals_cell_contents",
-    "named_expression_locals_unbound",
-    "exception_cleanup_name",
-})
+# Preserve the original ordinary programs/tails and report their excluded SOAC
+# observations explicitly. These legacy frame-only variants are not admitted
+# strict programs: run=False must not turn missing admission into a fake runtime
+# failure. Frame-free semantic companions remain in test_strict_call_context.py.
+SOAC_FRAME_INSPECTION_XFAILS = {
+    "yield_from_stack_names": "source and caller frame names through sys._getframe()/f_back",
+    "dir_filters": "function-local names through argumentless dir()",
+    "locals_cell_contents": "closure/cell contents through locals()",
+    "named_expression_locals_unbound": "walrus binding visibility through locals()",
+    "exception_cleanup_name": "deleted exception binding visibility through locals()",
+}
 
 # Reviewed individually; adding a new stock source does not opt it into strict
 # execution. The original bodies and validation tails remain unchanged. The
@@ -1363,13 +1364,22 @@ def _case_paths() -> list[Path]:
 
 def _case_parameters():
     paths = _case_paths()
-    return [
-        pytest.param(mode, path, id=f"{mode}-{path.stem}")
-        for mode in ("stock", "soac", "entry", "cpython")
-        for path in paths
-        if mode != "cpython" or path.stem in CPYTHON_INTERPRETER_CASES
-        if mode not in {"soac", "entry"} or path.stem not in ORDINARY_FRAME_INSPECTION_CASES
-    ]
+    parameters = []
+    for mode in ("stock", "soac", "entry", "cpython"):
+        for path in paths:
+            if mode == "cpython" and path.stem not in CPYTHON_INTERPRETER_CASES:
+                continue
+            marks = []
+            if mode in {"soac", "entry"} and path.stem in SOAC_FRAME_INSPECTION_XFAILS:
+                marks.append(pytest.mark.xfail(
+                    reason=(
+                        "SOAC frame inspection is out of scope (2026-08-25 PDT): "
+                        + SOAC_FRAME_INSPECTION_XFAILS[path.stem]
+                    ),
+                    run=False,
+                ))
+            parameters.append(pytest.param(mode, path, marks=marks, id=f"{mode}-{path.stem}"))
+    return parameters
 
 
 @pytest.mark.integration

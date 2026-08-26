@@ -624,6 +624,9 @@ def test_ambiguous_or_async_validator_is_an_explicit_harness_error(
         "NotImplementedError('not supported')",
         "TypeError('An asyncio.Future, a coroutine or an awaitable is required')",
         "AssertionError('context: not supported')",
+        "AssertionError('frame inspection mismatch')",
+        "AssertionError('traceback frame differs')",
+        "AssertionError('exact finalizer order differs')",
     ],
 )
 def test_unexpected_failures_are_not_converted_to_xfails(
@@ -657,6 +660,37 @@ def test_unexpected_failures_are_not_converted_to_xfails(
     assert suite.attrib["tests"] == "1"
     assert suite.attrib["failures"] == "1"
     assert suite.attrib["skipped"] == "0"
+
+
+def test_excluded_frame_cases_are_collected_with_narrow_xfail_marks():
+    from tests.test_integration_cases import _case_parameters
+
+    frame_cases = {
+        "yield_from_stack_names",
+        "dir_filters",
+        "locals_cell_contents",
+        "named_expression_locals_unbound",
+        "exception_cleanup_name",
+    }
+    parameters = {
+        (parameter.values[0], parameter.values[1].stem): parameter
+        for parameter in _case_parameters()
+    }
+    expected = {
+        (mode, name) for mode in ("soac", "entry") for name in frame_cases
+    }
+    missing = expected - parameters.keys()
+    assert not missing, f"excluded observations must remain visible in collection: {sorted(missing)}"
+    for key, parameter in parameters.items():
+        marks = [mark for mark in parameter.marks if mark.name == "xfail"]
+        if key not in expected:
+            assert not marks, f"ordinary or semantic case was unexpectedly xfailed: {key}"
+            continue
+        assert len(marks) == 1
+        assert marks[0].kwargs["run"] is False
+        assert "frame inspection" in marks[0].kwargs["reason"]
+        assert "2026-08-25" in marks[0].kwargs["reason"]
+    assert {("stock", name) for name in frame_cases} <= parameters.keys()
 
 
 # These are fixture-scheduling tests, not synthetic strict-admission evidence.

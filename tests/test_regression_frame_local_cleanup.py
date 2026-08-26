@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -221,6 +222,70 @@ def validate(module):
     assert_cleanup(module.events, ['handler'], ['del:caught'])
 ''',
     )
+
+
+class _ExactImplicitFinalizerOrderDifference(AssertionError):
+    """An excluded order comparison, after semantic and safety checks pass."""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
+@pytest.mark.xfail(
+    raises=_ExactImplicitFinalizerOrderDifference,
+    strict=False,
+    reason=(
+        "2026-08-24 (PDT): SOAC does not promise CPython's exact timing or "
+        "relative order of implicit finalizers"
+    ),
+)
+def test_rebind_and_del_exact_implicit_finalizer_order(
+    cleanup_project, entry_interpreter
+):
+    completed = cleanup_project.run_case(
+        "frame_local_cleanup",
+        _SOAC_CLEANUP_VALIDATION + r'''
+import json
+
+def validate(module):
+    observed = {}
+    for name, released in (
+        ('rebind_local', ['del:old', 'del:new']),
+        ('delete_local', ['del:deleted']),
+    ):
+        module.reset()
+        result = getattr(module, name)()
+        assert type(result) is list
+        assert explicit_events(result) == ['before', 'after'], result
+        assert_cleanup(module.events, ['before', 'after'], released)
+        observed[name] = [result, list(module.events)]
+    print(json.dumps(observed))
+''',
+        Path(__file__),
+        entry_interpreter=entry_interpreter,
+        required_functions=('rebind_local', 'delete_local'),
+    )
+    # Import, authentication, entry witnesses, subprocess success, explicit
+    # callbacks and complete cleanup must succeed before an order-only xfail.
+    observed = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert type(observed) is dict
+    assert set(observed) == {'rebind_local', 'delete_local'}
+    for snapshots in observed.values():
+        assert type(snapshots) is list and len(snapshots) == 2
+        for snapshot in snapshots:
+            assert type(snapshot) is list
+            assert all(type(event) is str for event in snapshot)
+    expected = {
+        'rebind_local': [
+            ['before', 'del:old', 'after'],
+            ['before', 'del:old', 'after', 'del:new'],
+        ],
+        'delete_local': [
+            ['before', 'del:deleted', 'after'],
+            ['before', 'del:deleted', 'after'],
+        ],
+    }
+    if observed != expected:
+        raise _ExactImplicitFinalizerOrderDifference((observed, expected))
 
 
 
