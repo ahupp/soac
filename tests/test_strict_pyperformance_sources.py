@@ -38,6 +38,10 @@ def source_tools():
         (b"#!/usr/bin/env python3\n# coding: latin-1\nlabel = '\xe9'\n", 3),
         (b"# coding: utf-8\r\nresult = 1\r\n", 2),
         (b"from __future__ import annotations", 2),
+        (b'"""module docstring"""; result = 1\n', 1),
+        (b"from __future__ import annotations; result = 1\n", 1),
+        (b'"""doc"""; from __future__ import annotations; result = 1\n', 1),
+        ('"""doc é"""; result = 1\r\n'.encode("utf-8"), 1),
         (b"", 1),
     ],
 )
@@ -46,6 +50,9 @@ def test_strict_opt_in_preserves_source_semantics_and_encoding(
 ):
     result, insertion = source_tools.strict_opt_in(source, "benchmark.py")
     assert insertion == expected_line
+    # AST parsing alone accepts misplaced futures; compile checks their real
+    # statement ordering without executing any analyzed source.
+    compile(result, "benchmark.py", "exec", dont_inherit=True)
     original = ast.parse(source)
     candidate = ast.parse(result)
     candidate.body = [
@@ -60,7 +67,9 @@ def test_strict_opt_in_preserves_source_semantics_and_encoding(
     assert ast.dump(candidate, include_attributes=False) == ast.dump(
         original, include_attributes=False
     )
-    if b"\r\n" in source:
+    if b"from __future__ import strict; " in result:
+        assert result.replace(b"from __future__ import strict; ", b"", 1) == source
+    elif b"\r\n" in source:
         assert b"import strict\r\n" in result
     if b"\xe9" in source:
         assert b"\xe9" in result

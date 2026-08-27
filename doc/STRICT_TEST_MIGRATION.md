@@ -1,5 +1,15 @@
 # Strict integration test migration
 
+## Single-file scenarios
+
+New source-level cases can use the [single-file scenario format](STRICT_SCENARIO_TESTS.md)
+under `tests/strict_scenarios/`: module sections define one analyzed project,
+then `ok`/`raise` blocks run in independent authenticated processes. A `raise`
+expectation covers only the final statement; module setup and preceding
+statements cannot satisfy it. The format guide also records the baseline
+migration inventory, separating direct candidates, required extensions and
+native/tooling tests that should retain their existing purpose.
+
 ## Why the old matrix is not evidence
 
 The initial audit found 298 delimiter cases under `tests/integration_modules`

@@ -341,11 +341,19 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    synchronous `validate_module(module)`/`validate(module)` or use top-level
    checks, not both. Never convert unexpected test failures to xfails based on
    exception text.
-   Every delimiter case needs an explicit strict-admission, strict-rejection,
+   Every legacy `# diet-python: validate` case needs an explicit strict-admission, strict-rejection,
    or ordinary-interoperability decision in `tests/test_integration_cases.py`;
    an unreviewed case fails before attempting a transformed run. Preserve the
    original stock body and validator when enrolling it. A strict-only rejection
    validator must name the documented contract difference.
+   New source-level cases can use one file under `tests/strict_scenarios/` with
+   `# module:name`, `# ok`, and `# raise:Exception` sections. Its adapter explicitly
+   adds strict opt-in, runs the real checker once per file/mode, then starts a
+   fresh authenticated process for every block. Only the final top-level
+   statement can satisfy `raise`; imports, admission and preceding setup must
+   succeed independently. See `doc/STRICT_SCENARIO_TESTS.md`. Preserve existing
+   ordinary controls and native witnesses when migrating; do not turn required
+   ordinary helper modules into strict ones merely to fit this minimal format.
    Publish and replay retained strict fixtures through the same recipe
    environment. `_pytest-run` prefixes `LD_LIBRARY_PATH` with the selected
    CPython library directory; direct `just --command` does not add that prefix.

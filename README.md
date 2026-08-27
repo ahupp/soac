@@ -618,6 +618,14 @@ than a global exception-message-to-xfail rule.
 The [strict test migration inventory](doc/STRICT_TEST_MIGRATION.md) records the
 legacy coverage gaps, reviewed cohorts, and unresolved compatibility cases.
 
+New source-level tests can use the [single-file scenario format](doc/STRICT_SCENARIO_TESTS.md)
+in `tests/strict_scenarios/`: `# module:name` sections define the analyzed modules,
+then `# ok` and `# raise:Exception` sections run in fresh authenticated processes.
+Only the final top-level statement is covered by a `raise` expectation; module
+setup and earlier statements must succeed. The adapter adds the strict opt-in
+explicitly and uses the existing real-checker/native-startup helper. Run these
+with `just pytest-fast --require-batch-runner tests/test_strict_scenarios.py`.
+
 The development dependency group includes Pydantic, Django, and SQLAlchemy for
 the real framework-fallback compatibility tests. These cover model construction,
 descriptors, validation/coercion, dictionary replacement, and instrumentation

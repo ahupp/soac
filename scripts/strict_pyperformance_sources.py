@@ -79,11 +79,23 @@ def strict_opt_in(source: bytes, filename: str) -> tuple[bytes, int]:
             else:
                 break
     newline = "\r\n" if "\r\n" in text else "\n"
-    before = "".join(lines[:insertion_line])
-    after = "".join(lines[insertion_line:])
-    if before and not before.endswith(("\n", "\r")):
-        before += newline
-    candidate = before + "from __future__ import strict" + newline + after
+    if first is not None and first.lineno == insertion_line:
+        # A docstring/future header can share its physical line with ordinary
+        # statements. Insert before that first ordinary statement, preserving
+        # all existing bytes and the future-import ordering rule. AST columns
+        # use UTF-8 bytes even when the original source has another encoding.
+        header_line = lines[insertion_line - 1].encode("utf-8")
+        before = "".join(lines[:insertion_line - 1]) + header_line[:first.col_offset].decode("utf-8")
+        after = header_line[first.col_offset:].decode("utf-8") + "".join(lines[insertion_line:])
+        candidate = before + "from __future__ import strict; " + after
+        added_line = insertion_line
+    else:
+        before = "".join(lines[:insertion_line])
+        after = "".join(lines[insertion_line:])
+        if before and not before.endswith(("\n", "\r")):
+            before += newline
+        candidate = before + "from __future__ import strict" + newline + after
+        added_line = insertion_line + 1
 
     transformed = ast.parse(candidate, filename=filename)
     added = [
@@ -101,7 +113,7 @@ def strict_opt_in(source: bytes, filename: str) -> tuple[bytes, int]:
         transformed, include_attributes=False
     ):
         raise ValueError(f"strict overlay changed benchmark syntax: {filename}")
-    return candidate.encode(encoding), insertion_line + 1
+    return candidate.encode(encoding), added_line
 
 
 def _main_guard(node: ast.stmt) -> bool:
