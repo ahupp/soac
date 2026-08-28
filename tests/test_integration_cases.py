@@ -22,7 +22,8 @@ MODULES_DIR = Path(__file__).resolve().parent / "integration_modules"
 # Preserve the original ordinary programs/tails and report their excluded SOAC
 # observations explicitly. These legacy frame-only variants are not admitted
 # strict programs: run=False must not turn missing admission into a fake runtime
-# failure. Frame-free semantic companions remain in test_strict_call_context.py.
+# failure. Frame-free semantic companions live in
+# strict_scenarios/execution/ordinary_code_uses_explicit_namespaces_and_captured_builtins.py.
 SOAC_FRAME_INSPECTION_XFAILS = {
     "yield_from_stack_names": "source and caller frame names through sys._getframe()/f_back",
     "dir_filters": "function-local names through argumentless dir()",

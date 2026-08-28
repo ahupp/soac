@@ -14,7 +14,6 @@ import pytest
 from scripts.strict_pyperformance_sources import strict_opt_in
 from tests._strict_integration import (
     ROOT,
-    StrictValidationCase,
     assert_strict_source_rejected,
     create_strict_project,
 )
@@ -53,80 +52,6 @@ def test_strict_source_surrogate_escape_is_rejected_before_publication(tmp_path,
     )
     start = source.index(r"\ud800")
     assert f"bytes {start}..{start + 6}" in error
-
-
-@pytest.fixture(scope="module")
-def strict_source_literal_controls(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-source-literal-controls"),
-        {
-            "literal_controls.py": r"""
-                # soac: module(strict_assign=true, checked_attr=true)
-                from typing import Literal
-                import ordinary_literals
-
-                def replacement(value: Literal["�"]) -> Literal["\ufffd"]:
-                    return value
-
-                def backslash(value: Literal[r"\ud800"]) -> Literal[r"\ud800"]:
-                    return value
-
-                def controls(value):
-                    return (
-                        "�", "\ufffd", r"\ud800", "\\ud800",
-                        rf"\ud800{value}", rt"\ud800{value}".strings,
-                        f"\\ud800{value}", t"\\ud800{value}".strings,
-                    )
-
-                def ordinary_values():
-                    return ordinary_literals.values()
-            """,
-            "ordinary_literals.py": r"""
-                def values():
-                    return "\ud800", "\ud83d\udc0d", "\U0000DFFF"
-            """,
-        },
-        modules={"literal_controls": "literal_controls.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True])
-def test_strict_source_literal_controls_and_ordinary_surrogates_remain_distinct(
-    strict_source_literal_controls, entry_interpreter
-):
-    expected_entry = "entry_interpreter" if entry_interpreter else "checked_native"
-    strict_source_literal_controls.run(
-        _NATIVE_PREDICATES
-        + f"expected_entry = {expected_entry!r}\n"
-        + r"""
-import literal_controls as checked
-import ordinary_literals as ordinary
-for name in ("replacement", "backslash", "controls", "ordinary_values"):
-    function = vars(checked)[name]
-    assert metadata(function) is not None
-    assert strict_owner(function) is not None
-    assert _soac_ext.strict_function_entry_kind(function) == expected_entry
-assert _soac_ext.strict_module_diagnostics(checked)["sealed"] is True
-assert _soac_ext.strict_module_diagnostics(ordinary) is None
-assert metadata(ordinary.values) is None
-assert strict_owner(ordinary.values) is None
-assert checked.replacement("�") == "�"
-assert checked.backslash(r"\ud800") == r"\ud800"
-# Literal annotations are outside the shared mandatory-check subset. They
-# must not coerce a runtime surrogate to the source replacement character.
-for function in (checked.replacement, checked.backslash):
-    surrogate = chr(0xD800)
-    assert function(surrogate) is surrogate
-assert checked.controls("X") == (
-    "�", "�", r"\ud800", r"\ud800", r"\ud800X", (r"\ud800", ""),
-    r"\ud800X", (r"\ud800", ""),
-)
-expected = ([0xD800], [0xD83D, 0xDC0D], [0xDFFF])
-assert tuple(list(map(ord, value)) for value in ordinary.values()) == expected
-assert tuple(list(map(ord, value)) for value in checked.ordinary_values()) == expected
-""",
-        entry_interpreter=entry_interpreter,
-    )
 
 
 @pytest.mark.parametrize("entry_interpreter", [False, True])
@@ -1113,132 +1038,8 @@ def test_cross_module_nested_creation_keeps_the_callee_source_owner(
     )
 
 
-@pytest.mark.parametrize("entry_interpreter", [False, True])
-def test_importlib_reload_cannot_reexecute_or_unseal_a_strict_module(
-    strict_import_protocols, entry_interpreter
-):
-    strict_import_protocols.run(
-        """
-        import importlib
-        import reload_audit, reload_helper
-        from soac.strict import StrictMutationError
-        original = reload_helper
-        function = original.read
-        spec = original.__spec__
-        assert reload_audit.events == ["executed"]
-        try:
-            importlib.reload(original)
-        except StrictMutationError:
-            # importlib first replaces __spec__. This final binding rejects
-            # reload before the loader can attempt a second body execution.
-            pass
-        else:
-            raise AssertionError("sealed module reloaded")
-        assert sys.modules["reload_helper"] is original
-        assert original.__spec__ is spec
-        assert reload_audit.events == ["executed"]
-        assert original.read is function and function() == 1
-        assert _soac_ext.strict_module_diagnostics(original)["sealed"] is True
-        """,
-        entry_interpreter=entry_interpreter,
-    )
-
-
-@pytest.fixture(scope="module")
-def strict_relative_star_package(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-relative-star-package"),
-        {
-            "relative_star_pkg/__init__.py": """
-                # soac: module(strict_assign=true, checked_attr=true)
-                from .child import *
-                VALUE = child.MARKER
-            """,
-            "relative_star_pkg/child.py": (
-                '__all__ = ["EXPORTED"]\nMARKER = "child"\nEXPORTED = 3\n'
-            ),
-        },
-        modules={"relative_star_pkg": "relative_star_pkg/__init__.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True])
-def test_authenticated_package_relative_star_keeps_ordinary_child_binding(
-    strict_relative_star_package, entry_interpreter
-):
-    strict_relative_star_package.run(
-        """
-        import relative_star_pkg as module
-        assert module.VALUE == "child"
-        assert module.EXPORTED == 3
-        assert _soac_ext.strict_module_diagnostics(module)["sealed"] is True
-        assert _soac_ext.strict_module_diagnostics(module.child) is None
-        assert not isinstance(module.child.__spec__.loader, import_hook.SoacLoader)
-        """,
-        entry_interpreter=entry_interpreter,
-    )
-
-
-def test_strict_module_docstring_is_visible_before_body_callbacks(tmp_path):
-    project = create_strict_project(
-        tmp_path,
-        {
-            "doc_plain.py": '''
-                """plain docs"""
-                # soac: module(strict_assign=true, checked_attr=true)
-                from doc_support import observe
-                observe(__name__)
-                VALUE = 1
-            ''',
-            "doc_deferred.py": '''
-                """deferred docs"""
-                # soac: module(strict_assign=true, checked_attr=true)
-                from doc_support import observe
-                observe(__name__)
-                VALUE: int = 1
-            ''',
-            "doc_stringized.py": '''
-                """stringized docs"""
-                # soac: module(strict_assign=true, checked_attr=true)
-                from __future__ import annotations
-                from doc_support import observe
-                observe(__name__)
-                VALUE: int = 1
-            ''',
-            "doc_support.py": """
-                import sys
-                events = []
-                def observe(name):
-                    events.append((name, sys.modules[name].__doc__))
-            """,
-        },
-        modules={
-            name: f"{name}.py"
-            for name in ("doc_plain", "doc_deferred", "doc_stringized")
-        },
-    )
-    project.run(
-        """
-        import doc_plain, doc_deferred, doc_stringized, doc_support
-        assert doc_support.events == [
-            ("doc_plain", "plain docs"),
-            ("doc_deferred", "deferred docs"),
-            ("doc_stringized", "stringized docs"),
-        ]
-        for module, document in (
-            (doc_plain, "plain docs"),
-            (doc_deferred, "deferred docs"),
-            (doc_stringized, "stringized docs"),
-        ):
-            assert _soac_ext.strict_module_diagnostics(module)["sealed"] is True
-            assert module.__doc__ == document and module.VALUE == 1
-        """
-    )
-
-
-# The original import regressions are shared by the ordinary controls and
-# authenticated cases. The fixture retains their original test-name mapping,
-# source, validation, explicit function witnesses, and ordinary dependencies.
+# Ordinary controls and admission failures retain the original registry.
+# Authenticated positive source cases now live in strict_scenarios/imports/.
 _REVIEWED_IMPORT_CASES = json.loads(
     (Path(__file__).parent / "fixtures/strict_import_regressions.json").read_text()
 )
@@ -1260,28 +1061,6 @@ _REVIEWED_IMPORT_RUNTIME_REJECTIONS = {
     "function_replaced_code": (
         "strict code execution requires an authenticated interpreter activation"
     ),
-}
-# This case only observes implicit function locals. Preserve its complete
-# ordinary control without requiring either SOAC frame inspection or refusal.
-_REVIEWED_IMPORT_ORDINARY_ONLY_CASES = {"locals_recent_assignment"}
-# The original formatter case checks the exception message and handled state,
-# not reconstructed SOAC frames. Keep its positive validator in every engine.
-_REVIEWED_TRACEBACK_FORMATTING_CASES = ("except_handled_exception_state",)
-_REVIEWED_IMPORT_POSITIVES = tuple(
-    name for name in _REVIEWED_IMPORT_CASES
-    if name not in _REVIEWED_IMPORT_REJECTIONS
-    and name not in _REVIEWED_IMPORT_RUNTIME_REJECTIONS
-    and name not in _REVIEWED_IMPORT_ORDINARY_ONLY_CASES
-)
-# Implicit eval still lacks the explicit namespace required by the supported
-# dynamic-code protocol. Its refusal is independent of SOAC frame inspection.
-# Override only selected validation; preserve the original fixture and source.
-_REVIEWED_IMPORT_SELECTED_VALIDATIONS = {
-    name: (
-        'with pytest.raises(NotImplementedError, match="requires explicit globals"):\n'
-        "    module.value()\n"
-    )
-    for name in ("eval_current_locals", "eval_for_loop_target_local")
 }
 # Ordinary execution keeps the original locals and implicit-eval results.
 _REVIEWED_IMPORT_ORDINARY_VALIDATIONS = {
@@ -1313,56 +1092,12 @@ def test_reviewed_import_regression_keeps_ordinary_execution(tmp_path, name):
     )
 
 
-def _selected_reviewed_import_case_modes(
-    items, *, test_path, positive_test, runtime_rejection_test,
-):
-    """Read actual worker collection; this schedules tests, never admission."""
-    test_path = Path(test_path).resolve()
-    selected = set()
-    for item in items:
-        function = getattr(item, "obj", None)
-        if function is positive_test:
-            allowed = _REVIEWED_IMPORT_POSITIVES
-        elif function is runtime_rejection_test:
-            allowed = _REVIEWED_IMPORT_RUNTIME_REJECTIONS
-        else:
-            continue
-        if Path(item.path).resolve() != test_path:
-            continue
-        params = getattr(getattr(item, "callspec", None), "params", None)
-        if not isinstance(params, dict) or not {"name", "entry_interpreter"} <= params.keys():
-            raise ValueError("collected reviewed import case is missing its parameters")
-        name = params["name"]
-        mode = params["entry_interpreter"]
-        if type(name) is not str or name not in allowed:
-            raise ValueError("collected reviewed import case is not in its reviewed role")
-        if type(mode) is not bool:
-            raise ValueError("collected reviewed import case has an unexpected mode")
-        selected.add((name, mode))
-    return frozenset(selected)
-
-
 @pytest.fixture(scope="module")
-def strict_reviewed_import_selected_case_modes(request):
-    return _selected_reviewed_import_case_modes(
-        request.session.items,
-        test_path=Path(__file__),
-        positive_test=test_reviewed_import_regressions_use_authenticated_entries,
-        runtime_rejection_test=test_reviewed_import_regression_runtime_rejection_is_terminal,
-    )
-
-
-@pytest.fixture(scope="module")
-def strict_reviewed_import_regressions(
-    tmp_path_factory, strict_reviewed_import_selected_case_modes,
-):
-    selected_names = {name for name, _ in strict_reviewed_import_selected_case_modes}
-    if not selected_names:
-        raise ValueError("reviewed import project has no collected cases")
+def strict_reviewed_import_regressions(tmp_path_factory):
     sources = {}
     modules = {}
     for name, case in _REVIEWED_IMPORT_CASES.items():
-        if name not in selected_names:
+        if name not in _REVIEWED_IMPORT_RUNTIME_REJECTIONS:
             continue
         relative = f"{name}.py"
         sources[relative] = strict_opt_in(case["source"].encode(), relative)[0].decode()
@@ -1432,78 +1167,6 @@ def test_reviewed_import_regression_runtime_rejection_is_terminal(
     )
 
 
-@pytest.fixture(scope="module")
-def strict_reviewed_import_results(
-    strict_reviewed_import_regressions, strict_reviewed_import_selected_case_modes,
-):
-    results_by_mode = {}
-    for entry_interpreter in (False, True):
-        selected_names = tuple(
-            name for name in _REVIEWED_IMPORT_POSITIVES
-            if (name, entry_interpreter) in strict_reviewed_import_selected_case_modes
-        )
-        if not selected_names:
-            continue
-        # Each worker runs only its collected positive pairs. Rejection cases
-        # share source preparation but keep their original isolated validator.
-        cases = {
-            name: StrictValidationCase(
-                "import pytest\nimport sys\n"
-                + "def validate_module(module):\n"
-                + textwrap.indent(
-                    _REVIEWED_IMPORT_SELECTED_VALIDATIONS.get(name, case["validation"])
-                    + (
-                        "assert module.capture(False) == (False, 'ValueError', None)\n"
-                        "assert sys.exception() is None\n"
-                        if name in _REVIEWED_TRACEBACK_FORMATTING_CASES else ""
-                    ),
-                    "    ",
-                ),
-                Path(__file__),
-                required_functions=tuple(case["required_functions"]),
-            )
-            for name, case in _REVIEWED_IMPORT_CASES.items()
-            if name in selected_names
-        }
-        results = strict_reviewed_import_regressions.run_cases(
-            cases, entry_interpreter=entry_interpreter
-        )
-        assert set(results) == set(selected_names), "runtime did not report every requested case"
-        results_by_mode[entry_interpreter] = results
-    if not results_by_mode:
-        raise ValueError("reviewed import results have no collected positive cases")
-    return results_by_mode
-
-
-@pytest.mark.parametrize("name", _REVIEWED_IMPORT_POSITIVES)
-@pytest.mark.parametrize("entry_interpreter", [False, True])
-def test_reviewed_import_regressions_use_authenticated_entries(
-    strict_reviewed_import_results, name, entry_interpreter
-):
-    error = strict_reviewed_import_results[entry_interpreter][name]
-    assert error is None, f"{name} failed through the real strict import:\n{error}"
-
-
-@pytest.mark.parametrize("name", _REVIEWED_TRACEBACK_FORMATTING_CASES)
-def test_reviewed_traceback_formatting_preserves_original_native_behavior(tmp_path, name):
-    case = _REVIEWED_IMPORT_CASES[name]
-    relative = f"{name}.py"
-    source = strict_opt_in(case["source"].encode(), relative)[0].decode()
-    project = create_strict_project(
-        tmp_path,
-        {relative: source, **case["dependencies"]},
-        modules={name: relative},
-        backend="cpython",
-    )
-    project.run_case(
-        name,
-        "def validate_module(module):\n" + textwrap.indent(case["validation"], "    "),
-        Path(__file__),
-        required_functions=tuple(case["required_functions"]),
-        backend="cpython",
-    )
-
-
 @pytest.mark.parametrize("name", _REVIEWED_IMPORT_REJECTIONS)
 def test_reviewed_import_regression_rejection_does_not_publish_authority(
     tmp_path, name
@@ -1520,7 +1183,6 @@ def test_reviewed_import_regression_rejection_does_not_publish_authority(
     diagnostic = (tmp_path / "checker.stderr.log").read_text()
     assert _REVIEWED_IMPORT_REJECTIONS[name] in diagnostic, diagnostic
     assert not (tmp_path / "authority/deployment.json").exists()
-
 
 
 @pytest.mark.parametrize("checked_attr", [False, True])
@@ -1638,84 +1300,6 @@ def multiline(values):
 def nested(groups):
     return list(tuple(checked(value) for value in values) for values in groups)
 """
-
-
-def test_cpython_backend_generator_argument_ranges_preserve_native_execution(tmp_path):
-    project = create_strict_project(
-        tmp_path,
-        {
-            "generator_arguments.py": (
-                "# soac: module(strict_assign=true, checked_attr=true)\n" + _CPYTHON_GENERATOR_ARGUMENT_SOURCE
-            ),
-            "ordinary_generator_arguments.py": _CPYTHON_GENERATOR_ARGUMENT_SOURCE,
-            "generator_argument_support.py": "from typing import Any\nevents: list[Any] = []\n",
-        },
-        modules={"generator_arguments": "generator_arguments.py"},
-        backend="cpython",
-    )
-    project.run_case(
-        "generator_arguments",
-        """
-import ctypes
-import generator_arguments as module
-import ordinary_generator_arguments as ordinary
-from generator_argument_support import events
-from soac import _soac_ext
-from tests._strict_integration import _assert_cpython_function_witness
-
-diagnostic = _soac_ext.strict_module_diagnostics(module)
-assert _soac_ext.strict_module_diagnostics(ordinary) is None
-names = ("checked", "sole", "explicit", "grouped", "multiline", "nested")
-for name in names:
-    function = vars(module)[name]
-    observed = _assert_cpython_function_witness(
-        function, diagnostic,
-    )
-    assert observed["original_code_entered"] is False
-    assert _soac_ext.strict_function_diagnostics(vars(ordinary)[name]) is None
-
-for name in ("sole", "explicit", "grouped", "multiline"):
-    native = vars(module)[name]
-    stock = vars(ordinary)[name]
-    events.clear()
-    expected = stock([2, 3, 5])
-    assert expected == [2, 3, 5] and events == [2, 3, 5]
-    events.clear()
-    assert native([2, 3, 5]) == expected and events == [2, 3, 5]
-    assert _soac_ext.strict_function_diagnostics(native)["original_code_entered"] is True
-
-events.clear()
-expected = ordinary.nested([[2, 3], [], [5]])
-assert expected == [(2, 3), (), (5,)] and events == [2, 3, 5]
-events.clear()
-assert module.nested([[2, 3], [], [5]]) == expected
-assert events == [2, 3, 5]
-for _ in range(128):
-    events.clear()
-    assert module.sole([7, 11]) == [7, 11]
-    assert events == [7, 11]
-
-call = ctypes.pythonapi.PyObject_CallOneArg
-call.argtypes = [ctypes.py_object, ctypes.py_object]
-call.restype = ctypes.py_object
-events.clear()
-assert call(module.sole, [13, 17]) == [13, 17]
-assert events == [13, 17]
-for invoke in (module.sole, lambda values: call(module.sole, values)):
-    events.clear()
-    assert invoke([1, "ordinary", 3]) == [1, "ordinary", 3]
-    assert events == [1, "ordinary", 3], "an annotation skipped an original body callback"
-events.clear()
-assert ordinary.sole([1, "ordinary", 3]) == [1, "ordinary", 3]
-assert events == [1, "ordinary", 3]
-assert _soac_ext.strict_function_diagnostics(module.checked)["original_code_entered"] is True
-assert _soac_ext.strict_function_diagnostics(module.nested)["original_code_entered"] is True
-""",
-        Path(__file__),
-        required_functions=("checked", "sole", "explicit", "grouped", "multiline", "nested"),
-        
-        backend="cpython",
-    )
 
 
 @pytest.fixture(scope="module")

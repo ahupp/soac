@@ -17,11 +17,15 @@ from types import FunctionType, ModuleType
 
 from tests._strict_integration import (
     ROOT,
+    STRICT_RUNTIME_TIMEOUT as STRICT_RUNTIME_TIMEOUT,
     StrictProject,
     _assert_cpython_function_witness,
     _assert_cpython_module_witness,
     create_strict_project,
 )
+
+
+SCENARIO_MODES = ("soac", "entry", "cpython")
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,13 @@ class StrictScenario:
     path: Path
     modules: tuple[ScenarioModule, ...]
     blocks: tuple[ScenarioBlock, ...]
+    modes: tuple[str, ...] = SCENARIO_MODES
+
+
+def scenario_pytest_id(scenario: StrictScenario, mode: str, root: Path) -> str:
+    """One shared spelling for collection and exact supervisor enrollment."""
+    relative = scenario.path.relative_to(root).with_suffix("").as_posix()
+    return f"{relative}-{mode}"
 
 
 def _qualified_name(value: str) -> bool:
@@ -112,6 +123,7 @@ def parse_strict_scenario(path: Path) -> StrictScenario:
     # str.splitlines also splits legal string contents such as U+0085/U+2028.
     lines = io.StringIO(source, newline="").readlines()
     markers: list[tuple[int, str, str | None]] = []
+    modes = None
     depth = 0
     try:
         for token in tokenize.generate_tokens(
@@ -125,7 +137,26 @@ def parse_strict_scenario(path: Path) -> StrictScenario:
             if token.type != tokenize.COMMENT or token.start[1] != 0 or depth:
                 continue
             text = token.string
-            if not re.match(r"#\s*(?:module|ok|raise)(?:\s|:|$)", text):
+            if re.match(r"#\s*modes(?:\s*:|\s*$)", text):
+                if markers or modes is not None:
+                    raise ValueError(
+                        f"{path}:{token.start[0]}: modes must appear once before modules"
+                    )
+                match = re.fullmatch(r"#\s*modes\s*:\s*(.+?)\s*", text)
+                if match is None:
+                    raise ValueError(
+                        f"{path}:{token.start[0]}: malformed modes directive"
+                    )
+                modes = tuple(part.strip() for part in match[1].split(","))
+                if len(set(modes)) != len(modes) or any(
+                    mode not in SCENARIO_MODES for mode in modes
+                ):
+                    raise ValueError(
+                        f"{path}:{token.start[0]}: modes must be distinct names from "
+                        + ", ".join(SCENARIO_MODES)
+                    )
+                continue
+            if not re.match(r"#\s*(?:module|ok|raise)(?:\s*:|\s*$)", text):
                 continue
             match = re.fullmatch(r"#\s*(?:(module|raise)\s*:\s*(\S+)|ok)\s*", text)
             if match is None:
@@ -192,7 +223,23 @@ def parse_strict_scenario(path: Path) -> StrictScenario:
             raise ValueError(
                 f"{path}: module {name!r} needs a declared parent {parent!r}"
             )
-    return StrictScenario(path.resolve(), tuple(modules), tuple(blocks))
+    return StrictScenario(
+        path.resolve(), tuple(modules), tuple(blocks), modes or SCENARIO_MODES
+    )
+
+
+def discover_strict_scenarios(root: Path) -> tuple[StrictScenario, ...]:
+    """Enroll every source file in the tree, with stable relative-path ordering.
+
+    These files are scenario input, not importable pytest modules. Fail on an
+    empty/mistyped tree instead of silently collecting no behavioral coverage.
+    """
+    paths = sorted(
+        root.rglob("*.py"), key=lambda path: path.relative_to(root).as_posix()
+    )
+    if not paths:
+        raise ValueError(f"{root}: no strict scenario files found")
+    return tuple(parse_strict_scenario(path) for path in paths)
 
 
 @dataclass
@@ -404,6 +451,14 @@ def _check_modules(
             assert type(module) is ModuleType, (
                 f"ordinary module {name} changed representation"
             )
+            origin = getattr(vars(module).get("__spec__"), "origin", None)
+            assert (
+                isinstance(origin, str)
+                and Path(origin).resolve() == Path(source_path).resolve()
+            ), (
+                f"ordinary module {name} did not execute its declared source: "
+                f"expected {source_path}, observed {origin!r}"
+            )
             assert _soac_ext.strict_module_diagnostics(module) is None, (
                 f"ordinary module {name} acquired strict ownership"
             )
@@ -466,9 +521,11 @@ def run_strict_scenario(path: Path, root: Path, *, mode: str = "soac") -> Strict
     expectation (for example os._exit(0)). The original helper still owns
     signing, native startup, execution-mode selection and subprocess logs.
     """
-    if mode not in {"soac", "entry", "cpython"}:
+    if mode not in SCENARIO_MODES:
         raise ValueError(f"unsupported strict scenario mode {mode!r}")
     scenario = parse_strict_scenario(path)
+    if mode not in scenario.modes:
+        raise ValueError(f"{path}: scenario is not enrolled for mode {mode!r}")
     names = {module.name for module in scenario.modules}
     paths = {
         module.name: module.name.replace(".", "/")

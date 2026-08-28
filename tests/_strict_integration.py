@@ -22,6 +22,8 @@ from pathlib import Path
 from types import FunctionType, MappingProxyType, ModuleType
 
 ROOT = Path(__file__).resolve().parents[1]
+# Each independently authenticated runtime invocation keeps this deadline.
+STRICT_RUNTIME_TIMEOUT = 120
 
 
 @lru_cache(maxsize=1)
@@ -437,7 +439,7 @@ class StrictProject:
         entry_interpreter: bool = False,
         opt_mode: str = "none",
         extra_env: Mapping[str, str] | None = None,
-        timeout: int = 120,
+        timeout: int = STRICT_RUNTIME_TIMEOUT,
         check: bool = True,
         backend: str | None = None,
     ) -> subprocess.CompletedProcess[str]:

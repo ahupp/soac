@@ -372,13 +372,20 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    an unreviewed case fails before attempting a transformed run. Preserve the
    original stock body and validator when enrolling it. A strict-only rejection
    validator must name the documented contract difference.
-   New source-level cases can use one file under `tests/strict_scenarios/` with
+   Source-level cases use the recursively collected, themed tree under
+   `tests/strict_scenarios/`, with shared module setup and many independent
+   cases per file. Use
    `# module:name`, `# ok`, and `# raise:Exception` sections. Each module section
    supplies source-comment selection or inherits package defaults; the adapter
    preserves those bytes, runs the real checker once per file/mode, then starts a
    fresh authenticated process for every block. Only the final top-level
    statement can satisfy `raise`; imports, admission and preceding setup must
-   succeed independently. See `doc/STRICT_SCENARIO_TESTS.md`. Preserve existing
+   succeed independently. An optional `# modes:soac,entry` or `# modes:cpython`
+   header retains genuinely backend-specific controls; do not silently omit
+   their assertions. `just test-all` executes the recursive dispatcher, and
+   each file/backend gets its own bounded parallel-test batch. Remove the
+   original pytest tests and dead fixtures when their assertions are migrated.
+   See `doc/STRICT_SCENARIO_TESTS.md`. Preserve existing
    ordinary controls and native witnesses when migrating; do not turn required
    ordinary helper modules into strict ones merely to fit this minimal format.
    Publish and replay retained strict fixtures through the same recipe
@@ -1073,7 +1080,10 @@ explicit ordinary
   The parallel pytest runner used by `just pytest ...`, `just pytest-fast ...`,
   and `just test-all` reports currently running batches every
   `SOAC_PYTEST_PROGRESS_INTERVAL` seconds, default `10`, and kills any one
-  batch that exceeds `SOAC_PYTEST_BATCH_TIMEOUT` seconds, default `300`. Set
+  ordinary batch that exceeds `SOAC_PYTEST_BATCH_TIMEOUT` seconds, default `300`.
+  A source scenario gets that base plus the unchanged 120-second runtime limit
+  for each parsed block after the first; exact file/backend enrollment controls
+  this bounded aggregate allowance. Runtime/checker limits stay unchanged. Set
   either value to `0` to disable that behavior. Batches stay file-local with
   at most four collected tests, independently of total suite size. Integration
   cohorts run only the worker's actual collected case/mode pairs, retaining their

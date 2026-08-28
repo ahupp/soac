@@ -240,69 +240,6 @@ def test_generator_protocol_native_control(case):
             assert event[-1] == ("RuntimeError", ("caller handler",))
 
 
-@pytest.fixture(scope="module")
-def generator_protocol_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-generator-protocol"),
-        {"generator_protocol.py": SOURCE},
-        modules={"generator_protocol": "generator_protocol.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-@pytest.mark.parametrize("case", CASES)
-def test_generator_protocol_preserves_native_callbacks(
-    generator_protocol_project, entry_interpreter, case
-):
-    expected = ordinary_events(case)
-    validation = VALIDATE.replace(
-        "def validate(module):",
-        "def validate(module):\n"
-        f"    CASE = {case!r}\n"
-        f"    EXPECTED = {expected!r}\n"
-        "    RESULTS = []",
-        1,
-    )
-    generator_protocol_project.run_case(
-        "generator_protocol",
-        validation,
-        Path(__file__),
-        entry_interpreter=entry_interpreter,
-        required_functions=("make_delegate", "make_plain"),
-    )
-
-
-def test_cpython_generator_close_preserves_completion_value_and_handler(tmp_path):
-    case = "close_return_value"
-    expected = ordinary_events(case)
-    assert ("result", 73) in expected, expected
-    project = create_strict_project(
-        tmp_path,
-        {"generator_protocol.py": SOURCE},
-        modules={"generator_protocol": "generator_protocol.py"},
-        backend="cpython",
-    )
-    validation = VALIDATE.replace(
-        "def validate(module):",
-        "def validate(module):\n"
-        f"    CASE = {case!r}\n"
-        f"    EXPECTED = {expected!r}\n"
-        "    RESULTS = []",
-        1,
-    )
-    project.run_case(
-        "generator_protocol",
-        validation,
-        Path(__file__),
-        required_functions=(
-            "make_delegate", "make_plain", "make_injection",
-            "injection_plain", "injection_handled", "injection_delegated",
-        ),
-        
-        backend="cpython",
-    )
-
-
 INJECTION_CASES = ("plain_throw", "handled_throw", "created_throw", "delegate_error")
 
 INJECTION_VALIDATE = """
@@ -370,29 +307,6 @@ def test_generator_injected_exception_native_control(case):
     assert len(events) == 1
     assert events[0][2] == expected_context
     assert events[0][3] is True
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-@pytest.mark.parametrize("case", INJECTION_CASES)
-def test_generator_injected_exception_uses_own_handled_item(
-    generator_protocol_project, entry_interpreter, case
-):
-    expected = ordinary_events(case, INJECTION_VALIDATE)
-    validation = INJECTION_VALIDATE.replace(
-        "def validate(module):",
-        "def validate(module):\n"
-        f"    CASE = {case!r}\n"
-        f"    EXPECTED = {expected!r}\n"
-        "    RESULTS = []",
-        1,
-    )
-    generator_protocol_project.run_case(
-        "generator_protocol",
-        validation,
-        Path(__file__),
-        entry_interpreter=entry_interpreter,
-        required_functions=("make_injection",),
-    )
 
 
 DELIVERY_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
@@ -554,39 +468,6 @@ def test_generator_delivery_native_control(case):
     assert ordinary_delivery_events(case) == DELIVERY_EXPECTED[case]
 
 
-@pytest.fixture(scope="module")
-def generator_delivery_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-generator-delivery"),
-        {"generator_delivery.py": DELIVERY_SOURCE},
-        modules={"generator_delivery": "generator_delivery.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-@pytest.mark.parametrize("case", DELIVERY_EXPECTED)
-def test_generator_delivery_preserves_completion_callbacks_and_cleanup(
-    generator_delivery_project, entry_interpreter, case
-):
-    expected = ordinary_delivery_events(case)
-    assert expected == DELIVERY_EXPECTED[case]
-    validation = DELIVERY_VALIDATE.replace(
-        "def validate(module):",
-        "def validate(module):\n"
-        f"    CASE = {case!r}\n"
-        f"    EXPECTED = {expected!r}\n"
-        "    RESULTS = []",
-        1,
-    )
-    generator_delivery_project.run_case(
-        "generator_delivery",
-        validation,
-        Path(__file__),
-        entry_interpreter=entry_interpreter,
-        required_functions=("make_delivery",),
-    )
-
-
 TERMINAL_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def terminal_values(mode, make_payload):
     payload = make_payload()
@@ -719,39 +600,6 @@ def ordinary_terminal_events(case):
 @pytest.mark.parametrize("case", TERMINAL_CASES)
 def test_generator_terminal_finalizer_native_control(case):
     assert ordinary_terminal_events(case) == TERMINAL_EXPECTED
-
-
-@pytest.fixture(scope="module")
-def generator_terminal_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-generator-terminal"),
-        {"generator_terminal.py": TERMINAL_SOURCE},
-        modules={"generator_terminal": "generator_terminal.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-@pytest.mark.parametrize("case", TERMINAL_CASES)
-def test_generator_terminal_cleanup_is_reentry_safe_and_finishes_closed(
-    generator_terminal_project, entry_interpreter, case
-):
-    expected = ordinary_terminal_events(case)
-    assert expected == TERMINAL_EXPECTED
-    validation = TERMINAL_VALIDATE.replace(
-        "def validate(module):",
-        "def validate(module):\n"
-        f"    CASE = {case!r}\n"
-        f"    EXPECTED = {expected!r}\n"
-        "    RESULTS = []",
-        1,
-    )
-    generator_terminal_project.run_case(
-        "generator_terminal",
-        validation,
-        Path(__file__),
-        entry_interpreter=entry_interpreter,
-        required_functions=("make_terminal",),
-    )
 
 
 SUSPENDED_NATIVE_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
@@ -943,30 +791,6 @@ def test_suspended_native_identity_and_state_control(kind, case):
     )
 
 
-@pytest.fixture(scope="module")
-def suspended_native_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-suspended-native"),
-        {"suspended_native.py": SUSPENDED_NATIVE_SOURCE},
-        modules={"suspended_native": "suspended_native.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-@pytest.mark.parametrize("kind", ["coroutine", "async_generator"])
-@pytest.mark.parametrize("case", ["identity", "state", "concurrent"])
-def test_suspended_objects_preserve_native_identity_and_state(
-    suspended_native_project, entry_interpreter, kind, case
-):
-    suspended_native_project.run_case(
-        "suspended_native",
-        suspended_native_validation(kind, case, native=False),
-        Path(__file__),
-        entry_interpreter=entry_interpreter,
-        required_functions=("make_suspended",),
-    )
-
-
 # Keep the original normal and suspended programs. Traceback-local retention
 # is an ordinary CPython control; SOAC preserves their explicit calls, errors,
 # replacement/deletion semantics and eventual cleanup without a source frame.
@@ -1118,162 +942,7 @@ def test_source_traceback_lifetime_native_control(kind, case):
     )
 
 
-@pytest.fixture(scope="module")
-def traceback_lifetime_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-source-traceback-lifetime"),
-        {"traceback_lifetime.py": TRACEBACK_LIFETIME_SOURCE},
-        modules={"traceback_lifetime": "traceback_lifetime.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-@pytest.mark.parametrize("kind", ["function", "generator", "coroutine", "async_generator"])
-@pytest.mark.parametrize("case", ["escape", "retain", "replace", "delete"])
-def test_source_exceptions_preserve_callbacks_and_cleanup_without_frame_retention(
-    traceback_lifetime_project, entry_interpreter, kind, case
-):
-    traceback_lifetime_project.run_case(
-        "traceback_lifetime",
-        traceback_lifetime_validation(kind, case),
-        Path(__file__),
-        entry_interpreter=entry_interpreter,
-        required_functions=("make_lifetime",),
-    )
-
-
-
 # Fresh delegation never reuses the previous native resume packet.
-_INITIAL_DELEGATION_SOURCE = """
-# soac: module(strict_assign=true, checked_attr=true)
-
-def after_send(delegate):
-    marker = yield "first"
-    result = yield from delegate
-    return marker, result
-
-def after_caught_throw(delegate):
-    try:
-        yield "first"
-    except ValueError:
-        return (yield from delegate)
-
-async def after_await(first, second):
-    first_result = await first
-    second_result = await second
-    return first_result, second_result
-
-async def after_caught_await(first, second):
-    try:
-        await first
-    except ValueError:
-        return await second
-
-def make_after_send(delegate):
-    return after_send(delegate)
-
-def make_after_caught_throw(delegate):
-    return after_caught_throw(delegate)
-
-def make_after_await(first, second):
-    return after_await(first, second)
-
-def make_after_caught_await(first, second):
-    return after_caught_await(first, second)
-"""
-
-_INITIAL_DELEGATION_VALIDATION = """
-import ctypes
-import pytest
-import ordinary_initial_entry
-from soac import _soac_ext
-
-def delegate():
-    yield "delegated"
-    return "delegate-result"
-
-def exercise(module, case):
-    class Awaitable:
-        def __init__(self, token):
-            self.token = token
-
-        def __await__(self):
-            result = yield self.token
-            return result
-
-    if case == "after_send":
-        generator = module.make_after_send(delegate())
-        assert next(generator) == "first"
-        assert generator.send("sent-value") == "delegated"
-        with pytest.raises(StopIteration) as done:
-            next(generator)
-        assert done.value.value == ("sent-value", "delegate-result")
-    elif case == "after_caught_throw":
-        generator = module.make_after_caught_throw(delegate())
-        assert next(generator) == "first"
-        assert generator.throw(ValueError("injected")) == "delegated"
-        with pytest.raises(StopIteration) as done:
-            next(generator)
-        assert done.value.value == "delegate-result"
-    elif case == "after_await":
-        coroutine = module.make_after_await(Awaitable("first"), Awaitable("second"))
-        assert coroutine.send(None) == "first"
-        assert coroutine.send("first-result") == "second"
-        with pytest.raises(StopIteration) as done:
-            coroutine.send("second-result")
-        assert done.value.value == ("first-result", "second-result")
-    elif case == "after_caught_await":
-        coroutine = module.make_after_caught_await(Awaitable("first"), Awaitable("second"))
-        assert coroutine.send(None) == "first"
-        assert coroutine.throw(ValueError("injected")) == "second"
-        with pytest.raises(StopIteration) as done:
-            coroutine.send("second-result")
-        assert done.value.value == "second-result"
-    else:
-        raise AssertionError(case)
-
-def validate_module(module):
-    case = __CASE__
-    owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
-    owner.argtypes = [ctypes.py_object]
-    owner.restype = ctypes.c_void_p
-    factory_name = "make_" + case
-    assert not owner(getattr(ordinary_initial_entry, factory_name))
-    assert _soac_ext.strict_module_diagnostics(ordinary_initial_entry) is None
-    exercise(ordinary_initial_entry, case)
-    assert owner(getattr(module, factory_name))
-    # run_case already requires the exact requested native/entry execution kind.
-    exercise(module, case)
-"""
-
-@pytest.fixture(scope="module")
-def initial_delegation_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-initial-delegation"),
-        {
-            "initial_entry.py": _INITIAL_DELEGATION_SOURCE,
-            "ordinary_initial_entry.py": _INITIAL_DELEGATION_SOURCE.replace(
-                "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
-            ),
-        },
-        modules={"initial_entry": "initial_entry.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True])
-@pytest.mark.parametrize(
-    "case", ["after_send", "after_caught_throw", "after_await", "after_caught_await"]
-)
-def test_fresh_delegation_does_not_reuse_the_previous_resume_packet(
-    initial_delegation_project, entry_interpreter, case
-):
-    initial_delegation_project.run_case(
-        "initial_entry",
-        _INITIAL_DELEGATION_VALIDATION.replace("__CASE__", repr(case)),
-        Path(__file__),
-        required_functions=("make_" + case,),
-        entry_interpreter=entry_interpreter,
-    )
 
 
 CYCLIC_TRACEBACK_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
@@ -1394,28 +1063,6 @@ def test_cyclic_async_traceback_native_gc_control():
     )
     exec_integration_validation(
         CYCLIC_TRACEBACK_VALIDATE, module, Path(__file__), mode="stock"
-    )
-
-
-@pytest.fixture(scope="module")
-def cyclic_traceback_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-cyclic-async-traceback"),
-        {"cyclic_traceback.py": CYCLIC_TRACEBACK_SOURCE},
-        modules={"cyclic_traceback": "cyclic_traceback.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-def test_cyclic_async_traceback_does_not_root_suspended_source_state(
-    cyclic_traceback_project, entry_interpreter
-):
-    cyclic_traceback_project.run_case(
-        "cyclic_traceback",
-        CYCLIC_TRACEBACK_VALIDATE,
-        Path(__file__),
-        required_functions=("make",),
-        entry_interpreter=entry_interpreter,
     )
 
 
@@ -1584,36 +1231,6 @@ def test_suspended_expression_operand_native_lifetime_control(case):
     assert ordinary_suspended_operand_events(case)
 
 
-@pytest.fixture(scope="module")
-def suspended_operand_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-suspended-operands"),
-        {"suspended_operands.py": SUSPENDED_OPERAND_SOURCE},
-        modules={"suspended_operands": "suspended_operands.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-@pytest.mark.parametrize("case", SUSPENDED_OPERAND_CASES)
-def test_suspended_expression_operands_preserve_semantics_and_required_cleanup(
-    suspended_operand_project, entry_interpreter, case,
-):
-    expected = ordinary_suspended_operand_events(case)
-    validation = SUSPENDED_OPERAND_VALIDATE.replace(
-        "def validate(module):",
-        "def validate(module):\n"
-        f"    CASE = {case!r}\n"
-        f"    EXPECTED = {expected!r}\n"
-        "    RESULTS = []",
-        1,
-    )
-    suspended_operand_project.run_case(
-        "suspended_operands", validation, Path(__file__),
-        required_functions=("make_suspended_call",),
-        entry_interpreter=entry_interpreter,
-    )
-
-
 DELEGATED_THROW_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def suspended_delegation(make, values):
     local = make()
@@ -1748,36 +1365,6 @@ def ordinary_delegated_throw_result(case):
 @pytest.mark.parametrize("case", DELEGATED_THROW_CASES)
 def test_delegated_throw_source_traceback_native_control(case):
     assert ordinary_delegated_throw_result(case)
-
-
-@pytest.fixture(scope="module")
-def delegated_throw_project(tmp_path_factory):
-    return create_strict_project(
-        tmp_path_factory.mktemp("strict-delegated-throw"),
-        {"delegated_throw.py": DELEGATED_THROW_SOURCE},
-        modules={"delegated_throw": "delegated_throw.py"},
-    )
-
-
-@pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
-@pytest.mark.parametrize("case", DELEGATED_THROW_CASES)
-def test_delegated_throw_preserves_results_exceptions_and_cleanup(
-    delegated_throw_project, entry_interpreter, case,
-):
-    expected = ordinary_delegated_throw_result(case)
-    validation = DELEGATED_THROW_VALIDATE.replace(
-        "def validate(module):",
-        "def validate(module):\n"
-        f"    CASE = {case!r}\n"
-        f"    EXPECTED = {expected!r}\n"
-        "    RESULTS = []",
-        1,
-    )
-    delegated_throw_project.run_case(
-        "delegated_throw", validation, Path(__file__),
-        required_functions=("make_suspended_delegation",),
-        entry_interpreter=entry_interpreter,
-    )
 
 
 ITERATOR_ACTIVATION_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)

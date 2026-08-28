@@ -649,9 +649,12 @@ than a global exception-message-to-xfail rule.
 The [strict test migration inventory](doc/STRICT_TEST_MIGRATION.md) records the
 legacy coverage gaps, reviewed cohorts, and unresolved compatibility cases.
 
-New source-level tests can use the [single-file scenario format](doc/STRICT_SCENARIO_TESTS.md)
-in `tests/strict_scenarios/`: `# module:name` sections define the analyzed modules,
-then `# ok` and `# raise:Exception` sections run in fresh authenticated processes.
+Source-level tests use the [single-file scenario format](doc/STRICT_SCENARIO_TESTS.md)
+in the recursively collected, themed `tests/strict_scenarios/` tree:
+`# module:name` sections define shared modules, then any number of `# ok` and
+`# raise:Exception` cases run in fresh authenticated processes. Each file/backend
+is analyzed once; cases never share mutable runtime state. A `# modes:...` header
+can retain a backend-specific control without dropping its assertions.
 Only the final top-level statement is covered by a `raise` expectation; module
 setup and earlier statements must succeed. Each module section carries its own
 source policy or inherits package defaults; the adapter preserves those bytes
@@ -711,6 +714,46 @@ artifact directory, and the setup recipe symlinks `vendor/cpython`, `work/`,
 `.uv-cache`, `.uv/`, and `.xdg/` from the parent checkout so temporary
 worktrees can reuse the already-fetched offline state and shared benchmark
 artifacts.
+
+## Test case metadata browser
+
+Run `just test-case-browser` in the Ubuntu VM, then open
+`http://127.0.0.1:8002` on the host. Pass a port to override the default, for
+example `just test-case-browser 9002`. From the host:
+
+```bash
+python3 scripts/run_lima_with_host_environment.py \
+  --instance ubuntu24 \
+  --workdir /home/adamh.guest/soac \
+  -- just test-case-browser
+```
+
+The browser recursively lists `tests/strict_scenarios/`. Search by scenario or
+class name, and use Left/Right to move through the filtered list (outside text
+inputs). Each setup module has its own blue-green source box. Classes, fields,
+methods, functions, and global bindings align with their inferred type,
+properties, and expandable raw JSON. Each paired block grows to fit its longer
+side, with alternating backgrounds separating declarations. Validation cases
+have separate warm-colored boxes. Hover dotted properties, including raw JSON
+keys, for explanations of their meaning and limits. Inherited and generated
+members without a local declaration remain in their class's raw record.
+
+Selecting a scenario automatically runs the verified offline checker through
+`scripts/run_ty.py`. Rapid navigation queues only the latest selection. The
+browser preserves module source bytes and package layout, and does not import
+the scenario modules or execute their validation cases. The displayed
+`ClassTypeFact` records are construction proposals, not proof of installed
+runtime contracts; ordinary modules and withheld records are explicitly
+distinguished. Raw JSON preserves 64-bit source hashes without JavaScript
+rounding.
+
+The server listens only on loopback and accepts local, same-origin requests.
+Inspection evidence and checker logs are retained under
+`work/test-case-browser/`. Successful snapshots are reused within the server
+session only while the scenario bytes match; restart the server after changing
+the checker or its dependencies to obtain new inference. The existing selected
+CPython environment is required, but the browser itself adds no Python or
+JavaScript package dependencies.
 
 ## Documentation Site
 
@@ -849,8 +892,13 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   Overrides the pytest trace output path used when `SOAC_PYTEST_TRACE=1`.
 
 - `SOAC_PYTEST_BATCH_TIMEOUT=<seconds>`
-  Per-batch timeout for the parallel pytest runner used by `just pytest ...`,
+  Base per-batch timeout for the parallel pytest runner used by `just pytest ...`,
   `just pytest-fast ...`, and `just test-all`. The default is `300` seconds.
+  Ordinary batches and one-block source scenarios use this value unchanged.
+  A multi-block strict scenario adds the unchanged 120-second runtime limit
+  for each block after the first; its actual parsed enrollment determines the
+  aggregate deadline. Individual runtime/checker limits are not increased.
+  Set the base to `0` to disable the outer deadline, as before.
   These parallel controls apply to selector-only invocations. Passing pytest
   options such as `-q` or `-v` uses serial passthrough instead, without per-batch
   timeouts or progress reports.

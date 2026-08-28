@@ -2,13 +2,25 @@
 
 ## Single-file scenarios
 
-New source-level cases can use the [single-file scenario format](STRICT_SCENARIO_TESTS.md)
-under `tests/strict_scenarios/`: module sections define one analyzed project,
-then `ok`/`raise` blocks run in independent authenticated processes. A `raise`
+Source-level cases use the [single-file scenario format](STRICT_SCENARIO_TESTS.md)
+under the recursively collected, themed `tests/strict_scenarios/` tree: shared
+module sections define one analyzed project, then any number of `ok`/`raise`
+blocks run in independent authenticated processes. Backend-specific controls
+use an explicit `# modes:...` header; all three backends are the default. A `raise`
 expectation covers only the final statement; module setup and preceding
-statements cannot satisfy it. The format guide also records the baseline
-migration inventory, separating direct candidates, required extensions and
-native/tooling tests that should retain their existing purpose.
+statements cannot satisfy it. The format guide separately records the actual
+bulk migration and its execution evidence and limitations, the retained
+specialized/native/tooling tests, and the historical inspection inventories.
+Candidate counts from an older inspection are not the current remaining-test count.
+
+## Reading the historical checkpoints
+
+The dated and versioned results below preserve earlier implementation and
+validation evidence; they are not results for the later themed scenario
+migration. References to retired configuration/future syntax or earlier
+call-value checks describe those checkpoints, not current policy. Current
+selection uses source comments and runtime value enforcement is field-only,
+as specified by `OPT_GOAL.md` and `doc/TYPE_DRIVEN_OPTIMIZATION.md`.
 
 ## Why the old matrix is not evidence
 
@@ -1193,10 +1205,12 @@ artifacts and rebuilt dependencies. Reuse the actual cached toolchain and record
 its identity, rather than inferring it from a dependency's toolchain file.
 
 Checked-field tests must opt into their intended field policy and inspect the
-published policy before interpreting write behavior. The default test-project
-configuration enables supported parameter/return checks but disables field
-checks. The private-capture fixture initially checked only class participation
-and nominal-leaf presence, which led to an incorrect enforcement diagnosis;
+published policy before interpreting write behavior. At this historical
+checkpoint, the test-project defaults enabled parameter/return checks and
+disabled field checks. That configuration has since been removed: current
+runtime value enforcement is field-only and selected through source comments.
+The private-capture fixture initially checked only class participation and
+nominal-leaf presence, which led to an incorrect enforcement diagnosis;
 the exported `language_policy` immediately distinguished the fixture mismatch.
 
 The first v6 full gate stopped after workspace Rust tests: 513 passed and 142

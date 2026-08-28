@@ -573,6 +573,13 @@ build-web-inspector-server: ensure-cpython ensure-shared-python
 
 build-web-inspector: build-web-inspector-server
 
+test-case-browser browser_port="8002": ensure-venv-fast ensure-shared-python
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+  exec "$VENV_DIR/bin/python" scripts/test_case_browser.py --port "$1"
+
 docs-install:
   #!/usr/bin/env bash
   set -euo pipefail

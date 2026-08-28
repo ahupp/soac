@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from tests._strict_integration import create_strict_project
-from tests.test_strict_class_runtime import _CPYTHON_CLASS_CONSTRUCTION
 
 SOURCE = """
 # soac: module(strict_assign=true, checked_attr=true)
@@ -173,155 +172,8 @@ assert second.invoke(left, lambda: 2) == 32
 """
 
 
-_CPYTHON_METHOD_VALIDATION = """
-from tests._strict_integration import _assert_cpython_function_witness
-
-module_witness = _soac_ext.strict_module_diagnostics(methods)
-for cls in (methods.Base, methods.Override, methods.Inherited, methods.FieldShadow, first, second):
-    assert_native_class(cls)
-assert get_type_owner(first) != get_type_owner(second)
-for cls in (first, second):
-    for name in ("method", "invoke"):
-        witness = _assert_cpython_function_witness(
-            vars(cls)[name], module_witness,
-        )
-        assert witness["finalized"] is True
-        assert witness["original_code_entered"] is True
-
-# Exercise the owning-result helper directly, and its StackRef sibling through
-# the public vectorcall method API. No private StackRef layout is mirrored.
-get_method = ctypes.pythonapi._PyObject_GetMethod
-get_method.argtypes = [
-    ctypes.py_object, ctypes.py_object, ctypes.POINTER(ctypes.c_void_p),
-]
-get_method.restype = ctypes.c_int
-decref = ctypes.pythonapi.Py_DecRef
-decref.argtypes = [ctypes.c_void_p]
-decref.restype = None
-vectorcall_method = ctypes.pythonapi.PyObject_VectorcallMethod
-vectorcall_method.argtypes = [
-    ctypes.py_object, ctypes.POINTER(ctypes.py_object), ctypes.c_size_t, ctypes.c_void_p,
-]
-vectorcall_method.restype = ctypes.py_object
-
-def resolve(receiver):
-    result = ctypes.c_void_p()
-    unbound = get_method(receiver, "method", ctypes.byref(result))
-    assert unbound in (0, 1) and result.value is not None
-    try:
-        target = ctypes.cast(result, ctypes.py_object).value
-    finally:
-        # target has its own Python reference; consume the helper's owned one.
-        decref(result)
-    return unbound, target
-
-def owning_method_call(receiver, *arguments):
-    unbound, target = resolve(receiver)
-    return target(receiver, *arguments) if unbound else target(*arguments)
-
-def stackref_method_call(receiver, *arguments):
-    values = (ctypes.py_object * (1 + len(arguments)))(receiver, *arguments)
-    return vectorcall_method("method", values, len(values), None)
-
-ordinary_namespace = {"__name__": "ordinary_method_control"}
-exec(compile(ordinary_source, "<ordinary-method-control>", "exec"), ordinary_namespace)
-ordinary_receivers = (
-    ordinary_namespace["Base"](), ordinary_namespace["Override"](),
-    ordinary_namespace["Inherited"](),
-    ordinary_namespace["FieldShadow"](lambda value: value + 90),
-)
-for receiver, control, declaring, expected in (
-    (base, ordinary_receivers[0], methods.Base, 12),
-    (override, ordinary_receivers[1], methods.Override, 22),
-    (inherited, ordinary_receivers[2], methods.Base, 12),
-    (field, ordinary_receivers[3], None, 92),
-):
-    actual_kind, target = resolve(receiver)
-    control_kind, control_target = resolve(control)
-    assert actual_kind == control_kind == (declaring is not None)
-    if declaring is not None:
-        assert target is vars(declaring)["method"]
-    else:
-        assert target is vars(receiver)["method"]
-        assert control_target is vars(control)["method"]
-    for call in (owning_method_call, stackref_method_call):
-        assert call(receiver, 2) == call(control, 2) == expected
-
-# Both native lookup APIs must ignore hidden dictionary values only for actual
-# protected receivers. The same original source without opt-in stays ordinary.
-for receiver, control, expected in zip(
-    (base, override, inherited), ordinary_receivers[:3], (11, 21, 11),
-):
-    hidden = lambda *arguments: "dictionary shadow"
-    vars(receiver)["method"] = hidden
-    vars(control)["method"] = hidden
-    assert resolve(receiver)[0] == 1
-    assert resolve(control) == (0, hidden)
-    for call in (owning_method_call, stackref_method_call):
-        assert call(receiver) == expected
-        assert call(control) == "dictionary shadow"
-        methods.EVENTS.clear()
-        try:
-            call(receiver, "wrong")
-        except TypeError as error:
-            assert type(error) is TypeError
-        else:
-            raise AssertionError("C method lookup lost the original addition error")
-        expected_body = "override" if receiver is override else "base"
-        assert methods.EVENTS == [expected_body], "an annotation prevented C-call body entry"
-    assert vars(receiver)["method"] is hidden
-
-# The existing ordinary property override retains descriptor binding and lookup
-# errors through both helpers, not a source-catalogued base-method shortcut.
-events.clear()
-kind, target = resolve(child)
-assert kind == 0 and events == ["lookup"]
-assert target(argument()) == ("ordinary", 3)
-assert events == ["lookup", "argument"]
-events.clear()
-assert stackref_method_call(child, 3) == ("ordinary", 3)
-assert events == ["lookup"]
-for call in (owning_method_call, stackref_method_call):
-    try:
-        call(Broken(), 3)
-    except ValueError as error:
-        assert error is original
-    else:
-        raise AssertionError("C method lookup discarded the actual descriptor error")
-assert events == ["lookup"]
-"""
-
-
-@pytest.mark.parametrize(
-    ("methods", "entry_interpreter"),
-    [("soac", False), ("soac", True), ("cpython", False)],
-    indirect=["methods"],
-    ids=["False", "True", "cpython"],
-)
-def test_virtual_calls_preserve_actual_binding_and_body_effects(
-    methods, entry_interpreter
-):
-    if methods.backend == "cpython":
-        ordinary_source = SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
-        methods.run_case(
-            "methods",
-            _CPYTHON_CLASS_CONSTRUCTION + TRAINING + VALIDATION
-            + f"\nordinary_source = {ordinary_source!r}\n"
-            + _CPYTHON_METHOD_VALIDATION,
-            Path(__file__),
-            required_functions=(
-                "Base.method", "Base.invoke", "Override.method",
-                "FieldShadow.__init__", "make_family",
-            ),
-            
-        )
-        return
-    methods.run(
-        TRAINING + VALIDATION + _entry_witness(entry_interpreter),
-        entry_interpreter=entry_interpreter,
-    )
-
-
+# Retained harness: Shares profile/apply artifacts for retained paths and keeps its distinct
+# native exact-release/traceback control; preserve the mixed execution-mode harness.
 @pytest.mark.parametrize(
     ("methods", "entry_interpreter"),
     [("soac", False), ("soac", True), ("cpython", False)],
@@ -419,6 +271,8 @@ def _entry_witness(entry_interpreter):
     )
 
 
+# Retained harness: Checks emitted source-plan records, native machine-code size, and structured
+# dispatch counters from profile/apply/verify artifacts.
 def test_sealed_virtual_calls_select_source_plans_and_exercise_native_entries(
     methods, tmp_path
 ):
@@ -615,6 +469,8 @@ for class_name in ('Base', 'Override', 'Inherited'):
 """
 
 
+# Retained harness: Exercises native vectorcall mutation under a shared profile/apply artifact
+# directory and explicit mode switches.
 @pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
 def test_public_vectorcall_change_during_arguments_uses_the_captured_method(
     methods, tmp_path, entry_interpreter
@@ -642,6 +498,8 @@ def test_public_vectorcall_change_during_arguments_uses_the_captured_method(
         )
 
 
+# Retained harness: Runs none/profile/apply over one profile directory, checking captured
+# callable/argument cleanup and entry witnesses across those modes.
 @pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
 def test_argument_error_releases_captured_callable_and_earlier_values(
     methods, tmp_path, entry_interpreter
@@ -698,6 +556,8 @@ assert sorted(events[3:]) == ['callable released', 'first released', 'receiver r
         )
 
 
+# Retained harness: Retains none/profile/apply artifact sequencing and ordinary-control
+# cleanup/callback comparisons across modes.
 @pytest.mark.parametrize("entry_interpreter", [False, True], ids=["compiled", "entry"])
 def test_virtual_call_preserves_callbacks_and_releases_temporaries(
     methods, tmp_path, entry_interpreter

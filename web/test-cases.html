@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SOAC · Test cases & type metadata</title>
+  <link rel="stylesheet" href="/test-cases.css">
+  <script src="/test-cases.js" defer></script>
+</head>
+<body>
+  <header><a class="brand" href="/">SOAC <span>/ Test cases</span></a><span class="tag">LOCAL CHECKER INSPECTOR</span></header>
+  <div class="layout">
+    <aside aria-label="Test case navigation">
+      <label for="search">Find a scenario or class</label>
+      <input id="search" type="search" placeholder="e.g. dataclass, Checked, fields…" autocomplete="off">
+      <label class="checkbox"><input id="types-only" type="checkbox"> With type definitions only</label>
+      <p id="count" class="muted" aria-live="polite">Loading scenarios…</p>
+      <nav id="catalog"></nav>
+    </aside>
+    <main id="main">
+      <div class="toolbar">
+        <div><div id="theme" class="eyebrow">SOURCE SCENARIOS</div><h1 id="title">Choose a test case</h1><div id="summary" class="muted"></div></div>
+        <div class="navigation" aria-label="Scenario navigation"><button id="previous" title="Previous scenario (Left arrow)" aria-label="Previous scenario">←</button><span id="position" class="muted"></span><button id="next" title="Next scenario (Right arrow)" aria-label="Next scenario">→</button></div>
+      </div>
+      <div id="status" role="status" aria-live="polite"></div>
+      <div id="error" role="alert" hidden></div>
+      <div class="controls"><span class="muted">← / → Previous / next scenario · Hover dotted properties for details</span><span id="snapshot" class="muted"></span></div>
+      <div id="content"><div class="empty">Select a scenario to inspect its source and type definitions.</div></div>
+      <details id="evidence" hidden><summary>Checker diagnostics & provenance</summary><pre id="diagnostics"></pre></details>
+    </main>
+  </div>
+</body>
+</html>

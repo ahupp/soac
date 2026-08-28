@@ -2,9 +2,11 @@
 
 import ast
 import builtins
+import json
+import subprocess
 import sys
 from pathlib import Path
-from types import FunctionType, ModuleType
+from types import FunctionType, ModuleType, SimpleNamespace
 
 import pytest
 
@@ -13,18 +15,28 @@ from tests._strict_scenarios import (
     _check_modules,
     _execute_block,
     _surviving_function_witnesses,
+    discover_strict_scenarios,
     parse_strict_scenario,
     run_strict_scenario,
+    scenario_pytest_id,
 )
 
 
-SCENARIOS = Path(__file__).with_name("strict_scenarios")
+SCENARIOS = Path(__file__).with_name("strict_scenarios").resolve()
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("mode", ["soac", "entry", "cpython"])
 @pytest.mark.parametrize(
-    "path", sorted(SCENARIOS.glob("*.py")), ids=lambda path: path.stem
+    ("path", "mode"),
+    [
+        pytest.param(
+            scenario.path,
+            mode,
+            id=scenario_pytest_id(scenario, mode, SCENARIOS),
+        )
+        for scenario in discover_strict_scenarios(SCENARIOS)
+        for mode in scenario.modes
+    ],
 )
 def test_strict_scenario(path: Path, mode: str, tmp_path: Path) -> None:
     project = run_strict_scenario(path, tmp_path / path.stem, mode=mode)
@@ -39,6 +51,91 @@ def write_scenario(tmp_path: Path, source: str) -> Path:
     path = tmp_path / "scenario.py"
     path.write_text(source)
     return path
+
+
+def test_discovery_enrolls_nested_files_and_distinguishes_equal_basenames(
+    tmp_path: Path,
+) -> None:
+    sources = {
+        "fields/basic.py": "# modes:soac,entry\n",
+        "modules/nested/basic.py": "# modes:cpython\n",
+        "ordinary.py": "",
+    }
+    for relative, header in sources.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(header + "# module:example\n# ok\npass\n# ok\npass\n")
+    scenarios = discover_strict_scenarios(tmp_path)
+    assert [item.path.relative_to(tmp_path).as_posix() for item in scenarios] == list(sources)
+    assert [item.modes for item in scenarios] == [
+        ("soac", "entry"), ("cpython",), ("soac", "entry", "cpython"),
+    ]
+    assert all(len(item.blocks) == 2 for item in scenarios)
+    assert {
+        (item.path.relative_to(tmp_path).as_posix(), mode)
+        for item in scenarios for mode in item.modes
+    } == {
+        ("fields/basic.py", "soac"),
+        ("fields/basic.py", "entry"),
+        ("modules/nested/basic.py", "cpython"),
+        ("ordinary.py", "soac"),
+        ("ordinary.py", "entry"),
+        ("ordinary.py", "cpython"),
+    }
+
+
+def test_discovery_rejects_empty_or_missing_trees(tmp_path: Path) -> None:
+    for root in (tmp_path, tmp_path / "missing"):
+        with pytest.raises(ValueError, match="no strict scenario files"):
+            discover_strict_scenarios(root)
+
+
+def test_runner_rejects_unenrolled_mode_before_publication(tmp_path: Path) -> None:
+    path = write_scenario(tmp_path, "# modes:cpython\n# module:example\n# ok\npass\n")
+    root = tmp_path / "run"
+    with pytest.raises(ValueError, match="not enrolled for mode 'soac'"):
+        run_strict_scenario(path, root, mode="soac")
+    assert not root.exists()
+
+
+def test_real_pytest_collection_enrolls_the_recursive_catalog_once(tmp_path: Path) -> None:
+    """Exercise the actual dispatcher/config, not only the discovery helper."""
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "strict_scenarios"
+    for relative, header in {
+        "fields/test_same.py": "# modes:soac,entry\n",
+        "modules/nested/test_same.py": "# modes:cpython\n",
+        "ordinary.py": "",
+    }.items():
+        path = tree / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            header + '# module:example\nraise AssertionError("scenario source was imported")\n'
+            '# ok\npass\n# ok\npass\n'
+        )
+    (tmp_path / "test_dispatch.py").write_bytes(Path(__file__).read_bytes())
+    journal = tmp_path / "collection.json"
+    (tmp_path / "conftest.py").write_text(
+        "import json\nimport sys\nfrom pathlib import Path\n"
+        + f"sys.path.insert(0, {str(root)!r})\n"
+        + "def pytest_collection_finish(session):\n"
+        + "    rows = [{'id': item.nodeid, 'path': str(item.callspec.params['path']), "
+        + "'mode': item.callspec.params['mode']} for item in session.items]\n"
+        + f"    Path({str(journal)!r}).write_text(json.dumps(rows))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-m", "pytest", "-c", str(root / "pytest.ini"),
+         str(tmp_path), "--collect-only", "-q", "-k", "test_strict_scenario"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    rows = json.loads(journal.read_text())
+    assert len(rows) == len({row["id"] for row in rows}) == 6
+    assert {(Path(row["path"]).relative_to(tree).as_posix(), row["mode"]) for row in rows} == {
+        ("fields/test_same.py", "soac"), ("fields/test_same.py", "entry"),
+        ("modules/nested/test_same.py", "cpython"),
+        ("ordinary.py", "soac"), ("ordinary.py", "entry"), ("ordinary.py", "cpython"),
+    }
 
 
 def test_parser_retains_sections_locations_and_real_comment_boundaries(
@@ -135,6 +232,12 @@ def test_parser_preserves_exact_bytes_and_physical_line_boundaries(
         ("# module:a\n# raise:\npass\n", "malformed"),
         ("# module:a\n# raise:ValueError()\npass\n", "invalid raise name"),
         ("# module:a\n# ok:yes\npass\n", "malformed"),
+        ("# modes:\n# module:a\n# ok\npass\n", "malformed modes"),
+        ("# modes:python\n# module:a\n# ok\npass\n", "distinct names"),
+        ("# modes:soac,soac\n# module:a\n# ok\npass\n", "distinct names"),
+        ("# modes:soac,\n# module:a\n# ok\npass\n", "distinct names"),
+        ("# modes:soac\n# modes:entry\n# module:a\n# ok\npass\n", "once before"),
+        ("# module:a\n# modes:soac\n# ok\npass\n", "once before"),
     ],
 )
 def test_parser_rejects_ambiguous_or_incomplete_files(
@@ -164,6 +267,21 @@ assert package.child.value == 1
         "package.child",
     )
     assert ast.parse(scenario.modules[0].source).body == []
+
+
+def test_prose_comments_are_not_malformed_directives(tmp_path: Path) -> None:
+    body = (
+        "# module opt-in is separate from fixture enrollment.\n"
+        "# modes may differ for native controls.\n"
+        "# raise only on a protected write.\n"
+        "value = 1\n"
+    )
+    scenario = parse_strict_scenario(write_scenario(
+        tmp_path,
+        "# module:example\n" + body + "# ok\n# ok means normal completion.\nassert value == 1\n",
+    ))
+    assert scenario.modules[0].source == body
+    assert len(scenario.blocks) == 1
 
 
 def test_function_witnesses_do_not_confuse_generators_and_nested_scopes(
@@ -451,7 +569,10 @@ def test_qualified_exception_accepts_subclasses() -> None:
 
 
 @pytest.mark.integration
-def test_runner_records_failures_and_still_runs_later_blocks(tmp_path: Path) -> None:
+@pytest.mark.parametrize("first_failure", ["runtime", "timeout"])
+def test_runner_records_failures_and_still_runs_later_blocks(
+    tmp_path: Path, monkeypatch, first_failure: str,
+) -> None:
     path = write_scenario(
         tmp_path,
         """# module:example
@@ -476,11 +597,28 @@ raise TypeError("prefix must fail")
 A().foo = "bad"
 """,
     )
+    from tests._strict_integration import STRICT_RUNTIME_TIMEOUT
+
     root = tmp_path / "run"
+    original_run = subprocess.run
+    runtime_deadlines = []
+
+    def run(command, *args, **kwargs):
+        if str(command[-1]).endswith("/driver.py"):
+            runtime_deadlines.append(kwargs["timeout"])
+            if first_failure == "timeout" and len(runtime_deadlines) == 1:
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(AssertionError) as captured:
         run_strict_scenario(path, root, mode="cpython")
     error = str(captured.value)
-    assert "unexpected block failure" in error
+    if first_failure == "timeout":
+        assert f"timed out after {STRICT_RUNTIME_TIMEOUT} seconds" in error
+    else:
+        assert "unexpected block failure" in error
+    assert runtime_deadlines == [STRICT_RUNTIME_TIMEOUT] * 6
     assert "[raise:ValueError]" in error
     assert "expected TypeError, but block completed" in error
     assert "without completing the block" in error
@@ -488,6 +626,34 @@ A().foo = "bad"
     assert len(tuple(root.glob("runtime-*/driver.py"))) == 6
     assert {file.name for file in root.glob("block-*.complete")} == {"block-2.complete"}
     assert (root / "authority/deployment.json").is_file()
+
+
+@pytest.mark.integration
+def test_cached_ordinary_module_cannot_replace_declared_setup(
+    tmp_path: Path,
+) -> None:
+    path = write_scenario(
+        tmp_path,
+        '# module:sys\nraise AssertionError("declared setup must execute")\n# ok\npass\n',
+    )
+    root = tmp_path / "run"
+    with pytest.raises(AssertionError, match="ordinary module .* did not execute its declared source"):
+        run_strict_scenario(path, root, mode="cpython")
+    assert not tuple(root.glob("block-*.complete"))
+
+
+def test_ordinary_source_witness_rejects_a_foreign_cached_origin(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    name = "ordinary_cached_scenario_unit"
+    module = ModuleType(name)
+    module.__spec__ = SimpleNamespace(origin=str(tmp_path / "foreign.py"))
+    monkeypatch.setitem(sys.modules, name, module)
+    with pytest.raises(AssertionError, match="did not execute its declared source"):
+        _check_modules(
+            ((name, str(tmp_path / "declared.py"), "not-a-contract", ()),),
+            "not-a-publication", "cpython", {},
+        )
 
 
 @pytest.mark.integration

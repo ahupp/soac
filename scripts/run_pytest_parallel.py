@@ -17,9 +17,11 @@ REPO_ROOT = Path(os.environ["REPO_ROOT"])
 VENV_PYTHON = Path(os.environ["VENV_DIR"]) / "bin" / "python"
 LOGS_DIR = REPO_ROOT / "work" / "logs"
 MAX_BATCH_NODEIDS = 4
+SCENARIO_NODE_GROUP = "tests/test_strict_scenarios.py::test_strict_scenario"
 # These reviewed compatibility tests run several subprocess phases or validate
-# multiple authenticated modules per node. Give each selected node its own
-# unchanged batch timeout instead of sharing it with neighboring tests.
+# multiple authenticated modules per node. Isolate their batch deadlines
+# from neighboring tests. Source scenarios additionally compose the existing
+# per-block deadline across their independent runtime invocations below.
 SINGLETON_NODE_GROUPS = frozenset(
     {
         "tests/test_counter_dump_file.py::"
@@ -28,6 +30,7 @@ SINGLETON_NODE_GROUPS = frozenset(
         "test_profiled_pyperformance_nqueens_preserves_rebinding_and_ordinary_tracing",
         "tests/test_closed_iterator_pipeline.py::"
         "test_reviewed_closed_pipelines_use_authenticated_entries",
+        SCENARIO_NODE_GROUP,
     }
 )
 
@@ -54,6 +57,7 @@ class ActiveBatch:
     selector_count: int
     pid: int
     start_s: float
+    timeout_s: float
 
 
 class BatchMonitor:
@@ -72,7 +76,8 @@ class BatchMonitor:
             self.interrupted_by = signum
 
     def launch(
-        self, cmd: list[str], batch: PytestBatch, batch_id: int, start_s: float
+        self, cmd: list[str], batch: PytestBatch, batch_id: int, start_s: float,
+        timeout_s: float,
     ) -> subprocess.Popen[str] | None:
         # Serialize the cancellation boundary with process publication. A launch
         # already in progress must publish its group before stop() can finish.
@@ -90,7 +95,8 @@ class BatchMonitor:
             self._processes[batch_id] = proc
             with self._lock:
                 self._active[batch_id] = ActiveBatch(
-                    batch_id, batch.label, len(batch.selectors), proc.pid, start_s
+                    batch_id, batch.label, len(batch.selectors), proc.pid, start_s,
+                    timeout_s,
                 )
             return proc
 
@@ -276,6 +282,43 @@ def make_nodeid_batches(nodeids: list[str], jobs: int) -> list[PytestBatch]:
     for file_path, file_group in file_nodeids.items():
         batches.extend(make_file_batches(file_path, file_group, target_batch_size))
     return sorted(batches, key=lambda batch: len(batch.selectors), reverse=True)
+
+
+def scenario_extra_timeouts(nodeids: list[str]) -> dict[str, float]:
+    """Compose existing runtime limits only for exact parsed enrollments.
+
+    The parser and strict helper have no native/checker work at import time.
+    Import them only when the actual collection includes source scenarios;
+    ordinary runner invocations retain their existing dependencies and budgets.
+    """
+    selected = {
+        node for node in nodeids if node_group_key(node) == SCENARIO_NODE_GROUP
+    }
+    if not selected:
+        return {}
+    source_root = Path(__file__).resolve().parents[1]
+    previous_path = sys.path[:]
+    try:
+        sys.path.insert(0, str(source_root))
+        from tests import _strict_scenarios as scenarios
+    finally:
+        sys.path[:] = previous_path
+    expected_parser = source_root / "tests" / "_strict_scenarios.py"
+    if Path(scenarios.__file__).resolve() != expected_parser:
+        raise ValueError("scenario timeout parser was imported from another checkout")
+    root = (REPO_ROOT / "tests/strict_scenarios").resolve()
+    enrolled = {
+        (
+            f"{SCENARIO_NODE_GROUP}["
+            f"{scenarios.scenario_pytest_id(scenario, mode, root)}]"
+        ): (len(scenario.blocks) - 1) * scenarios.STRICT_RUNTIME_TIMEOUT
+        for scenario in scenarios.discover_strict_scenarios(root)
+        for mode in scenario.modes
+    }
+    unknown = selected - enrolled.keys()
+    if unknown:
+        raise ValueError(f"scenario timeout enrollment is missing: {sorted(unknown)}")
+    return {node: enrolled[node] for node in selected}
 
 
 def pytest_cmd(args: list[str]) -> list[str]:
@@ -505,7 +548,7 @@ def run_pytest(
 ) -> RunResult | None:
     cmd = pytest_cmd(args)
     start = time.monotonic()
-    proc = monitor.launch(cmd, batch, batch_id, start)
+    proc = monitor.launch(cmd, batch, batch_id, start, timeout_s)
     if proc is None:
         return None
     timed_out = False
@@ -562,10 +605,12 @@ def print_running_batches(active: list[ActiveBatch], now_s: float) -> None:
     print(f"[diet-python pytest] still running {len(active)} batch(es):")
     for batch in active:
         elapsed_s = now_s - batch.start_s
+        deadline = f"{batch.timeout_s:.1f}s" if batch.timeout_s > 0 else "disabled"
         print(
             "  - "
             f"pid={batch.pid} elapsed={elapsed_s:.1f}s "
-            f"nodeids={batch.selector_count} {batch.label}"
+            f"nodeids={batch.selector_count} "
+            f"deadline={deadline} {batch.label}"
         )
 
 
@@ -629,13 +674,20 @@ def main(argv: list[str]) -> int:
         ).returncode
 
     batches = make_nodeid_batches(nodeids, jobs)
+    try:
+        extra_timeouts = scenario_extra_timeouts(nodeids)
+    except (OSError, SyntaxError, ValueError) as error:
+        print(f"[diet-python pytest] {error}", file=sys.stderr)
+        return 2
     jobs = min(jobs, len(batches))
     print(
         f"[diet-python pytest] running {len(nodeids)} test nodeids "
         f"in {len(batches)} batches across {jobs} workers"
     )
     if batch_timeout_s > 0:
-        print(f"[diet-python pytest] per-batch timeout: {batch_timeout_s:.1f}s")
+        print(f"[diet-python pytest] base per-batch timeout: {batch_timeout_s:.1f}s")
+        if any(extra_timeouts.values()):
+            print("[diet-python pytest] source scenarios use parsed aggregate deadlines")
     else:
         print("[diet-python pytest] per-batch timeout: disabled")
     if progress_interval_s > 0:
@@ -686,12 +738,17 @@ def main(argv: list[str]) -> int:
         for batch_id, batch in enumerate(batches):
             if monitor.cancelled:
                 break
+            effective_timeout_s = batch_timeout_s
+            if effective_timeout_s > 0:
+                effective_timeout_s += sum(
+                    extra_timeouts.get(node, 0) for node in batch.selectors
+                )
             future = pool.submit(
                 run_pytest,
                 [f"--tb={tb}", *batch.selectors],
                 batch,
                 batch_id,
-                batch_timeout_s,
+                effective_timeout_s,
                 monitor,
             )
             futures[future] = batch

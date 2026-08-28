@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from tests._strict_integration import create_strict_project
-from tests.test_strict_class_runtime import _CPYTHON_CLASS_CONSTRUCTION
 
 SOURCE = """
 # soac: module(strict_assign=true, checked_attr=true)
@@ -419,95 +418,3 @@ def test_source_owned_body_calls_preserve_dispatch_and_fixed_target_selection(
                 assert emitted[name]["machine_code_size_bytes"] > 0
 
 
-def test_cpython_final_method_policy_uses_the_admitted_class_and_actual_c_mutations(
-    tmp_path,
-):
-    project = create_strict_project(
-        tmp_path,
-        {"checked_calls.py": SOURCE},
-        modules={"checked_calls": "checked_calls.py"},
-        backend="cpython",
-    )
-    ordinary_source = SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
-    project.run_case(
-        "checked_calls",
-        _CPYTHON_CLASS_CONSTRUCTION + f"\nordinary_source = {ordinary_source!r}\n" + """
-import checked_calls as subject
-from soac.strict import StrictMutationError
-
-assert_native_class(subject.FinalCalls)
-checked = subject.FinalCalls.checked
-assert checked.__final__ is True
-assert _soac_ext.strict_function_diagnostics(checked)["finalized"] is True
-receiver = subject.FinalCalls()
-for _ in range(128):
-    assert receiver.checked(3) == receiver.forward(3) == 5
-for call in (receiver.checked, receiver.forward):
-    try:
-        call("wrong")
-    except TypeError as error:
-        assert type(error) is TypeError
-    else:
-        raise AssertionError("a final method lost its original addition error")
-
-# Ordinary Python final is advisory. Reuse the exact subject, only without its
-# module opt-in, as the control for every overridden-name operation below.
-ordinary = {"__name__": "ordinary_final_method_control"}
-exec(compile(ordinary_source, "<ordinary-final-method-control>", "exec"), ordinary)
-control = type("Control", (ordinary["FinalCalls"],), {"checked": lambda self, value: value})
-assert control().forward("ordinary") == "ordinary"
-
-body_effects = []
-class WrongOperand:
-    def __add__(self, value):
-        body_effects.append(value)
-        return "ordinary body"
-assert ordinary["FinalCalls"]().forward(WrongOperand()) == "ordinary body"
-assert body_effects == [2]
-body_effects.clear()
-for call in (receiver.checked, receiver.forward):
-    body_effects.clear()
-    assert call(WrongOperand()) == "ordinary body"
-    assert body_effects == [2]
-
-def rejected(operation):
-    try:
-        operation()
-    except StrictMutationError:
-        return
-    raise AssertionError("actual inherited final-method policy was bypassed")
-
-rejected(lambda: type("OverrideFinal", (subject.FinalCalls,), {"checked": lambda self, value: value}))
-class InheritsFinal(subject.FinalCalls):
-    pass
-assert get_type_owner(InheritsFinal) is None
-info = ConstructionInfoV1()
-assert get_construction(InheritsFinal, ctypes.byref(info), ctypes.sizeof(info)) == 0
-assert info.owner is None and info.permanent_contract_published == 0
-assert InheritsFinal().forward(3) == 5
-
-set_attr = ctypes.pythonapi.PyObject_SetAttr
-set_attr.argtypes = [ctypes.py_object] * 3
-set_attr.restype = ctypes.c_int
-set_item = ctypes.pythonapi.PyDict_SetItem
-set_item.argtypes = [ctypes.py_object] * 3
-set_item.restype = ctypes.c_int
-class_dict = ctypes.pythonapi.PyType_GetDict
-class_dict.argtypes = [ctypes.py_object]
-class_dict.restype = ctypes.py_object
-replacement = lambda self, value: "ordinary replacement"
-for setter in (setattr, type.__setattr__, set_attr):
-    setter(control, "checked", replacement)
-    assert control().forward(3) == "ordinary replacement"
-    rejected(lambda: setter(InheritsFinal, "checked", replacement))
-    assert "checked" not in vars(InheritsFinal)
-    assert InheritsFinal().forward(3) == 5
-assert set_item(class_dict(control), "checked", replacement) == 0
-rejected(lambda: set_item(class_dict(InheritsFinal), "checked", replacement))
-assert "checked" not in vars(InheritsFinal)
-assert subject.FinalCalls.checked is checked and InheritsFinal().forward(3) == 5
-""",
-        Path(__file__),
-        required_functions=("FinalCalls.checked", "FinalCalls.forward"),
-        
-    )

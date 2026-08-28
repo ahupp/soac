@@ -318,6 +318,110 @@ class TestAllPhaseWorkflow(unittest.TestCase):
             [other],
         )
 
+    def test_nested_scenario_files_and_modes_get_independent_batch_budgets(self):
+        import io
+        import itertools
+        import runpy
+        from collections import Counter
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest.mock import Mock, patch
+
+        from tests._strict_integration import STRICT_RUNTIME_TIMEOUT
+
+        with patch.dict(os.environ, {
+            "REPO_ROOT": str(ROOT), "VENV_DIR": str(ROOT / ".venv"),
+        }):
+            runner = runpy.run_path(str(ROOT / "scripts" / "run_pytest_parallel.py"))
+        main = runner["main"]
+        group = "tests/test_strict_scenarios.py::test_strict_scenario"
+        nodes = [
+            *(f"{group}[fields/basic-{mode}]" for mode in ("soac", "entry", "cpython")),
+            f"{group}[modules/nested/basic-cpython]",
+            f"{group}_ordinary[fields/basic-soac]",
+            "tests/test_other.py::test_strict_scenario[fields/basic-soac]",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree = root / "tests/strict_scenarios"
+            (tree / "fields").mkdir(parents=True)
+            (tree / "modules/nested").mkdir(parents=True)
+            (tree / "fields/basic.py").write_text(
+                '# module:example\ntext = """\n# ok\n"""\n# ok\npass\n'
+            )
+            (tree / "modules/nested/basic.py").write_text(
+                "# modes:cpython\n# module:example\n# ok\npass\n"
+                "# raise:ValueError\nraise ValueError()\n# ok\npass\n"
+            )
+            for jobs in (1, 4):
+                batches = runner["make_nodeid_batches"](nodes, jobs)
+                self.assertEqual(
+                    Counter(node for batch in batches for node in batch.selectors),
+                    Counter(nodes),
+                )
+                for batch in batches:
+                    for node in nodes[:4]:
+                        if node in batch.selectors:
+                            self.assertEqual(batch.selectors, [node])
+                for base in (0, 17.5, 300):
+                    with self.subTest(jobs=jobs, base=base):
+                        supervised = []
+                        pids = itertools.count(2000)
+
+                        def launch(command, **kwargs):
+                            selected = [argument for argument in command if argument in nodes]
+                            self.assertTrue(kwargs["start_new_session"])
+                            process = Mock(pid=next(pids), returncode=0)
+
+                            def communicate(*, timeout=None):
+                                supervised.extend((node, timeout) for node in selected)
+                                return "", ""
+
+                            process.communicate.side_effect = communicate
+                            return process
+
+                        with (
+                            patch.dict(os.environ, {
+                                "PYTEST_NUMPROCS": str(jobs),
+                                "SOAC_PYTEST_BATCH_TIMEOUT": str(base),
+                                "SOAC_PYTEST_PROGRESS_INTERVAL": "0",
+                            }),
+                            patch.dict(main.__globals__, {
+                                "REPO_ROOT": root,
+                                "collect_test_nodeids": lambda _: (0, nodes, ""),
+                                "terminate_process_group": lambda _: None,
+                            }),
+                            patch.object(subprocess, "Popen", side_effect=launch),
+                            redirect_stdout(io.StringIO()),
+                        ):
+                            status = main(["--require-batch-runner", "tests"])
+                        self.assertEqual(status, 0)
+                        self.assertEqual(Counter(node for node, _ in supervised), Counter(nodes))
+                        self.assertEqual(dict(supervised), {
+                            node: (None if base == 0 else base + (
+                                2 * STRICT_RUNTIME_TIMEOUT if node == nodes[3] else 0
+                            ))
+                            for node in nodes
+                        })
+
+            # A similarly spelled mode or nonexistent path cannot acquire an
+            # enlarged deadline or start a worker outside the parsed catalog.
+            for unknown in (
+                f"{group}[modules/nested/basic-entry]",
+                f"{group}[modules/nested/missing-cpython]",
+            ):
+                with (
+                    self.subTest(unknown=unknown),
+                    patch.dict(os.environ, {"PYTEST_NUMPROCS": "1"}),
+                    patch.dict(main.__globals__, {
+                        "REPO_ROOT": root,
+                        "collect_test_nodeids": lambda _: (0, [unknown], ""),
+                    }),
+                    patch.object(subprocess, "Popen") as launch,
+                    redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(main(["--require-batch-runner", "tests"]), 2)
+                    launch.assert_not_called()
+
     def test_required_batch_runner_rejects_passthrough_before_execution(self):
         import io
         import runpy

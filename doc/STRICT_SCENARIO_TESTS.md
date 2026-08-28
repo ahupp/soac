@@ -1,9 +1,17 @@
 # Single-file strict integration scenarios
 
-A file under `tests/strict_scenarios/` describes one source-level scenario.
-`tests/test_strict_scenarios.py` collects one test per file and execution mode:
-compiled SOAC, entry-interpreted SOAC, and strict CPython. It uses the actual
-vendored checker and authenticated native startup, not manually installed facts.
+A file under `tests/strict_scenarios/` defines shared module setup followed by
+any number of independent test blocks. The tree is grouped by theme, with
+further subdirectories where useful (for example `modules/bindings/` and
+`imports/regressions/`). `tests/test_strict_scenarios.py` discovers **every
+`.py` file recursively**, using its relative path and backend as the test ID.
+These are source fixtures, not Python modules imported by pytest.
+
+By default each file runs in compiled SOAC, entry-interpreted SOAC, and strict
+CPython. Each file/backend is analyzed once with the actual vendored checker;
+every block then gets a fresh authenticated process and fresh module instances.
+Setup code is shared in the file, but mutable runtime state is never shared
+between blocks. No native facts are manually installed.
 
 ## Format
 
@@ -24,11 +32,21 @@ assert a.foo == 1
 
 a = A()
 a.foo = "str"
+
+# ok
+
+assert A().foo == 0  # The earlier blocks cannot change this case's setup.
 ```
 
 - `# module:name` starts a Python source module. All module sections precede
   test blocks. Multiple modules can import each other using their declared
   names. The first module supplies the bare names used by validation blocks.
+- An optional `# modes:soac,entry` or `# modes:cpython` header, before the first
+  module, limits backend enrollment. It may list any nonempty subset of the
+  three distinct names. Use it for a genuinely backend-specific subject, such
+  as an ordinary CPython frame control; do not replace assertions with empty
+  backend conditionals. Invalid, duplicate or misplaced mode declarations fail
+  collection. This is test enrollment, not a source strictness rule.
 - Module sections contain the production `# soac:` rules. The adapter does
   not insert a future import, comment rule or config file. Unselected sections
   stay ordinary; package/module/class settings compose exactly as they do in
@@ -42,9 +60,10 @@ a.foo = "str"
   Exception-name resolution is also outside the expectation.
 - Directives are standalone column-zero comments. Strings, indented comments,
   comments inside bracketed expressions and trailing comments are not markers.
+  Prose such as `# module opt-in` or `# raise only on writes` is not a directive.
   Missing/empty blocks, duplicate modules and malformed directives are errors.
 
-In the last block above, a `TypeError` from `A()` is a **failure**. Only the
+In the `raise:TypeError` block above, a `TypeError` from `A()` is a **failure**. Only the
 assignment can satisfy the expectation. Semicolon-separated statements are
 distinct statements too. A compound statement such as `with` or `if` counts
 as one top-level statement; prefer a final simple operation when that is the
@@ -53,6 +72,23 @@ runtime exceptions.
 
 There is no validator-function convention inside a block: its statements
 execute directly. Defining a function does not implicitly call it.
+
+Run the complete tree through the dispatcher:
+
+```bash
+just pytest-fast --require-batch-runner tests/test_strict_scenarios.py
+```
+
+`just test-all` includes this dispatcher through its normal `tests/` selection.
+The parallel runner isolates each file/backend in its own batch. Its outer
+deadline is the configured batch base (300 seconds by default), plus 120
+seconds for each block after the first, using the actual parsed block count.
+Every runtime process still has its unchanged 120-second deadline; checker
+deadlines are unchanged. A failed or timed-out block is recorded while later
+independent blocks continue. The worker retains its bounded aggregate deadline
+and process-group cleanup. A single file/backend can be replayed with
+a selector such as
+`tests/test_strict_scenarios.py::test_strict_scenario[fields/basic_assignment-soac]`.
 
 For packages, declare the parent and each selected child, for example
 `# module:package` and `# module:package.child`. The parent becomes
@@ -116,6 +152,16 @@ modules/functions must have no strict ownership or JIT metadata. Mutable
 objects, module caches, builtins changes and test
 locals from one block do not carry into the next block.
 
+An import written inside a validation block does **not** defer initialization:
+all declared modules have already been imported. If a case must change ordinary
+support state before a selected module captures it, put that deterministic
+mutation in an ordinary helper module declared between the support and model
+sections. Keep the original support/model source bytes and policies unchanged.
+Use a separate scenario file when other cases need the unmodified initial state;
+do not change expected defaults or move setup into the exception expectation.
+More involved interleaving that this ordering cannot preserve stays in a
+specialized harness.
+
 Validation is ordinary Python, outside the analyzed/sealed modules. It receives
 a copy of the first module's namespace and an explicit `module` reference.
 Consequently, `answer = 2` changes a validation local, whereas
@@ -157,42 +203,174 @@ From the Lima guest checkout:
 
 ```sh
 just pytest-fast --require-batch-runner tests/test_strict_scenarios.py
-just pytest-fast --require-batch-runner 'tests/test_strict_scenarios.py::test_strict_scenario[field_assignment-soac]'
+just pytest-fast --require-batch-runner 'tests/test_strict_scenarios.py::test_strict_scenario[fields/basic_assignment-soac]'
 ```
 
 Use the documented Lima launcher from the host. Logs, source projects, signed
 publications and per-block subprocess output are retained by the existing
 `StrictProject` helper.
 
-## Current migration audit — 2026-08-28 (PDT)
+## Actual migration — 2026-08-28 (PDT)
+
+The themed tree contains **259 files with 455 independent blocks**. Its
+explicit mode enrollment selects **508 file/backend tests**, requiring **928
+isolated block executions**. Shared fixtures stay together; variants needing
+different module bodies or pre-import setup remain separate files. These are
+source/enrollment counts, not a claim that every enrolled execution has passed.
+
+**216 authored regular tests were migrated and removed**, not merely inspected
+or wrapped. This includes 207 of the earlier 250 strict-source cases, seven
+ordinary controls and two native-API cases expressible with inline ctypes.
+The 18 files that existed before this bulk migration were also moved into
+the themed tree without changing their bytes. Eleven tests of the retired
+import/entry-specific fixture schedulers and annotation adapter were removed
+with those unused adapters;
+recursive collection and independent execution are tested at the replacement
+runner boundary.
+
+| Theme | Files | Independent blocks | File/backend tests |
+| --- | ---: | ---: | ---: |
+| Annotations | 13 | 23 | 23 |
+| Classes | 25 | 44 | 44 |
+| Dataclasses | 28 | 53 | 50 |
+| Execution | 38 | 46 | 80 |
+| Fields | 9 | 25 | 24 |
+| Frameworks | 3 | 3 | 9 |
+| Functions | 46 | 87 | 73 |
+| Generators | 10 | 61 | 19 |
+| Imports | 36 | 36 | 72 |
+| Methods | 17 | 22 | 36 |
+| Modules | 23 | 26 | 46 |
+| Packages | 2 | 3 | 5 |
+| Policy composition | 9 | 26 | 27 |
+| **Total** | **259** | **455** | **508** |
+
+**108 authored tests remain in the regular strict files**: 43 strict-source
+tests with retained specialized harnesses, plus 65 other-layer tests (27
+ordinary controls, eight native-ABI probes, nine external-C-fixture consumers,
+and 21 preparation/worker-tooling tests). The 513 native unittest methods are
+still a separate layer. These counts do not include the scenario dispatcher
+or its own unit/integration regressions.
+
+The 43 retained source tests have these primary requirements, counted once
+even when a test covers several phases:
+
+| Retained harness | Authored tests |
+| --- | ---: |
+| Shared profile/replay and structured counter/plan evidence | 20 |
+| Expected initializer failures and terminal cleanup | 6 |
+| Checker rejection and absence of publication | 2 |
+| Loader construction/execution phase observations | 2 |
+| Post-publication source/artifact mutation | 2 |
+| Published signature-shard inspection | 1 |
+| Alternate venv, path selection or background scheduling | 4 |
+| Actual module-wrapper retirement | 2 |
+| Interleaved imports, validation and worker completion | 3 |
+| Native namespace ownership/refcount control | 1 |
+| **Total** | **43** |
+
+Retained does not mean untested or impossible to express in a future adapter.
+In particular, the three retained interleaved-import tests combine imports
+with intermediate validation or worker completion. Eager setup alone cannot
+preserve those phases; deterministic pre-import mutation by itself is simpler
+and can use an ordinary helper section. The earlier
+inspection overestimated those three candidates. Conversely, explicit backend
+enrollment enabled eleven cases previously in its extension/review bucket.
+Inline supported C-API operations are not by themselves a missing capability.
+
+The per-original-test mappings, original source snapshots, byte hashes and
+removal audits are retained in `work/strict-scenario-migration/`. Scenario
+comments name their original subjects; no scenario invokes a deleted pytest
+test. The combined audit verifies module-section bytes, every original-test
+removal and all file/backend enrollments. Those static checks are distinct
+from actual runtime execution evidence.
+
+### Migration execution evidence — 2026-08-29 (PDT)
+
+The pre-repair focused runner cohort passed **85 tests in 31 batches**, including
+actual recursive pytest collection, shared-setup isolation, final-statement-only
+exceptions and ordinary source-origin checks. It used the verified optimized
+runtime with unchanged input/runtime postchecks. This validates that checkpoint,
+not the complete migrated tree or subsequent import-order/timeout repairs.
+
+| Evidence | Status |
+| --- | --- |
+| Original single `just test-all` | 1,974 Rust tests passed; Python finished with 1,286 passing and 12 failing batches, with no timeouts. The original scenario tree completed 499 passing and seven failing file/backend runs. |
+| Targeted repair replay | All 104 tests in 35 batches passed: 20 retained assignment-cleanup cases, ten changed/new scenario runs, and 74 runner regressions. Input hashes were unchanged and the optimized runtime postcheck passed. |
+| Final scenario execution accounting | All 508 final file/backend runs and 928 isolated case executions have unique verified receipts; zero missing, duplicate or inconsistent entries. |
+
+The failures exposed migration defects: string-based fixture dependencies had
+been pruned, dataclass setup imports/mutations moved past their required import
+boundaries, an extraction ignored a nested `return` and emitted an impossible
+native-only parameter branch, and copied module globals shadowed a validator's
+builtin `staticmethod`. Repairs restored the original subjects and assertions;
+the impossible duplicate alone was removed. No new xfails masked these defects.
+The replay also tested aggregate scenario deadlines and continuation after an
+individual case timeout without increasing the per-process deadline.
+
+The original supervisor's final JSON receipt was lost after a tool-session
+interruption. Its final input map and runtime postcheck are unavailable. A
+separate point-in-time recovery compared the immutable pre-gate tree with the
+current checkout: all original scenario and runner bytes matched; the only
+seven changed paths belonged to the separately developed test-case browser.
+Committed native/checker source verification and a fresh **current-only**
+optimized runtime preflight passed. This does **not** establish a continuously
+frozen original gate or reconstruct its missing postcheck.
+
+The final accounting preserves that limitation and the seven original failed
+scenario rows. It combines original driver/completion evidence with the clean
+targeted replay, rather than claiming a fresh green full gate. The replay used
+a fresh tracked-path inventory, durable startup hashes, guest-side supervisor
+output, and an atomic final receipt. No second full gate was run.
+
+Retained evidence under `work/strict-scenario-migration/` includes
+`execution-receipts-original-final-v1.json`,
+`original-gate-recovery-current-only-v2.json`,
+`execution-cohort-repair-final-v1.json`, and `execution-union-final-v1.json`.
+The replay log and postcheck receipt are
+`work/logs/comment-policy-scenario-migration-repair-v1.{log,json}`. Original
+logs, source snapshots and failed reports remain unchanged. Collection alone
+is not execution evidence: the accounting checks exact case drivers,
+completion receipts, publication hashes, and native pre/post witnesses.
+The older comment-policy results below remain historical. This work made no
+optimization or benchmark claims, and nothing was pushed.
+
+## Historical inspection of the 18-file starting tree — 2026-08-28 (PDT)
+
+This inspection preceded the bulk migration above. At that point the scenario
+tree held 18 files, and only two authored regular tests had been removed through
+scenario migration. The counts and old filenames below are preserved historical
+evidence, **not the current remaining backlog**. Use the actual migration section
+for the 216 removals and 108 retained tests.
 
 A guest AST inventory rechecked at **00:31 PDT on 2026-08-28** counted
 **324 authored tests**
 in the 22 regular `test_strict_*.py` files: 320 functions and four unittest
-methods. This is after two original authored checked-field tests were migrated
-into three scenario files and after field-write/policy reconciliation. It counts
+methods. This was after two original authored checked-field tests were migrated
+into three scenario files and after field-write/policy reconciliation. It counted
 neither backend invocations nor case-parameter expansion. One authored function
 can cover several source variants and therefore require several scenario files.
 
-Of these, **250 are non-native strict source-integration cases**.
-**199 are candidates for the current format**: 86 straightforward source and
-validator extractions, plus 113 whose ordinary helpers, source-policy choices
-or backend-witness bookkeeping are now expressible. **51 still need additional
-runner capabilities or a separately reviewed split.** These are static
-source-review counts, not conversion completion or passing-test evidence.
+Of these, **250 were non-native strict source-integration cases**.
+**199 were classified as fitting the then-current format**: 86 straightforward
+source/validator extractions and 113 with expressible ordinary helpers,
+source-policy choices or backend-witness bookkeeping. **51 were marked for
+additional runner capabilities or a separately reviewed split.** These were
+inspection classifications, not completed conversions or passing-test evidence;
+later implementation and review superseded them.
 
-The other 74 regular-file tests are counted separately: **34 ordinary-only
+The other 74 regular-file tests were counted separately: **34 ordinary-only
 controls, 10 native-ABI probes, nine external-C-fixture consumers and 21
 checker/benchmark preparation or worker-tooling tests**. Six of the ten ABI
-probes and seven of the nine C-fixture consumers do use actual checker
-publication; their additional native subject/setup is why they are separate,
-not a claim that they bypass analysis. The two remaining C-fixture consumers
-are ordinary controls. Ordinary-only scenarios are allowed, but moving a
+probes and seven of the nine C-fixture consumers used actual checker
+publication; their additional native subject/setup explained the separate
+classification, not a bypass of analysis. The two remaining C-fixture consumers
+were ordinary controls. Ordinary-only scenarios are allowed, but moving a
 control does not add a strict source-integration case.
 
-In the table, **Ready** and **Ordinary/policy** both fit the current format.
-The latter records formerly blocked ordinary setup, field-policy or witness
-work, rather than a proposed new directive. **Other** identifies separate test
+In this historical table, **Ready** and **Ordinary/policy** were considered
+expressible at the time. The latter recorded ordinary setup, field-policy or
+witness work, not a proposed new directive. **Other** identified separate test
 layers: **O** ordinary control, **A** native ABI, **C** external C fixture,
 **T** preparation/worker tooling.
 
@@ -222,33 +400,35 @@ layers: **O** ordinary control, **A** native ABI, **C** external C fixture,
 | `test_strict_pyperformance_sources.py` | 21 | 0 | 0 | 0 | 21 T |
 | **Total** | **324** | **86** | **113** | **51** | **74** |
 
-### Remaining capabilities and boundaries
+### Requirements recorded by that inspection
 
-The 51 non-native source cases have these requirements; a mixed case can
-appear in more than one requirement count:
+The 51 reviewed source cases had these requirements; mixed cases appeared in
+more than one count. Some were subsequently migrated with backend enrollment
+or reviewed setup splits. This list does not replace the current 43 retained
+source-harness requirements above:
 
-- **20** retain profile/apply/verify state, counters or optimization-plan
+- **20** retained profile/apply/verify state, counters or optimization-plan
   artifacts. Plain unprofiled execution would lose the assertion. This audit
   does not resume optimization or benchmark work.
-- **11** have a genuinely backend-specific subject: exact native source-frame,
+- **11** had a genuinely backend-specific subject: exact native source-frame,
   closure/refcount/implicit-cleanup observations, or an escaped SOAC private
-  execution handle. This needs explicit backend enrollment or a reviewed
+  execution handle. These needed explicit backend enrollment or a reviewed
   semantic split, not an empty guarded block. A native entry witness alone is
   not a blocker.
-- **Seven** intentionally fail a selected initializer, including one of the
-  profile cases; **two** expect checker rejection. Imports, analysis and
+- **Seven** intentionally failed a selected initializer, including one of the
+  profile cases; **two** expected checker rejection. Imports, analysis and
   authentication must still succeed outside a runtime `raise` expectation.
-- **Two** mutate published source/artifacts before admission; **one** inspects
-  emitted signature facts; **three** observe loader/module states before body
-  execution. These need explicit publication/admission-phase access.
-- **Four** require another interpreter environment, source-tree/path-selection
+- **Two** mutated published source/artifacts before admission; **one** inspected
+  emitted signature facts; **three** observed loader/module states before body
+  execution. These required explicit publication/admission-phase access.
+- **Four** required another interpreter environment, source-tree/path-selection
   layout, or background execution with its logs and timeout controls.
-- **Two** require lifetime-neutral module validation. The current runner keeps
+- **Two** required lifetime-neutral module validation. The runner kept
   module wrappers alive in its precheck map and `_execute_block` argument, then
-  imports them for postchecks. Deleting a copied validator global cannot prove
+  imported them for postchecks. Deleting a copied validator global cannot prove
   that the actual wrapper was collected.
 
-The nine external-C-fixture consumers additionally require their real compiled
+The nine external-C-fixture consumers additionally required their real compiled
 watcher/iterator fixtures. Inline ctypes calls to already-supported C APIs do
 not themselves need a new format capability. Manual native capability/policy
 construction and private implementation-payload replacement remain distinct
@@ -262,7 +442,7 @@ is not an equivalent control. Likewise, ordinary generated-dataclass and
 stdlib dataclass-helper frames keep their ordinary observer behavior. They are
 not excluded SOAC source-frame observations.
 
-There are separately **513 authored methods** in the ten native files:
+The inspection separately counted **513 authored methods** in ten native files:
 
 | Native file (`test_strict_` prefix) | Methods |
 | --- | ---: |
@@ -278,31 +458,36 @@ There are separately **513 authored methods** in the ten native files:
 | `type_native.py` | 72 |
 | **Total** | **513** |
 
-`test_strict_scenarios.py` is another separate layer: one parametrized scenario
+`test_strict_scenarios.py` then contained a separate parametrized scenario
 dispatcher and 18 parser/expectation/runner regressions. Do not add its
 file/backend invocations or the historical source/JSON registries below to the
 authored-function migration denominator.
 
-Two original authored tests were migrated into three scenario files:
+At that checkpoint, two original authored tests had migrated into three files:
 `migrated_checked_fields_explicit.py`,
 `migrated_checked_fields_opted_out_child.py`, and
 `migrated_checked_fields_ordinary_base_fallback.py`. The latter two preserve the
 separate outcomes split from the old mixed inheritance test. The original test
-functions were removed, not wrapped inside `ok`; the 199 remaining candidates
-are not thereby migrated or validated.
+functions had been removed, not wrapped inside `ok`. That checkpoint alone
+did not migrate or validate the other 199 candidates; the subsequent bulk
+migration is recorded separately above.
 
-Current evidence is under
-`work/strict-single-file-audit/post-ruff-f50-v1/`:
-`current-authored-tests.json` records fresh names, source hashes and counts;
-`current-classification.json` records each current classification and reason;
-`current-summary.json` contains compact per-file counts and exact remaining
-capability/fixture lists. `refresh-summary.json` verifies the unchanged counts
+Evidence for that inspection remains under
+`work/strict-single-file-audit/post-ruff-f50-v1/`. The `current-` filename prefix
+refers to that fixed checkpoint, not today's tree:
+`current-authored-tests.json` recorded names, source hashes and counts;
+`current-classification.json` recorded classifications and reasons;
+`current-summary.json` recorded per-file counts and then-remaining
+capability/fixture lists. `refresh-summary.json` verified the unchanged counts
 after the diagnostic parametrization and native test rename. Only stdlib
 AST/JSON inventory commands ran for this audit, not project tests, checker
 publication or benchmarks. Earlier audit receipts in the parent directory and
 the historical baseline below are retained unchanged.
 
-## Comment-policy verification — 2026-08-28 (PDT)
+## Historical comment-policy verification — 2026-08-28 (PDT)
+
+This checkpoint preceded the themed bulk migration and its repairs. Its gate
+and replay results do not validate the later 259-file tree.
 
 The full `just test-all` run completed at **23:48 PDT on 2026-08-27**, using
 the selected optimized CPython build. Its retained result was **881 JIT tests
@@ -336,7 +521,7 @@ postchecks. CPython remains pinned to
 gate, individual replays, checker cohort, focused follow-up and inventory
 receipts by hash. Original failures and intermediate replay evidence remain
 available beside it. These results do not claim a fresh green full-gate run,
-bulk migration of the remaining cases, remote availability, or performance
+the then-unimplemented bulk migration, remote availability, or performance
 evidence. No optimization or benchmark campaign was run, and nothing was
 pushed.
 
@@ -402,7 +587,7 @@ to checker-driven coverage.
 These are different counting units, overlapping the pytest wrapper families;
 **do not add them to the authored-test counts above**.
 
-| Source collection | Total entries/files | Current strict-behavior candidates |
+| Historical source collection | Entries/files then | Candidates at that inspection |
 | --- | ---: | ---: |
 | Legacy `tests/integration_modules/*.py` delimiter files | 298 | 246 |
 | Builtin primitive JSON cases | 4 | 4 |
@@ -410,14 +595,14 @@ These are different counting units, overlapping the pytest wrapper families;
 | Import regression JSON cases | 47 | 32 |
 | Module precondition JSON cases | 19 | 0 complete; 19 after splitting ordinary controls |
 
-Of the 246 legacy candidates, 238 retain the original source/validator pair,
-five use an already-reviewed strict-rejection validator, and three use an
-already-retained frame-free semantic validator. Another seven need embedded
-ordinary controls split out, one needs ordinary dependency support, two expect
-import failure, 35 exercise ordinary interoperation plus checker rejection,
-five are frame-only XFAILs, one has bad syntax and one remains unreviewed.
-The four JSON registries contain 36 current-strict-behavior candidates out of
-82 entries; 33 preserve the original source/validator pair.
+Of the 246 legacy candidates, 238 retained the original source/validator pair,
+five used an already-reviewed strict-rejection validator, and three used an
+already-retained frame-free semantic validator. Another seven needed embedded
+ordinary controls split out, one needed ordinary dependency support, two expected
+import failure, 35 exercised ordinary interoperation plus checker rejection,
+five were frame-only XFAILs, one had bad syntax and one remained unreviewed.
+The four JSON registries then contained 36 strict-behavior candidates out of
+82 entries; 33 preserved the original source/validator pair.
 
 This is a **static, source-reviewed migration assessment**, not evidence that
 all candidates have been converted or pass under the new default field policy.
