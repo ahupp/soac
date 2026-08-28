@@ -34,12 +34,19 @@ value = 7
 assert value == 7
 '''
     path.write_text(source)
-    prepared = ast.parse(_strict_case_source(path))
+    original_source, validation = split_integration_case(path)
+    prepared_source = _strict_case_source(path)
+    assert prepared_source.startswith(
+        "# soac: module(strict_assign=true, checked_attr=true)\n"
+    )
+    prepared = ast.parse(prepared_source)
     assert ast.get_docstring(prepared) == "Original module documentation."
-    assert len(prepared.body) == 4
+    # Comment selection must preserve every original Python statement.
+    assert ast.compare(prepared, ast.parse(original_source), compare_attributes=False)
+    compile(prepared_source, str(path), "exec", dont_inherit=True)
     assert isinstance(prepared.body[-1], ast.Assign)
     assert prepared.body[-1].targets[0].id == "value"
-    assert split_integration_case(path)[1].strip() == "assert value == 7"
+    assert validation.strip() == "assert value == 7"
 
 
 @pytest.mark.parametrize("partial", [None, "partial diagnostic", b"partial diagnostic"])
@@ -60,7 +67,7 @@ def test_strict_checker_timeout_keeps_partial_diagnostics(
     with pytest.raises(AssertionError, match="actual checker timed out after 1.25s"):
         strict.create_strict_project(
             tmp_path,
-            {"example.py": "from __future__ import strict\n"},
+            {"example.py": "# soac: module(strict_assign=true, checked_attr=true)\n"},
             modules={"example": "example.py"},
             analysis_timeout=1.25,
         )
@@ -1064,7 +1071,7 @@ def test_unknown_backend_refuses_before_checker_publication(tmp_path, monkeypatc
     monkeypatch.setattr(strict, "_checker", unexpected)
     with pytest.raises(ValueError, match="unknown strict execution backend"):
         strict.create_strict_project(
-            tmp_path / "untouched", {"example.py": "from __future__ import strict\n"},
+            tmp_path / "untouched", {"example.py": "# soac: module(strict_assign=true, checked_attr=true)\n"},
             modules={"example": "example.py"}, backend="not-a-backend",
         )
     assert list(tmp_path.iterdir()) == []
@@ -1120,12 +1127,20 @@ def test_retained_function_witnesses_authenticate_entries_around_validation(
 ):
     from tests._strict_integration import StrictProject, StrictValidationCase
 
-    # Driver construction only: this supplies no checker facts or execution
-    # authority. Real strict-project cases exercise the resulting witnesses.
+    # Driver construction only: the explicit policy selects the sealed-binding
+    # witness shape but supplies no checker facts or execution authority.
+    # Real strict-project cases exercise the resulting witnesses.
     project = StrictProject(
         tmp_path, tmp_path, tmp_path / "deployment.json",
         {"generation": "driver-only"}, {"example": "example.py"},
         backend="soac", environment={},
+        policies={
+            "example": {
+                "strict_assign": True,
+                "checked_attr": True,
+                "class_overrides": [],
+            },
+        },
     )
     case = StrictValidationCase(
         "pass\n", tmp_path / "validate.py",
@@ -1142,6 +1157,7 @@ def test_retained_function_witnesses_authenticate_entries_around_validation(
     loops = [node for node in program.body if isinstance(node, ast.For)]
     assert len(loops) == 2
     for loop in loops:
+        assert ast.literal_eval(loop.iter) == case.required_functions
         queries = [
             node for node in ast.walk(loop)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -1165,6 +1181,15 @@ def test_annotation_runtime_validator_uses_the_explicit_module_interface():
     captured = []
 
     class RecordingProject:
+        # Validator construction only; this is not runtime admission authority.
+        policies = {
+            "fields_disabled": {
+                "strict_assign": True,
+                "checked_attr": False,
+                "class_overrides": [],
+            },
+        }
+
         def run_case(self, module_name, validation, module_path, **options):
             captured.append((module_name, validation, module_path, options))
 
@@ -1319,7 +1344,7 @@ def test_entry_runtime_fixtures_run_only_requested_pairs_and_keep_failures(
     assert set(sources) == set(modules.values()) | {"entry_support.py"}
     for name in requested:
         assert sources[f"entry_{name}.py"] == (
-            "from __future__ import strict\n\n"
+            "# soac: module(strict_assign=true, checked_attr=true)\n\n"
             + textwrap.dedent(family.CASES[name].source).lstrip("\n")
         )
     assert sources["entry_support.py"] == "\ndef helper(value, scale=1):\n    return value * scale + 7\n"

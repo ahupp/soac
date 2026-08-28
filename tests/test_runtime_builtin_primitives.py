@@ -41,7 +41,7 @@ def test_original_range_bad_calls_are_strict_checker_errors(tmp_path):
     case = _REVIEWED_BUILTIN_CASES["runtime_range_is_reusable_iterable"]
     errors = assert_strict_source_rejected(
         tmp_path / "original-invalid-range-calls",
-        "from __future__ import strict\n" + case["source"],
+        "# soac: module(strict_assign=true, checked_attr=true)\n" + case["source"],
         module_name="builtin_model",
         diagnostic="CheckerError: no-matching-overload",
     )
@@ -71,7 +71,7 @@ def strict_reviewed_builtin_project(tmp_path_factory, request):
     )
     project = create_strict_project(
         tmp_path_factory.mktemp("strict-builtins-" + name),
-        {"builtin_model.py": "from __future__ import strict\n" + case["source"]},
+        {"builtin_model.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + case["source"]},
         modules={"builtin_model": "builtin_model.py"},
     )
     return case, project

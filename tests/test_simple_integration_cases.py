@@ -32,7 +32,7 @@ STRICT_CASES = {
 def strict_simple_project(tmp_path_factory):
     modules = {name: f"{name}.py" for name in STRICT_CASES}
     sources = {
-        path: "from __future__ import strict\n"
+        path: "# soac: module(strict_assign=true, checked_attr=true)\n"
         + split_integration_case(MODULES_DIR / path)[0]
         for path in modules.values()
     }

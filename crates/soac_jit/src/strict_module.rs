@@ -33,6 +33,8 @@ const TERMINAL_TEARDOWN: c_int = 4;
 const SET_EXISTING: c_int = 5;
 const CACHE_INSERT: c_int = 6;
 const CACHE_REPLACE: c_int = 7;
+const CLONE: c_int = 14;
+const ADMISSION_ONLY: c_uint = 4;
 
 type PolicyCallback = unsafe extern "C" fn(
     *mut ffi::PyObject,
@@ -82,6 +84,7 @@ struct NamespacePolicy {
     module_name: String,
     startup_identity: Fingerprint,
     source_digest: Fingerprint,
+    strict_assign: bool,
     mutable_names: BTreeSet<String>,
     reserved_names: BTreeSet<String>,
     execution_started: AtomicBool,
@@ -159,7 +162,7 @@ fn begin_namespace_sealing(
             "strict module is not initializing",
         ));
     }
-    if unsafe { PyDict_SealSoacNamespace(actual_globals) } < 0 {
+    if policy.strict_assign && unsafe { PyDict_SealSoacNamespace(actual_globals) } < 0 {
         policy.phase.store(Phase::Failed as u8, Ordering::Release);
         return Err(PyErr::fetch(py));
     }
@@ -459,7 +462,8 @@ impl NamespacePolicy {
         startup_identity: Fingerprint,
         facts: &ModuleTypeFacts,
     ) -> Result<Self, &'static str> {
-        if facts.source_dialect != SourceDialect::SoacStrict {
+        if facts.source_dialect != SourceDialect::SoacStrict || !facts.language_policy.is_selected()
+        {
             return Err("strict namespace requires authenticated strict source");
         }
         let mut mutable_names = BTreeSet::new();
@@ -473,9 +477,10 @@ impl NamespacePolicy {
                     mutable_names.insert(binding.name.clone());
                 }
                 GlobalMutability::FinalAfterSeal | GlobalMutability::LateAppendOnly => {}
-                GlobalMutability::Unknown => {
+                GlobalMutability::Unknown if facts.language_policy.strict_assign => {
                     return Err("strict source has an unresolved global mutation policy");
                 }
+                GlobalMutability::Unknown => {}
             }
         }
         Ok(Self {
@@ -484,6 +489,7 @@ impl NamespacePolicy {
             module_name: facts.module.module_name.clone(),
             startup_identity,
             source_digest: facts.source_digest,
+            strict_assign: facts.language_policy.strict_assign,
             mutable_names,
             reserved_names,
             execution_started: AtomicBool::new(false),
@@ -499,6 +505,14 @@ impl NamespacePolicy {
             value if value == Phase::Sealed as u8 => Phase::Sealed,
             value if value == Phase::Failed as u8 => Phase::Failed,
             _ => Phase::Terminal,
+        }
+    }
+
+    fn native_flags(&self) -> c_uint {
+        if self.strict_assign {
+            0
+        } else {
+            ADMISSION_ONLY
         }
     }
 
@@ -535,7 +549,13 @@ impl NamespacePolicy {
         }
         match self.phase() {
             Phase::Discovered => operation == VALIDATE_INITIAL,
-            Phase::Initializing => matches!(operation, SET | SET_EXISTING | DELETE | CLEAR),
+            Phase::Initializing => {
+                matches!(operation, SET | SET_EXISTING | DELETE | CLEAR)
+                    || (!self.strict_assign && operation == CLONE)
+            }
+            Phase::Sealing | Phase::Sealed if !self.strict_assign => {
+                matches!(operation, SET | SET_EXISTING | DELETE | CLEAR | CLONE)
+            }
             Phase::Sealing | Phase::Sealed => match operation {
                 SET => true,
                 SET_EXISTING | DELETE => name.is_some_and(|name| self.mutable_names.contains(name)),
@@ -613,6 +633,12 @@ unsafe extern "C" fn validate_namespace(
                 py,
                 "strict module is failed or terminal",
             ));
+        }
+        if !policy.strict_assign && policy.permits(operation, None) {
+            // Admission-only dictionaries keep ordinary key and mutation
+            // semantics. The native commit boundary has already resolved any
+            // user-defined hashing/equality; only owner liveness is checked.
+            return Ok(());
         }
         if operation == CLEAR {
             if policy.permits(operation, None) {
@@ -762,7 +788,12 @@ impl StrictModuleExecutionRef {
         // it. A successful match proves the actual dictionary still retains
         // that exact owner. Do not dereference the borrowed identity first.
         if unsafe {
-            PyDict_MatchesSoacPolicy(actual_globals.as_ptr(), owner, validate_namespace, 0)
+            PyDict_MatchesSoacPolicy(
+                actual_globals.as_ptr(),
+                owner,
+                validate_namespace,
+                self.policy.native_flags(),
+            )
         } != 1
         {
             return Err(strict_runtime_unavailable(
@@ -942,7 +973,7 @@ impl StrictModuleExecutionRef {
         register_pending_before(&owner, kind, object, before)
     }
 
-    pub(crate) fn is_sealed(
+    pub(crate) fn is_ready(
         &self,
         py: Python<'_>,
         actual_globals: &Bound<'_, PyDict>,
@@ -959,10 +990,8 @@ impl StrictModuleExecutionRef {
         verified: &VerifiedStrictModule,
     ) -> PyResult<bool> {
         self.acquire_owner(py, actual_globals, verified)?;
-        Ok(matches!(
-            self.policy.phase(),
-            Phase::Sealing | Phase::Sealed
-        ))
+        Ok(self.policy.strict_assign
+            && matches!(self.policy.phase(), Phase::Sealing | Phase::Sealed))
     }
 
     pub(crate) fn remove_pending(
@@ -1066,22 +1095,24 @@ impl StrictModuleRuntimeState {
                 state.owned_globals(py)?.as_ptr(),
                 state.owner.as_ptr(),
                 validate_namespace,
-                0,
+                state.policy.native_flags(),
             )
         } < 0
         {
             return Err(PyErr::fetch(py));
         }
-        let names = PyTuple::new(py, state.policy.reserved_names.iter())?;
-        if unsafe {
-            _PyDict_ReserveSoacNamespaceKeys(
-                state.owned_globals(py)?.as_ptr(),
-                state.owner.as_ptr(),
-                names.as_ptr(),
-            )
-        } < 0
-        {
-            return Err(PyErr::fetch(py));
+        if state.policy.strict_assign {
+            let names = PyTuple::new(py, state.policy.reserved_names.iter())?;
+            if unsafe {
+                _PyDict_ReserveSoacNamespaceKeys(
+                    state.owned_globals(py)?.as_ptr(),
+                    state.owner.as_ptr(),
+                    names.as_ptr(),
+                )
+            } < 0
+            {
+                return Err(PyErr::fetch(py));
+            }
         }
         if !state
             .policy
@@ -1205,7 +1236,12 @@ impl StrictModuleRuntimeState {
             ));
         }
         if unsafe {
-            PyDict_MatchesSoacPolicy(globals.as_ptr(), self.owner.as_ptr(), validate_namespace, 0)
+            PyDict_MatchesSoacPolicy(
+                globals.as_ptr(),
+                self.owner.as_ptr(),
+                validate_namespace,
+                self.policy.native_flags(),
+            )
         } != 1
         {
             return Err(strict_runtime_unavailable(
@@ -1267,7 +1303,8 @@ impl StrictModuleRuntimeState {
         Ok(self.initializer_entry.get().copied())
     }
 
-    /// Activate final binding barriers before any class/function finalizer.
+    /// Begin authenticated completion before any class/function finalizer.
+    /// Activate final binding barriers only when `strict_assign` selects them.
     pub fn begin_sealing(&self, py: Python<'_>) -> PyResult<()> {
         self.check_owner(py)?;
         begin_namespace_sealing(py, &self.policy, self.owned_globals(py)?.as_ptr())
@@ -1319,11 +1356,17 @@ impl StrictModuleRuntimeState {
             });
     }
 
-    /// False during initialization/sealing is a dynamic execution state, not
-    /// permission to treat a failed or terminal strict module as ordinary.
-    pub fn is_sealed(&self, py: Python<'_>) -> PyResult<bool> {
+    /// Completion is independent of namespace freezing: a field-only module
+    /// can be ready while retaining ordinary global dictionary mutations.
+    /// A failed or terminal module is never treated as ordinary.
+    pub fn is_ready(&self, py: Python<'_>) -> PyResult<bool> {
         self.check_owner(py)?;
         Ok(self.policy.phase() == Phase::Sealed)
+    }
+
+    /// Whether completion has also frozen the selected module bindings.
+    pub fn is_sealed(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self.is_ready(py)? && self.policy.strict_assign)
     }
 
     pub fn matches_globals(&self, py: Python<'_>, globals: &Bound<'_, PyDict>) -> PyResult<bool> {
@@ -1413,7 +1456,10 @@ mod tests {
             "strict_policy_fixture",
             b"from __future__ import strict\n",
             SourceDialect::SoacStrict,
-            ResolvedStrictPolicy::default(),
+            ResolvedStrictPolicy {
+                strict_assign: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         for (name, mutability) in [
@@ -1491,6 +1537,101 @@ mod tests {
         assert!(!policy.permits(CACHE_INSERT, Some("__annotations__")));
         assert!(!policy.permits(CACHE_REPLACE, Some("__annotations__")));
         assert!(!policy.permits(VALIDATE_INITIAL, Some("final_value")));
+    }
+
+    #[test]
+    fn admission_only_completion_never_freezes_bindings_or_accepts_terminal_writes() {
+        let mut facts = facts();
+        facts.language_policy.strict_assign = false;
+        facts.language_policy.checked_attr = true;
+        facts.global_bindings[0].mutability = GlobalMutability::Unknown;
+        let policy = NamespacePolicy::from_facts(
+            0,
+            0,
+            Fingerprint::digest(b"admission-only fixture"),
+            &facts,
+        )
+        .unwrap();
+        assert_eq!(policy.native_flags(), ADMISSION_ONLY);
+        assert!(policy.permits(VALIDATE_INITIAL, None));
+        for phase in [Phase::Initializing, Phase::Sealing, Phase::Sealed] {
+            policy.phase.store(phase as u8, Ordering::Release);
+            for operation in [SET, SET_EXISTING, DELETE, CLEAR, CLONE] {
+                assert!(policy.permits(operation, None));
+            }
+            for operation in [VALIDATE_INITIAL, CACHE_INSERT, CACHE_REPLACE] {
+                assert!(!policy.permits(operation, None));
+            }
+        }
+        for phase in [Phase::Failed, Phase::Terminal] {
+            policy.phase.store(phase as u8, Ordering::Release);
+            for operation in [SET, SET_EXISTING, DELETE, CLEAR, CLONE] {
+                assert!(!policy.permits(operation, None));
+            }
+        }
+    }
+
+    #[test]
+    fn installed_admission_only_namespace_keeps_ordinary_dictionary_operations() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let mut facts = facts();
+            facts.language_policy.strict_assign = false;
+            facts.language_policy.checked_attr = true;
+            let (module, state) = installed(py, &facts);
+            let globals = module.dict();
+            state.begin_execution(py).unwrap();
+            for stage in 0..3 {
+                match stage {
+                    1 => state.begin_sealing(py).unwrap(),
+                    2 => state.finish_sealing(py).unwrap(),
+                    _ => {}
+                }
+                assert_eq!(state.is_ready(py).unwrap(), stage == 2);
+                assert!(!state.is_sealed(py).unwrap());
+                globals.set_item(7, "first").unwrap();
+                globals.set_item(7, "replacement").unwrap();
+                assert_eq!(
+                    globals
+                        .get_item(7)
+                        .unwrap()
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "replacement",
+                );
+                globals.del_item(7).unwrap();
+                globals.set_item("final_value", stage).unwrap();
+                globals.set_item("final_value", stage + 1).unwrap();
+                globals.call_method0("clear").unwrap();
+                let incoming = PyDict::new(py);
+                incoming.set_item(8, stage).unwrap();
+                globals.call_method1("update", (&incoming,)).unwrap();
+                assert_eq!(
+                    globals
+                        .get_item(8)
+                        .unwrap()
+                        .unwrap()
+                        .extract::<i32>()
+                        .unwrap(),
+                    stage
+                );
+                globals.call_method0("clear").unwrap();
+            }
+            let execution = state.execution_ref();
+            execution.acquire_live_owner(py, &globals).unwrap();
+            // Dictionary ownership is independent of the wrapper's lifetime.
+            drop(module);
+            drop(state);
+            globals.set_item(9, "escaped").unwrap();
+            globals.set_item(9, "still mutable").unwrap();
+            let owner = execution.acquire_live_owner(py, &globals).unwrap();
+            let clear = unsafe { (*ffi::Py_TYPE(owner.as_ptr())).tp_clear }.unwrap();
+            assert_eq!(unsafe { clear(owner.as_ptr()) }, 0);
+            assert!(globals.set_item(9, "terminal").is_err());
+            assert!(globals.call_method0("clear").is_err());
+        });
     }
 
     #[test]

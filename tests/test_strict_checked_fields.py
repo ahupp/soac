@@ -10,7 +10,7 @@ import pytest
 from tests._strict_integration import create_strict_project
 
 _CHECKED = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from typing import Any
 
 class Checked:
@@ -53,6 +53,12 @@ class Defaults:
     def read_number(self):
         return self.number
 
+class PredicateFree:
+    # Participation does not turn Any or inferred declarations into predicates.
+    def __init__(self, initial=1):
+        self.payload: Any = initial
+        self.inferred = initial
+
 def make_reader(initial):
     class Reader:
         def __init__(self):
@@ -63,18 +69,20 @@ def make_reader(initial):
 """
 
 _UNCHECKED_BASE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
+# soac: class(checked_attr=false)
 class UncheckedBase:
     def __init__(self, initial: int = 1):
         self.inferred = initial
-        self.annotation_disabled: int = initial
+        self.annotation_opted_out: int = initial
 """
 
 _DISABLED_CHILD = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from checked import Checked
 
+# soac: class(checked_attr=false)
 class DisabledChild(Checked):
     def __init__(self):
         super().__init__()
@@ -82,7 +90,7 @@ class DisabledChild(Checked):
 """
 
 _ENABLED_CHILD = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from unchecked_base import UncheckedBase
 
 class EnabledChild(UncheckedBase):
@@ -109,15 +117,6 @@ def checked_fields(request, tmp_path_factory):
             "disabled_child": "disabled_child.py",
             "enabled_child": "enabled_child.py",
         },
-        policy="""
-[tool.soac.strict]
-include = ["checked.py", "unchecked_base.py", "disabled_child.py", "enabled_child.py"]
-checked_fields = "supported_annotations"
-
-[[tool.soac.strict.overrides]]
-include = ["unchecked_base.py", "disabled_child.py"]
-checked_fields = "disabled"
-""",
         backend=backend,
     )
 
@@ -200,11 +199,11 @@ get_construction.argtypes = [
 ]
 get_construction.restype = ctypes.c_int
 
-for name, module, classes in (
-    ("checked", checked, (checked.Checked, checked.Defaults)),
-    ("unchecked_base", unchecked_base, (unchecked_base.UncheckedBase,)),
-    ("disabled_child", disabled_child, (disabled_child.DisabledChild,)),
-    ("enabled_child", enabled_child, (enabled_child.EnabledChild,)),
+for name, module, classes, participates in (
+    ("checked", checked, (checked.Checked, checked.Defaults, checked.PredicateFree), True),
+    ("unchecked_base", unchecked_base, (unchecked_base.UncheckedBase,), False),
+    ("disabled_child", disabled_child, (disabled_child.DisabledChild,), False),
+    ("enabled_child", enabled_child, (enabled_child.EnabledChild,), False),
 ):
     source_path, source_sha256 = expected_modules[name]
     diagnostic = _assert_cpython_module_witness(
@@ -212,6 +211,9 @@ for name, module, classes in (
         source_sha256=source_sha256, artifact_generation=expected_generation,
     )
     for cls in classes:
+        if not participates:
+            assert is_sealed(cls) == 0 and get_type_owner(cls) is None
+            continue
         info = ConstructionInfoV1()
         assert get_construction(cls, ctypes.byref(info), ctypes.sizeof(info)) == 1
         assert info.abi_version == 1 and info.struct_size == ctypes.sizeof(info)
@@ -224,6 +226,7 @@ for name, module, classes in (
             checked.Checked.store_choice,
             checked.Checked.read_number,
             checked.Defaults.read_number,
+            checked.PredicateFree.__init__,
         ),
         "unchecked_base": (unchecked_base.UncheckedBase.__init__,),
         "disabled_child": (disabled_child.DisabledChild.__init__,),
@@ -232,7 +235,7 @@ for name, module, classes in (
         observed = _assert_cpython_function_witness(
             function, diagnostic,
         )
-        assert observed["finalized"]
+        assert observed["finalized"] is participates
 """
 
 
@@ -255,139 +258,6 @@ def run(project, program, **options):
         _PRELUDE + witness_inputs + _CPYTHON_FIELD_WITNESSES
         + textwrap.dedent(program) + _CPYTHON_FIELD_WITNESSES,
         Path(__file__), backend="cpython", **options,
-    )
-
-
-@pytest.mark.parametrize(
-    ("checked_fields", "entry_interpreter"),
-    [
-        pytest.param("soac", False, id="False"),
-        pytest.param("soac", True, id="True"),
-        pytest.param("cpython", False, id="cpython"),
-    ],
-    indirect=["checked_fields"],
-    scope="module",
-)
-def test_explicit_fields_check_without_coercion_or_inferred_requirements(
-    checked_fields, entry_interpreter
-):
-    program = """
-        value = checked.Checked()
-        dictionary = storage(value)
-        assert_ordinary_dictionary(dictionary)
-        class Integer(int):
-            pass
-        for accepted in (True, 17, Integer(19), 10 ** 100):
-            value.number = accepted
-            assert value.number is accepted
-            value.widened = accepted
-            assert value.widened is accepted
-        floating = float('2.5')
-        value.widened = floating
-        assert value.widened is floating
-        for name, invalid in [('number', 1.5), ('flag', 1), ('none_only', 0),
-                              ('maybe', 1), ('choice', []), ('widened', '2.5')]:
-            previous = getattr(value, name)
-            required_error(lambda: setattr(value, name, invalid))
-            assert getattr(value, name) is previous
-        for accepted in (None, 'text'):
-            value.maybe = accepted
-            assert value.maybe is accepted
-        for accepted in (None, 'text', 8, True):
-            value.store_choice(accepted)
-            assert value.choice is accepted
-        required_error(lambda: value.store_choice([]))
-        required_error(lambda: value.store_number('bad through a transformed method'))
-        assert dictionary is vars(value)
-        assert_ordinary_dictionary(dictionary)
-
-        # This ordinary field has an inferred integer type, but the source
-        # never selected a mandatory annotation or indexed storage for it.
-        marker = object()
-        value.inferred = marker
-        assert value.inferred is marker
-        dictionary['inferred'] = 'still unchecked'
-        assert value.inferred == 'still unchecked'
-
-        defaults = checked.Defaults()
-        default_storage = storage(defaults)
-        assert defaults.number == 10 and default_storage == {}
-        required_error(lambda: setattr(defaults, 'number', 'bad default shadow'))
-        defaults.number = 2
-        del defaults.number
-        assert defaults.number == 10 and default_storage == {}
-        """
-    if checked_fields.backend == "cpython":
-        program = textwrap.dedent(program) + """
-# Repeated original-code operations must retain checks without SOAC compilation.
-warmed = checked.Checked()
-for item in range(128):
-    warmed.store_number(item)
-    assert warmed.read_number() == item
-required_error(lambda: warmed.store_number("bad after native warmup"))
-assert warmed.number == 127
-required_error(lambda: c_generic_setattr(warmed, "number", "bad generic C write"))
-assert c_generic_setattr(warmed, "number", 129) == 0
-assert warmed.read_number() == 129
-"""
-    run(checked_fields, program, entry_interpreter=entry_interpreter)
-
-
-@pytest.mark.parametrize(
-    ("checked_fields", "entry_interpreter"),
-    [
-        pytest.param("soac", False, id="False"),
-        pytest.param("soac", True, id="True"),
-        pytest.param("cpython", False, id="cpython"),
-    ],
-    indirect=["checked_fields"],
-    scope="module",
-)
-def test_inheritance_keeps_actual_base_checks_without_retroactive_upgrade(
-    checked_fields, entry_interpreter
-):
-    run(
-        checked_fields,
-        """
-        child = disabled_child.DisabledChild()
-        child_storage = storage(child)
-        base_storage = storage(checked.Checked())
-        assert_ordinary_dictionary(child_storage)
-        assert_ordinary_dictionary(base_storage)
-        required_error(lambda: setattr(child, 'number', 'base contract still applies'))
-        required_error(lambda: child_storage.__setitem__('choice', []))
-        child.number = True
-        child.own = 'this declaration belongs to the disabled child module'
-        assert child.number is True and isinstance(child.own, str)
-
-        enabled = enabled_child.EnabledChild()
-        enabled_storage = storage(enabled)
-        unchecked = unchecked_base.UncheckedBase()
-        assert is_sealed(type(unchecked)) == 1
-        unchecked_storage = vars(unchecked)
-        # Its module explicitly disables fields and it has no checked base.
-        # Permanent class sealing does not require an empty instance policy.
-        assert type(unchecked_storage) is dict and has_policy(unchecked_storage) == 0
-        assert_ordinary_dictionary(enabled_storage)
-        assert_ordinary_dictionary(unchecked_storage)
-        for name in ('inferred', 'annotation_disabled'):
-            setattr(enabled, name, 'no retroactive source requirement')
-            assert getattr(enabled, name) == 'no retroactive source requirement'
-            ordinary_value = object()
-            setattr(unchecked, name, ordinary_value)
-            assert getattr(unchecked, name) is ordinary_value
-            native_value = object()
-            assert c_generic_setattr(unchecked, name, native_value) == 0
-            assert getattr(unchecked, name) is native_value
-            dictionary_value = object()
-            assert c_setitem(unchecked_storage, name, dictionary_value) == 0
-            assert getattr(unchecked, name) is dictionary_value
-        assert vars(unchecked) is unchecked_storage and has_policy(unchecked_storage) == 0
-        required_error(lambda: setattr(enabled, 'own', 'own explicit annotation is selected'))
-        enabled.own = 11
-        assert enabled.own == 11
-        """,
-        entry_interpreter=entry_interpreter,
     )
 
 
@@ -838,7 +708,7 @@ def test_unmaterialized_checked_field_stores_keep_policy_in_profile_verify_and_a
     )
     body = f"class_name = {class_name!r}\n" + body
     validation = "def validate_module(module):\n" + textwrap.indent(body, "    ")
-    source = _CHECKED.replace("from __future__ import strict\n", "", 1)
+    source = _CHECKED.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
     with stock_module(tmp_path / "ordinary", "ordinary_unmaterialized_fields", source) as ordinary:
         exec_integration_validation(validation, ordinary, Path(__file__), mode="stock")
 
@@ -938,7 +808,7 @@ def test_ordinary_deleted_field_key_can_compare_during_alias_setup(tmp_path):
     from tests._integration import stock_module
 
     # Use the same class source with ordinary CPython, without field policy.
-    source = _CHECKED.replace("from __future__ import strict\n", "", 1)
+    source = _CHECKED.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
     with stock_module(tmp_path, "ordinary_field_alias_setup", source) as module:
         value = module.Checked(7)
         dictionary = vars(value)
@@ -1240,21 +1110,23 @@ assert not empty_dictionary and info(empty_dictionary)['has_slot']
 required_error(lambda: c_setitem(empty_dictionary, 'number', 'wrong'))
 assert not empty_dictionary and empty.number == 10
 
-# No storage bit is not a waiver of an independently installed class contract.
-unchecked = unchecked_base.UncheckedBase()
+# An admitted class with only Any/inferred fields needs no storage predicate.
+# This is a source-type control, not the removed sealed-but-disabled policy.
+unchecked = checked.PredicateFree()
 assert is_sealed(type(unchecked)) == 1
 assert not info(unchecked)['has_slot']
 assert not info(vars(unchecked))['has_slot']
-unchecked.annotation_disabled = 'allowed by the original disabled policy'
+unchecked.payload = 'Any does not impose a value predicate'
+unchecked.inferred = object()
 from soac.strict import StrictMutationError
-original_code = unchecked_base.UncheckedBase.__init__.__code__
+original_code = checked.PredicateFree.__init__.__code__
 try:
-    unchecked_base.UncheckedBase.__init__.__code__ = original_code
+    checked.PredicateFree.__init__.__code__ = original_code
 except StrictMutationError:
     pass
 else:
     raise AssertionError('no storage bit disabled the installed method seal')
-assert unchecked_base.UncheckedBase.__init__.__code__ is original_code
+assert checked.PredicateFree.__init__.__code__ is original_code
 """,
         entry_interpreter=entry_interpreter,
     )
@@ -1342,7 +1214,7 @@ def nominal_field_project(request, tmp_path_factory):
         tmp_path_factory.mktemp(f"strict-nominal-fields-{backend}"),
         {
             "nominal_fields.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from nominal_field_probe import OrdinaryTarget, change_target, observe
 
 class MutableHolder:
@@ -1459,11 +1331,6 @@ def observe(cls: Any) -> None:
 """,
         },
         modules={"nominal_fields": "nominal_fields.py"},
-        policy="""
-[tool.soac.strict]
-include = ["nominal_fields.py"]
-checked_fields = "supported_annotations"
-""",
         backend=backend,
     )
 
@@ -1482,7 +1349,8 @@ set_item.restype = ctypes.c_int
 generic_set = ctypes.pythonapi.PyObject_GenericSetAttr
 generic_set.argtypes = [ctypes.py_object] * 3
 generic_set.restype = ctypes.c_int
-assert _soac_ext.strict_module_diagnostics(module)['sealed']
+module_state = _soac_ext.strict_module_diagnostics(module)
+assert module_state['ready'] and module_state['strict_assign'] and module_state['sealed']
 
 def rejected(operation):
     try:

@@ -423,6 +423,18 @@ pub(crate) fn globals_pending_at_adoption(
     if auth.is_interpreter() && !auth.interpreter_source_authority()? {
         return Ok(false);
     }
+    if !auth
+        .verified_module()
+        .type_facts()
+        .facts()
+        .language_policy
+        .strict_assign
+    {
+        // Mutable module bindings never become nominal capabilities. There
+        // is no future publication boundary to await; existing field checks
+        // retain their independently captured actual declaration targets.
+        return Ok(false);
+    }
     let globals = auth.globals()?;
     if auth
         .execution_ref()

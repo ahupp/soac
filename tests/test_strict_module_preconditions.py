@@ -136,7 +136,7 @@ def strict_reviewed_precondition_project(tmp_path_factory):
     for name in _REVIEWED_PRECONDITION_CASES:
         case = _reviewed_precondition_case(name)
         relative = name + ".py"
-        sources[relative] = "from __future__ import strict\n" + case["source"]
+        sources[relative] = "# soac: module(strict_assign=true, checked_attr=true)\n" + case["source"]
         sources["ordinary_" + relative] = case["source"]
         modules[name] = relative
     return create_strict_project(
@@ -229,7 +229,7 @@ def size(values):
     project = create_strict_project(
         tmp_path,
         {
-            "late_builtins.py": "from __future__ import strict\n" + source,
+            "late_builtins.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + source,
             "ordinary_late_builtins.py": source,
         },
         modules={"late_builtins": "late_builtins.py"},
@@ -392,9 +392,9 @@ def cpython_module_globals_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("cpython-module-globals"),
         {
-            "native_globals.py": "from __future__ import strict\n" + _MODULE_GLOBALS_SOURCE,
+            "native_globals.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _MODULE_GLOBALS_SOURCE,
             "ordinary_globals.py": _MODULE_GLOBALS_SOURCE,
-            "native_globals_failure.py": "from __future__ import strict\n" + _MODULE_GLOBALS_FAILURE_SOURCE,
+            "native_globals_failure.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _MODULE_GLOBALS_FAILURE_SOURCE,
             "ordinary_globals_failure.py": _MODULE_GLOBALS_FAILURE_SOURCE,
             "module_globals_probe.py": _MODULE_GLOBALS_PROBE,
         },
@@ -636,7 +636,7 @@ def test_cpython_module_c_dictionary_mutations_are_atomic_and_honor_explicit_glo
     project = create_strict_project(
         tmp_path,
         {
-            "capi_module.py": "from __future__ import strict\n" + _C_API_MODULE_SOURCE,
+            "capi_module.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _C_API_MODULE_SOURCE,
             "ordinary_capi_module.py": _C_API_MODULE_SOURCE,
         },
         modules={"capi_module": "capi_module.py"},

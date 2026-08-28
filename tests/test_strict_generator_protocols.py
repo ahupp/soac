@@ -8,7 +8,7 @@ import pytest
 from tests._integration import exec_integration_validation
 from tests._strict_integration import create_strict_project
 
-SOURCE = """from __future__ import strict
+SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def make_delegate(delegate, observe):
     def values():
         try:
@@ -205,7 +205,7 @@ def ordinary_events(case, validation=VALIDATE):
     module = ModuleType("ordinary_generator_protocol")
     exec(  # noqa: S102 - the ordinary control is the literal source above.
         compile(
-            SOURCE.removeprefix("from __future__ import strict\n"),
+            SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)),
             "exec",
             dont_inherit=True,
@@ -395,7 +395,7 @@ def test_generator_injected_exception_uses_own_handled_item(
     )
 
 
-DELIVERY_SOURCE = """from __future__ import strict
+DELIVERY_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def delegated_delivery(delegate_factory, events):
     try:
         result = yield from delegate_factory()
@@ -533,7 +533,7 @@ def ordinary_delivery_events(case):
     module = ModuleType("ordinary_generator_delivery")
     exec(  # noqa: S102 - the ordinary control is the separate literal source above.
         compile(
-            DELIVERY_SOURCE.removeprefix("from __future__ import strict\n"),
+            DELIVERY_SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)),
             "exec",
             dont_inherit=True,
@@ -587,7 +587,7 @@ def test_generator_delivery_preserves_completion_callbacks_and_cleanup(
     )
 
 
-TERMINAL_SOURCE = """from __future__ import strict
+TERMINAL_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def terminal_values(mode, make_payload):
     payload = make_payload()
     yield 'ready'
@@ -700,7 +700,7 @@ def ordinary_terminal_events(case):
     module = ModuleType("ordinary_generator_terminal")
     exec(  # noqa: S102 - the ordinary control is the separate literal source above.
         compile(
-            TERMINAL_SOURCE.removeprefix("from __future__ import strict\n"),
+            TERMINAL_SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)),
             "exec",
             dont_inherit=True,
@@ -754,7 +754,7 @@ def test_generator_terminal_cleanup_is_reentry_safe_and_finishes_closed(
     )
 
 
-SUSPENDED_NATIVE_SOURCE = """from __future__ import strict
+SUSPENDED_NATIVE_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 async def source_coroutine(delegate, observe):
     observe('enter')
     try:
@@ -928,7 +928,7 @@ def test_suspended_native_identity_and_state_control(kind, case):
     module = ModuleType("ordinary_suspended_native")
     exec(  # noqa: S102 - ordinary control uses the same source without strict opt-in.
         compile(
-            SUSPENDED_NATIVE_SOURCE.removeprefix("from __future__ import strict\n"),
+            SUSPENDED_NATIVE_SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)),
             "exec",
             dont_inherit=True,
@@ -984,7 +984,7 @@ TRACEBACK_LIFETIME_BODY = """    payload = make_payload('first')
 """
 
 TRACEBACK_LIFETIME_SOURCE = (
-    "from __future__ import strict\n"
+    "# soac: module(strict_assign=true, checked_attr=true)\n"
     "def lifetime_function(mode, make_payload, save, delegate):\n"
     + TRACEBACK_LIFETIME_BODY
     + "    return 41\n\n"
@@ -1106,7 +1106,7 @@ def test_source_traceback_lifetime_native_control(kind, case):
     module = ModuleType("ordinary_source_traceback_lifetime")
     exec(  # noqa: S102 - ordinary control uses the identical literal source.
         compile(
-            TRACEBACK_LIFETIME_SOURCE.removeprefix("from __future__ import strict\n"),
+            TRACEBACK_LIFETIME_SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)),
             "exec",
             dont_inherit=True,
@@ -1145,7 +1145,7 @@ def test_source_exceptions_preserve_callbacks_and_cleanup_without_frame_retentio
 
 # Fresh delegation never reuses the previous native resume packet.
 _INITIAL_DELEGATION_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def after_send(delegate):
     marker = yield "first"
@@ -1253,7 +1253,7 @@ def initial_delegation_project(tmp_path_factory):
         {
             "initial_entry.py": _INITIAL_DELEGATION_SOURCE,
             "ordinary_initial_entry.py": _INITIAL_DELEGATION_SOURCE.replace(
-                "from __future__ import strict\n", "", 1
+                "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
             ),
         },
         modules={"initial_entry": "initial_entry.py"},
@@ -1276,7 +1276,7 @@ def test_fresh_delegation_does_not_reuse_the_previous_resume_packet(
     )
 
 
-CYCLIC_TRACEBACK_SOURCE = """from __future__ import strict
+CYCLIC_TRACEBACK_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def make(save, payload_factory, connect):
     async def source():
         payload = payload_factory()
@@ -1385,7 +1385,7 @@ def test_cyclic_async_traceback_native_gc_control():
     module = ModuleType("ordinary_cyclic_async_traceback")
     exec(  # noqa: S102 - ordinary control uses the identical literal source.
         compile(
-            CYCLIC_TRACEBACK_SOURCE.removeprefix("from __future__ import strict\n"),
+            CYCLIC_TRACEBACK_SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)),
             "exec",
             dont_inherit=True,
@@ -1419,7 +1419,7 @@ def test_cyclic_async_traceback_does_not_root_suspended_source_state(
     )
 
 
-SUSPENDED_OPERAND_SOURCE = """from __future__ import strict
+SUSPENDED_OPERAND_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def suspended_call(make, consume, later):
     local = make('local')
     consume(make('operand'), (yield 'ready'), later())
@@ -1565,7 +1565,7 @@ def ordinary_suspended_operand_events(case):
     module = ModuleType("ordinary_suspended_operands")
     exec(  # noqa: S102 - native control uses the same source without strict opt-in.
         compile(
-            SUSPENDED_OPERAND_SOURCE.removeprefix("from __future__ import strict\n"),
+            SUSPENDED_OPERAND_SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)), "exec", dont_inherit=True,
         ),
         vars(module),
@@ -1614,7 +1614,7 @@ def test_suspended_expression_operands_preserve_semantics_and_required_cleanup(
     )
 
 
-DELEGATED_THROW_SOURCE = """from __future__ import strict
+DELEGATED_THROW_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def suspended_delegation(make, values):
     local = make()
     return (yield from values)
@@ -1731,7 +1731,7 @@ def ordinary_delegated_throw_result(case):
     module = ModuleType("ordinary_delegated_throw")
     exec(  # noqa: S102 - same original source without strict opt-in.
         compile(
-            DELEGATED_THROW_SOURCE.removeprefix("from __future__ import strict\n"),
+            DELEGATED_THROW_SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)), "exec", dont_inherit=True,
         ),
         vars(module),
@@ -1780,7 +1780,7 @@ def test_delegated_throw_preserves_results_exceptions_and_cleanup(
     )
 
 
-ITERATOR_ACTIVATION_SOURCE = """from __future__ import strict
+ITERATOR_ACTIVATION_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def values(make, observe):
     observe('source-enter', None)
     for value in make():
@@ -1866,7 +1866,7 @@ def ordinary_iterator_activation_events():
     module = ModuleType("ordinary_iterator_activation")
     exec(  # noqa: S102 - native control uses the same original source.
         compile(
-            ITERATOR_ACTIVATION_SOURCE.removeprefix("from __future__ import strict\n"),
+            ITERATOR_ACTIVATION_SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n"),
             str(Path(__file__)), "exec", dont_inherit=True,
         ),
         vars(module),

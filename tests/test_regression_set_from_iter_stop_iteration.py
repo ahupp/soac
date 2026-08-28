@@ -45,7 +45,7 @@ def test_set_from_iter_preserves_successful_consumption(values, expected):
 @pytest.fixture(scope="module")
 def strict_set_consumption_project(tmp_path_factory):
     source = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def collect(values):
     return set(value for value in values)
@@ -55,7 +55,7 @@ def collect(values):
         {
             "set_consumption_model.py": source,
             "ordinary_set_consumption_model.py": source.replace(
-                "from __future__ import strict\n", "", 1
+                "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
             ),
         },
         modules={"set_consumption_model": "set_consumption_model.py"},

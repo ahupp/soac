@@ -116,7 +116,7 @@ def strict_reviewed_pipeline_project(tmp_path_factory, request):
     sources, modules = {}, {}
     for name, case in _REVIEWED_PIPELINE_CASES.items():
         relative = name + ".py"
-        sources[relative] = "from __future__ import strict\n" + case["source"]
+        sources[relative] = "# soac: module(strict_assign=true, checked_attr=true)\n" + case["source"]
         sources["ordinary_" + relative] = case["source"]
         modules[name] = relative
     return create_strict_project(
@@ -653,7 +653,7 @@ def strict_intrinsic_pipeline_project(tmp_path_factory):
     }
     files = {}
     for name, source in sources.items():
-        files[f"{name}.py"] = "from __future__ import strict\n" + source
+        files[f"{name}.py"] = "# soac: module(strict_assign=true, checked_attr=true)\n" + source
         files[f"ordinary_{name}.py"] = source
     return create_strict_project(
         tmp_path_factory.mktemp("strict-intrinsic-pipeline"),
@@ -667,7 +667,7 @@ def test_checked_native_iterator_imports_survive_reserved_codegen(tmp_path):
         tmp_path,
         {
             "native_imports.py": (
-                "from __future__ import strict\n"
+                "# soac: module(strict_assign=true, checked_attr=true)\n"
                 "def collect(callback, values):\n"
                 "    return list(map(callback, values))\n"
             )

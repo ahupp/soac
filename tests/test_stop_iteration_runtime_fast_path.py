@@ -79,7 +79,7 @@ def _create_project(tmp_path, module_name, mode, scenario, *, work_dir=None):
             patch.setenv(name, value)
         return create_strict_project(
             tmp_path / "strict-publication",
-            {f"{module_name}.py": "from __future__ import strict\n" + source.lstrip("\n")},
+            {f"{module_name}.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + source.lstrip("\n")},
             modules={module_name: f"{module_name}.py"},
             backend="soac",
         )

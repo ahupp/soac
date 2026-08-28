@@ -92,10 +92,11 @@ generated dependency graph. Names below are Cargo package names.
   native library/search paths and Rust-side Python initialization.
 
 - `soac_source`
-  Range-preserving validation of Ruff source tokens before lowering or offline
-  literal inference. `validate_source_literals` rejects unsupported surrogate
-  escapes with `UnsupportedSurrogateEscape`; it does not change ordinary
-  CPython strings or add parser dependencies to `soac_contracts`.
+  Range-preserving source-comment policy parsing and validation of Ruff tokens
+  before lowering or offline literal inference. `validate_source_literals`
+  rejects unsupported surrogate escapes with `UnsupportedSurrogateEscape`;
+  it does not change ordinary CPython strings or add parser dependencies to
+  `soac_contracts`.
 
 - `soac_jit_runtime`
   ABI-shaped, raw-CPython helpers compiled to CLIF for inlining into generated
@@ -182,9 +183,9 @@ materialized by archive preparation is now an explicit regular-file portability
 commit. Preparation emits the actual source path and commit identity as JSON.
 
 `just ty -- ...` builds and runs the separate offline semantic exporter. It uses
-the actual vendored checker, accepts an explicit `[tool.soac.strict]` project
-policy and selected CPython 3.15 executable, and publishes authenticated module
-shards without importing project modules. See [the offline tool guide](tools/ty/README.md)
+the actual vendored checker and selected CPython 3.15 executable, resolves
+source-comment policies, and publishes authenticated module shards
+without importing project modules. See [the offline tool guide](tools/ty/README.md)
 for signing-key creation, `check` options, deployment authority, dependency
 invalidation, and focused tests. `just ty --debug-build -- ...` uses the isolated
 debug build; `just ty --update-lockfile` refreshes workspace/path dependencies in
@@ -205,18 +206,43 @@ Source preparation, authenticated artifact loading, and runtime
 construction/sealing remain separate boundaries: a signed type fact is not a
 live runtime capability.
 
-The current source targets type-artifact schema 6 and strict-contract version 2.
-Runtime parameter/return policy keys are removed, not accepted as disabled
-aliases. Static signatures remain checker facts; selected field writes are the
-runtime value invariant. Regenerate older publications for the new policy;
-the ongoing native/runtime migration must be built and validated before this
+Both source-policy flags default to `false`. A module can select them with:
+
+```python
+# soac: module(strict_assign=true, checked_attr=true)
+```
+
+`# soac: package(...)` in `__init__.py` supplies package defaults, inherited
+outer-to-inner; a module directive overrides only its own file. Missing keys
+inherit. `# soac: class(checked_attr=true)` or `false`, placed before the class
+and its decorators, overrides that exact class AST node. `checked_attr` selects
+eligible class invariants and supported field-write checks; unsupported framework
+classes remain dynamic. Disabling it introduces no new local class contract but
+never revokes inherited checks. `strict_assign` independently controls module
+assignment invariants: checked classes can live in a mutable module, and a strict
+module need not introduce checked classes. The retired `[tool.soac.strict]` TOML
+policy is rejected, not translated.
+
+Comments are offline selection input, not execution authority. Ordinary CPython
+ignores them. Strict helpers and scenarios preserve the supplied source; neither
+inserts `from __future__ import strict`. Authenticated startup and actual runtime
+binding install the selected contracts. The trusted raw compiler sets its
+internal strict ownership guard flag without changing source bytes or treating
+that flag as source policy.
+
+The current source targets type-artifact schema 7, strict-contract version 3,
+SOAC dialect version 2, and deployment schema 3. Runtime parameter/return policy
+keys are removed, not accepted as disabled aliases. Static signatures remain
+checker facts; selected field writes are the runtime value invariant.
+Regenerate older publications for the new policy; the ongoing native/runtime
+migration must be built and validated before this
 source checkpoint is a working-runtime claim. Direct bases and logical MRO
 entries distinguish source-class references from semantic builtin types; an
 alias of builtin `object` is not identified by its spelling. Nominal leaves
-explicitly belong to a source function annotation or an exact field declaration; inherited fields
-retain their original declaring class and assignment. Field annotation provenance
+explicitly belong to a source function annotation or an exact field declaration;
+inherited fields retain their original declaring class and assignment. Field annotation provenance
 must be present even when explicitly unresolved (`null`). Schema-1 through
-schema-5 publications must be regenerated, not loaded with inferred defaults.
+schema-6 publications must be regenerated, not loaded with inferred defaults.
 
 `soac.strict.StrictMutationError` and `StrictRuntimeUnavailableError` are aliases
 of the native per-interpreter exception classes, also exported from `soac`.
@@ -563,9 +589,12 @@ After editing CPython bytecode definitions, use
 regenerate review files in a disposable guest checkout of the exact logical
 commit, without editing selected sources. Commit those generated files in a
 separate top commit in CPython and record the regeneration command in its
-message. `just regenerate-cpython-cases --check` verifies the pinned
-generated-only top commit against its logical parent. There is no maintained
-generated patch file to apply.
+message. `just regenerate-cpython-cases --check` regenerates a pinned
+generated-only top commit from its exact logical parent. If the pinned top is
+purely logical, it regenerates from that exact commit and requires byte-identical
+generated outputs; no synthetic generated commit is needed. Mixed logical and
+generated commits are rejected. There is no maintained generated patch file to
+apply.
 
 The workflows in `AGENTS.md` also require Jujutsu for version-control
 operations; install it with `cargo install --locked jj-cli` if `jj` is not
@@ -600,11 +629,13 @@ Runtime integration tests use `tests._strict_integration.create_strict_project`
 to analyze explicitly selected source modules with the pinned offline checker,
 then `StrictProject.run` to launch the selected interpreter with the generated
 native startup configuration. Selected sources must include the real
-`from __future__ import strict` opt-in; the shared helper does not insert it.
+source-comment directives or inherit package selection; the shared helper does
+not insert future imports or synthesize a TOML strictness policy.
 For delimiter-based cases, `run_case` also
-checks actual module-seal/source/generation diagnostics before executing the
-validation tail outside the sealed module. `SOAC_MODULE_ENABLED` and test mode
-flags do not grant strict authority. Keep ordinary controls on
+checks actual policy, module-seal/source/generation diagnostics before executing
+the validation tail outside the module. A module is sealed only when its
+resolved `strict_assign` flag selects that invariant. `SOAC_MODULE_ENABLED` and
+test mode flags do not grant strict authority. Keep ordinary controls on
 `tests._integration.stock_module`; the old in-process `soac`/`entry` helpers
 fail explicitly until their callers are migrated.
 
@@ -622,8 +653,10 @@ New source-level tests can use the [single-file scenario format](doc/STRICT_SCEN
 in `tests/strict_scenarios/`: `# module:name` sections define the analyzed modules,
 then `# ok` and `# raise:Exception` sections run in fresh authenticated processes.
 Only the final top-level statement is covered by a `raise` expectation; module
-setup and earlier statements must succeed. The adapter adds the strict opt-in
-explicitly and uses the existing real-checker/native-startup helper. Run these
+setup and earlier statements must succeed. Each module section carries its own
+source policy or inherits package defaults; the adapter preserves those bytes
+and uses the existing real-checker/native-startup helper without implicit future
+imports. Run these
 with `just pytest-fast --require-batch-runner tests/test_strict_scenarios.py`.
 
 The development dependency group includes Pydantic, Django, and SQLAlchemy for
@@ -1128,9 +1161,11 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   benchmark venv. The fixed `driver-local-static-imports-v1` policy opts in the
   driver and its statically imported local modules; unimported `.py` input data,
   dynamically imported dependencies, third-party packages (including `tomli`),
-  and standard-library code remain ordinary. Class policy is automatic, unknown
-  framework classes stay dynamic, parameter/return annotations remain static
-  checker facts, and optional checked fields are disabled for this source policy.
+  and standard-library code remain ordinary. Selected overlay files receive
+  `# soac: module(strict_assign=true, checked_attr=true)`: eligible classes and
+  supported fields are checked, unknown framework classes stay dynamic, and
+  parameter/return annotations remain static checker facts. Optimization and
+  benchmark execution remain deferred until separately requested.
 
   The `terminal-main-measurement-suffix-v1` preparation preserves definitions
   and setup in module initialization, then runs the unchanged measurement
@@ -1206,12 +1241,12 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   benchmark selection, interpreter, or output files.
   Every result must retain the same original input fingerprint, strict source
   selection, and harness policy across rounds and the previous strict revision.
-  The schema-3 strict-source manifest also records the exact policy projection:
-  an upstream `pyproject.toml` keeps its original bytes, comments, and values;
-  only the declared `[tool.soac.strict]` table may be appended. An identical
-  existing policy is reused unchanged, while conflicting policies or sealed
-  TOML namespaces are rejected. Verification regenerates this projection from
-  the original driver metadata, not merely from editable manifest hashes.
+  The schema-4 strict-source manifest and schema-2 execution manifest record the
+  disclosed source-comment insertion and unchanged upstream configuration.
+  `pyproject.toml` keeps its exact bytes or remains absent; no strict TOML table
+  is appended or projected. Retired strict TOML policy is rejected. Verification
+  reconstructs the source and configuration observations from original driver
+  metadata, not merely from editable manifest hashes.
   Each complete `summary.txt` and `summary.json` reports
   benchmark-result-specific transformed project/dependency and standard-library
   module coverage, distinct measured apply-worker process counts, compiled

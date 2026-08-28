@@ -18,7 +18,7 @@ def _run_basic_block_case(
     filename = f"{module_name}.py"
     project = create_strict_project(
         tmp_path / "strict",
-        {filename: "from __future__ import strict\n" + textwrap.dedent(source)},
+        {filename: "# soac: module(strict_assign=true, checked_attr=true)\n" + textwrap.dedent(source)},
         modules={module_name: filename},
         backend="soac",
     )
@@ -262,7 +262,7 @@ def namedexpr_namespace_project(tmp_path_factory, request):
     project = create_strict_project(
         tmp_path_factory.mktemp(f"strict-namedexpr-namespace-{mode}"),
         {
-            "namedexpr_model.py": "from __future__ import strict\n" + _NAMED_EXPRESSION_SOURCE,
+            "namedexpr_model.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _NAMED_EXPRESSION_SOURCE,
             "ordinary_namedexpr.py": _NAMED_EXPRESSION_SOURCE,
             "namedexpr_namespace.py": _NAMED_EXPRESSION_NAMESPACE,
         },

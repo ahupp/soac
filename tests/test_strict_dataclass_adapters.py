@@ -4,6 +4,18 @@ import pytest
 
 from tests._strict_integration import create_strict_project
 
+_FIELD_WRITE_ASSERTIONS = """
+from soac.strict import StrictMutationError
+
+def field_write_rejected(operation):
+    try:
+        operation()
+    except TypeError as error:
+        assert not isinstance(error, StrictMutationError)
+        return
+    raise AssertionError('selected instance storage accepted an incompatible value')
+"""
+
 _SUPPORT = """
 events = []
 classes = []
@@ -35,7 +47,7 @@ def observe(cls):
 """
 
 _MODELS = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import InitVar, dataclass, field
 from typing import ClassVar
 import adapter_support
@@ -74,7 +86,7 @@ class Manual:
 """
 
 _CALLBACK_MODELS = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 import adapter_support
 
@@ -106,7 +118,7 @@ source_functions = (model.Record.__post_init__, model.Record.total, model.Manual
 entries_before = tuple(_soac_ext.strict_function_entry_kind(fn) for fn in source_functions)
 stock = types.ModuleType('ordinary_dataclass_model')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict\\n', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', ''),
              '<ordinary dataclass control>', 'exec'), vars(stock))
 
 def result_or_error(operation):
@@ -139,6 +151,12 @@ def exercise(module):
     constructor_error = result_or_error(lambda: module.Record(1, 2))
     assert constructor_error[0:2] == ('raised', TypeError)
 
+    # InitVar and __post_init__ arguments are ordinary call values. Only the
+    # real int fields are selected; no predicate is installed for seed.
+    seeded = module.Record(seed='ordinary InitVar')
+    assert seeded.items == ['ordinary InitVar']
+    assert 'seed' not in (vars(seeded) if not slots else module.Record.__slots__)
+
     frozen = module.Frozen(5)
     assert frozen == module.Frozen(5) and frozen < module.Frozen(6)
     assert hash(frozen) == hash(module.Frozen(5))
@@ -146,8 +164,8 @@ def exercise(module):
     delete = result_or_error(lambda: delattr(frozen, 'x'))
     assert assign[0:2] == ('raised', dataclasses.FrozenInstanceError)
     assert delete[0:2] == ('raised', dataclasses.FrozenInstanceError)
-    # Frozen dataclasses retain stock object.__setattr__ semantics. Field
-    # checking is disabled in this fixture, independently of frozen=True.
+    # The frozen wrapper does not block object.__setattr__; the selected field
+    # policy still applies, and this compatible int write remains legal.
     object.__setattr__(frozen, 'x', 8)
     assert frozen.x == 8
 
@@ -297,7 +315,7 @@ import dataclass_model as model
 
 stock = types.ModuleType('ordinary_pickle_dataclass_model')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict\\n', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', ''),
              '<ordinary dataclass pickle control>', 'exec'), vars(stock))
 
 def exercise(module):
@@ -356,7 +374,7 @@ adapter_support.classes.clear()
 adapter_support.expect_pending = False
 stock = types.ModuleType('ordinary_dataclass_callbacks')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict\\n', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', ''),
              '<ordinary dataclass replacement control>', 'exec'), vars(stock))
 stock_observed = tuple(adapter_support.classes)
 assert len(stock_observed) == 2
@@ -409,7 +427,7 @@ def make_value() -> int:
 """
 
 _GENERATED_CHECK_MODELS = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass, field
 import generated_check_support
 
@@ -446,7 +464,7 @@ def generated_dataclass_checks(tmp_path_factory):
     )
 
 
-_GENERATED_CHECK_ASSERTIONS = """
+_GENERATED_CHECK_ASSERTIONS = _FIELD_WRITE_ASSERTIONS + """
 import ctypes
 import dataclasses
 import generated_check_support as support
@@ -538,6 +556,8 @@ for name in ('accept', '__init__'):
     if name == 'accept':
         # This is the actual source MakeFunction before runtime attachment,
         # not a standalone native function manufactured by the test helper.
+        # Authentication marks the compiled code internally; a source policy
+        # comment alone does not give ordinary compile this flag or authority.
         assert row['source_id'] > 0 and row['flags'] & __future__.strict.compiler_flag
         assert not row['owner_present'] and row['creation'] == 0
         assert not row['success']
@@ -590,8 +610,8 @@ def test_generated_dataclass_factory_marker_keeps_ordinary_expression_semantics(
         + """
 from generated_check_model import Factory
 support.events.clear()
-assert Factory('wrong').value == 'wrong'
-assert support.events == []
+# The sentinel is not an int argument. Ordinary generated control flow must
+# consume it and assign the actual compatible factory result to the field.
 assert Factory(dataclasses._HAS_DEFAULT_FACTORY).value == 11
 assert support.events == ['factory']
 support.events.clear()
@@ -599,6 +619,45 @@ assert Factory().value == 11 and support.events == ['factory']
 support.events.clear()
 assert Factory(9).value == 9 and support.events == []
 assert_generated_owner(Factory)
+""",
+        entry_interpreter=entry_interpreter,
+    )
+
+
+@pytest.mark.parametrize("entry_interpreter", [False, True])
+def test_generated_dataclass_checks_storage_after_binding_and_factory_effects(
+    generated_dataclass_checks, entry_interpreter
+):
+    generated_dataclass_checks.run(
+        _GENERATED_CHECK_ASSERTIONS
+        + """
+support.default_value = 'wrong'
+from generated_check_model import Default, Factory
+assert_generated_owner(Default)
+assert_generated_owner(Factory)
+
+default_receiver = object.__new__(Default)
+field_write_rejected(lambda: Default.__init__(default_receiver))
+assert vars(default_receiver) == {}
+field_write_rejected(lambda: Default())
+assert Default(4).value == 4
+
+receiver = object.__new__(Factory)
+support.events.clear()
+field_write_rejected(lambda: Factory.__init__(receiver, 'wrong'))
+assert vars(receiver) == {} and support.events == []
+field_write_rejected(lambda: Factory('wrong'))
+assert support.events == []
+
+support.produced = 'wrong'
+field_write_rejected(lambda: Factory.__init__(receiver))
+assert support.events == ['factory'], 'field rejection skipped or replayed the factory'
+assert vars(receiver) == {}, 'the failing field store partially installed its value'
+
+support.produced = 11
+support.events.clear()
+assert Factory.__init__(receiver) is None
+assert receiver.value == 11 and support.events == ['factory']
 """,
         entry_interpreter=entry_interpreter,
     )
@@ -652,7 +711,13 @@ def test_generated_dataclass_uses_the_actually_bound_nonfactory_default(
 # source bytes. The actual default, not the checker's type, reaches binding.
 support.default_value = 'wrong'
 from generated_check_model import Default
-assert Default().value == 'wrong'
+assert Default.__init__.__defaults__ == ('wrong',)
+class Foreign:
+    pass
+foreign = Foreign()
+assert Default.__init__(foreign) is None and foreign.value == 'wrong'
+# Explicit binding supplies a compatible value for the actual checked field;
+# the separate storage case covers rejection of the captured default there.
 assert Default(4).value == 4
 assert_generated_owner(Default)
 """,
@@ -691,7 +756,7 @@ setter(function, stock_entry)
 try:
     assert function(foreign, 'ordinary') is None
     assert foreign.value == 'ordinary'
-    assert Factory('ordinary').value == 'ordinary'
+    field_write_rejected(lambda: Factory('ordinary'))
 finally:
     setter(function, original_entry)
 assert Factory(5).value == 5
@@ -706,6 +771,9 @@ owner = ctypes.pythonapi.PyFunction_GetSoacStrictOwner
 owner.argtypes = [ctypes.py_object]
 owner.restype = ctypes.c_void_p
 assert not owner(copy)
+receiver = Factory(5)
+field_write_rejected(lambda: copy(receiver, 'ordinary'))
+assert receiver.value == 5, 'an unowned public copy bypassed the storage predicate'
 """,
         entry_interpreter=entry_interpreter,
     )
@@ -772,7 +840,7 @@ assert Factory().value == 11
 
 
 _MUTATION_MODEL = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 
 @dataclass(init=False, eq=False)
@@ -927,7 +995,7 @@ stock = types.ModuleType('ordinary_mutated_dataclass_model')
 sys.modules[stock.__name__] = stock
 sys.settrace(trace)
 try:
-    exec(compile(source.replace('from __future__ import strict\\n', ''),
+    exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', ''),
                  '<ordinary dataclass mutation>', 'exec'), vars(stock))
 finally:
     sys.settrace(None)
@@ -1066,7 +1134,7 @@ assert_observer_type(model.Record)
 assert_observer_type(later)
 stock = types.ModuleType('ordinary_watched_dataclass_recovery')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary dataclass watcher recovery>', 'exec'), vars(stock))
 ordinary_later = stock.make_record()
 assert not owner(stock.Record) and not owner(ordinary_later)
@@ -1141,7 +1209,7 @@ sealed.restype = ctypes.c_int
 assert sealed(good) == 1
 stock = types.ModuleType('ordinary_later_dataclass_model')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict\\n', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', ''),
              '<ordinary later dataclass control>', 'exec'), vars(stock))
 assert repr(good()) == repr(stock.make_record()())
 if failed is not None:
@@ -1175,7 +1243,7 @@ def positional() -> int:
     return positional_value
 """,
             "mixed_factory_site.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass, field
 import factory_site_support as support
 
@@ -1185,7 +1253,7 @@ class Value:
     items: list[int] = field(default_factory=support.items)
 """,
             "ordered_factory_sites.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass, field
 import factory_site_support as support
 
@@ -1202,7 +1270,7 @@ class Value:
     )
 
 
-_FACTORY_SITE_ASSERTIONS = """
+_FACTORY_SITE_ASSERTIONS = _FIELD_WRITE_ASSERTIONS + """
 import ctypes
 import factory_site_support as support
 
@@ -1227,7 +1295,11 @@ def test_generated_dataclass_preserves_independent_mutable_factory_results(
 from mixed_factory_site import Value
 adopted(Value)
 support.events.clear()
-assert Value('wrong').checked == 'wrong'
+class Foreign:
+    pass
+foreign = Foreign()
+assert Value.__init__(foreign, 'ordinary') is None
+assert foreign.checked == 'ordinary' and foreign.items == []
 assert support.events == ['items']
 support.events.clear()
 first, second = Value(), Value()
@@ -1255,10 +1327,13 @@ support.events.clear()
 value = Value()
 assert value.keyword == 3 and value.positional == 4
 assert support.events == ['keyword', 'positional']
-support.keyword_value = 'wrong'
+class Foreign:
+    pass
+foreign = Foreign()
+support.keyword_value = 'ordinary'
 support.events.clear()
-value = Value()
-assert value.keyword == 'wrong' and value.positional == 4
+assert Value.__init__(foreign) is None
+assert foreign.keyword == 'ordinary' and foreign.positional == 4
 assert support.events == ['keyword', 'positional']
 support.events.clear()
 value = Value(9, keyword=8)
@@ -1269,8 +1344,51 @@ assert support.events == []
     )
 
 
+@pytest.mark.parametrize("entry_interpreter", [False, True])
+def test_generated_dataclass_field_rejections_preserve_factory_prefix_effects(
+    generated_factory_sites, entry_interpreter
+):
+    generated_factory_sites.run(
+        _FACTORY_SITE_ASSERTIONS
+        + """
+from mixed_factory_site import Value as Mixed
+from ordered_factory_sites import Value as Ordered
+adopted(Mixed)
+adopted(Ordered)
+
+# The first actual store fails before the later items factory is evaluated.
+mixed = object.__new__(Mixed)
+support.events.clear()
+field_write_rejected(lambda: Mixed.__init__(mixed, 'wrong'))
+assert vars(mixed) == {} and support.events == []
+
+# Generated stores follow source field order, not constructor parameter order.
+# Rejection retains completed effects and prevents only the incompatible store.
+ordered = object.__new__(Ordered)
+support.keyword_value = 'wrong'
+support.events.clear()
+field_write_rejected(lambda: Ordered.__init__(ordered))
+assert support.events == ['keyword'] and vars(ordered) == {}
+
+support.keyword_value = 3
+support.positional_value = 'wrong'
+support.events.clear()
+field_write_rejected(lambda: Ordered.__init__(ordered))
+assert support.events == ['keyword', 'positional']
+assert vars(ordered) == {'keyword': 3}
+
+support.positional_value = 4
+support.events.clear()
+assert Ordered.__init__(ordered) is None
+assert vars(ordered) == {'keyword': 3, 'positional': 4}
+assert support.events == ['keyword', 'positional']
+""",
+        entry_interpreter=entry_interpreter,
+    )
+
+
 _SLOTS_LIFECYCLE_MODEL = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 import adapter_support
 
@@ -1307,7 +1425,7 @@ def slotted_dataclass_lifecycle(tmp_path_factory, request):
             "adapter_support.py": _SUPPORT + "\nheld = []\n",
             "slot_lifecycle_model.py": _SLOTS_LIFECYCLE_MODEL,
             "slot_hybrid_model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 
 @dataclass
@@ -1319,7 +1437,7 @@ class Hybrid(DictionaryBase):
     other: int = 2
 """,
             "slot_hybrid_unchecked_model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 
 class DictionaryBase:
@@ -1336,11 +1454,6 @@ class Hybrid(DictionaryBase):
             "slot_hybrid_model": "slot_hybrid_model.py",
             "slot_hybrid_unchecked_model": "slot_hybrid_unchecked_model.py",
         },
-        policy="""
-[tool.soac.strict]
-include = ["slot_lifecycle_model.py", "slot_hybrid_model.py", "slot_hybrid_unchecked_model.py"]
-checked_fields = "supported_annotations"
-""",
         backend=backend,
     )
 
@@ -1371,7 +1484,7 @@ def bad_type(operation):
         operation()
     except TypeError:
         return
-    raise AssertionError('a selected field or initializer accepted the wrong type')
+    raise AssertionError('selected physical storage accepted an incompatible value')
 """
 
 
@@ -1672,7 +1785,7 @@ assert replacement_ref() is None, 'a completed invocation retained its replaceme
 support.expect_pending = False
 stock = types.ModuleType('ordinary_slot_lifecycle_model')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict\\n', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', ''),
              '<ordinary slots lifecycle control>', 'exec'), vars(stock))
 ordinary_original = weakref.ref(support.classes[0][0])
 ordinary_replacement = weakref.ref(support.held[0])
@@ -1787,6 +1900,7 @@ def test_cpython_backend_dataclass_behavior_and_actual_generated_ownership(cpyth
     project.run_case(
         "dataclass_model",
         f"source = {source!r}\nslots = {slots!r}\n"
+        + _FIELD_WRITE_ASSERTIONS
         + """
 import ctypes
 import dataclasses
@@ -1801,7 +1915,7 @@ from soac.strict import StrictMutationError
 
 stock = types.ModuleType('ordinary_dataclass_model')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict\\n', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', ''),
              '<ordinary dataclass control>', 'exec'), vars(stock))
 
 def result_or_error(operation):
@@ -1833,6 +1947,10 @@ def exercise(module):
     assert 'shared' not in (vars(first) if not slots else module.Record.__slots__)
     constructor_error = result_or_error(lambda: module.Record(1, 2))
     assert constructor_error[0:2] == ('raised', TypeError)
+    # InitVar is a call value, not instance storage constrained by its annotation.
+    seeded = module.Record(seed='ordinary InitVar')
+    assert seeded.items == ['ordinary InitVar']
+    assert 'seed' not in (vars(seeded) if not slots else module.Record.__slots__)
     frozen = module.Frozen(5)
     assert frozen == module.Frozen(5) and frozen < module.Frozen(6)
     assert hash(frozen) == hash(module.Frozen(5))
@@ -1940,7 +2058,8 @@ call = ctypes.pythonapi.PyObject_Call
 call.argtypes = [ctypes.py_object, ctypes.py_object, ctypes.py_object]
 call.restype = ctypes.py_object
 assert call(model.Record, (4,), {'value': 5}).total() == 9
-assert call(model.Record, ('wrong',), {}).first == 'wrong'
+field_write_rejected(lambda: call(model.Record, ('wrong',), {}))
+assert call(model.Record, (4,), {'seed': 'ordinary InitVar'}).items == ['ordinary InitVar']
 assert stock.Record('ordinary').first == 'ordinary'
 for function in (model.Record.__post_init__, model.Record.total, model.Manual.__init__):
     assert _soac_ext.strict_function_diagnostics(function)['original_code_entered'] is True
@@ -1956,7 +2075,7 @@ def test_cpython_call_join_generic_dataclass_and_builtin_descriptor_births(tmp_p
     from pathlib import Path
 
     source = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 
 @dataclass
@@ -2024,7 +2143,7 @@ def no_native_class_contract(actual):
 
 stock = types.ModuleType('ordinary_generic_descriptor_control')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary generic descriptor control>', 'exec'), vars(stock))
 assert not type_owner(stock.Box) and not type_owner(stock.Operations)
 assert stock.Box('ordinary').value == 'ordinary'
@@ -2109,7 +2228,7 @@ def test_cpython_dataclass_postclear_completion_error_uses_caller_handlers_and_t
     from pathlib import Path
 
     source = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 import postclear_observer as support
 
@@ -2170,6 +2289,7 @@ def capture(error):
     project.run_case(
         "postclear_model",
         f"source = {source!r}\n"
+        + _FIELD_WRITE_ASSERTIONS
         + """
 import ast
 import ctypes
@@ -2185,11 +2305,11 @@ owner = ctypes.pythonapi.PyType_GetSoacContractOwner
 owner.argtypes = [ctypes.py_object]
 owner.restype = ctypes.c_void_p
 
-# Exact ordinary source control: only the future opt-in is absent. A normal
+# Exact ordinary source control: only the policy comment is absent. A normal
 # dataclass accepts this late mutation and returns the resulting ordinary type.
 stock = types.ModuleType('ordinary_postclear_control')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary postclear control>', 'exec'), vars(stock))
 previous_profile = sys.getprofile()
 support.armed = True
@@ -2246,7 +2366,7 @@ support.events.clear()
 selected = model.build()
 assert owner(selected)
 assert selected(4).value == 4
-assert selected('wrong').value == 'wrong'
+field_write_rejected(lambda: selected('wrong'))
 assert support.events == ['finally']
 assert _soac_ext.strict_function_diagnostics(model.build)['original_code_entered']
 """,
@@ -2262,7 +2382,7 @@ def test_cpython_dataclass_compiler_uses_actual_captured_exec_globals(tmp_path, 
     from pathlib import Path
 
     source = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 
 def make():
@@ -2280,6 +2400,7 @@ def make():
     project.run_case(
         "captured_exec_globals",
         f"source = {source!r}\nmutation = {mutation!r}\n"
+        + _FIELD_WRITE_ASSERTIONS
         + """
 import ctypes
 import dataclasses
@@ -2291,7 +2412,7 @@ from soac.strict import StrictRuntimeUnavailableError
 
 stock = types.ModuleType('ordinary_captured_exec_globals')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary captured exec globals>', 'exec'), vars(stock))
 builder_code = dataclasses._FuncBuilder.add_fns_to_class.__code__
 foreign_globals = [None]
@@ -2386,7 +2507,7 @@ invoke.argtypes = [ctypes.py_object, ctypes.py_object, ctypes.py_object]
 invoke.restype = ctypes.py_object
 assert invoke(selected, (8,), {}).value == 8
 for operation in (lambda: selected('wrong'), lambda: invoke(selected, ('wrong',), {})):
-    assert operation().value == 'wrong'
+    field_write_rejected(operation)
 assert _soac_ext.strict_function_diagnostics(model.make)['original_code_entered']
 """,
         Path(__file__),
@@ -2404,7 +2525,7 @@ def test_cpython_failed_dataclass_cleanup_preserves_primary_and_escaped_barriers
     from pathlib import Path
 
     source = f"""
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 import failed_apply_observer as support
 
@@ -2470,6 +2591,7 @@ def profile(frame, event, result):
     project.run_case(
         "failed_apply_model",
         f"source = {source!r}\nslots = {slots!r}\nfailure = {failure!r}\n"
+        + _FIELD_WRITE_ASSERTIONS
         + """
 import ctypes
 import dataclasses
@@ -2482,7 +2604,7 @@ from soac.strict import StrictMutationError, StrictRuntimeUnavailableError
 
 stock = types.ModuleType('ordinary_failed_apply_model')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary failed Apply control>', 'exec'), vars(stock))
 # The actual public factory gives the same original wrap code used by Apply.
 support.root_code = dataclasses.dataclass(slots=slots).__code__
@@ -2582,7 +2704,7 @@ selected = model.build()
 assert all(selected is not actual for actual in failed)
 assert owner(selected) and sealed(selected) == 1
 assert selected(9).value == 9
-assert selected('wrong').value == 'wrong'
+field_write_rejected(lambda: selected('wrong'))
 assert support.events == ['finally']
 assert owner(model.Stable) == stable_owner and model.Stable().value() == 17
 for actual in failed:

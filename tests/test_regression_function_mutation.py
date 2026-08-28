@@ -305,7 +305,7 @@ _INTEROP_CASES = tuple(name for name in _MUTATION_CASES if "profiled_call" not i
 _PROFILE_CASES = tuple(name for name in _MUTATION_CASES if "profiled_call" in name)
 
 _SEALED_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def target(increment=1):
     return 40 + increment
@@ -404,7 +404,7 @@ def mutation_project(tmp_path_factory):
             f"import stock_{module_name} as ordinary\n" + caller
         )
         sources[f"{module_name}.py"] = (
-            f"from __future__ import strict\nimport ordinary_{module_name} as ordinary\n"
+            f"# soac: module(strict_assign=true, checked_attr=true)\nimport ordinary_{module_name} as ordinary\n"
             + caller
         )
         modules[module_name] = f"{module_name}.py"

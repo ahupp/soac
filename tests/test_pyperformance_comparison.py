@@ -142,7 +142,10 @@ def _timing_evidence(benchmark, modules=None):
         "artifact_generation": "1" * 64,
         "sealed_strict_modules": [
             {
-                "schema": 1,
+                "schema": 2,
+                "ready": True,
+                "strict_assign": True,
+                "checked_attr": True,
                 "module_name": name,
                 "source_kind": kind,
                 "source_path": f"/fixture/strict/{name}.py",
@@ -696,7 +699,20 @@ def test_cache_files_do_not_prove_strict_admission_or_sealing(tmp_path):
     assert summary["sealed_strict_execution_evidence_complete"] is False
 
 
-@pytest.mark.parametrize("changed", [None, "seal", "source", "generation", "ordinary"])
+@pytest.mark.parametrize(
+    "changed",
+    [
+        None,
+        "schema",
+        "ready",
+        "strict_assign",
+        "checked_attr",
+        "seal",
+        "source",
+        "generation",
+        "ordinary",
+    ],
+)
 def test_native_seal_evidence_is_independent_of_compilation_and_checked_per_round(
     tmp_path, changed
 ):
@@ -714,6 +730,8 @@ def test_native_seal_evidence_is_independent_of_compilation_and_checked_per_roun
     }
     if changed == "seal":
         row["sealed_strict_modules"][0]["sealed"] = False
+    elif changed in {"schema", "ready", "strict_assign", "checked_attr"}:
+        row["sealed_strict_modules"][0][changed] = 1 if changed == "schema" else False
     elif changed == "source":
         row["strict_source_fingerprint"] = "f" * 64
     elif changed == "generation":

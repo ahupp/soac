@@ -99,9 +99,9 @@ def strict_gc_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-gc-cycles"),
         {
-            "alias_model.py": "from __future__ import strict\n" + _ALIAS_SOURCE,
+            "alias_model.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _ALIAS_SOURCE,
             "ordinary_alias_model.py": _ALIAS_SOURCE,
-            "cycle_model.py": "from __future__ import strict\n" + _CYCLE_SOURCE,
+            "cycle_model.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _CYCLE_SOURCE,
             "ordinary_cycle_model.py": _CYCLE_SOURCE,
         },
         modules={"alias_model": "alias_model.py", "cycle_model": "cycle_model.py"},

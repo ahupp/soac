@@ -30,7 +30,8 @@ use soac_contracts::{
 use ty_project::{ProjectDatabase, ProjectMetadata};
 use ty_python_core::AnalysisDialect;
 use ty_python_semantic::{
-    Db as _, SoacDependencyPath, effective_analysis_settings, export_soac_module,
+    Db as _, SoacDependencyPath, SoacSourcePolicies, effective_analysis_settings,
+    export_soac_module,
 };
 
 use inputs::AnalysisSystem;
@@ -288,7 +289,7 @@ fn sources(
     options: &Check,
     project: &Path,
     source_root: &Path,
-    policy: &ProjectPolicy,
+    policy: &mut ProjectPolicy,
     system: &AnalysisSystem,
     output: &Path,
 ) -> Result<BTreeMap<String, (PathBuf, soac_contracts::ResolvedStrictPolicy)>> {
@@ -351,19 +352,17 @@ fn sources(
     };
     let mut modules = BTreeMap::new();
     for (name, path) in paths {
-        let relative = path
-            .strip_prefix(project)
+        path.strip_prefix(project)
             .context("selected source is outside the project")?;
-        if let Some(policy) = policy.for_path(relative)? {
-            ensure!(
-                modules.insert(name, (path, policy)).is_none(),
-                "duplicate canonical module name"
-            );
-        }
+        let resolved = policy.for_path(&path, system)?;
+        ensure!(
+            modules.insert(name, (path, resolved)).is_none(),
+            "duplicate canonical module name"
+        );
     }
     ensure!(
         !modules.is_empty(),
-        "no source files match the strict project selection"
+        "no Python source files selected for analysis"
     );
     Ok(modules)
 }
@@ -410,12 +409,28 @@ fn check(options: Check) -> Result<publish::Publication> {
     system.observe_path(system_path(&project_selection)?)?;
     system.observe_path(system_path(&source_selection)?)?;
     let config_path = project.join("pyproject.toml");
-    let policy = ProjectPolicy::parse(&system.read_to_string(system_path(&config_path)?)?)?;
+    match system.read_to_string(system_path(&config_path)?) {
+        Ok(source) => policy::reject_config_policy(&source)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut policy = ProjectPolicy::new(source_root.clone());
     ensure!(
         output != source_root,
         "artifact output must not replace the source root"
     );
-    let modules = sources(&options, &project, &source_root, &policy, &system, &output)?;
+    let modules = sources(
+        &options,
+        &project,
+        &source_root,
+        &mut policy,
+        &system,
+        &output,
+    )?;
+    let source_policies = modules
+        .values()
+        .map(|(path, policy)| Ok((system_path(path)?.to_path_buf(), policy.clone())))
+        .collect::<Result<SoacSourcePolicies>>()?;
     let python_selection = absolute(&options.python, &project);
     system.observe_path(system_path(&python_selection)?)?;
     let python = python_selection.canonicalize()?;
@@ -453,6 +468,17 @@ fn check(options: Check) -> Result<publish::Publication> {
         }
     }
     let mut metadata = ProjectMetadata::discover_without_uv(system_path(&project)?, &system)?;
+    // ty may select an ancestor's configuration rather than --project itself.
+    // Check that actual project too, without scanning unrelated ancestors.
+    if metadata.root() != system_path(&project)? {
+        let discovered_config = metadata.root().join("pyproject.toml");
+        match system.read_to_string(&discovered_config) {
+            Ok(source) => policy::reject_config_policy(&source)
+                .with_context(|| format!("invalid SOAC configuration in {discovered_config}"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     metadata.apply_configuration_files(&system)?;
     // ty's ranged configuration values need their real option provenance.
     // Use its configuration parser rather than deserializing detached JSON,
@@ -485,17 +511,12 @@ fn check(options: Check) -> Result<publish::Publication> {
             )),
         },
     )?;
-    let mut selected_source_owners = Vec::new();
-    for (name, (path, _)) in &modules {
-        let file = system_path_to_file(&database, system_path(path)?)?;
-        let program_file = database.program_file(file);
-        let parsed = ruff_db::parsed::parsed_module(&database, program_file.python_file(&database))
-            .load(&database);
-        if soac_source::has_strict_future(parsed.suite()) {
-            selected_source_owners.push((name, path));
-        }
-    }
-    // The project glob also discovers ordinary dependencies. Their normal
+    let selected_source_owners = modules
+        .iter()
+        .filter(|(_, (_, policy))| policy.is_selected())
+        .map(|(name, (path, _))| (name, path))
+        .collect::<Vec<_>>();
+    // Discovery also finds ordinary dependencies. Their normal
     // source/stub resolution must not be replaced by strict source ownership.
     let selected_source_modules = selected_source_owners
         .iter()
@@ -533,10 +554,7 @@ fn check(options: Check) -> Result<publish::Publication> {
         );
         search_paths.extend(configuration.import_search_paths.iter().cloned());
         per_file_settings.insert(format!("system:{}", path.display()), configuration);
-        let export = export_soac_module(&database, file, name, module_policy.clone())?;
-        if export.facts.source_dialect == SourceDialect::OrdinaryPython {
-            continue;
-        }
+        let export = export_soac_module(&database, file, name, &source_policies)?;
         for diagnostic in &export.facts.diagnostics {
             eprintln!(
                 "{name}:{}..{}: {:?}: {}{}",
@@ -551,6 +569,12 @@ fn check(options: Check) -> Result<publish::Publication> {
                 }
             );
         }
+        if export.facts.source_dialect == SourceDialect::OrdinaryPython {
+            // This command publishes selected contracts, not a normal ty check.
+            // Ordinary diagnostics are informative; no contract is emitted for
+            // them. Consumed inputs still participate in authentication.
+            continue;
+        }
         deployed_modules.push(DeployedModule {
             module_name: name.clone(),
             source_path: path.clone(),
@@ -558,10 +582,6 @@ fn check(options: Check) -> Result<publish::Publication> {
         });
         exports.push(export);
     }
-    ensure!(
-        !exports.is_empty(),
-        "no selected source contains a valid strict future import"
-    );
     // Every consumed source gets its actual ProgramFile policy, including
     // imported source/stubs that were not selected as strict output modules.
     for export in &exports {
@@ -616,7 +636,7 @@ fn check(options: Check) -> Result<publish::Publication> {
         },
         python_platform: interpreter.platform.clone(),
         cpython_abi_fingerprint: interpreter.abi_fingerprint(&inputs)?,
-        normalized_project_policy: policy.fingerprint()?,
+        normalized_project_policy: fingerprint(&source_policies)?,
         resolved_typechecker_configuration: configuration,
         import_search_path: fingerprint(&(search_paths, &analysis_environment))?,
         typeshed_fingerprint: Fingerprint::from_hex(CHECKER_SOURCE)?,

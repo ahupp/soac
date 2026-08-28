@@ -17,7 +17,7 @@ use crate::{
     ResolvedStrictPolicy, legacy_source_hash,
 };
 
-pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 2;
+pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 3;
 
 /// The part of a directory listing actually consumed by offline analysis.
 /// A source-selection view is not an import-resolution exclusion: imports use

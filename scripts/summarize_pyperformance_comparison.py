@@ -464,7 +464,10 @@ def _has_sealed_worker_evidence(row, metadata) -> bool:
     for state in states:
         if (
             not isinstance(state, dict)
-            or state.get("schema") != 1
+            or state.get("schema") != 2
+            or state.get("ready") is not True
+            or state.get("strict_assign") is not True
+            or state.get("checked_attr") is not True
             or state.get("sealed") is not True
             or not isinstance(state.get("module_name"), str)
             or state["module_name"] in names

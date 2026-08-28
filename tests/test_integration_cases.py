@@ -1149,7 +1149,7 @@ def _ordinary_interop_cohort_results(
         bridge = f"interop_{name}"
         sources[f"{name}.py"] = source
         sources[f"{bridge}.py"] = (
-            "from __future__ import strict\n"
+            "# soac: module(strict_assign=true, checked_attr=true)\n"
             f"import {name} as ordinary\n"
             "def invoke_validation(callback, source, path):\n"
             "    return callback(source, ordinary, path, mode='stock')\n"
@@ -1293,13 +1293,13 @@ def strict_class_annotations_mutation_results(
 @pytest.fixture(scope="module")
 def strict_bad_syntax_diagnostic(tmp_path_factory):
     source, _ = split_integration_case(MODULES_DIR / "bad_syntax.py")
-    # Deliberately invalid source cannot go through the AST-preserving opt-in
-    # helper. It must fail offline, before any authority can be published.
+    # Policy discovery parses the source before later dialect validation.
+    # Require its concrete syntax diagnostic before any authority is published.
     return assert_strict_source_rejected(
         tmp_path_factory.mktemp("strict-bad-syntax"),
-        "from __future__ import strict\n" + source,
+        "# soac: module(strict_assign=true, checked_attr=true)\n" + source,
         module_name="bad_syntax",
-        diagnostic="source is not valid in the selected checker dialect and Python version",
+        diagnostic="Simple statements must be separated by newlines or semicolons",
     )
 
 

@@ -18,8 +18,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 use soac_contracts::{
     AnnotationOrigin, ClassReference, ClassTypeFact, DefinitionKind, DynamicClassReason,
-    FieldReference, FieldTypeFact, GlobalMutability, NominalBindingFact, NominalBindingOwner,
-    StaticType,
+    FieldReference, FieldTypeFact, NominalBindingFact, NominalBindingOwner, StaticType,
 };
 use soac_core::block_py::CallableSourceRole;
 
@@ -407,13 +406,12 @@ pub(crate) fn prepare_own_field_bindings<'py>(
                             && facts.global_bindings.iter().any(|global| {
                                 global.name == leaf.name
                                     && global.definition.as_ref() == Some(&leaf.binding)
-                                    && matches!(
-                                        global.mutability,
-                                        GlobalMutability::FinalAfterSeal
-                                            | GlobalMutability::LateAppendOnly
-                                    )
                             }) =>
                     {
+                        // The signed leaf identifies this lexical operand,
+                        // not a permanently immutable global. Required field
+                        // predicates capture its actual type now and retain
+                        // that target after later module rebinding.
                         dictionary_binding(py, globals.as_any(), &key)?
                     }
                     DefinitionKind::Function => {

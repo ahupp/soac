@@ -44,7 +44,7 @@ fn rewrite_ast_to_ast_for_testing(source: &str) -> (Context, Suite, SemanticAstS
         .expect("source should parse")
         .into_syntax();
     let mut body = module.body;
-    rewrite_future_annotations::rewrite(&mut body, None).expect("future annotation rewrite");
+    rewrite_future_annotations::rewrite(&mut body, None, false).expect("future annotation rewrite");
     let context = Context::new(source);
     rewrite_class_def::record_class_static_attributes(&context, &mut body);
     rewrite_class_def::private::rewrite_private_names(&context, &mut body);

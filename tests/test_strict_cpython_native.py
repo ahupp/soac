@@ -1864,12 +1864,22 @@ async def coroutine(argument: "argument") -> "result":
         self.assertEqual(self.source_id(child.replace()), 0)
 
     def test_nonfuture_source_has_no_string_metadata_and_errors_stay_native(self):
-        source = b"from __future__ import strict\nvalue: int\n"
-        code, rows, _ = self.compile_details(source, len(source), "<native-strings>", -1)
-        self.assertGreater(self.source_id(code), 0)
-        self.assertEqual(rows, ())
+        for source in (
+            b"from __future__ import strict\nvalue: int\n",
+            b"# soac: module(checked_attr=true)\nvalue: int\n",
+            b"value: int\n",
+        ):
+            with self.subTest(source=source):
+                code, rows, _ = self.compile_details(
+                    source, len(source), "<native-strings>", -1
+                )
+                self.assertGreater(self.source_id(code), 0)
+                self.assertEqual(rows, ())
+                # Authenticated compilation marks the code independently of
+                # comment syntax; it never authorizes an unowned execution.
+                with self.assertRaisesRegex(self.runtime_error, "strict.*execution"):
+                    exec(code, {})
         for source, error in (
-            (b"value: int\n", ValueError),
             (b"from __future__ import strict\ndef broken(:\n", SyntaxError),
             (b"from __future__ import strict\n\x00", ValueError),
         ):
@@ -2389,30 +2399,45 @@ assert 'soac' not in sys.modules and 'soac._soac_ext' not in sys.modules
             self.assertIsInstance(error_type("native"), base)
 
     def test_verified_compilation_marks_exact_tree_without_native_fallback(self):
-        source = b"from __future__ import strict\ndef value(): return 17\n"
-        code = self.compile_verified(source, len(source), "<strict-native>", -1)
-        nested = next(
-            item for item in code.co_consts if isinstance(item, types.CodeType)
-        )
-        identity = self.source_id(code)
-        self.assertGreater(identity, 0)
-        self.assertEqual(self.source_id(nested), identity)
-        with self.assertRaisesRegex(self.runtime_error, "strict.*execution"):
-            exec(code, {})
-        call = types.FunctionType(nested, {})
-        for _ in range(20):
-            with self.assertRaisesRegex(self.runtime_error, "strict.*execution"):
-                call()
-        copied = nested.replace(co_flags=0)
-        self.assertEqual(self.source_id(copied), 0)
-        self.assertTrue(copied.co_flags & STRICT)
-        with self.assertRaisesRegex(self.runtime_error, "strict.*execution"):
-            types.FunctionType(copied, {})()
-        unmarshaled = marshal.loads(marshal.dumps(nested))
-        self.assertEqual(self.source_id(unmarshaled), 0)
-        self.assertTrue(unmarshaled.co_flags & STRICT)
-        with self.assertRaises(self.runtime_error):
-            types.FunctionType(unmarshaled, {})()
+        # The trusted caller resolves selection, including inherited policy
+        # without a local directive. Compilation marks source, not an execution owner.
+        for prefix, ordinary_strict_flag in (
+            (b"", False),
+            (b"# soac: module(strict_assign=true)\n", False),
+            (b"from __future__ import strict\n", True),
+        ):
+            with self.subTest(prefix=prefix):
+                source = prefix + b"def value(): return 17\n"
+                ordinary = compile(
+                    source, "<strict-native>", "exec", dont_inherit=True
+                )
+                self.assertEqual(self.source_id(ordinary), 0)
+                self.assertEqual(bool(ordinary.co_flags & STRICT), ordinary_strict_flag)
+                code = self.compile_verified(source, len(source), "<strict-native>", -1)
+                nested = next(
+                    item for item in code.co_consts if isinstance(item, types.CodeType)
+                )
+                identity = self.source_id(code)
+                self.assertGreater(identity, 0)
+                self.assertEqual(self.source_id(nested), identity)
+                self.assertTrue(code.co_flags & STRICT)
+                self.assertTrue(nested.co_flags & STRICT)
+                with self.assertRaisesRegex(self.runtime_error, "strict.*execution"):
+                    exec(code, {})
+                call = types.FunctionType(nested, {})
+                for _ in range(20):
+                    with self.assertRaisesRegex(self.runtime_error, "strict.*execution"):
+                        call()
+                copied = nested.replace(co_flags=0)
+                self.assertEqual(self.source_id(copied), 0)
+                self.assertTrue(copied.co_flags & STRICT)
+                with self.assertRaisesRegex(self.runtime_error, "strict.*execution"):
+                    types.FunctionType(copied, {})()
+                unmarshaled = marshal.loads(marshal.dumps(nested))
+                self.assertEqual(self.source_id(unmarshaled), 0)
+                self.assertTrue(unmarshaled.co_flags & STRICT)
+                with self.assertRaises(self.runtime_error):
+                    types.FunctionType(unmarshaled, {})()
 
     def test_warmed_make_function_rejects_unowned_strict_code_before_body(self):
         ordinary = compile(
@@ -2518,13 +2543,15 @@ assert 'soac' not in sys.modules and 'soac._soac_ext' not in sys.modules
                         unexpected.close()
                     self.assertEqual(events, [])
 
-    def test_verified_compile_rejects_missing_opt_in_and_embedded_nul(self):
+    def test_verified_compile_rejects_embedded_nul(self):
         for source in (
-            b"value = 17\n",
+            b"\0value = 17\n",
+            b"# soac: module(strict_assign=true)\n\0value = 17\n",
             b"from __future__ import strict\n\0value = 17\n",
         ):
-            with self.assertRaises((ValueError, SyntaxError)):
-                self.compile_verified(source, len(source), "<strict-native>", -1)
+            with self.subTest(source=source):
+                with self.assertRaises((ValueError, SyntaxError)):
+                    self.compile_verified(source, len(source), "<strict-native>", -1)
 
     def test_function_semantic_setters_reject_before_replacing_values(self):
         def value(argument=1, *, keyword=2):

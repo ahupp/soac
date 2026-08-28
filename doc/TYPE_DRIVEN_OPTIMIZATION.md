@@ -6,6 +6,57 @@ title: "Type-Driven Runtime Contracts"
 
 ## Dated design changes
 
+### 2026-08-27 (PDT) — composable source-comment policy
+
+Use source comments, not a strictness configuration file or a future import:
+
+```python
+# In a package's __init__.py:
+# soac: package(strict_assign=true, checked_attr=true)
+
+# In a module header, overriding only this file:
+# soac: module(strict_assign=false)
+
+# Before one class, and before all its decorators:
+# soac: class(checked_attr=false)
+class Dynamic:
+    pass
+```
+
+Both flags default to false. Resolve package defaults from outer to inner
+`__init__.py` within the source root, then the file's module directive, then
+an exact class-declaration override. Missing keys inherit; an explicit false
+can be overridden by a more specific true. A module rule in `__init__.py`
+does not change descendant modules. A class rule applies only to that AST
+declaration, not same-named definitions or lexically nested classes. Comments
+may use consecutive comment-only continuation lines inside parentheses.
+Unknown keys/scopes, invalid booleans, duplicate rules and misplaced comments
+are errors; strings never count as directives.
+
+`strict_assign` selects global-binding freezing after initialization.
+`checked_attr` selects automatic eligible class participation and supported
+annotated field checks, together with existing class/method-mutation barriers.
+These are independent capabilities. Ordinary modules/classes stay ordinary
+unless selected, and unsupported framework classes still decline a new
+contract. Opt-out does not revoke an ancestor's or storage's installed checks.
+Nominal field bindings in a mutable module capture the authenticated actual
+type at construction; rebinding its global name does not retarget that check
+or grant a stable global-value proof.
+
+Offline resolution observes the bytes and absence of every consulted package
+source, and the versioned publication authenticates the resolved flags and
+exact class ranges. Only authenticated startup and actual runtime construction
+install contracts; comments alone are not authority, and ordinary CPython
+ignores them. Retire the project-policy/future double opt-in and reject
+`[tool.soac.strict]`. Old publications require regeneration: artifact schema 7,
+strict-contract version 3, dialect version 2 and deployment version 3. Do not
+silently reinterpret them or alter installed contracts. Static signatures
+remain static; runtime call-type checks remain out of scope, and optimization
+and benchmarks remain deferred. See
+[source rules](STRICT_MODULES.md#source-policy-rules), the
+[mixed-module scenario format](STRICT_SCENARIO_TESTS.md), and its
+[local verification record](STRICT_SCENARIO_TESTS.md#comment-policy-verification--2026-08-28-pdt).
+
 ### 2026-08-25 (PDT) — tracing, profiling and monitoring out of scope
 
 Exclude CPython-compatible tracing, profiling and monitoring of SOAC execution
@@ -402,9 +453,9 @@ a fixed field index, method table, direct-call plan, or SOAC native-code entry.
 
 ## Relationship to the existing strict-module proposal
 
-`doc/STRICT_MODULES.md` remains the source of truth for the strict future
-feature, module lifecycle, append-only final global bindings, interoperability,
-native-mutation limitations, and protected optimization capabilities.
+`doc/STRICT_MODULES.md` remains the source of truth for source-comment policy,
+authenticated module readiness, selected binding sealing, interoperability,
+native-mutation limitations, and protected capabilities.
 
 This document defines the following refinements, now reflected in the strict
 language contract and compatibility policy:
@@ -543,37 +594,25 @@ separate offline workspace depends on `ty_python_semantic` and `ty_project`.
 An external offline artifact avoids importing the checker database, project
 resolver, and incremental-analysis engine into the runtime execution path.
 
-Use one shared project-level policy instead of requiring per-class
-annotations:
+Use package defaults and module/class source overrides instead of requiring
+per-class annotations or a strictness configuration file:
 
-```toml
-[tool.soac.strict]
-include = ["services/**", "libraries/**"]
-exclude = ["generated/**"]
-default_class_policy = "automatic"
-unsupported_class_policy = "dynamic"
-typing_final_policy = "enforce_for_participating_classes"
-checked_fields = "disabled"
-field_failure = "type_error"
-unsupported_value_type = "dynamic"
-
-[tool.soac.strict.adapters]
-dataclasses = "stdlib"
-pydantic = "dynamic"
+```python
+# package/__init__.py
+# soac: package(strict_assign=true, checked_attr=true)
 ```
 
-The `pydantic` setting could later name a verified cooperative adapter. Merely
-listing a library never establishes a runtime capability.
-
-Field-check settings are repository-level language policy, not per-class
-annotations or optimization heuristics. The illustrated configuration leaves
-instance-field value checks disabled; a project can opt into supported writes
-with `checked_fields = "supported_annotations"`. Static type analysis remains
-independent of runtime call behavior. Class construction, storage checks and
-artifact fingerprints consume the same resolved field settings. A mandatory
-field check raises its configured strict-language error; an independent
-optimization guard instead takes its ordinary generic path. The removed
-parameter/return-check policy keys are rejected, including disabled spellings.
+The shared `ResolvedStrictPolicy` stores independent `strict_assign` and
+`checked_attr` flags plus exact-range `ClassPolicyOverride` entries. The shared
+`soac_source::parse_soac_directives` parser binds comments to real tokens and
+AST declarations; the offline resolver owns package ancestry and authenticates
+consulted files and absence. Runtime consumers use the same signed resolution.
+There is no second default-class, adapter, field-failure or checked-fields
+configuration. Eligible classes and ordinary dataclasses participate
+automatically; unsupported frameworks remain dynamic. An incompatible selected
+field write raises `TypeError`. Unsupported value expressions remain dynamic
+for that value, not a narrowed subset. Static signatures do not imply runtime
+call checks. See [source policy rules](STRICT_MODULES.md#source-policy-rules).
 
 ### Sound analysis configuration
 
@@ -607,7 +646,7 @@ configuration, dependency, directory-query, interpreter/library, and environment
 inputs. These analysis settings and artifacts alone are not runtime enforcement
 or a sealed optimization capability.
 
-Deployment schema 2 records the selected interpreter and the source kind/path
+Deployment schema 3 records the selected interpreter and the source kind/path
 and actual per-file checker settings for every consumed dependency. The shared
 verifier derives System dependency digests and source identities from current
 bytes; Vendored identities bind to the startup-pinned checker/typeshed build.
@@ -633,9 +672,9 @@ source file in both directions of the checker's resolver, including per-file
 environments. The binding is part of the configuration fingerprint. Ambiguous
 aliases and missing selected files are errors; neither a fabricated known-module
 identity nor a fallback stub may stand in for the selected source. Ordinary
-dependencies discovered by project globs keep normal source/stub resolution.
-Selection uses the original parsed top-level strict future import, not matching
-source text, and does not itself grant executable authority.
+dependencies keep normal source/stub resolution. Selection uses token-parsed
+SOAC comment rules and explicit package ancestry, not matching arbitrary text
+or executing imports, and does not itself grant executable authority.
 
 Generated framework fields also retain semantic declaration provenance. Fields
 whose first declaration is the actual builtin `object` do not become
@@ -655,12 +694,13 @@ type-facts/
         ...
 ```
 
-Artifact schema 6 / strict contract 2 removes runtime function-check policy and
-rejects older publications rather than reinterpreting their guarantees. It
+Artifact schema 7 / strict contract 3 binds independent module/class source
+rules and rejects older publications rather than reinterpreting their
+guarantees. Runtime function-check policy remains removed. It
 retains the required `FieldTypeFact.annotation_origin` and
 `FieldTypeFact.annotation_definition`. Its explicit,
 inferred, absent, or unresolved origin is part of signed content and every
-derived shard, generation, and cache identity; schema-1 through schema-5 artifacts
+derived shard, generation, and cache identity; schema-1 through schema-6 artifacts
 and signatures are rejected. The definition names the actual annotated
 assignment, or is explicitly null when no unique source declaration is known.
 Omitting that key is invalid even when its value would be null.
@@ -695,7 +735,7 @@ no nominal target; semantic `Annotated` metadata is not part of the value type.
 Field and function annotations never borrow each other's resolved targets.
 Source field identity alone still cannot distinguish repeated executions of a
 factory: enforcement also needs the actual construction/field-contract owner.
-The schema-6 manifest authentication domain and all derived identities include
+The schema-7 manifest authentication domain and all derived identities include
 this provenance, with no legacy default for an omitted field.
 
 Schema 6 preserves the explicit distinction between source-class and builtin references in both
@@ -2933,18 +2973,18 @@ repository.
 
 ### Shared language policy
 
-The checker and runtime consume the same project-level strict policy and
-source future-feature marker:
+The checker and runtime consume the same source-resolved, authenticated policy:
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 ```
 
 The checker must understand that strict-module semantics apply only where the
 runtime loader can authenticate and enforce the matching module contract.
 
-Ordinary modules and unsupported dynamic classes do not silently inherit
-strict restrictions.
+Package directives provide explicit inherited defaults. Unselected modules
+and unsupported dynamic classes do not silently acquire new restrictions;
+installed ancestor and storage contracts remain enforced.
 
 ### Module binding diagnostics
 
@@ -2963,7 +3003,7 @@ sealed:
 Examples:
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true)
 
 LIMIT = 1
 LIMIT = 2  # allowed: still executing module initialization
@@ -3056,11 +3096,10 @@ assuming the existing general-purpose checker already proves it.
 
 ### Finality and inheritance diagnostics
 
-Ordinary `typing.final` is advisory in Python. This proposal upgrades it to
-runtime-enforced finality only when the shared project policy explicitly
-selects `typing_final_policy = "enforce_for_participating_classes"` and the
-actual class constructor installs the corresponding barrier. An explicit
-existing strict-runtime finality declaration can provide the same capability.
+Ordinary `typing.final` is advisory in Python. For classes selected by
+`checked_attr=true`, finality is enforced only when actual construction installs
+the corresponding barrier. There is no separate finality policy switch, and
+an annotation on a dynamic class never grants the runtime capability.
 
 Under that policy, rules must reject:
 
@@ -3126,7 +3165,7 @@ strict-construction-contract-mismatch
 
 Definitive violations prevent publication of a strict class contract.
 Uncertainty conservatively removes the affected capability or leaves the
-class dynamic according to project policy.
+class dynamic according to its resolved source policy.
 
 Suppressing a checker diagnostic cannot make a runtime invariant true.
 Suppressed, unresolved, or dynamically typed regions must not silently retain
@@ -3167,9 +3206,11 @@ must still verify the actual final class and field catalog.
 Make the changes in the checker's structured semantic pipeline rather than
 postprocessing formatted diagnostics or matching source text:
 
-1. Ruff's future-feature parser recognizes the authenticated SOAC strict
-   dialect.
-2. The vendored `__future__` typing stub exposes the feature in that dialect.
+1. Ruff parses the Python source; the shared
+   `soac_source::parse_soac_directives` parser reads real comment tokens and
+   binds class directives to exact AST ranges.
+2. The offline resolver composes package/module/class rules, authenticates
+   consulted package files and absence, and rejects retired strictness TOML.
 3. `ty_project` builds the complete configured project/environment database.
 4. `ty_python_semantic` class-definition inference classifies strict owners,
    metaclasses, decorators, inherited members, and logical fields.
@@ -3187,6 +3228,8 @@ The relevant upstream source areas are `ty_project/src/db.rs`,
 `ty_python_semantic/src/types/diagnostic.rs`, and
 `ruff_python_parser/src/semantic_errors.rs`. The exact revisions of all
 Ruff-family crates must remain compatible.
+SOAC's shared grammar lives in `crates/soac_source/src/directives.rs`; package
+ancestry and source-policy resolution live in `tools/ty/src/policy.rs`.
 
 The current maintained export path implements the two final-global rules,
 class mutation, instance-method shadowing, ClassVar instance writes,
@@ -3328,25 +3371,30 @@ can eliminate the guard.
 Before lowering or importing an opted-in module:
 
 1. Read the actual source bytes.
-2. Resolve its canonical module identity.
-3. Authenticate the matching offline shard and source digest.
+2. Resolve its canonical module identity within the authenticated deployment.
+3. Authenticate the matching offline shard, source digest, and resolved
+   package/module/class source policy, including consulted package files and
+   absence.
 4. Validate Python version, platform, CPython ABI, checker revision, policy,
    and relevant dependency fingerprints.
-5. Reject stale or incomplete strict artifacts before executing user code,
-   unless the configured fallback still authenticates the strict future and
-   fully enforces every promised strict module/global contract while merely
-   withholding optional class/type optimization capabilities.
+5. Reject stale or incomplete mandatory artifacts before executing user code.
+   Withholding optional optimization capabilities must not discard any
+   selected enforcement contract.
 6. Attach authenticated class and function contracts to the actual interpreter
    module/code construction context; a SOAC IR consumer is optional future work.
 7. Pass construction handles through the actual class-definition path.
 
-The source future feature and class facts must be captured before existing
-lowering rewrites remove annotated assignments or future imports.
+Resolve source comments and bind class facts to original declaration ranges
+before lowering rewrites remove comments, annotated assignments or future
+imports. Runtime consumers use the authenticated resolution, not a new policy
+inferred from rewritten source or the internal guarded-code flag.
 
-A missing type-fact shard can never downgrade a `from __future__ import
-strict` module into ordinary unprotected execution. If a mandatory checked,
-frozen, or physical-layout policy cannot be constructed without the artifact,
-the module fails closed before any user instruction.
+A missing mandatory shard can never downgrade a module selected by the
+authenticated source policy into ordinary unprotected execution. This includes
+selection inherited from a package or requested by an exact class rule. If a
+promised contract cannot be installed without the artifact, admission fails
+closed before any user instruction. Ordinary unselected modules require no
+strict shard merely because they are imported by a selected module.
 
 Do not import or execute otherwise unnecessary modules merely to validate
 their cached dependency fingerprints.
@@ -3355,15 +3403,19 @@ their cached dependency fingerprints.
 
 Already installed policies must apply during module initialization and
 reentrant callbacks. For classes constructed during initialization, no
-seal-dependent capability may be consumed before:
+capability may be consumed before its own admission boundary. Any fact that
+also depends on final module bindings requires the selected module seal:
 
 ```text
-module initialization
+authenticated module initialization completion (READY)
     + final decorators
     + final class adoption
-    + class/function freezing
-    + module SEALED
+    + selected class/method metadata protections
+    + module binding seal only when strict_assign=true
 ```
+
+A checked-attribute-only module becomes ready without freezing its globals
+or ordinary free functions. Readiness never proves a final global binding.
 
 Circular imports, reentrant class callbacks, and functions invoked during
 module initialization use safe interpreter behavior while honoring every
@@ -3373,9 +3425,9 @@ Any retained eager SOAC compilation path may produce generic code, but cannot
 consume nonexistent sealed class/function capabilities. Such compilation is
 not required to demonstrate this interpreter milestone.
 
-For a factory-defined class created after module sealing, use the final
-class's separate verified/sealed lifecycle instead of waiting for another
-module seal.
+For a factory-defined class created after authenticated module completion,
+use the final class's separate verified/sealed lifecycle. No second module
+completion or binding-seal transition is required.
 
 ### Cache fingerprints
 
@@ -3383,18 +3435,19 @@ Include at least:
 
 ```text
 module source hash
-strict future-feature state
+source-policy dialect/contract versions and shared parser identity
 offline artifact schema
 ty revision and exporter revision
-effective project and per-module policy
+resolved package/module/exact-class policy
+consulted package-initializer source and absence fingerprints
 Python version, platform, and CPython ABI
 resolved stubs and dependency fingerprints
 class source identities
 actual verified class/metaclass/decorator identities
 actual installed storage and inherited write policies
 physical field prefixes and method-family slots, only if installed
-frozen function/code/signature identities
-selected checked-field policies
+actual source/function ownership and independently sealed callable metadata
+declaring-class checked_attr rules and inherited field predicates
 every consumed external strict capability
 ```
 
@@ -3426,14 +3479,11 @@ Update `doc/STRICT_MODULES.md` and `OPT_GOAL.md` to agree on:
 No implementation may rely on incompatible assumptions remaining elsewhere
 in the documented strict contract.
 
-The offline analyzer must also understand the strict dialect. Extend the
-matched Ruff parser's recognized future-feature set, `ty`'s module policy,
-and the corresponding `__future__` typing stub to accept
-`from __future__ import strict` only in the authenticated SOAC analysis mode.
-The currently pinned parser otherwise rejects unknown future features before
-strict diagnostics or artifact export can run. Preserve ordinary Ruff/CPython
-diagnostics outside that mode and include the dialect/parser version in the
-artifact fingerprint.
+The offline analyzer must understand the shared source-comment grammar and
+resolve its package/module/class scopes before exporting strict facts. The
+retained parser recognition of the legacy `strict` future is not a policy
+opt-in. Preserve ordinary Ruff/CPython diagnostics outside SOAC analysis, and
+include source-policy dialect/parser versions in the artifact fingerprint.
 
 Upgrade or backport Python 3.15 checker/parser/typeshed support and the
 conservative narrowing options as part of the same coordinated toolchain
@@ -3449,9 +3499,10 @@ inheritance/finality, standard dataclass facts, and the nine rules above.
 Cross-module plain strict bases use the same semantic classifier and recursive
 MRO queries as local proposals, including scoped suppression and source-change
 invalidation. Known dynamic bases propagate dynamic participation. Foreign
-dataclass/transform bases still require an explicit per-file adapter-policy
-context before they can become candidates; an importer's policy is not reused
-as the defining file's authority. None of these proposals replaces runtime
+standard-dataclass bases use their declaring file's resolved source policy and
+the same automatic semantic classifier; unsupported transforms remain dynamic.
+An importer's policy is not reused as the defining file's authority.
+None of these proposals replaces runtime
 matching of actual protected base objects.
 Publication reuses unchanged content-addressed shards; persistent incremental
 checker databases and complete ecosystem adapters are not implemented.

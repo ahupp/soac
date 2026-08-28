@@ -53,10 +53,7 @@ pub use identity::{
     AttributeSiteIdentity, CallExpressionKind, CallSiteIdentity, ClassReference, DefinitionKind,
     Fingerprint, ModuleContentId, SourceIdentity, SourceRange, legacy_source_hash,
 };
-pub use policy::{
-    AdapterPolicy, AutomaticClassPolicy, CheckedFieldPolicy, FailurePolicy, ResolvedStrictPolicy,
-    StdlibDataclassPolicy, TypingFinalPolicy, UnsupportedClassPolicy, UnsupportedValueTypePolicy,
-};
+pub use policy::{CheckedFieldPolicy, ClassPolicyOverride, ResolvedStrictPolicy};
 pub use validation::validate_module_facts;
 
 #[cfg(test)]

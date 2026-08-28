@@ -3,10 +3,12 @@
 import ast
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -33,15 +35,19 @@ def source_tools():
     "source, expected_line",
     [
         (b"result = 1\n", 1),
-        (b'"""module docstring"""\nresult = 1\n', 2),
-        (b'"""doc"""\nfrom __future__ import annotations\nresult = 1', 3),
+        (b'"""module docstring"""\nresult = 1\n', 1),
+        (b'"""doc"""\nfrom __future__ import annotations\nresult = 1', 1),
         (b"#!/usr/bin/env python3\n# coding: latin-1\nlabel = '\xe9'\n", 3),
         (b"# coding: utf-8\r\nresult = 1\r\n", 2),
-        (b"from __future__ import annotations", 2),
+        (b"# Original CR-only header\rresult = 1\r", 2),
+        (b"from __future__ import annotations", 1),
         (b'"""module docstring"""; result = 1\n', 1),
         (b"from __future__ import annotations; result = 1\n", 1),
         (b'"""doc"""; from __future__ import annotations; result = 1\n', 1),
         ('"""doc é"""; result = 1\r\n'.encode("utf-8"), 1),
+        (b'\xef\xbb\xbf"""BOM and docstring"""\nresult = 1\n', 1),
+        (b"# comment without a final newline", 2),
+        (b"#!/usr/bin/env python3", 2),
         (b"", 1),
     ],
 )
@@ -50,30 +56,77 @@ def test_strict_opt_in_preserves_source_semantics_and_encoding(
 ):
     result, insertion = source_tools.strict_opt_in(source, "benchmark.py")
     assert insertion == expected_line
-    # AST parsing alone accepts misplaced futures; compile checks their real
-    # statement ordering without executing any analyzed source.
-    compile(result, "benchmark.py", "exec", dont_inherit=True)
+    # The added comment must not change real future flags or statement order.
+    assert compile(result, "benchmark.py", "exec", dont_inherit=True).co_flags == compile(
+        source, "benchmark.py", "exec", dont_inherit=True
+    ).co_flags
     original = ast.parse(source)
     candidate = ast.parse(result)
-    candidate.body = [
-        node
-        for node in candidate.body
-        if not (
-            isinstance(node, ast.ImportFrom)
-            and node.module == "__future__"
-            and any(alias.name == "strict" for alias in node.names)
-        )
-    ]
     assert ast.dump(candidate, include_attributes=False) == ast.dump(
         original, include_attributes=False
     )
-    if b"from __future__ import strict; " in result:
-        assert result.replace(b"from __future__ import strict; ", b"", 1) == source
-    elif b"\r\n" in source:
-        assert b"import strict\r\n" in result
+    comments = [
+        token
+        for token in tokenize.generate_tokens(
+            io.StringIO(
+                result.decode(tokenize.detect_encoding(io.BytesIO(result).readline)[0]),
+                newline=None,
+            ).readline
+        )
+        if token.type == tokenize.COMMENT
+        and token.string == source_tools.SOURCE_DECLARATION
+    ]
+    assert len(comments) == 1 and comments[0].start[0] == insertion
+    newline = b"\r\n" if b"\r\n" in source else b"\r" if b"\r" in source else b"\n"
+    unchanged = result.replace(
+        source_tools.SOURCE_DECLARATION.encode() + newline, b"", 1
+    )
+    # A header-only file without an EOL needs one separator before the comment.
+    expected = (
+        source + newline
+        if source and not original.body and not source.endswith((b"\n", b"\r"))
+        else source
+    )
+    assert unchanged == expected
     if b"\xe9" in source:
         assert b"\xe9" in result
         assert result.splitlines()[1] == b"# coding: latin-1"
+    if source.startswith(b"\xef\xbb\xbf"):
+        assert result.startswith(b"\xef\xbb\xbf")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"# soac: module(checked_attr=false)\nclass C: pass\n",
+        b"# soac: class(checked_attr=false)\nclass C: pass\n",
+        b"# soac module(checked_attr=true)\nclass C: pass\n",
+        b"# CR-only header\r# soac: module(checked_attr=true)\rclass C: pass\r",
+    ],
+)
+def test_strict_opt_in_rejects_existing_source_policy(source_tools, source):
+    with pytest.raises(ValueError, match="already declares SOAC policy"):
+        source_tools.strict_opt_in(source, "module.py")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"from __future__ import strict\nclass C: pass\n",
+        b"'# soac: module(strict_assign=true, checked_attr=true)'\nclass C: pass\n",
+    ],
+)
+def test_strict_opt_in_does_not_infer_authority_from_futures_or_strings(
+    source_tools, source
+):
+    candidate, _ = source_tools.strict_opt_in(source, "module.py")
+    assert (
+        candidate.replace(source_tools.SOURCE_DECLARATION.encode() + b"\n", b"", 1)
+        == source
+    )
+    assert ast.dump(ast.parse(candidate), include_attributes=False) == ast.dump(
+        ast.parse(source), include_attributes=False
+    )
 
 
 def _benchmark(tmp_path):
@@ -100,6 +153,9 @@ def test_strict_overlay_records_opt_in_and_has_path_independent_comparison_ident
     assert first["modules"] == {"__main__": "run_benchmark.py", "helper": "helper.py"}
     assert script.read_bytes() == original
     assert source_tools.verify_source_overlay(tmp_path / "first") == first
+    assert not (Path(first["project"]) / "pyproject.toml").exists()
+    assert first["configuration_sha256"] is None
+    assert first["configuration_provenance"]["presence"] == "absent"
     copied = Path(first["project"]) / "input.dat"
     assert copied.read_bytes() == (script.parent / "input.dat").read_bytes()
 
@@ -134,9 +190,9 @@ def test_strict_overlay_rejects_existing_source_links_and_authority_confusion(
     source_tools, tmp_path
 ):
     script = _benchmark(tmp_path)
-    script.write_text("from __future__ import strict\n")
+    script.write_text("# soac: module(strict_assign=true, checked_attr=true)\n")
     output = tmp_path / "strict"
-    with pytest.raises(ValueError, match="already opts into strict"):
+    with pytest.raises(ValueError, match="already declares SOAC policy"):
         source_tools.prepare_source_overlay(script, output)
     assert not output.exists()
     script.write_text("result = 1\n")
@@ -395,7 +451,9 @@ def test_failed_offline_analysis_never_publishes_worker_selection(
     assert not (tmp_path / "bundle" / "execution.json").exists()
 
 
-@pytest.mark.parametrize("changed", ["python", "deployment", "source"])
+@pytest.mark.parametrize(
+    "changed", ["python", "deployment", "source", "source_policy", "schema"]
+)
 def test_worker_selection_rejects_changed_offline_inputs(
     source_tools, tmp_path, changed
 ):
@@ -405,8 +463,17 @@ def test_worker_selection_rejects_changed_offline_inputs(
         selected = selected.resolve()
     elif changed == "deployment":
         Path(execution["deployment"]).write_text("{}\n")
-    else:
+    elif changed == "source":
         script.write_text("raise AssertionError('changed input')\n")
+    else:
+        manifest_path = Path(execution["manifest_path"])
+        manifest = json.loads(manifest_path.read_text())
+        manifest[changed] = (
+            "legacy-future-selection"
+            if changed == "source_policy"
+            else source_tools.EXECUTION_SCHEMA - 1
+        )
+        manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError):
         source_tools.verify_strict_benchmark(Path(execution["manifest_path"]), selected)
 
@@ -506,6 +573,10 @@ if __name__ == "__main__":
             for state in row["sealed_strict_modules"]
             if state["module_name"] == "__main__"
         )
+        assert main["schema"] == 2
+        assert main["ready"] is True
+        assert main["strict_assign"] is True
+        assert main["checked_attr"] is True
         assert main["sealed"] is True
         assert main["artifact_generation"] == execution["publication"]["generation"]
         assert main["source_path"] == execution["source"]["strict_script"]
@@ -521,7 +592,7 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("newline", (b"\n", b"\r\n"))
-def test_strict_overlay_preserves_upstream_pyproject_and_discloses_policy(
+def test_strict_overlay_preserves_upstream_configuration_and_discloses_source_policy(
     source_tools, tmp_path, newline
 ):
     script = _benchmark(tmp_path)
@@ -543,97 +614,105 @@ def test_strict_overlay_preserves_upstream_pyproject_and_discloses_policy(
     )
     original = script.parent / "pyproject.toml"
     original.write_bytes(upstream)
+    ty_config = newline.join(
+        (
+            b"# Keep ty configuration bytes",
+            b"[environment]",
+            b'python-version = "3.15"',
+        )
+    )
+    (script.parent / "ty.toml").write_bytes(ty_config)
     first = source_tools.prepare_source_overlay(script, tmp_path / "first")
     second = source_tools.prepare_source_overlay(script, tmp_path / "second")
     candidate = (Path(first["project"]) / "pyproject.toml").read_bytes()
     assert original.read_bytes() == upstream
-    assert candidate.startswith(upstream)
-    parsed = tomllib.loads(candidate.decode())
-    policy = parsed["tool"].pop("soac")["strict"]
-    assert policy["include"] == sorted(first["modules"].values())
-    assert parsed == tomllib.loads(upstream.decode())
+    assert candidate == upstream
+    assert tomllib.loads(candidate.decode()) == tomllib.loads(upstream.decode())
+    assert (Path(first["project"]) / "ty.toml").read_bytes() == ty_config
     record = next(
         record
         for record in first["files"]
         if record["relative_path"] == "pyproject.toml"
     )
     assert record["module_name"] is None
+    assert record["strict_directive_line"] is None
     assert record["stock_sha256"] == hashlib.sha256(upstream).hexdigest()
     assert record["strict_sha256"] == hashlib.sha256(candidate).hexdigest()
-    assert first["policy_sha256"] == record["strict_sha256"]
-    projection = first["policy_projection"]
-    assert projection["upstream_sha256"] == record["stock_sha256"]
-    assert upstream + projection["appended_utf8"].encode() == candidate
+    assert first["configuration_sha256"] == record["strict_sha256"]
+    provenance = first["configuration_provenance"]
+    assert provenance["upstream_sha256"] == record["stock_sha256"]
+    assert provenance["presence"] == "preserved"
+    assert first["source_policy"] == source_tools.SOURCE_POLICY
     assert first["source_fingerprint"] == second["source_fingerprint"]
     assert source_tools.verify_source_overlay(tmp_path / "first") == first
 
 
-def test_strict_overlay_reuses_equivalent_existing_policy_without_reserializing(
-    source_tools, tmp_path
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        b'# Preserve an inline namespace without extending it.\ntool = {other = "upstream-data"}\n',
+        b'[tool]\nsoac = "upstream-data"\n',
+        b'[tool.ty.environment]\npython-version = "3.15"\n',
+    ],
+)
+def test_strict_overlay_preserves_unrelated_configuration_without_reserializing(
+    source_tools, tmp_path, upstream
 ):
     script = _benchmark(tmp_path)
-    first = source_tools.prepare_source_overlay(script, tmp_path / "generated")
-    declarations = (
-        (Path(first["project"]) / "pyproject.toml").read_bytes().splitlines()[1:]
-    )
-    upstream = (
-        b"# Preserve comments, quoted keys, and the original order.\n"
-        b'[project]\nname = "original"\n\n'
-        b'[tool."soac".strict]\n' + b"\n".join(reversed(declarations))
-    )
     (script.parent / "pyproject.toml").write_bytes(upstream)
     output = tmp_path / "existing"
     manifest = source_tools.prepare_source_overlay(script, output)
     assert (Path(manifest["project"]) / "pyproject.toml").read_bytes() == upstream
-    assert manifest["policy_projection"]["appended_utf8"] == ""
+    assert manifest["configuration_provenance"]["presence"] == "preserved"
     assert (
-        manifest["policy_projection"]["upstream_sha256"]
+        manifest["configuration_provenance"]["upstream_sha256"]
         == hashlib.sha256(upstream).hexdigest()
     )
     assert source_tools.verify_source_overlay(output) == manifest
 
 
 @pytest.mark.parametrize(
-    "conflict",
+    "upstream",
     (
-        "different_value",
-        "additional_policy",
-        "partial_policy",
-        "namespace",
-        "inline_namespace",
+        b'[tool.soac.strict]\ninclude = ["helper.py", "run_benchmark.py"]\ndefault_class_policy = "automatic"\nunsupported_class_policy = "dynamic"\nchecked_fields = "disabled"\n',
+        b'[tool.soac.strict]\nchecked_fields = "supported_annotations"\n',
+        b'[[tool.soac.strict.overrides]]\ninclude = ["helper.py"]\n',
+        b'tool = {soac = {strict = {}}}\n',
+        b'[tool."soac".strict]\n',
     ),
 )
-def test_strict_overlay_never_overwrites_conflicting_upstream_policy(
-    source_tools, tmp_path, conflict
+def test_strict_overlay_rejects_retired_config_policy_even_when_previously_equivalent(
+    source_tools, tmp_path, upstream
 ):
     script = _benchmark(tmp_path)
-    baseline = source_tools.prepare_source_overlay(script, tmp_path / "baseline")
-    policy = (Path(baseline["project"]) / "pyproject.toml").read_bytes()
-    if conflict == "different_value":
-        upstream = policy.replace(
-            b'checked_fields = "disabled"',
-            b'checked_fields = "supported_annotations"',
-        )
-        assert upstream != policy
-    elif conflict == "additional_policy":
-        upstream = policy + b'exclude = ["helper.py"]\n'
-    elif conflict == "partial_policy":
-        upstream = b'[tool.soac.strict]\nchecked_fields = "disabled"\n'
-    elif conflict == "namespace":
-        upstream = b'[tool]\nsoac = "upstream-data"\n'
-    else:
-        upstream = b'tool = {other = "upstream-data"}\n'
     original = script.parent / "pyproject.toml"
     original.write_bytes(upstream)
     output = tmp_path / "conflict"
-    with pytest.raises(ValueError, match="conflicts|without rewriting"):
+    with pytest.raises(ValueError, match="retired"):
         source_tools.prepare_source_overlay(script, output)
     assert original.read_bytes() == upstream
     assert not output.exists()
 
 
-@pytest.mark.parametrize("changed", ("metadata", "policy", "disclosure"))
-def test_strict_overlay_verifies_the_declared_config_projection_after_rehashing(
+@pytest.mark.parametrize("upstream", [b"[unterminated", b"\xff"])
+def test_strict_overlay_rejects_invalid_upstream_configuration_without_overwrite(
+    source_tools, tmp_path, upstream
+):
+    script = _benchmark(tmp_path)
+    original = script.parent / "pyproject.toml"
+    original.write_bytes(upstream)
+    output = tmp_path / "invalid"
+    with pytest.raises(ValueError, match="valid UTF-8 TOML"):
+        source_tools.prepare_source_overlay(script, output)
+    assert original.read_bytes() == upstream
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "changed",
+    ("metadata", "policy", "disclosure", "source_policy", "directive_line", "schema"),
+)
+def test_strict_overlay_verifies_source_and_configuration_provenance_after_rehashing(
     source_tools, tmp_path, changed
 ):
     script = _benchmark(tmp_path)
@@ -646,27 +725,41 @@ def test_strict_overlay_verifies_the_declared_config_projection_after_rehashing(
         candidate = original.replace(b'name = "original"', b'name = "altered"')
         assert candidate != original
     elif changed == "policy":
-        candidate = original.replace(
-            b'checked_fields = "disabled"',
-            b'checked_fields = "supported_annotations"',
-        )
-        assert candidate != original
+        candidate = original + b"\n[tool.soac.strict]\n"
     else:
         candidate = original
-        manifest["policy_projection"]["appended_utf8"] += "# false disclosure\n"
+        if changed == "disclosure":
+            manifest["configuration_provenance"]["presence"] = "absent"
+        elif changed == "source_policy":
+            manifest["source_policy"] = "legacy-future-selection"
+        elif changed == "directive_line":
+            module_record = next(
+                record
+                for record in manifest["files"]
+                if record["module_name"] is not None
+            )
+            module_record["strict_directive_line"] += 1
+        else:
+            manifest["schema"] = source_tools.SCHEMA - 1
     path.write_bytes(candidate)
     digest = hashlib.sha256(candidate).hexdigest()
-    manifest["policy_sha256"] = digest
+    manifest["configuration_sha256"] = digest
     for record in manifest["files"]:
         if record["relative_path"] == "pyproject.toml":
             record["strict_sha256"] = digest
     # These unkeyed provenance hashes are not runtime authority. Recomputing
-    # them must not waive exact reconstruction from upstream bytes and policy.
+    # them must not waive exact reconstruction from original inputs and rules.
     manifest["source_fingerprint"] = source_tools._source_fingerprint(manifest)
     manifest.pop("overlay_fingerprint")
     manifest["overlay_fingerprint"] = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     (output / "source-manifest.json").write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="configuration projection|policy projection"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "data changed|configuration provenance|source comment policy|"
+            "non-opt-in source change|fingerprint/schema"
+        ),
+    ):
         source_tools.verify_source_overlay(output)

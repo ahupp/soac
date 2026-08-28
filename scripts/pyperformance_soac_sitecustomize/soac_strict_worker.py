@@ -27,7 +27,10 @@ def sealed_module_evidence(execution):
         state = _soac_ext.strict_module_diagnostics(module)
         if (
             not state
-            or state.get("schema") != 1
+            or state.get("schema") != 2
+            or state.get("ready") is not True
+            or state.get("strict_assign") is not True
+            or state.get("checked_attr") is not True
             or state.get("sealed") is not True
             or state.get("module_name") != name
             or state.get("source_path") != str((project / relative).resolve())

@@ -1520,7 +1520,10 @@ fn apply_annotation_scope(
     }
     scope.names.qualname = context.native_annotation_qualname(source, plan.kind);
     let native_first_line = if source.definition_kind == soac_contracts::DefinitionKind::Module {
-        1
+        // Module providers start at the first original source statement, not
+        // necessarily the first line or the first annotated statement.
+        let native = context.native_definition(source);
+        context.line_number_at(native.header_offset as usize) as u32
     } else if source.definition_kind == soac_contracts::DefinitionKind::Class
         && plan.kind == AnnotationProviderKind::Dictionary
     {

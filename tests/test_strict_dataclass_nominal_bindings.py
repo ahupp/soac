@@ -29,7 +29,7 @@ def observe(cls):
 """
 
 _MODELS = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import InitVar, dataclass, field
 from nominal_dataclass_support import Target, post
 import nominal_dataclass_support as support
@@ -92,11 +92,6 @@ def nominal_dataclasses(tmp_path_factory):
             "nominal_dataclass_support.py": _SUPPORT,
         },
         modules={"nominal_dataclass_model": "nominal_dataclass_model.py"},
-        policy="""
-[tool.soac.strict]
-include = ["nominal_dataclass_model.py"]
-checked_fields = "disabled"
-""",
     )
 
 
@@ -115,18 +110,27 @@ def api(name, result):
 class_owner = api('PyType_GetSoacContractOwner', ctypes.c_void_p)
 function_owner = api('PyFunction_GetSoacStrictOwner', ctypes.c_void_p)
 metadata = api('PyFunction_GetSoacMetadata', ctypes.c_void_p)
-assert _soac_ext.strict_module_diagnostics(model)['sealed']
+module_state = _soac_ext.strict_module_diagnostics(model)
+assert module_state['ready'] and module_state['strict_assign'] and module_state['sealed']
 
 def generated_owner(cls):
     assert class_owner(cls), 'the dataclass silently declined construction'
     initializer = vars(cls)['__init__']
     assert function_owner(initializer)
     assert not metadata(initializer), 'generated code acquired source/JIT authority'
+
+def rejected_write(operation):
+    try:
+        operation()
+    except TypeError as error:
+        assert not isinstance(error, StrictMutationError), error
+    else:
+        raise AssertionError('selected field storage accepted a foreign value')
 """
 
 
 @pytest.mark.parametrize("entry_interpreter", [False, True])
-def test_generated_nominal_parameters_and_initvars_keep_ordinary_value_semantics(
+def test_generated_initvars_are_ordinary_but_actual_nominal_fields_are_checked(
     nominal_dataclasses, entry_interpreter
 ):
     expected = "entry_interpreter" if entry_interpreter else "checked_native"
@@ -138,17 +142,19 @@ generated_owner(model.Direct)
 good = support.Target()
 wrong = object()
 support.events.clear()
-assert model.Direct(wrong, good).payload is wrong
+rejected_write(lambda: model.Direct(wrong, good))
+assert support.events == [], 'a failed field write reached post-init'
 assert model.Direct(good, wrong).payload is good
-assert support.events == [('post', good), ('post', wrong)]
+assert support.events == [('post', wrong)], 'InitVar unexpectedly became an argument predicate'
 support.events.clear()
 value = model.Direct(good, good)
 assert value.payload is good and support.events == [('post', good)]
 assert 'seed' not in vars(value), 'InitVar became an instance storage field'
 
-# An annotation alone does not opt in to protected storage.
-value.payload = wrong
-assert value.payload is wrong
+# Storage is selected independently of the generated constructor's arguments.
+rejected_write(lambda: setattr(value, 'payload', wrong))
+rejected_write(lambda: vars(value).__setitem__('payload', wrong))
+assert value.payload is good
 vars(value)['payload'] = good
 assert value.payload is good
 
@@ -183,8 +189,8 @@ assert first_target is not second_target and first_base is not second_base
 assert class_owner(first_base) and class_owner(second_base)
 assert '__init__' not in vars(first_base) and '__init__' not in vars(second_base)
 
-# Both the genuine annotation cell and the mutable stdlib Field display cache
-# can change without imposing runtime argument predicates on Child.
+# Neither the genuine annotation cell nor the mutable stdlib Field display
+# cache may retarget the already-installed ancestor storage requirement.
 replace(second_target)
 for name in ('payload', 'seed'):
     first_base.__dataclass_fields__[name].type = second_target
@@ -193,18 +199,19 @@ generated_owner(first_child)
 generated_owner(second_child)
 left, right = first_target(), second_target()
 support.events.clear()
-assert first_child(right, left).payload is right
+rejected_write(lambda: first_child(right, left))
+assert support.events == []
 assert first_child(left, right).payload is left
-assert second_child(left, right).payload is left
+rejected_write(lambda: second_child(left, right))
 assert second_child(right, left).payload is right
-assert support.events == [('post', left), ('post', right), ('post', right), ('post', left)]
+assert support.events == [('post', right), ('post', left)]
 support.events.clear()
 first, second = first_child(left, left), second_child(right, right)
 assert first.payload is left and second.payload is right
 assert support.events == [('post', left), ('post', right)]
 assert 'seed' not in vars(first) and first.tag == 0
-first.payload = right
-assert first.payload is right, 'checked_fields was silently enabled'
+rejected_write(lambda: setattr(first, 'payload', right))
+assert first.payload is left
 """,
         entry_interpreter=entry_interpreter,
     )
@@ -223,6 +230,9 @@ class Foreign:
 
 foreign = Foreign()
 support.current = object()
+support.events.clear()
+rejected_write(model.Factory)
+assert support.events == ['factory'], 'field rejection moved ahead of the ordinary factory call'
 support.events.clear()
 assert model.Factory.__init__(foreign) is None
 assert support.events == ['factory'] and vars(foreign) == {'payload': support.current}
@@ -260,15 +270,18 @@ generated_owner(replacement)
 good = replacement()
 for cls in (original, replacement):
     assert function_owner(cls.__init__)
-    marker = object()
-    assert cls(marker).next is marker
     assert cls(good).next is good
+marker = object()
+assert original(marker).next is marker, 'disposed original storage became constrained'
+rejected_write(lambda: replacement(marker))
 ordinary = original()
-assert replacement(ordinary).next is ordinary
-# A distinct invocation has its own admitted type, not a runtime call predicate.
+rejected_write(lambda: replacement(ordinary))
+# A distinct invocation has its own field target, while the same generated
+# initializer still accepts wrong nominal arguments on ordinary storage.
 other = model.self_slots()
 other_value = other()
-assert replacement(other_value).next is other_value
+rejected_write(lambda: replacement(other_value))
+assert original(other_value).next is other_value
 
 # Dataclasses repairs the owned provider's cell, not its callable metadata.
 # Individual component adoption grants no source/JIT authority.
@@ -292,7 +305,7 @@ def named_self_dataclass(tmp_path_factory):
         tmp_path_factory.mktemp("strict-dataclass-initvar-named-self"),
         {
             "named_self_model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import InitVar, dataclass
 from nominal_dataclass_support import Target, post
 
@@ -307,11 +320,6 @@ class Record:
             "nominal_dataclass_support.py": _SUPPORT,
         },
         modules={"named_self_model": "named_self_model.py"},
-        policy="""
-[tool.soac.strict]
-include = ["named_self_model.py"]
-checked_fields = "disabled"
-""",
     )
 
 
@@ -331,6 +339,9 @@ support.events.clear()
 assert model.Record(self=wrong, payload=good).payload is good
 assert support.events == [('post', wrong)]
 support.events.clear()
+rejected_write(lambda: model.Record(self=good, payload=wrong))
+assert support.events == []
+support.events.clear()
 record = model.Record(self=good, payload=good)
 assert record.payload is good and vars(record) == {'payload': good}
 assert support.events == [('post', good)]
@@ -347,6 +358,9 @@ assert vars(foreign) == {'payload': good} and support.events == [('post', wrong)
 support.events.clear()
 initializer(foreign, self=good, payload=good)
 assert vars(foreign) == {'payload': good} and support.events == [('post', good)]
+support.events.clear()
+initializer(foreign, self=good, payload=wrong)
+assert vars(foreign) == {'payload': wrong} and support.events == [('post', good)]
 """,
         entry_interpreter=entry_interpreter,
     )
@@ -358,7 +372,7 @@ def source_self_slots(tmp_path_factory):
         tmp_path_factory.mktemp("strict-dataclass-source-self-slots"),
         {
             "source_self_slots_model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 import nominal_dataclass_support as support
 
@@ -399,11 +413,6 @@ def receiver_case():
             "nominal_dataclass_support.py": _SUPPORT,
         },
         modules={"source_self_slots_model": "source_self_slots_model.py"},
-        policy="""
-[tool.soac.strict]
-include = ["source_self_slots_model.py"]
-checked_fields = "disabled"
-""",
     )
 
 
@@ -446,11 +455,18 @@ else:
     assert method(wrong) is wrong
     ordinary = original()
     assert method(ordinary) is ordinary
-# The shared generated implementation also retains ordinary value semantics.
+# Generated calls stay ordinary; their writes follow the receiver's storage.
 for cls in (original, replacement):
     assert function_owner(cls.__init__)
-    assert cls('ordinary').value == 'ordinary'
     assert cls(7).value == 7
+    foreign = original()
+    assert cls.__init__(foreign, 'ordinary') is None
+    assert foreign.value == 'ordinary'
+    rejected_write(lambda: cls.__init__(good, 'ordinary'))
+    assert good.value == 1
+# Disposing the original class does not give it the replacement's field check.
+assert original('ordinary').value == 'ordinary'
+rejected_write(lambda: replacement('ordinary'))
 """,
         entry_interpreter=entry_interpreter,
     )
@@ -465,11 +481,6 @@ def cpython_nominal_dataclasses(tmp_path_factory):
             "nominal_dataclass_support.py": _SUPPORT,
         },
         modules={"nominal_dataclass_model": "nominal_dataclass_model.py"},
-        policy="""
-[tool.soac.strict]
-include = ["nominal_dataclass_model.py"]
-checked_fields = "disabled"
-""",
         backend="cpython",
     )
 
@@ -489,7 +500,7 @@ import types
 
 stock = types.ModuleType('ordinary_native_nominal_control')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary native nominal control>', 'exec'), vars(stock))
 good = support.Target()
 wrong = object()
@@ -500,15 +511,17 @@ assert support.events == [('post', wrong)]
 
 generated_owner(model.Direct)
 support.events.clear()
-assert model.Direct(wrong, good).payload is wrong
+rejected_write(lambda: model.Direct(wrong, good))
+assert support.events == []
 assert model.Direct(good, wrong).payload is good
-assert support.events == [('post', good), ('post', wrong)]
+assert support.events == [('post', wrong)]
 support.events.clear()
 record = model.Direct(good, good)
 assert record.payload is good and support.events == [('post', good)]
 assert 'seed' not in vars(record)
-record.payload = wrong
-assert record.payload is wrong, 'checked_fields was implicitly enabled'
+rejected_write(lambda: setattr(record, 'payload', wrong))
+rejected_write(lambda: vars(record).__setitem__('payload', wrong))
+assert record.payload is good
 
 # The original stdlib body still calls an ordinary factory exactly once.
 class Foreign:
@@ -517,6 +530,9 @@ class Foreign:
 foreign = Foreign()
 generated_owner(model.Factory)
 support.current = wrong
+support.events.clear()
+rejected_write(model.Factory)
+assert support.events == ['factory']
 support.events.clear()
 assert model.Factory.__init__(foreign) is None
 assert support.events == ['factory'] and vars(foreign) == {'payload': wrong}
@@ -531,6 +547,9 @@ invoke.argtypes = [ctypes.py_object, ctypes.py_object, ctypes.py_object]
 invoke.restype = ctypes.py_object
 assert invoke(model.Direct, (good, good), {}).payload is good
 assert invoke(model.Direct, (good, wrong), {}).payload is good
+support.events.clear()
+rejected_write(lambda: invoke(model.Direct, (wrong, good), {}))
+assert support.events == []
 """,
         Path(__file__),
         required_functions=("family",),
@@ -544,8 +563,8 @@ def test_cpython_dataclass_local_provider_forwarding_preserves_class_identity(
 ):
     from pathlib import Path
 
-    # The same source must preserve each local class/provider graph without
-    # imposing a runtime type predicate on constructor arguments or InitVars.
+    # Each construction captures its own actual nominal field target. The
+    # generated call's InitVar still has no runtime argument predicate.
     cpython_nominal_dataclasses.run_case(
         "nominal_dataclass_model",
         "from soac import _soac_ext\n"
@@ -556,15 +575,20 @@ left_target, left_base, replace, make_left = model.family()
 right_target, right_base, unused, make_right = model.family()
 assert left_target is not right_target and left_base is not right_base
 assert class_owner(left_base) and class_owner(right_base)
+replace(right_target)
+for name in ('payload', 'seed'):
+    left_base.__dataclass_fields__[name].type = right_target
 left_class, right_class = make_left(), make_right()
 generated_owner(left_class)
 generated_owner(right_class)
 left, right = left_target(), right_target()
 support.events.clear()
-assert left_class(right, left).payload is right
+rejected_write(lambda: left_class(right, left))
+assert support.events == []
 assert left_class(left, right).payload is left
-assert right_class(left, right).payload is left
-assert support.events == [('post', left), ('post', right), ('post', right)]
+rejected_write(lambda: right_class(left, right))
+assert right_class(right, left).payload is right
+assert support.events == [('post', right), ('post', left)]
 assert left_class(left, left).payload is left
 assert right_class(right, right).payload is right
 
@@ -577,8 +601,9 @@ assert right_class(right, right).payload is right
 
 
 _CPYTHON_PENDING_SLOTS_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
+from typing import Any
 import pending_slots_observer as support
 
 def make_node():
@@ -592,6 +617,15 @@ def make_node():
 
     return Node
 """
+
+
+def _pending_slots_source(field_annotation):
+    # Both controls participate. Any deliberately has no write predicate;
+    # the nominal control keeps the real construction-time Self requirement.
+    assert field_annotation in {"Any", "Node | None"}
+    return _CPYTHON_PENDING_SLOTS_SOURCE.replace(
+        "next: Node | None = None", f"next: {field_annotation} = None"
+    )
 
 _CPYTHON_PENDING_SLOTS_OBSERVER = """
 import dataclasses
@@ -636,19 +670,14 @@ def observe(frame, event, arg):
 
 @pytest.fixture(scope="module")
 def cpython_pending_slots(request, tmp_path_factory):
-    checked_fields = getattr(request, "param", "disabled")
+    field_annotation = getattr(request, "param", "Node | None")
     return create_strict_project(
         tmp_path_factory.mktemp("cpython-pending-slots-self"),
         {
-            "pending_slots_model.py": _CPYTHON_PENDING_SLOTS_SOURCE,
+            "pending_slots_model.py": _pending_slots_source(field_annotation),
             "pending_slots_observer.py": _CPYTHON_PENDING_SLOTS_OBSERVER,
         },
         modules={"pending_slots_model": "pending_slots_model.py"},
-        policy=f"""
-[tool.soac.strict]
-include = ["pending_slots_model.py"]
-checked_fields = "{checked_fields}"
-""",
         backend="cpython",
     )
 
@@ -656,8 +685,8 @@ checked_fields = "{checked_fields}"
 @pytest.mark.parametrize(
     ("cpython_pending_slots", "checked_field_writes"),
     [
-        pytest.param("disabled", False, id="disabled-fields"),
-        pytest.param("supported_annotations", True, id="checked-fields"),
+        pytest.param("Any", False, id="any-field"),
+        pytest.param("Node | None", True, id="nominal-field"),
     ],
     indirect=["cpython_pending_slots"],
     scope="module",
@@ -669,7 +698,7 @@ def test_cpython_dataclass_pending_calls_are_ordinary_and_selected_self_fields_a
 
     cpython_pending_slots.run_case(
         "pending_slots_model",
-        f"source = {_CPYTHON_PENDING_SLOTS_SOURCE!r}\n"
+        f"source = {(cpython_pending_slots.project / 'pending_slots_model.py').read_text()!r}\n"
         f"checked_field_writes = {checked_field_writes!r}\n"
         + """
 import ctypes
@@ -692,7 +721,7 @@ sealed = api('PyType_IsSoacSealed', ctypes.c_int)
 
 stock = types.ModuleType('ordinary_pending_slots_control')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary pending slots control>', 'exec'), vars(stock))
 support.keep_original = True
 old_profile = sys.getprofile()
@@ -819,7 +848,7 @@ if checked_field_writes:
     ordinary.next = ordinary
     assert vars(ordinary)["next"] is ordinary and not owner(original)
 else:
-    # The preexisting disabled-field case remains an independent policy control.
+    # An explicit Any field has no predicate even though its class participates.
     unchecked = object()
     good.next = unchecked
     assert good.next is unchecked
@@ -882,38 +911,33 @@ assert selected.accept(None, instance) is instance
 
 
 @pytest.mark.parametrize(
-    ("entry_interpreter", "checked_fields"),
+    ("entry_interpreter", "field_annotation"),
     [
-        pytest.param(False, "disabled", id="False"),
-        pytest.param(True, "disabled", id="True"),
-        pytest.param(False, "supported_annotations", id="checked-fields-compiled"),
-        pytest.param(True, "supported_annotations", id="checked-fields-entry"),
+        pytest.param(False, "Any", id="any-field-compiled"),
+        pytest.param(True, "Any", id="any-field-entry"),
+        pytest.param(False, "Node | None", id="nominal-field-compiled"),
+        pytest.param(True, "Node | None", id="nominal-field-entry"),
     ],
 )
 def test_soac_untraced_slots_preserve_selected_self_fields(
-    tmp_path, entry_interpreter, checked_fields
+    tmp_path, entry_interpreter, field_annotation
 ):
     from pathlib import Path
 
     project = create_strict_project(
         tmp_path,
         {
-            "pending_slots_model.py": _CPYTHON_PENDING_SLOTS_SOURCE,
+            "pending_slots_model.py": _pending_slots_source(field_annotation),
             "pending_slots_observer.py": _CPYTHON_PENDING_SLOTS_OBSERVER,
         },
         modules={"pending_slots_model": "pending_slots_model.py"},
-        policy=f"""
-[tool.soac.strict]
-include = ["pending_slots_model.py"]
-checked_fields = "{checked_fields}"
-""",
         backend="soac",
     )
     expected_entry = "entry_interpreter" if entry_interpreter else "checked_native"
     project.run_case(
         "pending_slots_model",
-        f"source = {_CPYTHON_PENDING_SLOTS_SOURCE!r}\n"
-        f"checked_field_writes = {checked_fields == 'supported_annotations'!r}\n"
+        f"source = {_pending_slots_source(field_annotation)!r}\n"
+        f"checked_field_writes = {field_annotation != 'Any'!r}\n"
         f"expected_entry = {expected_entry!r}\n"
         + """
 import ctypes
@@ -985,7 +1009,7 @@ for selected in (first, second):
 # The identical ordinary subject retains ordinary annotation behavior.
 stock = types.ModuleType('ordinary_soac_pending_slots_control')
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary SOAC pending slots control>', 'exec'), vars(stock))
 ordinary_type = stock.make_node()
 ordinary = ordinary_type()
@@ -994,7 +1018,7 @@ wrong_value = object()
 ordinary.next = wrong_value
 assert ordinary.next is wrong_value and ordinary_type(wrong_value).next is wrong_value
 
-# A foreign generated-init receiver has no protected field, in either policy.
+# A foreign generated-init receiver has no protected field, in either source control.
 # Its ordinary explicit setattr callback still runs once with the original value.
 recorder = support.Recorder()
 assert first.__init__(recorder, wrong_value) is None
@@ -1033,12 +1057,13 @@ if checked_field_writes:
     new.next = new
     assert new.next is new
 else:
-    # Disabled fields remain a separate policy control, not a check exemption.
+    # Any is a source-level control with no predicate, not a policy exemption.
     good.next = wrong_value
     assert good.next is wrong_value
     assert first(ordinary).next is ordinary
     assert second(good).next is good
-assert _soac_ext.strict_module_diagnostics(model)['sealed']
+module_state = _soac_ext.strict_module_diagnostics(model)
+assert module_state['ready'] and module_state['strict_assign'] and module_state['sealed']
 """,
         Path(__file__),
         required_functions=("make_node",),

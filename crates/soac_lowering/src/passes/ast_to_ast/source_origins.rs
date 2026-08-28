@@ -33,6 +33,7 @@ pub(crate) struct NativeSourceDefinition {
     pub qualname: String,
     pub first_offset: u32,
     /// The actual def/async/class keyword, distinct from an earlier decorator.
+    /// For a module, its first source statement anchors native annotation setup.
     pub header_offset: u32,
 }
 
@@ -334,7 +335,42 @@ impl SourceCatalog {
             catalog: Self::default(),
         };
         collector.visit_body(&mut original_body);
-        let catalog = collector.catalog;
+        let mut catalog = collector.catalog;
+        // Native module annotation setup uses the first original statement's
+        // location, including a docstring or future import but not comments.
+        // A decorated declaration starts at its header in CPython's statement
+        // AST, even though Ruff includes decorators in that statement's range.
+        let first_statement_offset = match body.first() {
+            Some(Stmt::FunctionDef(function)) => {
+                catalog
+                    .native_definition(function.range, DefinitionKind::Function)
+                    .expect("the first source function is recorded")
+                    .header_offset
+            }
+            Some(Stmt::ClassDef(class)) => {
+                catalog
+                    .native_definition(class.range, DefinitionKind::Class)
+                    .expect("the first source class is recorded")
+                    .header_offset
+            }
+            Some(statement) => statement.start().to_u32(),
+            None => 0,
+        };
+        assert!(catalog
+            .native_definitions
+            .insert(
+                (
+                    TextRange::new(0.into(), facts.source_size.into()),
+                    DefinitionKind::Module,
+                ),
+                NativeSourceDefinition {
+                    name: "<module>".into(),
+                    qualname: "<module>".into(),
+                    first_offset: 0,
+                    header_offset: first_statement_offset,
+                },
+            )
+            .is_none());
         // A signature authenticates the exporter, not a correspondence guessed
         // from a name. Recheck the exact lexical definition in this parser.
         for identity in facts

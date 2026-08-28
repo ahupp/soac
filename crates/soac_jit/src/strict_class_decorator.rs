@@ -630,7 +630,7 @@ pub(crate) unsafe extern "C" fn apply_class_decorator(
                     }
                     if current
                         .execution
-                        .is_sealed(py, &globals, &current.verified)?
+                        .is_ready(py, &globals, &current.verified)?
                     {
                         if !crate::strict_class::finalize_class(
                             py,

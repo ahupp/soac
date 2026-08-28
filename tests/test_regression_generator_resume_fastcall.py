@@ -69,7 +69,7 @@ def test_generator_resume_fastcall_preserves_callable_metadata():
 @pytest.fixture(scope="module")
 def strict_resume_project(tmp_path_factory):
     source = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def values():
     sent = yield 3
@@ -83,7 +83,7 @@ def resume():
         {
             "resume_model.py": source,
             "ordinary_resume_model.py": source.replace(
-                "from __future__ import strict\n", "", 1
+                "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
             ),
         },
         modules={"resume_model": "resume_model.py"},

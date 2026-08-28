@@ -27,7 +27,7 @@ def test_selected_native_handled_exception_layout(function_create_watch_extensio
 
 
 _HANDLED_EXCEPTION_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import sys
 
 def exercise_plain():
@@ -177,7 +177,7 @@ def strict_handled_exception_project(tmp_path_factory):
         tmp_path_factory.mktemp("strict-handled-exception-state"),
         {
             "handled_exception_state.py": _HANDLED_EXCEPTION_SOURCE,
-            "taskgroup_exception_lifetime.py": "from __future__ import strict\n"
+            "taskgroup_exception_lifetime.py": "# soac: module(strict_assign=true, checked_attr=true)\n"
             + source,
         },
         modules={
@@ -279,7 +279,7 @@ def test_cpython_taskgroup_exception_does_not_retain_runtime_helper_frames(tmp_p
     )
     project = create_strict_project(
         tmp_path / "cpython-taskgroup-exception-lifetime",
-        {"taskgroup_exception_lifetime.py": "from __future__ import strict\n" + source},
+        {"taskgroup_exception_lifetime.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + source},
         modules={"taskgroup_exception_lifetime": "taskgroup_exception_lifetime.py"},
         backend="cpython",
     )
@@ -451,7 +451,7 @@ def test_handler_cleanup_preserves_deletion_and_releases_locals(
     strict_handled_exception_project, entry_interpreter
 ):
     control_source = _HANDLED_EXCEPTION_SOURCE.replace(
-        "from __future__ import strict\n", ""
+        "# soac: module(strict_assign=true, checked_attr=true)\n", ""
     )
     strict_handled_exception_project.run(
         f"control_source = {control_source!r}\n"
@@ -628,7 +628,7 @@ def test_suspended_completion_keeps_pep479_context_and_releases_saved_locals(
     strict_handled_exception_project, entry_interpreter
 ):
     control_source = _HANDLED_EXCEPTION_SOURCE.replace(
-        "from __future__ import strict\n", ""
+        "# soac: module(strict_assign=true, checked_attr=true)\n", ""
     )
     strict_handled_exception_project.run(
         f"native_schedule = {entry_interpreter is None!r}\n"
@@ -737,7 +737,7 @@ assert sys.exception() is None
 
 
 _EXCEPTION_TRANSPORT_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def nested_return(error_factory, observe, set_handled, replacement):
     try:
@@ -788,7 +788,7 @@ def test_caught_exception_payload_preserves_callbacks_and_retires_every_owner(
     case,
 ):
     control_source = _EXCEPTION_TRANSPORT_SOURCE.replace(
-        "from __future__ import strict\n", ""
+        "# soac: module(strict_assign=true, checked_attr=true)\n", ""
     )
     strict_exception_transport_project.run(
         f"case = {case!r}\n"
@@ -870,7 +870,7 @@ assert sys.exception() is None
 
 
 _PENDING_RETURN_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def replace_return(make, observe):
     try:
@@ -931,7 +931,7 @@ def interleaved_return(make, observe):
 
 
 _SUSPENDED_TRANSPORT_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def group():
     def generate():
@@ -996,7 +996,7 @@ import weakref
 
 if native_control:
     namespace = {}
-    exec(compile(source.replace('from __future__ import strict\\n', '\\n'),
+    exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', '\\n'),
                  '<native-suspended-transport>', 'exec'), namespace)
     factory = namespace[case]
 else:
@@ -1105,7 +1105,7 @@ def test_pending_return_preserves_finally_values_and_retires_overridden_owners(
     strict_pending_return_project, entry_interpreter, case
 ):
     control_source = _PENDING_RETURN_SOURCE.replace(
-        "from __future__ import strict\n", ""
+        "# soac: module(strict_assign=true, checked_attr=true)\n", ""
     )
     strict_pending_return_project.run(
         f"case = {case!r}\n"

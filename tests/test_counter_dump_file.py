@@ -49,7 +49,7 @@ def _strict_counter_source(source):
     prefix = "".join(lines[:position])
     if prefix and not prefix.endswith("\n"):
         prefix += "\n"
-    return prefix + "from __future__ import strict\n" + "".join(lines[position:])
+    return prefix + "# soac: module(strict_assign=true, checked_attr=true)\n" + "".join(lines[position:])
 
 
 def _counter_project(root, modules, *, env, ordinary_sources=None, backend="soac"):

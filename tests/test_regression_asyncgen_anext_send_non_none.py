@@ -32,7 +32,7 @@ def validate_module(module):
         return
     project = create_strict_project(
         tmp_path,
-        {f"{module_name}.py": "from __future__ import strict\n" + source},
+        {f"{module_name}.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + source},
         modules={module_name: f"{module_name}.py"},
         backend="cpython" if mode == "cpython" else "soac",
     )

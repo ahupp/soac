@@ -9,7 +9,7 @@ import pytest
 from tests._strict_integration import ROOT, create_strict_project
 
 _CACHED_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from functools import cached_property
 
 class Cached:
@@ -53,7 +53,7 @@ def test_cached_property_keeps_original_descriptor_and_dynamic_cache_semantics(
 ):
     results = []
     for strict in (False, True):
-        source = _CACHED_SOURCE.replace("from __future__ import strict\n", "", 1)
+        source = _CACHED_SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
         load = (
             "import cached as module\n"
             if strict
@@ -175,7 +175,7 @@ def descriptors(request, tmp_path_factory):
         tmp_path_factory.mktemp(f"strict-source-descriptors-{backend}"),
         {
             "descriptors.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from builtins import staticmethod, staticmethod as builtin_staticmethod
 from descriptor_support import before_ready, default_value, identity, unknown_result
 

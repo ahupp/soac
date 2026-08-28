@@ -13,7 +13,7 @@ def test_profile_preserves_counter_sites_inside_joined_hot_loop(tmp_path: Path) 
         tmp_path,
         {
             f"{module_name}.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 class Box:
     def __init__(self):

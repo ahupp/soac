@@ -704,25 +704,35 @@ pub(crate) fn eligible_source_function(
         // and ordinary replay. It is not a promise of immutable evaluation.
         return false;
     }
+    let facts = verified.type_facts().facts();
+    let class_owner = if origin.definition.definition_kind == soac_contracts::DefinitionKind::Class
+    {
+        facts
+            .classes
+            .iter()
+            .find(|class| class.identity == origin.definition)
+    } else {
+        facts.source_class_owner(&origin.definition)
+    };
+    let selected = class_owner.map_or(facts.language_policy.strict_assign, |class| {
+        class.participation == soac_contracts::ParticipationProposal::Candidate
+            && facts
+                .language_policy
+                .checked_attributes(class.identity.source_range)
+    });
+    if !selected {
+        // Source ownership remains installed for entry/construction safety.
+        // It does not freeze mutable-module callables or opted-out classes;
+        // their ordinary metadata replacement path must remain available.
+        return false;
+    }
     if origin.role != CallableSourceRole::SourceFunction {
         return true;
     }
-    Some(verified)
-        .and_then(|module| {
-            if module
-                .type_facts()
-                .facts()
-                .function_has_statically_dynamic_class_owner(&origin.definition)
-            {
-                return None;
-            }
-            module
-                .type_facts()
-                .facts()
-                .functions
-                .iter()
-                .find(|function| function.identity == origin.definition)
-        })
+    facts
+        .functions
+        .iter()
+        .find(|function| function.identity == origin.definition)
         .is_some_and(|function| {
             !function.uncertainty.iter().any(|reason| {
                 matches!(
@@ -1530,7 +1540,7 @@ fn complete_function_definition<'py>(
         || facts.source_class_owner(&origin.definition).is_some()
         || !owner
             .execution_ref()
-            .is_sealed(py, &*owner.globals()?, owner.verified_module())?
+            .is_ready(py, &*owner.globals()?, owner.verified_module())?
     {
         return Ok(function.clone());
     }

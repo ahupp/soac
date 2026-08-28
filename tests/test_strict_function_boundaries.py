@@ -9,7 +9,7 @@ import pytest
 from tests._strict_integration import create_strict_project
 
 _SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from typing import Any, cast, final
 from support import events, marker, observe
 
@@ -350,7 +350,7 @@ from tests._strict_integration import _assert_cpython_function_witness
 # it does not borrow authenticated code objects or publish another contract.
 ordinary = ModuleType("ordinary_disabled_boundaries")
 source = Path(checked.__file__).read_text()
-exec(compile(source.removeprefix("from __future__ import strict\\n"),
+exec(compile(source.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\\n"),
              "<ordinary-disabled-boundaries>", "exec", dont_inherit=True),
      vars(ordinary))
 
@@ -617,7 +617,7 @@ decorated = Decorated().decorated
 
 
 _LAMBDA_SCOPE_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 module_list = [lambda: index for index in range(3)]
 module_set = {lambda: index for index in range(3)}
@@ -644,7 +644,7 @@ def factory():
 """
 
 _LAMBDA_DEFAULT_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 events = []
 def mark(name, value):
@@ -668,7 +668,7 @@ def _lambda_scopes_project(root, *, backend="soac"):
     for name, source in tuple(sources.items()):
         # Keep native line numbers equal while the control remains ordinary.
         sources[f"ordinary_{name}"] = source.replace(
-            "from __future__ import strict", "# ordinary source control", 1
+            "# soac: module(strict_assign=true, checked_attr=true)", "# ordinary source control", 1
         )
     return create_strict_project(
         root,
@@ -798,7 +798,7 @@ def test_lambda_defaults_are_created_in_the_enclosing_execution(
 
 
 _CAPTURED_GENERATOR_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from support import Payload, events
 
 def captured(reason):
@@ -823,7 +823,7 @@ def strict_captured_generators(tmp_path_factory):
         {
             "captured.py": _CAPTURED_GENERATOR_SOURCE,
             "ordinary_captured.py": _CAPTURED_GENERATOR_SOURCE.replace(
-                "from __future__ import strict", "# ordinary source control", 1
+                "# soac: module(strict_assign=true, checked_attr=true)", "# ordinary source control", 1
             ),
             "support.py": """
 events = []
@@ -952,7 +952,7 @@ def capture_frames(factory):
     return first, second
 """,
             "suspended.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from support import capture_frames, events, pause
 
 def make_frames():
@@ -1079,7 +1079,7 @@ from tests._strict_integration import _assert_cpython_function_witness
 # flags. The strict functions below retain their genuine original native code.
 ordinary = ModuleType("ordinary_suspended_binders")
 source = Path(suspended.__file__).read_text()
-exec(compile(source.removeprefix("from __future__ import strict\\n"),
+exec(compile(source.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\\n"),
              "<ordinary-suspended-binders>", "exec", dont_inherit=True),
      vars(ordinary))
 ordinary.old_frame.close()
@@ -1193,7 +1193,7 @@ def patch(function, same_code):
         events.append(("body", result))
 """,
             "checked_patch.py": f"""
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from support import patch
 
 def checked(value: int) -> int:
@@ -1401,7 +1401,7 @@ def compare(function, lifetime, factory):
     results.append(actual)
 """,
             "checked_defaults.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import probe
 
 def checked(first: int = 1, *, left: int = 2, right: int = 3) -> int:
@@ -1468,7 +1468,7 @@ def dynamic(function):
     return function
 """,
             "owned_annotations.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from provider_probe import dynamic, retain_and_replace, replace_and_observe_release
 
 def owned(value: int) -> int:
@@ -1564,7 +1564,7 @@ def install_changing_default(function):
     function.__kwdefaults__ = {Key(): 7}
 """,
             "active_frames.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from active_probe import dynamic, events, error, replace_body, replace_error
 
 # Unknown decorators deliberately keep these functions outside frozen source
@@ -1743,7 +1743,7 @@ def test_explicit_keyword_subclasses_preserve_native_binding_callbacks(
     project = create_strict_project(
         tmp_path,
         {
-            "keyword_calls.py": "from __future__ import strict\n"
+            "keyword_calls.py": "# soac: module(strict_assign=true, checked_attr=true)\n"
             + _EXPLICIT_KEYWORD_FUNCTIONS,
             "keyword_control.py": _EXPLICIT_KEYWORD_FUNCTIONS,
             "keyword_probe.py": _EXPLICIT_KEYWORD_PROBE,
@@ -1780,7 +1780,7 @@ def replace(function):
     return function
 """,
             "dynamic_function.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dynamic_probe import replace
 
 @replace
@@ -1831,7 +1831,7 @@ class Meta(type):
         return super().__new__(metaclass, name, bases, namespace)
 """,
             "framework_methods.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from framework_probe import Meta, instrument
 
 class Managed(metaclass=Meta):
@@ -2008,7 +2008,7 @@ def binding_identity_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-binding-identity"),
         {
-            "binding_identity.py": "from __future__ import strict\n"
+            "binding_identity.py": "# soac: module(strict_assign=true, checked_attr=true)\n"
             + _BINDING_IDENTITY_FUNCTIONS,
             "binding_identity_control.py": _BINDING_IDENTITY_FUNCTIONS,
             "binding_identity_probe.py": _BINDING_IDENTITY_PROBE,
@@ -2126,7 +2126,7 @@ def replace(function):
     return function
 """,
             "changed_code.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from fallback_probe import marker, replace
 
 @replace
@@ -2212,7 +2212,7 @@ def late_function_definitions(tmp_path_factory):
         tmp_path_factory.mktemp("strict-late-function-definitions"),
         {
             "late_functions.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from late_function_support import make_default, reuse_previous
 
 def factory():
@@ -2353,7 +2353,7 @@ def lexical_function_ownership(request, tmp_path_factory):
         tmp_path_factory.mktemp(f"strict-lexical-function-ownership-{backend}"),
         {
             "lexical_functions.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from lexical_function_support import DynamicMeta, remember, replacement
 
 def standalone(value: int = 1) -> int:
@@ -2591,7 +2591,7 @@ def named_keyword_operands(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-named-keyword-operands"),
         {
-            "keyword_operands.py": "from __future__ import strict\n"
+            "keyword_operands.py": "# soac: module(strict_assign=true, checked_attr=true)\n"
             + _NAMED_KEYWORD_OPERANDS,
             "keyword_operand_control.py": _NAMED_KEYWORD_OPERANDS,
             "keyword_operand_support.py": """
@@ -2814,7 +2814,7 @@ def validate_module(module):
 
 
 _NONLOCAL_CLASS_CELL_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def factory():
     class Model:
@@ -2845,7 +2845,7 @@ def strict_nonlocal_class_cell(tmp_path_factory):
         {
             "class_cell.py": _NONLOCAL_CLASS_CELL_SOURCE,
             "ordinary_class_cell.py": _NONLOCAL_CLASS_CELL_SOURCE.replace(
-                "from __future__ import strict", "# ordinary source control", 1
+                "# soac: module(strict_assign=true, checked_attr=true)", "# ordinary source control", 1
             ),
         },
         modules={"class_cell": "class_cell.py"},
@@ -2916,7 +2916,7 @@ def test_nonlocal_implicit_class_cell_read_write_delete(
     )
 
 
-_EAGER_CLASS_CELL_SOURCE = """from __future__ import strict
+_EAGER_CLASS_CELL_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 __class__ = 100
 def factory():
     class Outer:
@@ -2945,7 +2945,7 @@ def strict_eager_class_cell(tmp_path_factory):
         {
             "eager_cell.py": _EAGER_CLASS_CELL_SOURCE,
             "ordinary_eager_cell.py": _EAGER_CLASS_CELL_SOURCE.replace(
-                "from __future__ import strict", "# ordinary source control", 1
+                "# soac: module(strict_assign=true, checked_attr=true)", "# ordinary source control", 1
             ),
         },
         modules={"eager_cell": "eager_cell.py"},
@@ -3009,7 +3009,7 @@ def test_eager_nested_class_cell_has_distinct_outer_and_inner_owners(
 
 
 _PRIVATE_CLASS_CAPTURE_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from private_capture_support import argument, observe_namespace, observe_target, pause, replace_public_closure
 
 class Base:
@@ -3130,7 +3130,7 @@ def private_class_capture_project(tmp_path_factory):
         {
             "private_capture_model.py": _PRIVATE_CLASS_CAPTURE_SOURCE,
             "ordinary_private_capture.py": _PRIVATE_CLASS_CAPTURE_SOURCE.replace(
-                "from __future__ import strict", "# ordinary metadata control", 1
+                "# soac: module(strict_assign=true, checked_attr=true)", "# ordinary metadata control", 1
             ),
             "private_capture_support.py": """
 from collections.abc import Callable
@@ -3188,18 +3188,13 @@ def argument(should_fail: bool) -> bool:
 """,
         },
         modules={"private_capture_model": "private_capture_model.py"},
-        policy="""
-[tool.soac.strict]
-include = ["private_capture_model.py"]
-checked_fields = "supported_annotations"
-""",
     )
     # Native class ownership alone does not enable field predicates. Assert
     # the actual exported policy before treating a write as a checked boundary.
     shards = list((project.root / "artifacts/objects").glob("*.soac-types"))
     assert len(shards) == 1
     facts = json.loads(shards[0].read_text())
-    assert facts["language_policy"]["checked_fields"] == "supported_annotations"
+    assert facts["language_policy"]["checked_attr"] is True
     return project
 
 
@@ -3535,7 +3530,7 @@ def test_private_lexical_cells_live_with_their_function_or_suspended_frame_only(
 
 
 _TEMPORARY_LIFETIME_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import gc
 
 def failed_unpack(make, record, reject, key):
@@ -3594,7 +3589,7 @@ def suspended_live_operand(make, record, reject, key):
 
 
 _UNPACKED_SETITEM_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def unpacked_subscript_target(make, record, reject, key):
     try:
@@ -3627,7 +3622,7 @@ _SETITEM_LIFETIME_CASES = (
 
 
 def _operand_lifetime_project(tmp_path_factory, label, source):
-    ordinary = source.replace("from __future__ import strict\n", "", 1)
+    ordinary = source.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
     return create_strict_project(
         tmp_path_factory.mktemp(label),
         {
@@ -3809,7 +3804,7 @@ def test_assignment_operands_preserve_exceptions_suspension_and_cleanup(
 
 
 _AUGMENTED_AWAIT_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 async def augmented_name(make, wait):
     value = make()
@@ -3942,7 +3937,7 @@ def test_augmented_await_retires_each_operand_once(
 
 
 _SETATTR_OPERAND_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def attribute_assignment(target, make):
     target.value = make()
@@ -4031,7 +4026,7 @@ def setattr_operand_project(tmp_path_factory):
 @pytest.mark.parametrize("outcome", ["success", "error"])
 def test_native_attribute_assignment_replacement_ownership(outcome):
     namespace = {}
-    exec(_SETATTR_OPERAND_SOURCE.replace("from __future__ import strict\n", "", 1), namespace)
+    exec(_SETATTR_OPERAND_SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1), namespace)
     exec(_SETATTR_OPERAND_OBSERVER, namespace)
     events = namespace["observe_attribute_assignment"](
         namespace["attribute_assignment"], outcome, native_schedule=True
@@ -4079,7 +4074,7 @@ def test_attribute_assignment_preserves_callbacks_and_cleans_up(
 
 
 _SETATTR_CAPTURE_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def captured_receiver(first, second, make):
     first().value = make()
@@ -4208,7 +4203,7 @@ def setattr_capture_project(tmp_path_factory):
 @pytest.mark.parametrize("outcome", ["success", "receiver-error", "setter-error"])
 def test_native_attribute_assignment_captured_owners(case, outcome):
     namespace = {}
-    exec(_SETATTR_CAPTURE_SOURCE.replace("from __future__ import strict\n", "", 1), namespace)
+    exec(_SETATTR_CAPTURE_SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1), namespace)
     exec(_SETATTR_CAPTURE_OBSERVER, namespace)
     events = namespace["observe_captured_attribute_assignment"](
         namespace[case], case, outcome, native_schedule=True
@@ -4296,7 +4291,7 @@ def test_attribute_assignment_captured_receivers_preserve_identity_and_cleanup(
 
 
 _SETATTR_BORROWED_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def source_local(target, value):
     target.value = value
@@ -4346,7 +4341,7 @@ def test_attribute_assignment_source_local_preserves_identity_and_cleanup(
 
 
 _AUGMENTED_OPERAND_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def local_target(start, update, target, key, record):
     value = start()
@@ -4386,7 +4381,7 @@ def augmented_operand_project(tmp_path_factory):
         {
             "augmented_operand_model.py": _AUGMENTED_OPERAND_SOURCE,
             "ordinary_augmented_operand_model.py": _AUGMENTED_OPERAND_SOURCE.replace(
-                "from __future__ import strict\n", "", 1
+                "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
             ),
         },
         modules={"augmented_operand_model": "augmented_operand_model.py"},
@@ -4676,7 +4671,7 @@ def test_terminal_source_owners_preserve_outer_handler_and_release_payloads(
 
 
 _PREFIXED_SOURCE_BINDINGS = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 _dp_module_value = 40
 
@@ -4714,7 +4709,7 @@ def prefixed_source_bindings_project(tmp_path_factory):
         {
             "prefixed_model.py": _PREFIXED_SOURCE_BINDINGS,
             "ordinary_prefixed_model.py": _PREFIXED_SOURCE_BINDINGS.replace(
-                "from __future__ import strict", ""
+                "# soac: module(strict_assign=true, checked_attr=true)", ""
             ),
         },
         modules={"prefixed_model": "prefixed_model.py"},
@@ -4767,7 +4762,7 @@ def validate(module):
 # schedule control. SOAC comparisons exclude transient counts and opcode choice.
 
 _SOURCE_ARGUMENT_OWNERSHIP_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def argument_keep(value, probe, make, finish):
     probe("entered")
@@ -5042,7 +5037,7 @@ def test_native_source_argument_owner_handoff(case):
     namespace = {}
     exec(
         _SOURCE_ARGUMENT_OWNERSHIP_SOURCE.replace(
-            "from __future__ import strict\n", "", 1
+            "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
         ),
         namespace,
     )
@@ -5304,7 +5299,7 @@ assert _soac_ext.strict_function_entry_kind(function) == expected_entry
 
 
 _ANNOTATION_ONLY_RUNTIME_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import InitVar, dataclass, field
 from typing import Any, cast
 from annotation_runtime_support import body_error, default_value, events, factory
@@ -5389,7 +5384,9 @@ def annotation_only_runtime(tmp_path_factory, request):
         tmp_path_factory.mktemp(f"annotation-only-runtime-{request.node.name}-{backend}"),
         {
             "fields_enabled.py": _ANNOTATION_ONLY_RUNTIME_SOURCE,
-            "fields_disabled.py": _ANNOTATION_ONLY_RUNTIME_SOURCE,
+            "fields_disabled.py": _ANNOTATION_ONLY_RUNTIME_SOURCE.replace(
+                "checked_attr=true", "checked_attr=false", 1
+            ),
             "annotation_runtime_support.py": """
 from typing import Any
 
@@ -5411,15 +5408,6 @@ def factory() -> Any:
             "fields_enabled": "fields_enabled.py",
             "fields_disabled": "fields_disabled.py",
         },
-        policy="""
-[tool.soac.strict]
-include = ["fields_enabled.py", "fields_disabled.py"]
-checked_fields = "supported_annotations"
-
-[[tool.soac.strict.overrides]]
-include = ["fields_disabled.py"]
-checked_fields = "disabled"
-""",
         backend=backend,
     )
     return project, entry_interpreter
@@ -5427,13 +5415,15 @@ checked_fields = "disabled"
 
 def _run_annotation_only_case(fixture, module_name, validation):
     project, entry_interpreter = fixture
+    checked_attr = project.policies[module_name]["checked_attr"]
     ordinary_source = _ANNOTATION_ONLY_RUNTIME_SOURCE.replace(
-        "from __future__ import strict\n", "", 1
+        "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
     )
     project.run_case(
         module_name,
         "def validate_module(module):\n" + textwrap.indent(
-            f"ordinary_source = {ordinary_source!r}\n" + """
+            f"ordinary_source = {ordinary_source!r}\n"
+            f"checked_attr = {checked_attr!r}\n" + """
 import ctypes
 import gc
 import sys
@@ -5461,10 +5451,11 @@ assert _soac_ext.strict_module_diagnostics(module)['sealed']
 assert _soac_ext.strict_module_diagnostics(ordinary) is None
 for name in ('Token', 'Methods', 'Stored', 'Record', 'Slotted'):
     selected, control = getattr(module, name), getattr(ordinary, name)
-    assert class_owner(selected) and sealed(selected) == 1, name
+    assert bool(class_owner(selected)) is checked_attr, name
+    assert sealed(selected) == int(checked_attr), name
     assert not class_owner(control) and sealed(control) == 0, name
 for name in ('Record', 'Slotted'):
-    assert function_owner(getattr(module, name).__init__)
+    assert bool(function_owner(getattr(module, name).__init__)) is checked_attr
     assert not function_owner(getattr(ordinary, name).__init__)
 """
             + validation,
@@ -5483,7 +5474,7 @@ for name in ('Record', 'Slotted'):
 def test_annotations_do_not_add_runtime_argument_or_return_checks(annotation_only_runtime):
     _run_annotation_only_case(
         annotation_only_runtime,
-        "fields_disabled",
+        "fields_enabled",
         """
 c_call = api('PyObject_Call', obj, obj, obj, obj)
 marker = object()
@@ -6150,7 +6141,7 @@ def test_native_common_owner_metadata_does_not_pin_function_code_defaults_or_cel
     project = create_strict_project(
         tmp_path,
         {
-            "native_owner.py": "from __future__ import strict\n" + _NATIVE_COMMON_OWNER_CYCLE_SOURCE,
+            "native_owner.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _NATIVE_COMMON_OWNER_CYCLE_SOURCE,
             "ordinary_owner.py": _NATIVE_COMMON_OWNER_CYCLE_SOURCE,
         },
         modules={"native_owner": "native_owner.py"},
@@ -6232,7 +6223,7 @@ __builtins__ = INITIAL_BUILTINS
     project = create_strict_project(
         tmp_path,
         {
-            "builtin_birth.py": "from __future__ import strict\n" + source,
+            "builtin_birth.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + source,
             "ordinary_builtin_birth.py": source,
         },
         modules={"builtin_birth": "builtin_birth.py"},
@@ -6299,7 +6290,7 @@ def test_native_common_owner_provider_replacement_keeps_ordinary_calls_and_actua
         tmp_path,
         {
             "native_provider_pair.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from provider_pair_probe import exercise
 
 def build():
@@ -6425,7 +6416,7 @@ pair = build()
     project = create_strict_project(
         tmp_path,
         {
-            "provider_defaults.py": "from __future__ import strict\n" + body,
+            "provider_defaults.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + body,
             "ordinary_provider_defaults.py": body,
             "provider_defaults_probe.py": f"""
 import weakref
@@ -6498,7 +6489,7 @@ def prepare(function):
 
 def _native_function_capi_validation(body):
     """Reuse the original signed subject and its ordinary source-only control."""
-    ordinary_source = _SOURCE.replace("from __future__ import strict\n", "", 1)
+    ordinary_source = _SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
     return (
         "import ctypes\nimport types\nimport pytest\nimport checked\n"
         "from soac import _soac_ext\n"

@@ -325,7 +325,10 @@ mod tests {
             "example",
             source,
             SourceDialect::SoacStrict,
-            ResolvedStrictPolicy::default(),
+            ResolvedStrictPolicy {
+                strict_assign: true,
+                ..ResolvedStrictPolicy::default()
+            },
         )?;
         let shard = encode_module_shard(&facts)?;
         let manifest =

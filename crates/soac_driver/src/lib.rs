@@ -286,7 +286,10 @@ mod tests {
     fn prepare_suspended_owner_fixture(source: &str) -> BlockPyModule<BlockPyModuleShape> {
         use soac_contracts::*;
         let hash = Fingerprint::digest(b"suspended-owner-phase-test");
-        let policy = ResolvedStrictPolicy::default();
+        let policy = ResolvedStrictPolicy {
+            strict_assign: true,
+            ..Default::default()
+        };
         let environment = ArtifactEnvironment {
             ty_revision: "d2620d7312875790b114d821721cddf253f66423".into(),
             checker_source_fingerprint: hash,

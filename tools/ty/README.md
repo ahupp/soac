@@ -5,13 +5,15 @@
 analyzed Python modules, parse diagnostic prose, or establish runtime
 capabilities. The JIT does not link this workspace.
 
-Artifact schema 6 and strict-contract version 2 remove runtime parameter/return
-checking policy. Removed call-policy keys are rejected even in unmatched
-per-file overrides; old signed publications must be regenerated, not silently
-reinterpreted. Function signatures remain static facts. Only selected field
+Artifact schema 7, strict-contract version 3, SOAC dialect version 2, and
+deployment schema 3 bind resolved source-comment policy. Retired TOML strictness
+tables and runtime parameter/return policy keys are rejected; old signed
+publications must be regenerated, not silently reinterpreted.
+Function signatures remain static facts. Only selected field
 writes create runtime value obligations, including when ordinary generated
 constructors perform those writes. The native/runtime migration remains under
 implementation until the matching build and compatibility gates pass.
+Optimization and benchmarks remain deferred until separately requested.
 
 The schema retains field annotation, nominal-binding, and semantic base
 provenance. The semantic exporter
@@ -65,7 +67,7 @@ Quotation alone does not imply an empty provider closure: native method
 providers can retain their special class-dictionary capture. Runtime layouts
 must match the actual native provider, not an assumption based on string syntax.
 Unsupported binding expressions remain unresolved, not guessed from names or
-annotation text. Schema-1 through schema-5 artifacts and signatures must be
+annotation text. Schema-1 through schema-6 artifacts and signatures must be
 regenerated; omitted provenance is not accepted through compatibility defaults.
 
 Direct bases and logical MRO entries use an explicit `BaseReference`: a
@@ -124,19 +126,52 @@ deferred until publication is separately requested.
 Use `just fmt-rust soac_ty` and `just fmt-rust-check soac_ty` for this
 standalone Cargo workspace; the recipes select its manifest explicitly.
 
-The project being analyzed needs an explicit policy in `pyproject.toml`:
+Policy comes from Python source comments, not a configuration file. Both
+`strict_assign` and `checked_attr` default to `false`. For package defaults in
+`pkg/__init__.py`:
 
-```toml
-[tool.soac.strict]
-include = ["**/*.py"]
-exclude = ["generated/**"]
+```python
+# soac: package(strict_assign=true, checked_attr=true)
 ```
 
-Selected strict modules must contain `from __future__ import strict` in a valid
-future-import position. Merely importing a strict module does not opt another
-module in. Configuration resolves to the shared `ResolvedStrictPolicy` defaults;
-per-path changes use `[[tool.soac.strict.overrides]]` with `include`/`exclude`
-patterns and shared policy fields. There is no per-class eligibility list.
+Package settings inherit outer-to-inner through `__init__.py`; omitted keys
+retain the inherited value. A module override changes only that file. For
+example, `pkg/model.py` can keep checked classes without sealing its globals:
+
+```python
+# soac: module(strict_assign=false)
+
+class Checked:
+    value: int
+
+# soac: class(checked_attr=false)
+class Dynamic:
+    pass
+```
+
+Package/module directives are standalone header comments before the first
+statement other than an initial docstring and future imports. A class directive
+precedes the class and all its decorators at the same indentation; it binds the
+exact class AST node, including nested or repeated-name declarations, not a
+name pattern. Class directives accept only `checked_attr`, with either `true`
+or `false`; missing keys inherit. They do not implicitly select nested classes.
+No per-class annotations or eligibility list are required.
+
+`strict_assign` selects module assignment invariants independently of
+`checked_attr`, which selects eligible class invariants and supported field-write
+checks. Framework exclusions still cause dynamic fallback. An explicit class
+opt-out adds no new local contract but cannot revoke checks inherited from a
+protected base. Module `strict_assign=true` does not force `checked_attr=true`,
+and `checked_attr=true` does not seal otherwise mutable module globals.
+
+The old `[tool.soac.strict]` table and its overrides are rejected, not converted.
+Ordinary checker configuration remains supported and authenticated. Importing
+a participating module does not opt its importer in. Ordinary CPython ignores
+these comments; enforcement requires authenticated startup and actual runtime
+module/type binding. Neither test helpers nor scenario adapters insert future
+imports. The trusted raw compiler internally sets the strict ownership guard
+flag when compiling verified source; it does not rewrite source or resolve
+policy from that flag.
 
 Create a private build-side key outside the artifact output directory:
 
@@ -164,6 +199,12 @@ explicit modules, discovery excludes `.git`, `.jj`, `.venv`, `vendor`, `work`,
 `target`, `__pycache__`, and the chosen artifact output directory. These are
 discovery exclusions, not import exclusions: an explicitly consumed import into
 one of those directories is still resolved and authenticated.
+
+This command publishes selected contracts; it is not a replacement for ordinary
+`ty check`. Type diagnostics in unselected ordinary inputs are informational and
+do not block selected siblings. Consumed source bytes and configuration remain
+authenticated. Unsuppressed errors in selected exports still block publication;
+syntax, source-policy and authentication failures also remain fatal.
 
 The initial supported target is CPython 3.15 on Linux. The isolated interpreter
 probe uses `-I -S -B`; it reports actual site-packages/stdlib paths and the loaded
@@ -235,7 +276,7 @@ final input revalidation, and atomic replacement. A flush error leaves the
 previous descriptor untouched and removes the private staging file; buffering
 does not change the serialized bytes or any observation boundary.
 
-The signing seed is never stored in the artifact directory. The schema-2 descriptor
+The signing seed is never stored in the artifact directory. The schema-3 descriptor
 contains the public trust anchor, expected generation/environment, selected
 interpreter identity, module policies, dependency source paths and actual per-file
 checker settings, and observed inputs. It is **out-of-band startup authority** and must
@@ -301,9 +342,8 @@ then checks its resolved MRO recursively. Ordinary, unresolved, cyclic, ignored,
 or framework-managed bases still make the subclass dynamic. These are source
 proposals only: runtime admission must independently match the actual protected
 base objects and their exact source identities. External dataclass/transform
-bases currently remain dynamic because the four-argument exporter does not
-receive another file's effective adapter policy; the importing file's policy
-cannot authorize that transform.
+bases remain dynamic when their defining policy cannot be established; the
+importing file's source policy cannot authorize a foreign transform.
 
 The offline export path registers and emits these strict diagnostics using the
 shared policy and real checker symbol/member/call queries:
@@ -315,15 +355,16 @@ shared policy and real checker symbol/member/call queries:
   `strict-incompatible-override`.
 - `strict-incompatible-field-write` when supported checked fields are enabled.
 
-General-function global writes are checked as operations that must be valid
-after sealing. The exporter does not claim module-body sealing during circular
-imports. Arbitrary aliases/reflection/native callbacks, external class
+When `strict_assign` is selected, general-function global writes are checked as
+operations that must be valid after sealing. This is an assignment invariant,
+not function argument/return enforcement. The exporter does not claim module-body
+sealing during circular imports. Arbitrary aliases/reflection/native callbacks, external class
 participation, physical undeclared-field/dictionary-layout restrictions, and
 unsupported framework construction still require runtime enforcement or
 dynamic fallback. These diagnostics are emitted by the explicit SOAC exporter,
 not ordinary `ty check`; ordinary Python defaults and checking stay isolated.
 
-The artifact only proposes facts. Actual type construction, checked boundaries,
+The artifact only proposes facts. Actual type construction, checked field writes,
 module/class sealing, native mutation barriers, and optimization eligibility are
 separate runtime work. A signed shard alone cannot authorize direct dispatch or
 physical storage assumptions.

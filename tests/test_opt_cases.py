@@ -89,7 +89,7 @@ def _opt_project(root: Path, module_name: str, source: str, environment):
         patch.setenv("SOAC_OPT_MODE", "profile")
         return create_strict_project(
             root / "strict-publication",
-            {f"{module_name}.py": "from __future__ import strict\n" + source},
+            {f"{module_name}.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + source},
             modules={module_name: f"{module_name}.py"},
             backend="soac",
         )

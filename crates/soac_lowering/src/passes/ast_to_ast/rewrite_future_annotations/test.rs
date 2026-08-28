@@ -15,7 +15,7 @@ fn rewrite_module_with_metadata(
         .expect("parse should succeed")
         .into_syntax();
     let future_features =
-        rewrite(&mut module.body, canonical).expect("future imports should be valid");
+        rewrite(&mut module.body, canonical, false).expect("future imports should be valid");
     (future_features, module.body)
 }
 
@@ -110,7 +110,7 @@ fn rejects_late_and_nested_future_statements_before_scope_rewriting() {
         "if True:\n    from __future__ import strict\n",
     ] {
         let mut module = parse_module(source).unwrap().into_syntax();
-        let error = rewrite(&mut module.body, None).expect_err(source);
+        let error = rewrite(&mut module.body, None, false).expect_err(source);
         assert!(matches!(
             error.error,
             ruff_python_parser::ParseErrorType::OtherError(_)
@@ -129,22 +129,26 @@ fn invalid_future_import_reports_parse_error() {
         .expect("parse should succeed")
         .into_syntax();
 
-    let err = rewrite(&mut module.body, None).expect_err("future import should be invalid");
+    let err = rewrite(&mut module.body, None, false).expect_err("future import should be invalid");
 
     assert!(err.to_string().contains("not_a_feature"), "{err}");
 }
 
 #[test]
-fn strict_future_annotations_require_their_exact_native_range_entries() {
-    let source = "from __future__ import strict, annotations\nvalue: tuple[int, str]\n";
-    let original = parse_module(source).unwrap().into_syntax();
-    let mut missing = original.body.clone();
-    let error = rewrite(&mut missing, None).unwrap_err();
-    assert_eq!(
-        &source[error.location.start().to_usize()..error.location.end().to_usize()],
-        "tuple[int, str]",
-    );
-    let canonical = crate::CanonicalAnnotationStrings::from_native_entries(source, []).unwrap();
-    let mut incomplete = original.body;
-    assert!(rewrite(&mut incomplete, Some(&canonical)).is_err());
+fn authenticated_future_annotations_require_their_exact_native_range_entries() {
+    for source in [
+        "from __future__ import strict, annotations\nvalue: tuple[int, str]\n",
+        "# soac: module(checked_attr=true)\nfrom __future__ import annotations\nvalue: tuple[int, str]\n",
+    ] {
+        let original = parse_module(source).unwrap().into_syntax();
+        let mut missing = original.body.clone();
+        let error = rewrite(&mut missing, None, true).unwrap_err();
+        assert_eq!(
+            &source[error.location.start().to_usize()..error.location.end().to_usize()],
+            "tuple[int, str]",
+        );
+        let canonical = crate::CanonicalAnnotationStrings::from_native_entries(source, []).unwrap();
+        let mut incomplete = original.body;
+        assert!(rewrite(&mut incomplete, Some(&canonical), true).is_err());
+    }
 }

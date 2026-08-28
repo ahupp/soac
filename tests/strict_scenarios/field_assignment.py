@@ -1,4 +1,5 @@
 # module:mod1
+# soac: module(strict_assign=true, checked_attr=true)
 
 class A:
     foo: int = 0

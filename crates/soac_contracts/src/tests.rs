@@ -8,6 +8,14 @@ use crate::*;
 const SOURCE: &[u8] = b"from __future__ import strict\n\nclass Independent:\n    pass\n\nclass Box:\n    value: int\n    def get(self) -> int:\n        return self.value\n\ndef read(box: Box) -> int:\n    return box.get()\n";
 const SIGNING_SEED: [u8; 32] = [19; 32];
 
+fn checked_module_policy() -> ResolvedStrictPolicy {
+    ResolvedStrictPolicy {
+        strict_assign: true,
+        checked_attr: true,
+        class_overrides: Vec::new(),
+    }
+}
+
 fn fingerprint(label: &str) -> Fingerprint {
     Fingerprint::digest(label.as_bytes())
 }
@@ -88,7 +96,7 @@ fn example_facts() -> ModuleTypeFacts {
         "pkg.example",
         SOURCE,
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .expect("fixture module");
     let class_start = range(SOURCE, "class Box:").start;
@@ -334,7 +342,7 @@ fn facts_with_field_nominal_bindings() -> ModuleTypeFacts {
         "pkg.fields",
         source,
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .unwrap();
     let mut template = example_facts().classes.remove(0);
@@ -653,7 +661,7 @@ fn static_dynamic_method_policy_does_not_cross_nested_lexical_owners() {
         "nested_owners",
         NESTED,
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .unwrap();
     let getter = definition(
@@ -1119,7 +1127,7 @@ fn source_policy_and_legacy_identity_mismatches_fail_before_facts_are_returned()
         Err(ContractError::SourceMismatch(_))
     ));
     let mut policy = fixture.facts.language_policy.clone();
-    policy.checked_fields = CheckedFieldPolicy::SupportedAnnotations;
+    policy.checked_attr = false;
     assert!(matches!(
         manifest.verify_module("pkg.example", SOURCE, &policy, &[], fixture.shard.bytes()),
         Err(ContractError::PolicyMismatch(_))
@@ -1159,7 +1167,7 @@ fn field_binding_selection_depends_only_on_selected_storage_writes() {
     let mut policy = ResolvedStrictPolicy::default();
     assert!(class.required_field_bindings(&policy).is_empty());
 
-    policy.checked_fields = CheckedFieldPolicy::SupportedAnnotations;
+    policy.checked_attr = true;
     assert_eq!(
         class.required_field_bindings(&policy),
         vec![&class.instance_fields[0]]
@@ -1187,7 +1195,7 @@ fn field_binding_selection_depends_only_on_selected_storage_writes() {
         );
     }
     class.instance_fields[0].field_kind = FieldKind::InstanceField;
-    policy.checked_fields = CheckedFieldPolicy::Disabled;
+    policy.checked_attr = false;
     assert!(
         class.required_field_bindings(&policy).is_empty(),
         "a dataclass constructor must not invent a runtime field requirement"
@@ -1197,7 +1205,7 @@ fn field_binding_selection_depends_only_on_selected_storage_writes() {
     transform.generated_methods.clear();
     assert!(class.required_field_bindings(&policy).is_empty());
 
-    policy.checked_fields = CheckedFieldPolicy::SupportedAnnotations;
+    policy.checked_attr = true;
     assert_eq!(
         class.required_field_bindings(&policy),
         vec![&class.instance_fields[0]],
@@ -1221,7 +1229,7 @@ fn removed_function_type_policies_cannot_be_silently_reinterpreted() {
         ("parameter_failure", "type_error"),
         ("return_failure", "type_error"),
     ] {
-        let mut encoded = serde_json::to_value(ResolvedStrictPolicy::default()).unwrap();
+        let mut encoded = serde_json::to_value(checked_module_policy()).unwrap();
         encoded
             .as_object_mut()
             .unwrap()
@@ -1237,7 +1245,10 @@ fn removed_function_type_policies_cannot_be_silently_reinterpreted() {
 fn changed_policy_changes_content_generation_and_cache_identity_for_identical_source() {
     let first = Fixture::new(example_facts());
     let mut changed = example_facts();
-    changed.language_policy.checked_fields = CheckedFieldPolicy::SupportedAnnotations;
+    changed.language_policy.strict_assign = false;
+    for binding in &mut changed.global_bindings {
+        binding.mutability = GlobalMutability::Unknown;
+    }
     let second = Fixture::new(changed);
     assert_eq!(first.facts.module, second.facts.module);
     assert_eq!(first.facts.source_digest, second.facts.source_digest);
@@ -1346,7 +1357,7 @@ fn complete_generation_rejects_missing_or_mixed_shards_and_reuses_unchanged_shar
         "pkg.other",
         other_source,
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .expect("other facts");
     let other = encode_module_shard(&other).expect("other shard");
@@ -1394,7 +1405,7 @@ fn complete_generation_rejects_missing_or_mixed_shards_and_reuses_unchanged_shar
         "pkg.other",
         changed_source,
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .expect("changed facts");
     let changed = encode_module_shard(&changed).expect("changed shard");
@@ -1424,7 +1435,7 @@ fn internal_dependency_versions_cannot_be_mixed_with_another_generation() {
         "pkg.other",
         b"from __future__ import strict\n",
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .expect("other");
     let mut stale = dependency("pkg.example", SOURCE);
@@ -1486,7 +1497,7 @@ fn source_ranges_must_follow_utf8_byte_boundaries() {
         "pkg.unicode",
         source,
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .expect("facts");
     let invalid_start = range(source, "é").start + 1;
@@ -1717,12 +1728,84 @@ fn ordinary_source_does_not_acquire_strict_contracts_from_shared_policy() {
     facts.source_dialect = SourceDialect::OrdinaryPython;
     assert!(matches!(
         encode_module_shard(&facts),
-        Err(ContractError::InvalidStructure(_))
+        Err(ContractError::InvalidPolicy(_))
     ));
-    facts.global_bindings[0].mutability = GlobalMutability::Unknown;
-    facts.classes[0].participation =
-        ParticipationProposal::Dynamic(BTreeSet::from([DynamicClassReason::UnresolvedAnalysis]));
+    facts.language_policy = ResolvedStrictPolicy::default();
+    for binding in &mut facts.global_bindings {
+        binding.mutability = GlobalMutability::Unknown;
+    }
+    for class in &mut facts.classes {
+        class.participation =
+            ParticipationProposal::Dynamic(BTreeSet::from([DynamicClassReason::PolicyOptOut]));
+    }
     encode_module_shard(&facts).expect("ordinary semantic facts can remain dynamic");
+}
+
+#[test]
+fn source_class_rules_are_exact_and_do_not_change_module_bindings_or_nested_defaults() {
+    let outer = SourceRange::new(10, 80);
+    let nested = SourceRange::new(30, 60);
+    let mut policy = ResolvedStrictPolicy::default();
+    assert!(!policy.is_selected());
+    policy.class_overrides.push(ClassPolicyOverride {
+        class_range: outer,
+        checked_attr: true,
+    });
+    assert!(policy.is_selected());
+    assert!(!policy.strict_assign);
+    assert!(policy.checked_attributes(outer));
+    assert!(!policy.checked_attributes(nested));
+    policy.checked_attr = true;
+    policy.class_overrides[0].checked_attr = false;
+    assert!(!policy.checked_attributes(outer));
+    assert!(policy.checked_attributes(nested));
+    assert_eq!(policy.checked_fields(outer), CheckedFieldPolicy::Disabled);
+    assert_eq!(
+        policy.checked_fields(nested),
+        CheckedFieldPolicy::SupportedAnnotations
+    );
+}
+
+#[test]
+fn class_rule_ranges_and_opt_outs_are_validated_before_publication() {
+    let original = example_facts();
+    let class_range = original.classes[0].identity.source_range;
+    for overrides in [
+        vec![ClassPolicyOverride {
+            class_range: SourceRange::new(0, 0),
+            checked_attr: true,
+        }],
+        vec![
+            ClassPolicyOverride {
+                class_range,
+                checked_attr: true
+            };
+            2
+        ],
+        vec![ClassPolicyOverride {
+            class_range,
+            checked_attr: false,
+        }],
+    ] {
+        let mut facts = original.clone();
+        facts.language_policy.class_overrides = overrides;
+        assert!(matches!(
+            encode_module_shard(&facts),
+            Err(ContractError::InvalidPolicy(_))
+        ));
+    }
+    let mut facts = original;
+    facts
+        .language_policy
+        .class_overrides
+        .push(ClassPolicyOverride {
+            class_range,
+            checked_attr: false,
+        });
+    facts.classes[0].participation =
+        ParticipationProposal::Dynamic(BTreeSet::from([DynamicClassReason::PolicyOptOut]));
+    encode_module_shard(&facts)
+        .expect("local opt-out leaves the rest of the admitted module selected");
 }
 
 #[test]
@@ -1876,14 +1959,20 @@ fn dataclass_schema_preserves_pseudofields_defaults_and_generated_origins() {
     assert!(generated.implementation.is_none());
     assert!(generated.generated.is_some());
 
-    facts.language_policy.adapters.dataclasses = StdlibDataclassPolicy::Dynamic;
+    facts
+        .language_policy
+        .class_overrides
+        .push(ClassPolicyOverride {
+            class_range: facts.classes[0].identity.source_range,
+            checked_attr: false,
+        });
     assert!(matches!(
         encode_module_shard(&facts),
         Err(ContractError::InvalidPolicy(_))
     ));
     facts.classes[0].participation =
         ParticipationProposal::Dynamic(BTreeSet::from([DynamicClassReason::FrameworkManaged]));
-    encode_module_shard(&facts).expect("disabled adapter still permits dynamic dataclass facts");
+    encode_module_shard(&facts).expect("class opt-out still permits dynamic dataclass facts");
 }
 
 #[test]
@@ -2080,7 +2169,7 @@ fn logical_inheritance_cycles_are_rejected_before_publication() {
         "pkg.cycle",
         source,
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .expect("module");
     let first_start = range(source, "class A:").start;
@@ -2180,7 +2269,7 @@ fn one_generation_cannot_assign_conflicting_external_dependency_identities() {
         "pkg.other",
         b"from __future__ import strict\n",
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .expect("second module");
     let mutations: &[fn(&mut DependencyFingerprint)] = &[
@@ -2221,7 +2310,7 @@ fn optional_dependency_contracts_cannot_hide_conflicts_between_consumers() {
             name,
             b"from __future__ import strict\n",
             SourceDialect::SoacStrict,
-            ResolvedStrictPolicy::default(),
+            checked_module_policy(),
         )
         .expect("module");
         let mut dependency = producer.clone();
@@ -2465,7 +2554,7 @@ fn deployment_fixture() -> (AnalysisInputFixture, StrictArtifactDeployment) {
             .map(|name| DeployedModule {
                 module_name: name.into(),
                 source_path: fixture.0.join(format!("{name}.py")),
-                policy: ResolvedStrictPolicy::default(),
+                policy: checked_module_policy(),
             })
             .to_vec(),
         analysis_dependencies: vec![dependency],
@@ -2545,7 +2634,7 @@ fn analysis_snapshot_shares_actual_bytes_without_sharing_consumer_domains() {
     deployment.modules.push(DeployedModule {
         module_name: "external".into(),
         source_path: fixture.0.join("external.py"),
-        policy: ResolvedStrictPolicy::default(),
+        policy: checked_module_policy(),
     });
     let snapshot = deployment.verified_analysis_snapshot().unwrap();
     for module in &deployment.modules {
@@ -2598,7 +2687,7 @@ fn source_path_role_consumer_and_per_file_policy_are_independent_of_signed_depen
         "model",
         SOURCE,
         SourceDialect::SoacStrict,
-        ResolvedStrictPolicy::default(),
+        checked_module_policy(),
     )
     .unwrap();
     facts.consumed_dependencies = deployment.verified_analysis_dependencies("model").unwrap();
@@ -2649,7 +2738,7 @@ fn source_path_role_consumer_and_per_file_policy_are_independent_of_signed_depen
             4 => changed.modules.push(DeployedModule {
                 module_name: "external".into(),
                 source_path: fixture.0.join("external.py"),
-                policy: ResolvedStrictPolicy::default(),
+                policy: checked_module_policy(),
             }),
             _ => unreachable!(),
         }

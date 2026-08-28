@@ -4076,7 +4076,11 @@ mod tests {
             "interpreter_source_fixture",
             source.as_bytes(),
             SourceDialect::SoacStrict,
-            ResolvedStrictPolicy::default(),
+            ResolvedStrictPolicy {
+                strict_assign: true,
+                checked_attr: true,
+                ..Default::default()
+            },
         )
         .unwrap()
     }

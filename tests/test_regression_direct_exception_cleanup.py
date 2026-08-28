@@ -88,7 +88,7 @@ def _run_apply_module(
     filename = f"{module_name}.py"
     project = create_strict_project(
         tmp_path / "strict",
-        {filename: "from __future__ import strict\n" + textwrap.dedent(source)},
+        {filename: "# soac: module(strict_assign=true, checked_attr=true)\n" + textwrap.dedent(source)},
         modules={module_name: filename},
         backend="soac",
     )
@@ -245,7 +245,7 @@ def test_custom_new_only_field_reports_checker_attribute_limit(tmp_path: Path) -
     # test_import_time_constructor_registration.py.
     errors = assert_strict_source_rejected(
         tmp_path / "strict-rejection",
-        "from __future__ import strict\n" + textwrap.dedent(_CUSTOM_NEW_SOURCE),
+        "# soac: module(strict_assign=true, checked_attr=true)\n" + textwrap.dedent(_CUSTOM_NEW_SOURCE),
         module_name="direct_constructor_custom_new_fallback",
         diagnostic="unresolved-attribute",
     )

@@ -227,7 +227,7 @@ pub fn interpreter_module_diagnostics<'py>(
     let globals =
         unsafe { Borrowed::<PyAny>::from_ptr_or_err(py, ffi::PyModule_GetDict(module.as_ptr()))? }
             .cast::<PyDict>()?;
-    let sealed = execution.is_sealed(py, &globals, &verified)?;
+    let ready = execution.is_ready(py, &globals, &verified)?;
     let owner = StrictStateRef::<RootExecutionData>::from_owner(owner)?;
     if owner.data().module_identity != module.as_ptr() as usize {
         return Err(strict_runtime_unavailable(
@@ -238,9 +238,15 @@ pub fn interpreter_module_diagnostics<'py>(
     let entered = owner.data().original_code_entered.get();
     let facts = verified.type_facts();
     let result = PyDict::new(py);
-    result.set_item("schema", 1)?;
+    result.set_item("schema", 2)?;
     result.set_item("backend", "cpython")?;
-    result.set_item("sealed", sealed)?;
+    result.set_item("ready", ready)?;
+    result.set_item("strict_assign", facts.facts().language_policy.strict_assign)?;
+    result.set_item("checked_attr", facts.facts().language_policy.checked_attr)?;
+    result.set_item(
+        "sealed",
+        ready && facts.facts().language_policy.strict_assign,
+    )?;
     result.set_item("initializer_entry_kind", entered.then_some("original_code"))?;
     result.set_item("original_code_entered", entered)?;
     result.set_item("module_name", &facts.facts().module.module_name)?;

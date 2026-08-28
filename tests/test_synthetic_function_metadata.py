@@ -29,7 +29,7 @@ def metadata_project(tmp_path_factory, request):
     return create_strict_project(
         tmp_path_factory.mktemp(f"source-metadata-{request.param}"),
         {
-            "metadata_source.py": "from __future__ import strict\n" + _MODULE_SOURCE,
+            "metadata_source.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _MODULE_SOURCE,
             "metadata_ordinary.py": _MODULE_SOURCE,
         },
         modules={"metadata_source": "metadata_source.py"},

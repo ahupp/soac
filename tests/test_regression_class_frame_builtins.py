@@ -49,7 +49,7 @@ class Invalid:
         # Ordinary checker errors remain blocking strict-language diagnostics;
         # this analysis-only rejection does not claim a runtime admission.
         assert_strict_source_rejected(
-            tmp_path, "from __future__ import strict\n" + textwrap.dedent(source),
+            tmp_path, "# soac: module(strict_assign=true, checked_attr=true)\n" + textwrap.dedent(source),
             module_name="class_frame_builtins", diagnostic="unresolved-reference",
         )
         return
@@ -100,7 +100,7 @@ def validate_module(module):
         return
     project = create_strict_project(
         tmp_path,
-        {"class_context_callback.py": "from __future__ import strict\n" + textwrap.dedent(source)},
+        {"class_context_callback.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + textwrap.dedent(source)},
         modules={"class_context_callback": "class_context_callback.py"}, backend="cpython",
     )
     project.run_case(
@@ -156,7 +156,7 @@ def validate_module(module):
     path = f"{name}.py"
     project = create_strict_project(
         tmp_path,
-        {path: "from __future__ import strict\n" + textwrap.dedent(source)},
+        {path: "# soac: module(strict_assign=true, checked_attr=true)\n" + textwrap.dedent(source)},
         modules={name: path}, backend=backend,
     )
     project.run_case(

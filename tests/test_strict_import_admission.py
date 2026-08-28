@@ -44,7 +44,7 @@ def accept(value: Literal["\ud800"]) -> Literal["\ud800"]: return value""",
     ids=["plain", "f-string", "f-format", "t-string", "t-format", "literal-contract"],
 )
 def test_strict_source_surrogate_escape_is_rejected_before_publication(tmp_path, body):
-    source = f"from __future__ import strict\n{body}\n"
+    source = f"# soac: module(strict_assign=true, checked_attr=true)\n{body}\n"
     error = assert_strict_source_rejected(
         tmp_path,
         source,
@@ -61,7 +61,7 @@ def strict_source_literal_controls(tmp_path_factory):
         tmp_path_factory.mktemp("strict-source-literal-controls"),
         {
             "literal_controls.py": r"""
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from typing import Literal
                 import ordinary_literals
 
@@ -137,7 +137,7 @@ def test_strict_module_diagnostics_report_actual_seal_not_public_attributes(
         tmp_path,
         {
             "observed.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 import sys
                 from soac import _soac_ext
                 initializing = _soac_ext.strict_module_diagnostics(sys.modules[__name__])
@@ -194,12 +194,12 @@ def test_dependency_changed_after_loader_construction_blocks_later_admission(
         tmp_path,
         {
             "first.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 def answer() -> int:
                     return 1
             """,
             "second.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from dependency import VALUE
                 from audit import events
                 events.append("second body executed")
@@ -340,7 +340,7 @@ def test_native_prefix_binds_selected_venv_and_ignores_sys_prefix_spoof(tmp_path
         tmp_path / "contract",
         {
             "prefix_target.py": """
-            from __future__ import strict
+            # soac: module(strict_assign=true, checked_attr=true)
             from prefix_dependency import VALUE
             def read() -> int:
                 return VALUE
@@ -539,7 +539,7 @@ def test_native_caller_enters_authenticated_strict_function_without_adopting_pla
         tmp_path,
         {
             "strict_target.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 def add(value: int) -> int:
                     return value + 1
             """,
@@ -551,7 +551,7 @@ def test_native_caller_enters_authenticated_strict_function_without_adopting_pla
                 saved = []
             """,
             "failed_target.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 import sys
                 import ordinary_sink
                 current = sys.modules[__name__]
@@ -927,17 +927,17 @@ def strict_import_protocols(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-import-protocols"),
         {
-            "enabled/enabled_probe.py": "from __future__ import strict\nVALUE = 1\n",
+            "enabled/enabled_probe.py": "# soac: module(strict_assign=true, checked_attr=true)\nVALUE = 1\n",
             "skipped/skipped_probe.py": "VALUE = 2\n",
             "recursive_bg_pkg/__init__.py": "",
             "recursive_bg_pkg/child.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 VALUE = 5
                 def child_value():
                     return VALUE
             """,
             "recursive_bg_pkg/parent.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from recursive_bg_pkg import child
                 VALUE = child.VALUE + 1
                 def parent_value():
@@ -945,25 +945,25 @@ def strict_import_protocols(tmp_path_factory):
             """,
             "immediate_bg_pkg/__init__.py": "",
             "immediate_bg_pkg/mod.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 def identity(value):
                     return value
             """,
             "nested_function_helper.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 def outer():
                     def inner():
                         return 7
                     return inner()
             """,
             "nested_function_main.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 import nested_function_helper
                 VALUE = nested_function_helper.outer()
             """,
             "reload_audit.py": "events = []\n",
             "reload_helper.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 import reload_audit
                 reload_audit.events.append("executed")
                 VALUE = 1
@@ -1150,7 +1150,7 @@ def strict_relative_star_package(tmp_path_factory):
         tmp_path_factory.mktemp("strict-relative-star-package"),
         {
             "relative_star_pkg/__init__.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from .child import *
                 VALUE = child.MARKER
             """,
@@ -1185,21 +1185,22 @@ def test_strict_module_docstring_is_visible_before_body_callbacks(tmp_path):
         {
             "doc_plain.py": '''
                 """plain docs"""
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from doc_support import observe
                 observe(__name__)
                 VALUE = 1
             ''',
             "doc_deferred.py": '''
                 """deferred docs"""
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from doc_support import observe
                 observe(__name__)
                 VALUE: int = 1
             ''',
             "doc_stringized.py": '''
                 """stringized docs"""
-                from __future__ import strict, annotations
+                # soac: module(strict_assign=true, checked_attr=true)
+                from __future__ import annotations
                 from doc_support import observe
                 observe(__name__)
                 VALUE: int = 1
@@ -1522,12 +1523,15 @@ def test_reviewed_import_regression_rejection_does_not_publish_authority(
 
 
 
-def test_cpython_backend_module_diagnostics_authenticate_original_execution(tmp_path):
+@pytest.mark.parametrize("checked_attr", [False, True])
+def test_cpython_backend_module_diagnostics_authenticate_original_execution(
+    tmp_path, checked_attr
+):
     project = create_strict_project(
         tmp_path,
         {
-            "observed.py": """
-                from __future__ import strict
+            "observed.py": f"""
+                # soac: module(strict_assign=true, checked_attr={str(checked_attr).lower()})
                 import sys
                 from soac import _soac_ext
                 initializing = _soac_ext.strict_module_diagnostics(sys.modules[__name__])
@@ -1551,8 +1555,11 @@ def test_cpython_backend_module_diagnostics_authenticate_original_execution(tmp_
         observed = importlib.util.module_from_spec(spec)
         sys.modules['observed'] = observed
         before = _soac_ext.strict_module_diagnostics(observed)
-        assert before['schema'] == 1
+        assert before['schema'] == 2
         assert before['backend'] == 'cpython'
+        assert before['ready'] is False
+        assert before['strict_assign'] is True
+        assert before['checked_attr'] is {checked_attr!r}
         assert before['sealed'] is False
         assert before['initializer_entry_kind'] is None
         assert before['original_code_entered'] is False
@@ -1568,14 +1575,16 @@ def test_cpython_backend_module_diagnostics_authenticate_original_execution(tmp_
             artifact_generation={project.publication["generation"]!r},
         )
         for key in ('startup_identity', 'interpreter_id', 'source_sha256',
-                    'artifact_generation', 'source_path'):
+                    'artifact_generation', 'source_path', 'checked_attr'):
             assert before[key] == initializing[key] == sealed[key], key
         sealed['sealed'] = False
+        sealed['checked_attr'] = {not checked_attr!r}
         sealed['backend'] = 'soac'
         sealed['original_code_entered'] = False
         unchanged = _soac_ext.strict_module_diagnostics(observed)
         assert unchanged['sealed'] is True
         assert unchanged['backend'] == 'cpython'
+        assert unchanged['checked_attr'] is {checked_attr!r}
         assert unchanged['original_code_entered'] is True
         fake = types.ModuleType('observed')
         fake.__dict__.update(vars(observed))
@@ -1636,7 +1645,7 @@ def test_cpython_backend_generator_argument_ranges_preserve_native_execution(tmp
         tmp_path,
         {
             "generator_arguments.py": (
-                "from __future__ import strict\n" + _CPYTHON_GENERATOR_ARGUMENT_SOURCE
+                "# soac: module(strict_assign=true, checked_attr=true)\n" + _CPYTHON_GENERATOR_ARGUMENT_SOURCE
             ),
             "ordinary_generator_arguments.py": _CPYTHON_GENERATOR_ARGUMENT_SOURCE,
             "generator_argument_support.py": "from typing import Any\nevents: list[Any] = []\n",
@@ -1717,7 +1726,7 @@ def cpython_mandatory_artifact_project(tmp_path_factory):
         root,
         {
             "artifact_requested.py": f"""
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from pathlib import Path
                 Path({str(sentinel)!r}).write_text("module body executed", encoding="utf-8")
 
@@ -1725,7 +1734,7 @@ def cpython_mandatory_artifact_project(tmp_path_factory):
                     return 42
             """,
             "artifact_unrequested.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
 
                 def answer() -> int:
                     return 17

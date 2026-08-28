@@ -9,7 +9,7 @@ from tests._strict_integration import create_strict_project
 from tests.test_strict_class_runtime import _CPYTHON_CLASS_CONSTRUCTION
 
 SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from collections.abc import Callable
 
 EVENTS = []
@@ -302,7 +302,7 @@ def test_virtual_calls_preserve_actual_binding_and_body_effects(
     methods, entry_interpreter
 ):
     if methods.backend == "cpython":
-        ordinary_source = SOURCE.replace("from __future__ import strict\n", "", 1)
+        ordinary_source = SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
         methods.run_case(
             "methods",
             _CPYTHON_CLASS_CONSTRUCTION + TRAINING + VALIDATION
@@ -619,7 +619,7 @@ for class_name in ('Base', 'Override', 'Inherited'):
 def test_public_vectorcall_change_during_arguments_uses_the_captured_method(
     methods, tmp_path, entry_interpreter
 ):
-    ordinary_source = SOURCE.replace("from __future__ import strict\n", "", 1)
+    ordinary_source = SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
     control = (
         "import types\n"
         "ordinary = types.ModuleType('ordinary_method_control')\n"
@@ -702,7 +702,7 @@ assert sorted(events[3:]) == ['callable released', 'first released', 'receiver r
 def test_virtual_call_preserves_callbacks_and_releases_temporaries(
     methods, tmp_path, entry_interpreter
 ):
-    ordinary_source = SOURCE.replace("from __future__ import strict\n", "", 1)
+    ordinary_source = SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
     program = (
         "import methods\nimport types\n"
         "ordinary = types.ModuleType('ordinary_method_lifetime')\n"

@@ -2,6 +2,38 @@
 
 ## Current scope: interpreter enforcement, not optimization
 
+Source-policy amendment — 2026-08-27 (PDT): select strictness through **SOAC
+source comment blocks**, with no strictness configuration file. Both settings
+default to false. `# soac: package(strict_assign=true, checked_attr=true)` in
+`__init__.py` supplies inherited package defaults; a module-header
+`# soac: module(...)` overrides those defaults for that file alone. A
+`# soac: class(checked_attr=false)` (or `true`) immediately before a class's
+decorators overrides that exact declaration. Omitted keys inherit. Nested
+packages override only specified keys; module and class overrides do not flow
+to child modules or lexically nested classes.
+
+`strict_assign` selects post-initialization global-binding restrictions.
+`checked_attr` selects automatic eligible class participation, including
+supported annotated field writes and independent class/method-mutation
+protections. They are independent: checked classes may live in a module whose
+globals remain mutable. Opt-out never removes an inherited or installed
+contract. Unsupported framework classes still fall back before irreversible
+admission; no per-class annotation is required. Function-level value checks,
+optimization and benchmarks remain out of scope.
+
+The checker resolves these rules from original source, without executing it,
+and authenticates every consulted package file and its absence. Source comments
+request a contract; only authenticated startup and actual runtime binding
+install one. Ordinary CPython ignores comments. The retired strict future is
+not a source-policy opt-in, and `[tool.soac.strict]` is rejected rather than
+combined with comment rules. Republish old artifacts: schema 7, strict-contract
+version 3, dialect version 2 and deployment version 3 bind the new resolution
+semantics. Never reinterpret an old publication or revoke a live contract.
+This supersedes the earlier project-config/future double opt-in and separate
+`checked_fields` switch below. Validate both ordinary and selected modules in
+the single-file integration format, with analysis/import/setup failures outside
+the final-statement-only `# raise` expectation.
+
 Tracing, profiling and monitoring scope amendment — 2026-08-25 (PDT):
 **CPython-compatible observation of SOAC execution is out of scope.** This
 includes `sys.settrace`, `sys.setprofile`, `sys.monitoring`, corresponding
@@ -176,7 +208,7 @@ Implementation and compatibility validation remain required.
 The required path is:
 
 ```text
-Python source + explicit strict project policy
+Python source + resolved package/module/class comment rules
   -> offline ty analysis
   -> authenticated, versioned module/class/function contracts
   -> validation against the actual source, environment, and runtime objects
@@ -208,8 +240,9 @@ is correctness coverage, not a request to develop new optimizations.
    across Python operations, CPython generic and specialized paths, and
    supported C APIs. Remove function-level runtime parameter/return checks
    while preserving ordinary argument binding, call behavior and independently
-   required ownership/metadata protections. Field checks retain their separate
-   project opt-in. Rejection must precede the forbidden storage mutation, not
+   required ownership/metadata protections. `checked_attr` selects class and
+   supported field checks independently of `strict_assign`. Rejection must
+   precede the forbidden storage mutation, not
    earlier constructor effects.
 4. Preserve ordinary dataclass behavior, descriptors, dictionaries, requested
    slots, callbacks, object lifetime, and ordinary-Python interoperability
@@ -403,9 +436,9 @@ substitutions.
 
 Generate independent profile/apply evidence for each strict SOAC revision. Keep
 source identities, strict contracts, dependency fingerprints, caches, and
-measurements separate across revisions. Stock CPython cannot execute an
-unrecognized strict future feature, so disclose the opt-in source difference
-rather than describing this as an unchanged-source comparison. This
+measurements separate across revisions. Disclose the explicit source-policy
+comments in the strict overlay, even though ordinary CPython ignores them;
+preserve every other workload source byte. This
 strict-versus-stock result is the primary `1.10` acceptance score.
 
 For each retained performance change, report at least:
@@ -560,8 +593,9 @@ strict globals can appear later and shadow a builtin. Mutable globals, mutable
 ordinary dependencies, stock subclasses, unknown receivers, callable class-data
 shadow fields, and unsupported descriptors still require their actual checks or
 generic fallback. Frozen builtins require their own separately approved and
-enforced contract; checked field values require the selected project opt-in
-and complete write enforcement described below. Dictionary presence does not
+enforced contract; checked field values require the declaring class's resolved
+`checked_attr=true` rule and complete write enforcement described below.
+Dictionary presence does not
 preclude protected methods or fixed indexes, and nominal type acceptance does
 not imply exact representation or a participating strict receiver.
 
@@ -821,16 +855,18 @@ explicit approval. Ordinary modules do not acquire strict semantics merely by
 being transformed, imported by a strict module, or observed to have a convenient
 source shape.
 
-The initial strict contract requires:
+The selected strict contract requires:
 
-- explicit `from __future__ import strict` and fail-closed authenticated
-  runtime support;
-- append-only module bindings; previously absent names
+- source-comment package/module/class rules and fail-closed authenticated
+  runtime support for the selected contracts; `strict_assign` and
+  `checked_attr` are independent and both default false;
+- append-only module bindings when `strict_assign=true`; previously absent names
   may be added and immediately become final, while rebinding/deletion is
   permitted only for original statically declared `global NAME` bindings;
   stable indexes are an optional storage capability, not an enforcement goal;
 - automatic class-capability selection from source-authenticated offline `ty`
-  contracts and actual runtime construction, without manual per-class SOAC
+  contracts and actual runtime construction under `checked_attr=true`, without
+  manual per-class SOAC
   annotations; module membership, frozen classes, checked values, method
   dispatch, and physical instance storage remain independent;
 - real ordinary instance dictionaries, including ordinary dataclasses, with
@@ -958,11 +994,12 @@ containing module is strict.
 ### Selected checked-value contract
 
 The 2026-08-25 (PDT) field-assignment clarification selects storage checks only.
-`checked_fields = "disabled"` remains the default; a project opts in with
-`checked_fields = "supported_annotations"`. Runtime parameter/return policy
-knobs and their failure policies are removed, not retained as disabled aliases.
-Unsupported field types use `unsupported_value_type = "dynamic"`; selected
-mandatory field checks fail with `TypeError` before the bad value is stored.
+The 2026-08-27 (PDT) source-policy amendment selects eligible classes and their
+supported annotated writes with `checked_attr=true`, independently of
+`strict_assign`. Both flags default false; there is no separate checked-fields
+configuration. Runtime parameter/return policy knobs and their failure policies
+are removed, not retained as disabled aliases. Unsupported field types remain
+dynamic; selected mandatory checks fail with `TypeError` before the bad value is stored.
 The offline analyzer, runtime and cache fingerprints consume the same normalized
 policy, independent of warmup, profiles, optimization level or inlining. No
 per-class SOAC annotation is required.

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Regenerate native cases in a disposable checkout, never an applied patch.
 
---check verifies SOAC's pinned generated-only top commit against its exact
-logical parent. --revision accepts an explicit full logical commit for producing
+--check reproduces a pinned generated-only top commit from its exact logical
+parent. A logical top commit that changes no generated files is checked by
+regenerating its own exact tree and requiring unchanged output. Mixed commits
+are rejected. --revision accepts an explicit full logical commit for producing
 an ignored review artifact only; it cannot authorize a build or runtime.
 """
 from __future__ import annotations
@@ -57,13 +59,13 @@ def generate_cases(source: Path, build: Path) -> None:
             ) from error
 
 
-def generated_parent(source: Path, revision: str) -> str:
+def generation_input_revision(source: Path, revision: str) -> str:
     # Read the actual commit object, not a locally grafted or shallow revision
     # walk. A missing parent is an explicit local-availability failure; no fetch.
     header = preparation.git_bytes(source, "cat-file", "commit", revision).split(b"\n\n", 1)[0]
     parents = [line[7:].decode() for line in header.splitlines() if line.startswith(b"parent ")]
     if len(parents) != 1:
-        raise CPythonEnvironmentError("pinned generated-only commit must have exactly one parent")
+        raise CPythonEnvironmentError("pinned regeneration reference must have exactly one parent")
     parent = parents[0]
     preparation.commit_tree(source, parent)
     changed = {
@@ -73,9 +75,16 @@ def generated_parent(source: Path, revision: str) -> str:
             "--name-only", "-r", "-z", parent, revision, "--",
         ).split(b"\0") if name
     }
-    if not changed or not changed <= set(GENERATED_FILES):
+    generated_changes = changed & set(GENERATED_FILES)
+    if not generated_changes:
+        # A logical change need not invent a generated-only commit when the
+        # generator reproduces the already-committed outputs byte for byte.
+        # Regenerate HEAD itself: dropping to its parent would skip the change
+        # whose effect on generated output this check must establish.
+        return revision
+    if changed != generated_changes:
         raise CPythonEnvironmentError(
-            f"pinned top commit is not generated-only: {sorted(changed)}"
+            f"generated changes require a generated-only top commit: {sorted(changed)}"
         )
     return parent
 
@@ -135,7 +144,7 @@ def regenerate(
         selected = revision if revision is not None else pinned
         snapshot = preparation.revision_record(source, selected)
         reference = pinned if revision is None else None
-        logical = generated_parent(source, pinned) if reference is not None else selected
+        logical = generation_input_revision(source, pinned) if reference is not None else selected
 
         with preparation.canonical_checkout(source, logical) as staged:
             before = preparation.inventory(staged, logical)
@@ -150,7 +159,7 @@ def regenerate(
                 raise CPythonEnvironmentError(
                     f"case regeneration changed non-generated source files: {unexpected}"
                 )
-            if not changed:
+            if not changed and logical != reference:
                 raise CPythonEnvironmentError("case regeneration produced no generated changes")
             for name in changed:
                 if (
@@ -163,7 +172,7 @@ def regenerate(
             matches = after == snapshot["files"] if reference is not None else None
             if check and not matches:
                 raise CPythonEnvironmentError(
-                    "pinned generated commit is stale: regenerated checkout does not match"
+                    "pinned generated outputs are stale: regenerated checkout does not match"
                 )
             generated_files = {name: after[name] for name in changed}
             record = {

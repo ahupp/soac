@@ -1,12 +1,12 @@
-//! End-to-end offline analysis through the real patched checker, selected
+//! End-to-end offline analysis through the vendored checker, selected
 //! CPython process, signing/publication code, and shared artifact verifier.
 
 use super::*;
 use soac_contracts::{
-    AnnotationOrigin, ArtifactExpectations, ArtifactTrustAnchor, CheckedFieldPolicy,
-    DefinitionKind, DynamicClassReason, ModuleTypeFacts, NominalBindingOwner,
-    ParticipationProposal, StaticType, TransformKind, VerifiedTypeArtifactManifest,
-    verify_complete_generation, verify_manifest,
+    AnalysisInputState, AnnotationOrigin, ArtifactExpectations, ArtifactTrustAnchor,
+    CheckedFieldPolicy, DefinitionKind, DynamicClassReason, GlobalMutability, ModuleTypeFacts,
+    NominalBindingOwner, ParticipationProposal, StaticType, TransformKind,
+    VerifiedTypeArtifactManifest, verify_complete_generation, verify_manifest,
 };
 
 struct Fixture {
@@ -22,7 +22,7 @@ impl Fixture {
         fs::create_dir(&project)?;
         fs::write(
             project.join("pyproject.toml"),
-            "[project]\nname='offline-fixture'\nversion='0.0.0'\nrequires-python='>=3.15'\n[tool.soac.strict]\ninclude=['*.py']\n",
+            "[project]\nname='offline-fixture'\nversion='0.0.0'\nrequires-python='>=3.15'\n",
         )?;
         fs::write(project.join("model.py"), source)?;
         keygen(&project.join("signing.key"))?;
@@ -161,7 +161,7 @@ fn offline_check_lambda_identities_keep_original_lexical_ranges() -> Result<()> 
     let fixture = Fixture::new("")?;
     let marker = fixture.project.join("lambda-source-was-imported.txt");
     let mut source = r#""""Original λ byte offsets"""
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from pathlib import Path
 module_nested = lambda: (lambda: "nested")
 module_generator = (lambda: index for index in range(2))
@@ -212,7 +212,7 @@ fn offline_check_never_imports_source_and_repeated_publication_is_byte_identical
     let fixture = Fixture::new("")?;
     let marker = fixture.project.join("source-was-imported.txt");
     let source = format!(
-        "from __future__ import strict\nfrom dataclasses import dataclass\nfrom pathlib import Path\n@dataclass\nclass Point:\n    x: int\n    y: int = 0\nclass Fields:\n    def __init__(self, value: int):\n        self.explicit: int = value\n        self.inferred = value\ndef identity(value: int) -> int: return value\nPath({}).write_text('imported')\nraise RuntimeError('this module must never execute during offline analysis')\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom dataclasses import dataclass\nfrom pathlib import Path\n@dataclass\nclass Point:\n    x: int\n    y: int = 0\nclass Fields:\n    def __init__(self, value: int):\n        self.explicit: int = value\n        self.inferred = value\ndef identity(value: int) -> int: return value\nPath({}).write_text('imported')\nraise RuntimeError('this module must never execute during offline analysis')\n",
         serde_json::to_string(&marker)?
     );
     fs::write(fixture.project.join("model.py"), source)?;
@@ -341,11 +341,11 @@ fn offline_check_never_imports_source_and_repeated_publication_is_byte_identical
 
 #[test]
 fn offline_check_imported_nominals_preserve_local_bindings_and_dependency_identity() -> Result<()> {
-    let source = "from __future__ import strict\nfrom typing import Optional, Union\nfrom targets import Box\nfrom targets import Box as Alias\ndef field(owner: Box) -> int:\n    return owner.value\ndef call(owner: Box, extra: int) -> int:\n    return owner.read(extra)\ndef identity(owner: \"Box | Alias\", optional: Optional[Box] = None) -> Union[Box, Alias]:\n    return owner\n";
+    let source = "# soac: module(strict_assign=true, checked_attr=true)\nfrom typing import Optional, Union\nfrom targets import Box\nfrom targets import Box as Alias\ndef field(owner: Box) -> int:\n    return owner.value\ndef call(owner: Box, extra: int) -> int:\n    return owner.read(extra)\ndef identity(owner: \"Box | Alias\", optional: Optional[Box] = None) -> Union[Box, Alias]:\n    return owner\n";
     let fixture = Fixture::new(source)?;
     let target_marker = fixture.directory.path().join("target-was-imported.txt");
     let target_source = format!(
-        "from __future__ import strict\nfrom pathlib import Path\nclass Box:\n    value: int\n    def __init__(self, value: int):\n        self.value = value\n    def read(self, extra: int) -> int:\n        return self.value + extra\nPath({}).write_text('imported')\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom pathlib import Path\nclass Box:\n    value: int\n    def __init__(self, value: int):\n        self.value = value\n    def read(self, extra: int) -> int:\n        return self.value + extra\nPath({}).write_text('imported')\n",
         serde_json::to_string(&target_marker)?
     );
     fs::write(fixture.project.join("targets.py"), &target_source)?;
@@ -430,7 +430,7 @@ fn offline_check_nominal_fields_keep_assignment_owners_and_inherited_dependencie
         .path()
         .join("field-source-was-executed.txt");
     let source = format!(
-        r#"from __future__ import strict
+        r#"# soac: module(strict_assign=true, checked_attr=true)
 from pathlib import Path
 from dataclasses import dataclass
 from bases import Base, Target
@@ -454,7 +454,7 @@ Path({}).write_text("executed")
 "#,
         serde_json::to_string(&marker)?,
     );
-    let base_source = "from __future__ import strict\nfrom dataclasses import dataclass\nclass Target:\n    pass\n@dataclass\nclass Base:\n    inherited: Target\n";
+    let base_source = "# soac: module(strict_assign=true, checked_attr=true)\nfrom dataclasses import dataclass\nclass Target:\n    pass\n@dataclass\nclass Base:\n    inherited: Target\n";
     fs::write(fixture.project.join("model.py"), &source)?;
     fs::write(fixture.project.join("bases.py"), base_source)?;
     let (publication, deployment) = fixture.run()?;
@@ -560,7 +560,7 @@ Path({}).write_text("executed")
 #[test]
 fn offline_check_tracks_primitive_imports_transitive_sources_and_new_shadow_stubs() -> Result<()> {
     let fixture = Fixture::new(
-        "from __future__ import strict\nfrom configuration_values import NUMBER\nVALUE = NUMBER\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom configuration_values import NUMBER\nVALUE = NUMBER\n",
     )?;
     fs::write(
         fixture.project.join("configuration_values.py"),
@@ -589,8 +589,10 @@ fn offline_check_tracks_primitive_imports_transitive_sources_and_new_shadow_stub
 }
 
 #[test]
-fn offline_check_fingerprints_actual_configuration_and_per_file_language_policy() -> Result<()> {
-    let fixture = Fixture::new("from __future__ import strict\nclass Value:\n    value: int\n")?;
+fn offline_check_fingerprints_actual_configuration_and_source_rules() -> Result<()> {
+    let source =
+        "# soac: module(strict_assign=true, checked_attr=true)\nclass Value:\n    value: int\n";
+    let fixture = Fixture::new(source)?;
     let config_path = fixture.project.join("pyproject.toml");
     let base = fs::read_to_string(&config_path)?;
     let (first, deployment) = fixture.run()?;
@@ -599,28 +601,419 @@ fn offline_check_fingerprints_actual_configuration_and_per_file_language_policy(
         format!("{base}\n[tool.ty.analysis]\nstrict-equality-semantics=false\n"),
     )?;
     assert!(verify_analysis_inputs(&deployment.analysis_inputs).is_err());
-    let (configured, _) = fixture.run()?;
+    let (configured, configured_deployment) = fixture.run()?;
     assert_ne!(configured.generation, first.generation);
     fs::write(
-        &config_path,
-        format!(
-            "{base}\n[[tool.soac.strict.overrides]]\ninclude=['model.py']\nchecked_fields='supported_annotations'\n"
-        ),
+        fixture.project.join("model.py"),
+        source.replace("checked_attr=true", "checked_attr=false"),
     )?;
+    assert!(verify_analysis_inputs(&configured_deployment.analysis_inputs).is_err());
     let (overridden, updated) = fixture.run()?;
     assert_ne!(overridden.generation, configured.generation);
+    let facts = fixture.facts(&updated)?;
+    assert!(facts.language_policy.strict_assign);
+    assert!(!facts.language_policy.checked_attr);
     assert_eq!(
-        fixture.facts(&updated)?.language_policy.checked_fields,
-        CheckedFieldPolicy::SupportedAnnotations
+        facts
+            .language_policy
+            .checked_fields(facts.classes[0].identity.source_range),
+        CheckedFieldPolicy::Disabled
+    );
+    assert!(
+        matches!(&facts.classes[0].participation, ParticipationProposal::Dynamic(reasons)
+        if reasons.contains(&DynamicClassReason::PolicyOptOut))
+    );
+    assert_ne!(
+        updated.environment.normalized_project_policy,
+        configured_deployment.environment.normalized_project_policy
     );
     assert!(updated.environment.analysis.strict_equality_semantics);
     Ok(())
 }
 
 #[test]
+fn offline_check_unselected_and_future_only_sources_publish_no_contracts() -> Result<()> {
+    for source in [
+        "class Ordinary:\n    value: int\nraise RuntimeError('offline source must not execute')\n",
+        "from __future__ import strict\nclass Ordinary:\n    value: int\nraise RuntimeError('future import is not source selection')\n",
+        "'# soac: module(strict_assign=true, checked_attr=true)'\nclass Ordinary:\n    value: int\n",
+        "value: int = 'ordinary annotation mismatch'\n",
+    ] {
+        let fixture = Fixture::new(source)?;
+        let (publication, deployment) = fixture.run()?;
+        assert_eq!(publication.modules, 0);
+        assert!(deployment.modules.is_empty());
+        assert!(fixture.manifest(&deployment)?.manifest().modules.is_empty());
+        let path = fixture.project.join("model.py").canonicalize()?;
+        assert!(deployment.analysis_inputs.iter().any(|input| {
+            input.path == path
+                && matches!(&input.state, AnalysisInputState::File { digest, .. }
+                    if *digest == Fingerprint::digest(source))
+        }));
+        assert_eq!(fs::read_to_string(path)?, source);
+    }
+    Ok(())
+}
+
+#[test]
+fn offline_check_ordinary_errors_do_not_block_selected_consumers() -> Result<()> {
+    let fixture = Fixture::new(
+        "# soac: module(checked_attr=true)\nfrom ordinary import value\nclass Checked:\n    field: int\ndef supplied(): return value\n",
+    )?;
+    let ordinary_path = fixture.project.join("ordinary.py");
+    let ordinary_source = "value: int = 'ordinary annotation mismatch'\n";
+    fs::write(&ordinary_path, ordinary_source)?;
+    let (_, deployment) = fixture.run()?;
+    assert_eq!(
+        deployment
+            .modules
+            .iter()
+            .map(|module| module.module_name.as_str())
+            .collect::<Vec<_>>(),
+        ["model"]
+    );
+    let facts = fixture.facts(&deployment)?;
+    let dependency = facts
+        .consumed_dependencies
+        .iter()
+        .find(|dependency| dependency.module.module_name == "ordinary")
+        .expect("the ordinary producer is a consumed source, not a signed module");
+    assert_eq!(
+        dependency.source_digest,
+        Fingerprint::digest(ordinary_source)
+    );
+    assert!(dependency.strict_policy.is_none());
+
+    let original = fs::read(fixture.project.join("deployment.json"))?;
+    let changed_source = "value: int = 'changed ordinary annotation mismatch'\n";
+    fs::write(&ordinary_path, changed_source)?;
+    assert!(deployment.verified_analysis_dependencies("model").is_err());
+
+    // Selecting the same erroneous source requires a valid contract export;
+    // this is a checker error, not a runtime annotation obligation.
+    fs::write(
+        &ordinary_path,
+        format!("# soac: module(strict_assign=true)\n{changed_source}"),
+    )?;
+    let error = check(fixture.options()).expect_err("selected type errors block publication");
+    assert!(matches!(
+        error.downcast_ref::<soac_contracts::ContractError>(),
+        Some(soac_contracts::ContractError::BlockingDiagnostic(_))
+    ));
+    assert_eq!(fs::read(fixture.project.join("deployment.json"))?, original);
+    Ok(())
+}
+
+#[test]
+fn offline_check_mutable_module_can_request_checked_classes() -> Result<()> {
+    let source = "# soac: module(checked_attr=true)\nLIMIT = 1\nclass Checked:\n    value: int\ndef change():\n    globals()['LIMIT'] = 2\n";
+    let fixture = Fixture::new(source)?;
+    let (_, deployment) = fixture.run()?;
+    let facts = fixture.facts(&deployment)?;
+    assert!(!facts.language_policy.strict_assign);
+    assert!(facts.language_policy.checked_attr);
+    assert!(
+        facts
+            .global_bindings
+            .iter()
+            .all(|binding| binding.mutability == GlobalMutability::Unknown)
+    );
+    let class = &facts.classes[0];
+    assert_eq!(class.participation, ParticipationProposal::Candidate);
+    assert_eq!(
+        class.required_field_bindings(&facts.language_policy).len(),
+        1
+    );
+    assert_eq!(facts.source_digest, Fingerprint::digest(source));
+    Ok(())
+}
+
+#[test]
+fn offline_check_class_only_rule_does_not_select_other_or_nested_classes() -> Result<()> {
+    let source = "\"\"\"Original λ source bytes\"\"\"\n# soac: class(checked_attr=true)\nclass Checked:\n    value: int\n    class Nested:\n        nested: int\nclass Ordinary:\n    value: int\nLIMIT = 1\ndef change():\n    globals()['LIMIT'] = 2\n";
+    let fixture = Fixture::new(source)?;
+    let (_, deployment) = fixture.run()?;
+    let facts = fixture.facts(&deployment)?;
+    assert!(!facts.language_policy.strict_assign && !facts.language_policy.checked_attr);
+    assert_eq!(facts.language_policy.class_overrides.len(), 1);
+    assert!(
+        facts
+            .global_bindings
+            .iter()
+            .all(|binding| binding.mutability == GlobalMutability::Unknown)
+    );
+    let checked = facts
+        .classes
+        .iter()
+        .find(|class| class.identity.lexical_qualname == "Checked")
+        .unwrap();
+    assert_eq!(checked.participation, ParticipationProposal::Candidate);
+    assert_eq!(
+        checked
+            .required_field_bindings(&facts.language_policy)
+            .len(),
+        1
+    );
+    assert_eq!(
+        facts.language_policy.class_overrides[0].class_range,
+        checked.identity.source_range
+    );
+    for name in ["Checked.Nested", "Ordinary"] {
+        let class = facts
+            .classes
+            .iter()
+            .find(|class| class.identity.lexical_qualname == name)
+            .unwrap();
+        assert!(
+            matches!(&class.participation, ParticipationProposal::Dynamic(reasons)
+            if reasons.contains(&DynamicClassReason::PolicyOptOut))
+        );
+        assert!(
+            class
+                .required_field_bindings(&facts.language_policy)
+                .is_empty()
+        );
+    }
+    assert_eq!(facts.source_digest, Fingerprint::digest(source));
+    assert_eq!(
+        fs::read_to_string(fixture.project.join("model.py"))?,
+        source
+    );
+    Ok(())
+}
+
+#[test]
+fn offline_check_class_rules_bind_repeated_nested_and_decorated_source_ranges() -> Result<()> {
+    let source = "# soac: module(checked_attr=true)\nfrom dataclasses import dataclass\n# soac: class(checked_attr=false)\n@dataclass\nclass Repeated:\n    first: int = 1\nclass Repeated:\n    second: int = 2\n# soac: class(checked_attr=false)\nclass Outer:\n    class Inner:\n        value: int\n";
+    let fixture = Fixture::new(source)?;
+    let (_, deployment) = fixture.run()?;
+    let facts = fixture.facts(&deployment)?;
+    assert_eq!(facts.language_policy.class_overrides.len(), 2);
+    let first = facts
+        .classes
+        .iter()
+        .find(|class| {
+            class.identity.lexical_qualname == "Repeated"
+                && class
+                    .instance_fields
+                    .iter()
+                    .any(|field| field.name == "first")
+        })
+        .unwrap();
+    let second = facts
+        .classes
+        .iter()
+        .find(|class| {
+            class.identity.lexical_qualname == "Repeated"
+                && class
+                    .instance_fields
+                    .iter()
+                    .any(|field| field.name == "second")
+        })
+        .unwrap();
+    let outer = facts
+        .classes
+        .iter()
+        .find(|class| class.identity.lexical_qualname == "Outer")
+        .unwrap();
+    let inner = facts
+        .classes
+        .iter()
+        .find(|class| class.identity.lexical_qualname == "Outer.Inner")
+        .unwrap();
+    assert_eq!(
+        first.identity.source_range.start as usize,
+        source.find("@dataclass").unwrap()
+    );
+    assert_eq!(
+        first.identity.source_range.end as usize,
+        source.find("    first: int = 1").unwrap() + "    first: int = 1".len()
+    );
+    assert_ne!(first.identity.source_range, second.identity.source_range);
+    for class in [first, outer] {
+        assert!(
+            !facts
+                .language_policy
+                .checked_attributes(class.identity.source_range)
+        );
+        assert!(
+            matches!(&class.participation, ParticipationProposal::Dynamic(reasons)
+            if reasons.contains(&DynamicClassReason::PolicyOptOut))
+        );
+    }
+    for class in [second, inner] {
+        assert!(
+            facts
+                .language_policy
+                .checked_attributes(class.identity.source_range)
+        );
+        assert_eq!(class.participation, ParticipationProposal::Candidate);
+    }
+    assert_eq!(facts.source_digest, Fingerprint::digest(source));
+    Ok(())
+}
+
+#[test]
+fn offline_check_package_rules_authenticate_absence_and_do_not_inherit_module_overrides()
+-> Result<()> {
+    let fixture = Fixture::new(
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom pkg.model import Value\ndef identity(value: Value) -> Value: return value\n",
+    )?;
+    fs::create_dir(fixture.project.join("pkg"))?;
+    let child_source = "class Value:\n    value: int\n";
+    fs::write(fixture.project.join("pkg/model.py"), child_source)?;
+    let package_path = fixture.project.join("pkg/__init__.py");
+    let (initial, absent) = fixture.run()?;
+    assert!(
+        absent
+            .modules
+            .iter()
+            .all(|module| module.module_name != "pkg.model")
+    );
+    assert!(absent.analysis_inputs.iter().any(|input| {
+        input.path == package_path && matches!(&input.state, AnalysisInputState::Missing)
+    }));
+    let marker = fixture.project.join("package-source-was-imported.txt");
+    let package_source = format!(
+        "# soac: package(strict_assign=true, checked_attr=true)\n# soac: module(strict_assign=false, checked_attr=true)\nfrom pathlib import Path\nPath({}).write_text('imported')\n",
+        serde_json::to_string(&marker)?,
+    );
+    fs::write(&package_path, &package_source)?;
+    assert!(verify_analysis_inputs(&absent.analysis_inputs).is_err());
+    let (selected, deployment) = fixture.run()?;
+    assert_ne!(selected.generation, initial.generation);
+    assert!(
+        !marker.exists(),
+        "package policy discovery must not execute __init__.py"
+    );
+    let package = fixture.module_facts(&deployment, "pkg")?;
+    let child = fixture.module_facts(&deployment, "pkg.model")?;
+    assert!(!package.language_policy.strict_assign);
+    assert!(package.language_policy.checked_attr);
+    assert!(child.language_policy.strict_assign && child.language_policy.checked_attr);
+    assert_eq!(
+        child.classes[0].participation,
+        ParticipationProposal::Candidate
+    );
+    assert!(deployment.analysis_inputs.iter().any(|input| {
+        input.path == package_path
+            && matches!(&input.state, AnalysisInputState::File { digest, .. }
+                if *digest == Fingerprint::digest(&package_source))
+    }));
+    let changed_source = package_source.replacen(
+        "package(strict_assign=true, checked_attr=true)",
+        "package(strict_assign=true, checked_attr=false)",
+        1,
+    );
+    fs::write(&package_path, changed_source)?;
+    assert!(verify_analysis_inputs(&deployment.analysis_inputs).is_err());
+    let (changed, updated) = fixture.run()?;
+    assert_ne!(changed.generation, selected.generation);
+    assert!(!marker.exists());
+    let updated_child = fixture.module_facts(&updated, "pkg.model")?;
+    assert_eq!(updated_child.module, child.module);
+    assert!(updated_child.language_policy.strict_assign);
+    assert!(!updated_child.language_policy.checked_attr);
+    assert!(
+        matches!(&updated_child.classes[0].participation, ParticipationProposal::Dynamic(reasons)
+        if reasons.contains(&DynamicClassReason::PolicyOptOut))
+    );
+    assert!(
+        fixture
+            .module_facts(&updated, "pkg")?
+            .language_policy
+            .checked_attr
+    );
+    assert_ne!(
+        updated.environment.normalized_project_policy,
+        deployment.environment.normalized_project_policy
+    );
+    Ok(())
+}
+
+#[test]
+fn offline_check_rejects_retired_config_policy_without_replacing_authority() -> Result<()> {
+    let fixture =
+        Fixture::new("# soac: module(checked_attr=true)\nclass Value:\n    value: int\n")?;
+    let (_, deployment) = fixture.run()?;
+    let original = fs::read(fixture.project.join("deployment.json"))?;
+    let config = fixture.project.join("pyproject.toml");
+    let base = fs::read_to_string(&config)?;
+    for retired in [
+        "[tool.soac.strict]\ninclude=['*.py']\n",
+        "[[tool.soac.strict.overrides]]\ninclude=['model.py']\nchecked_fields='supported_annotations'\n",
+    ] {
+        fs::write(&config, format!("{base}\n{retired}"))?;
+        assert!(verify_analysis_inputs(&deployment.analysis_inputs).is_err());
+        assert!(check(fixture.options()).is_err());
+        assert_eq!(fs::read(fixture.project.join("deployment.json"))?, original);
+    }
+    Ok(())
+}
+
+#[test]
+fn offline_check_rejects_retired_discovered_parent_config_without_replacing_authority() -> Result<()>
+{
+    let fixture =
+        Fixture::new("# soac: module(checked_attr=true)\nclass Value:\n    value: int\n")?;
+    let source_root = fixture.project.join("src");
+    fs::create_dir(&source_root)?;
+    fs::rename(
+        fixture.project.join("model.py"),
+        source_root.join("model.py"),
+    )?;
+    let config = fixture.project.join("pyproject.toml");
+    let base = format!(
+        "{}\n[tool.ty.analysis]\nstrict-equality-semantics=false\n",
+        fs::read_to_string(&config)?
+    );
+    fs::write(&config, &base)?;
+    // This higher ancestor is not selected: the nearer actual ty config wins.
+    fs::write(
+        fixture.directory.path().join("pyproject.toml"),
+        "[tool.soac.strict]\n",
+    )?;
+    let options = || Check {
+        project: source_root.clone(),
+        modules: vec!["model=model.py".into()],
+        output: fixture.project.join("artifacts"),
+        signing_key: fixture.project.join("signing.key"),
+        deployment: fixture.project.join("deployment.json"),
+        ..fixture.options()
+    };
+    let (publication, deployment) = fixture.run_with_options(options())?;
+    assert_eq!(publication.modules, 1);
+    let observed_config = config.canonicalize()?;
+    assert!(deployment.analysis_inputs.iter().any(|input| {
+        input.path == observed_config
+            && matches!(&input.state, AnalysisInputState::File { digest, .. }
+                if *digest == Fingerprint::digest(&base))
+    }));
+    let original = fs::read(fixture.project.join("deployment.json"))?;
+    for retired in [
+        "[tool.soac.strict]\ninclude=['*.py']\n",
+        "[[tool.soac.strict.overrides]]\ninclude=['model.py']\nchecked_fields='supported_annotations'\n",
+    ] {
+        fs::write(&config, format!("{base}\n{retired}"))?;
+        assert!(verify_analysis_inputs(&deployment.analysis_inputs).is_err());
+        let error = check(options())
+            .expect_err("the actual discovered project cannot retain retired SOAC configuration");
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("[tool.soac.strict]"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(fixture.project.join("deployment.json"))?, original);
+    }
+    Ok(())
+}
+
+#[test]
 fn offline_check_suppressed_errors_demote_only_affected_classes() -> Result<()> {
     let fixture = Fixture::new(
-        "from __future__ import strict\nclass Damaged:\n    value: int = 'wrong'  # ty: ignore[invalid-assignment]\nclass Fine:\n    value: int = 1\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nclass Damaged:\n    value: int = 'wrong'  # ty: ignore[invalid-assignment]\nclass Fine:\n    value: int = 1\n",
     )?;
     let (_, deployment) = fixture.run()?;
     let facts = fixture.facts(&deployment)?;
@@ -644,28 +1037,22 @@ fn offline_check_suppressed_errors_demote_only_affected_classes() -> Result<()> 
 #[test]
 fn offline_check_authenticates_external_strict_base_proposals_and_invalidation() -> Result<()> {
     let fixture = Fixture::new(
-        "from __future__ import strict\nfrom bridge import Middle\nclass Child(Middle):\n    def __init__(self):\n        super().__init__()\n        self.own: int = 3\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom bridge import Middle\nclass Child(Middle):\n    def __init__(self):\n        super().__init__()\n        self.own: int = 3\n",
     )?;
-    let base_source = "from __future__ import strict\nclass Base:\n    def __init__(self):\n        self.inherited: int = 1\n";
+    let base_source = "# soac: module(checked_attr=true)\nclass Base:\n    def __init__(self):\n        self.inherited: int = 1\n";
     fs::write(fixture.project.join("base.py"), base_source)?;
     fs::write(
         fixture.project.join("bridge.py"),
-        "from __future__ import strict\nfrom base import Base\nclass Middle(Base): pass\n",
-    )?;
-    let config_path = fixture.project.join("pyproject.toml");
-    let config = fs::read_to_string(&config_path)?;
-    fs::write(
-        &config_path,
-        format!(
-            "{config}\n[[tool.soac.strict.overrides]]\ninclude=['model.py']\nchecked_fields='supported_annotations'\n"
-        ),
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom base import Base\nclass Middle(Base): pass\n",
     )?;
     let (first, deployment) = fixture.run()?;
     let facts = fixture.facts(&deployment)?;
     let child = &facts.classes[0];
     assert_eq!(child.participation, ParticipationProposal::Candidate);
     assert_eq!(
-        facts.language_policy.checked_fields,
+        facts
+            .language_policy
+            .checked_fields(child.identity.source_range),
         CheckedFieldPolicy::SupportedAnnotations
     );
     let ancestor = child
@@ -682,7 +1069,11 @@ fn offline_check_authenticates_external_strict_base_proposals_and_invalidation()
         .find(|module| module.module_name == "base")
         .unwrap()
         .policy;
-    assert_eq!(base_policy.checked_fields, CheckedFieldPolicy::Disabled);
+    assert!(!base_policy.strict_assign);
+    assert_eq!(
+        base_policy.checked_fields(ancestor.definition.source_range),
+        CheckedFieldPolicy::SupportedAnnotations
+    );
     let dependency = facts
         .consumed_dependencies
         .iter()
@@ -694,7 +1085,7 @@ fn offline_check_authenticates_external_strict_base_proposals_and_invalidation()
         &child.methods[0].implementation.clone().unwrap()
     ));
 
-    let changed = "from __future__ import strict\ndef framework[T](value: T) -> T: return value\n@framework\nclass Base:\n    def __init__(self):\n        self.inherited: int = 1\n";
+    let changed = "# soac: module(checked_attr=true)\ndef framework[T](value: T) -> T: return value\n@framework\nclass Base:\n    def __init__(self):\n        self.inherited: int = 1\n";
     fs::write(fixture.project.join("base.py"), changed)?;
     assert!(verify_analysis_inputs(&deployment.analysis_inputs).is_err());
     let (second, updated) = fixture.run()?;
@@ -720,12 +1111,13 @@ fn offline_check_authenticates_external_strict_base_proposals_and_invalidation()
 
 #[test]
 fn offline_check_rejects_real_strict_errors_without_replacing_startup_authority() -> Result<()> {
-    let fixture = Fixture::new("from __future__ import strict\nclass Value: pass\n")?;
+    let fixture =
+        Fixture::new("# soac: module(strict_assign=true, checked_attr=true)\nclass Value: pass\n")?;
     fixture.run()?;
     let original = fs::read(fixture.project.join("deployment.json"))?;
     fs::write(
         fixture.project.join("model.py"),
-        "from __future__ import strict\nLIMIT=1\ndef invalid(): globals()['LIMIT']=2\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nLIMIT=1\ndef invalid(): globals()['LIMIT']=2\n",
     )?;
     assert!(check(fixture.options()).is_err());
     assert_eq!(fs::read(fixture.project.join("deployment.json"))?, original);
@@ -734,7 +1126,8 @@ fn offline_check_rejects_real_strict_errors_without_replacing_startup_authority(
 
 #[test]
 fn offline_check_and_loader_reject_tampered_artifacts() -> Result<()> {
-    let fixture = Fixture::new("from __future__ import strict\nclass Value: pass\n")?;
+    let fixture =
+        Fixture::new("# soac: module(strict_assign=true, checked_attr=true)\nclass Value: pass\n")?;
     let (_, deployment) = fixture.run()?;
     let manifest = fixture.manifest(&deployment)?;
     let index = manifest.module_index("model")?;
@@ -761,7 +1154,7 @@ fn offline_check_and_loader_reject_tampered_artifacts() -> Result<()> {
 #[test]
 fn offline_check_detects_same_byte_dependency_symlink_retargeting() -> Result<()> {
     let fixture = Fixture::new(
-        "from __future__ import strict\nfrom external import NUMBER\nVALUE = NUMBER\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom external import NUMBER\nVALUE = NUMBER\n",
     )?;
     let first = fixture.directory.path().join("first.py");
     let second = fixture.directory.path().join("second.py");
@@ -779,7 +1172,8 @@ fn offline_check_detects_same_byte_dependency_symlink_retargeting() -> Result<()
 #[cfg(target_os = "linux")]
 #[test]
 fn offline_check_binds_actual_cpython_library_bytes_without_changing_shared_build() -> Result<()> {
-    let mut fixture = Fixture::new("from __future__ import strict\nclass Value: pass\n")?;
+    let mut fixture =
+        Fixture::new("# soac: module(strict_assign=true, checked_attr=true)\nclass Value: pass\n")?;
     let libraries = fixture.use_private_interpreter()?;
     let (first, deployment) = fixture.run()?;
     OpenOptions::new()
@@ -801,7 +1195,7 @@ fn offline_check_binds_actual_cpython_library_bytes_without_changing_shared_buil
 #[test]
 fn offline_check_preserves_selected_venv_and_package_only_dependencies() -> Result<()> {
     let mut fixture = Fixture::new(
-        "from __future__ import strict\nfrom only_this_venv import ANSWER\ndef read() -> int:\n    return ANSWER\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom only_this_venv import ANSWER\ndef read() -> int:\n    return ANSWER\n",
     )?;
     let base = fixture.python.canonicalize()?;
     let venv = fixture.directory.path().join("selected-venv");
@@ -877,7 +1271,8 @@ fn offline_check_preserves_selected_venv_and_package_only_dependencies() -> Resu
 #[cfg(target_os = "linux")]
 #[test]
 fn offline_check_tracks_new_path_files_and_distribution_metadata() -> Result<()> {
-    let mut fixture = Fixture::new("from __future__ import strict\nclass Value: pass\n")?;
+    let mut fixture =
+        Fixture::new("# soac: module(strict_assign=true, checked_attr=true)\nclass Value: pass\n")?;
     fixture.use_private_interpreter()?;
     let site = PathBuf::from(&interpreter_identity(&fixture.python)?.site_packages[0]);
     let (first, deployment) = fixture.run()?;
@@ -899,7 +1294,7 @@ fn offline_check_tracks_new_path_files_and_distribution_metadata() -> Result<()>
 fn offline_check_resolves_nested_class_cells_without_import_or_global_guessing() -> Result<()> {
     let fixture = Fixture::new("")?;
     let marker = fixture.project.join("nested-class-source-was-imported.txt");
-    let mut source = r#"from __future__ import strict
+    let mut source = r#"# soac: module(strict_assign=true, checked_attr=true)
 from pathlib import Path
 def exercise():
     class C:
@@ -940,7 +1335,7 @@ def exercise():
     let original_deployment = fs::read(fixture.project.join("deployment.json"))?;
     fs::write(
         fixture.project.join("model.py"),
-        "from __future__ import strict\nclass C:\n    def method(self):\n        global __class__\n        def nested(): return __class__\n        return nested\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nclass C:\n    def method(self):\n        global __class__\n        def nested(): return __class__\n        return nested\n",
     )?;
     assert!(check(fixture.options()).is_err());
     assert_eq!(
@@ -956,7 +1351,7 @@ fn offline_check_tracks_nonlocal_class_cells_without_namespace_bindings() -> Res
     let marker = fixture
         .project
         .join("nonlocal-class-source-was-imported.txt");
-    let mut source = r#"from __future__ import strict
+    let mut source = r#"# soac: module(strict_assign=true, checked_attr=true)
 from pathlib import Path
 def factory():
     class Model:
@@ -1046,7 +1441,7 @@ def factory():
     let original_deployment = fs::read(fixture.project.join("deployment.json"))?;
     fs::write(
         fixture.project.join("model.py"),
-        "from __future__ import strict\nclass Model:\n    def method(self):\n        __class__: int = 1\n        def invalid():\n            nonlocal __class__\n            __class__ = 'wrong'\n        return invalid\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nclass Model:\n    def method(self):\n        __class__: int = 1\n        def invalid():\n            nonlocal __class__\n            __class__ = 'wrong'\n        return invalid\n",
     )?;
     assert!(check(fixture.options()).is_err());
     assert_eq!(
@@ -1055,7 +1450,7 @@ def factory():
     );
     fs::write(
         fixture.project.join("model.py"),
-        "from __future__ import strict\n__class__ = 100\nclass Outer:\n    class Inner:\n        nonlocal __class__\n        value = __class__\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\n__class__ = 100\nclass Outer:\n    class Inner:\n        nonlocal __class__\n        value = __class__\n",
     )?;
     assert!(check(fixture.options()).is_err());
     assert_eq!(
@@ -1069,7 +1464,7 @@ def factory():
 fn offline_check_excludes_only_semantic_dataclass_kw_only_markers() -> Result<()> {
     let fixture = Fixture::new("")?;
     let marker = fixture.project.join("kw-only-source-was-imported.txt");
-    let mut source = r#"from __future__ import strict
+    let mut source = r#"# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass, KW_ONLY as Marker
 from pathlib import Path
 from typing import ClassVar
@@ -1151,7 +1546,7 @@ fn offline_check_authenticates_semantic_builtin_bases_without_import_or_name_gue
 
     let fixture = Fixture::new("")?;
     let marker = fixture.project.join("builtin-base-source-was-imported.txt");
-    let mut source = r#"from __future__ import strict
+    let mut source = r#"# soac: module(strict_assign=true, checked_attr=true)
 from builtins import object as ObjectRoot
 from dependency import Root
 from pathlib import Path
@@ -1180,7 +1575,7 @@ def namesake():
     fs::write(fixture.project.join("model.py"), &source)?;
     fs::write(
         fixture.project.join("dependency.py"),
-        "from __future__ import strict\nfrom builtins import object as Root\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom builtins import object as Root\n",
     )?;
     let (first, deployment) = fixture.run()?;
     assert!(!marker.exists(), "offline analysis must not execute source");
@@ -1227,7 +1622,7 @@ def namesake():
         [BaseReference::Class(shadow), object]
     );
 
-    let changed = "from __future__ import strict\nclass Root:\n    pass\n";
+    let changed = "# soac: module(strict_assign=true, checked_attr=true)\nclass Root:\n    pass\n";
     fs::write(fixture.project.join("dependency.py"), changed)?;
     assert!(verify_analysis_inputs(&deployment.analysis_inputs).is_err());
     let (second, updated) = fixture.run()?;
@@ -1264,7 +1659,7 @@ fn offline_check_keeps_dataclass_self_fields_and_native_receiver_policy() -> Res
         fixture.project.join("nominal_dataclass_support.py"),
         "class Target: pass\ndef post(value): pass\n",
     )?;
-    let mut source = r#"from __future__ import strict
+    let mut source = r#"# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import InitVar, KW_ONLY, dataclass, field
 from typing import ClassVar
 from pathlib import Path
@@ -1381,7 +1776,7 @@ class FieldNames:
     let previous = fs::read(fixture.project.join("deployment.json"))?;
     fs::write(
         fixture.project.join("model.py"),
-        "from __future__ import strict\nfrom dataclasses import dataclass\n@dataclass\nclass Conflict:\n    self: int\n    __dataclass_self__: int\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom dataclasses import dataclass\n@dataclass\nclass Conflict:\n    self: int\n    __dataclass_self__: int\n",
     )?;
     assert!(
         check(fixture.options()).is_err(),
@@ -1393,7 +1788,9 @@ class FieldNames:
 
 #[test]
 fn offline_source_surrogate_escape_never_replaces_startup_authority() -> Result<()> {
-    let fixture = Fixture::new("from __future__ import strict\ndef value(): return 'valid'\n")?;
+    let fixture = Fixture::new(
+        "# soac: module(strict_assign=true, checked_attr=true)\ndef value(): return 'valid'\n",
+    )?;
     fixture.run()?;
     let original = fs::read(fixture.project.join("deployment.json"))?;
     for body in [
@@ -1405,7 +1802,7 @@ def accept(value: Literal['\ud800']) -> Literal['\ud800']: return value"#,
     ] {
         fs::write(
             fixture.project.join("model.py"),
-            format!("from __future__ import strict\n{body}\n"),
+            format!("# soac: module(strict_assign=true, checked_attr=true)\n{body}\n"),
         )?;
         let error = check(fixture.options()).expect_err("unsupported source cannot be signed");
         assert!(
@@ -1421,7 +1818,7 @@ def accept(value: Literal['\ud800']) -> Literal['\ud800']: return value"#,
 #[test]
 fn offline_source_imported_surrogate_alias_never_signs_replacement_literal() -> Result<()> {
     let fixture = Fixture::new(
-        "from __future__ import strict\nfrom dependency import Alias\ndef accept(value: Alias) -> Alias: return value\n",
+        "# soac: module(strict_assign=true, checked_attr=true)\nfrom dependency import Alias\ndef accept(value: Alias) -> Alias: return value\n",
     )?;
     fs::write(
         fixture.project.join("dependency.py"),
@@ -1475,7 +1872,7 @@ fn offline_source_imported_surrogate_alias_never_signs_replacement_literal() -> 
 #[test]
 fn offline_source_raw_backslashes_and_replacement_literals_are_distinct() -> Result<()> {
     let fixture = Fixture::new(
-        r#"from __future__ import strict
+        r#"# soac: module(strict_assign=true, checked_attr=true)
 from typing import Literal
 def accept(value: Literal['�'], raw: Literal[r'\ud800']) -> Literal['\ufffd']:
     return value
@@ -1512,14 +1909,14 @@ fn offline_check_selected_source_aliases_preserve_real_import_and_owner_identity
         fs::write(
             fixture.project.join("model.py"),
             format!(
-                "from __future__ import strict\nfrom pathlib import Path\nclass Payload:\n    pass\nimport helper\nPath({}).write_text('imported')\n",
+                "# soac: module(strict_assign=true, checked_attr=true)\nfrom pathlib import Path\nclass Payload:\n    pass\nimport helper\nPath({}).write_text('imported')\n",
                 serde_json::to_string(&entry_marker)?,
             ),
         )?;
         fs::write(
             fixture.project.join("helper.py"),
             format!(
-                "from __future__ import strict\nfrom pathlib import Path\nfrom {selected} import Payload\ndef make() -> Payload:\n    return Payload()\nPath({}).write_text('imported')\n",
+                "# soac: module(strict_assign=true, checked_attr=true)\nfrom pathlib import Path\nfrom {selected} import Payload\ndef make() -> Payload:\n    return Payload()\nPath({}).write_text('imported')\n",
                 serde_json::to_string(&helper_marker)?,
             ),
         )?;
@@ -1576,7 +1973,8 @@ fn offline_check_selected_source_aliases_preserve_real_import_and_owner_identity
 
 #[test]
 fn offline_check_unselected_entry_point_stubs_remain_real_dependencies() -> Result<()> {
-    let fixture = Fixture::new("from __future__ import strict\nimport __main__\n")?;
+    let fixture =
+        Fixture::new("# soac: module(strict_assign=true, checked_attr=true)\nimport __main__\n")?;
     let (_, deployment) = fixture.run()?;
     let facts = fixture.facts(&deployment)?;
     let dependency = deployment

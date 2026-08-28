@@ -4,7 +4,7 @@ import pytest
 
 from tests._strict_integration import create_strict_project
 
-SOURCE = """from __future__ import strict
+SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def factory(left, right):
     def add():
         return left + right
@@ -179,7 +179,7 @@ def test_profiled_cell_regions_preserve_owned_inputs_and_fallback_order(
         entry_interpreter=entry_interpreter,
         extra_env={"SOAC_OPT_MODE": "profile", "SOAC_WORK_DIR": str(work)},
     )
-    stock = SOURCE.removeprefix("from __future__ import strict\n")
+    stock = SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n")
     cells_project.run(
         mode + f"STOCK_SOURCE = {stock!r}\n" + VALIDATION,
         entry_interpreter=entry_interpreter,

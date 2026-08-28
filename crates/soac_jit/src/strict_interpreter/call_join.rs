@@ -15,8 +15,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 use soac_contracts::{
-    ClassTypeFact, DecoratorKind, ParticipationProposal, SourceRange, StdlibDataclassPolicy,
-    TransformKind,
+    ClassTypeFact, DecoratorKind, ParticipationProposal, SourceRange, TransformKind,
 };
 
 use super::InterpreterInvocationIdentity;
@@ -201,25 +200,21 @@ fn class_fact<'a>(
 }
 
 fn supported_dataclass(state: &InterpreterCall<'_>, fact: &ClassTypeFact) -> bool {
-    supported_dataclass_proposal(
-        state
-            .data()
-            .source
-            .verified()
-            .type_facts()
-            .facts()
-            .language_policy
-            .adapters
-            .dataclasses,
-        fact,
-    )
+    state
+        .data()
+        .source
+        .verified()
+        .type_facts()
+        .facts()
+        .language_policy
+        .checked_attributes(fact.identity.source_range)
+        && supported_dataclass_proposal(fact)
 }
 
 /// Value-only prefilter. Actual CALL operands, helper graph, source execution,
 /// bases and namespace remain independently authenticated by the later joins.
-fn supported_dataclass_proposal(policy: StdlibDataclassPolicy, fact: &ClassTypeFact) -> bool {
-    policy == StdlibDataclassPolicy::Stdlib
-        && fact.participation == ParticipationProposal::Candidate
+fn supported_dataclass_proposal(fact: &ClassTypeFact) -> bool {
+    fact.participation == ParticipationProposal::Candidate
         && fact
             .uncertainty
             .iter()
@@ -897,15 +892,9 @@ mod tests {
     fn interpreter_dataclass_proposal_keeps_observed_open_world_candidates() {
         for slots in [false, true] {
             let mut fact = observed_dataclass_proposal(slots);
-            assert!(supported_dataclass_proposal(
-                StdlibDataclassPolicy::Stdlib,
-                &fact
-            ));
+            assert!(supported_dataclass_proposal(&fact));
             fact.uncertainty.clear();
-            assert!(supported_dataclass_proposal(
-                StdlibDataclassPolicy::Stdlib,
-                &fact
-            ));
+            assert!(supported_dataclass_proposal(&fact));
         }
     }
 
@@ -927,12 +916,12 @@ mod tests {
             let mut fact = observed_dataclass_proposal(false);
             fact.uncertainty = [reason].into();
             assert!(
-                !supported_dataclass_proposal(StdlibDataclassPolicy::Stdlib, &fact),
+                !supported_dataclass_proposal(&fact),
                 "unexpected class uncertainty admitted: {reason:?}"
             );
             fact.uncertainty.insert(UncertaintyReason::OpenWorld);
             assert!(
-                !supported_dataclass_proposal(StdlibDataclassPolicy::Stdlib, &fact),
+                !supported_dataclass_proposal(&fact),
                 "OpenWorld hid another class uncertainty: {reason:?}"
             );
         }
@@ -941,52 +930,34 @@ mod tests {
     #[test]
     fn interpreter_dataclass_proposal_keeps_policy_transform_and_decorator_refusals() {
         let original = observed_dataclass_proposal(false);
-        assert!(!supported_dataclass_proposal(
-            StdlibDataclassPolicy::Dynamic,
-            &original
-        ));
-        let mut fact = original.clone();
-        fact.participation =
-            ParticipationProposal::Dynamic([DynamicClassReason::UnknownDecorator].into());
-        assert!(!supported_dataclass_proposal(
-            StdlibDataclassPolicy::Stdlib,
-            &fact
-        ));
+        for reason in [
+            DynamicClassReason::PolicyOptOut,
+            DynamicClassReason::UnknownDecorator,
+        ] {
+            let mut fact = original.clone();
+            fact.participation = ParticipationProposal::Dynamic([reason].into());
+            assert!(!supported_dataclass_proposal(&fact));
+        }
         for kind in [
             TransformKind::DataclassTransform,
             TransformKind::UnsupportedFramework,
         ] {
             let mut fact = original.clone();
             fact.transform.as_mut().unwrap().kind = kind;
-            assert!(!supported_dataclass_proposal(
-                StdlibDataclassPolicy::Stdlib,
-                &fact
-            ));
+            assert!(!supported_dataclass_proposal(&fact));
         }
         let mut fact = original.clone();
         fact.transform = None;
-        assert!(!supported_dataclass_proposal(
-            StdlibDataclassPolicy::Stdlib,
-            &fact
-        ));
+        assert!(!supported_dataclass_proposal(&fact));
         let mut fact = original.clone();
         fact.transform.as_mut().unwrap().dataclass_options = None;
-        assert!(!supported_dataclass_proposal(
-            StdlibDataclassPolicy::Stdlib,
-            &fact
-        ));
+        assert!(!supported_dataclass_proposal(&fact));
         let mut fact = original.clone();
         fact.decorators.clear();
-        assert!(!supported_dataclass_proposal(
-            StdlibDataclassPolicy::Stdlib,
-            &fact
-        ));
+        assert!(!supported_dataclass_proposal(&fact));
         let mut fact = original.clone();
         fact.decorators.push(fact.decorators[0].clone());
-        assert!(!supported_dataclass_proposal(
-            StdlibDataclassPolicy::Stdlib,
-            &fact
-        ));
+        assert!(!supported_dataclass_proposal(&fact));
         for kind in [
             DecoratorKind::TypingFinal,
             DecoratorKind::StaticMethod,
@@ -999,10 +970,7 @@ mod tests {
         ] {
             let mut fact = original.clone();
             fact.decorators[0].kind = kind;
-            assert!(!supported_dataclass_proposal(
-                StdlibDataclassPolicy::Stdlib,
-                &fact
-            ));
+            assert!(!supported_dataclass_proposal(&fact));
         }
         // Even OpenWorld is not an allowed uncertainty on the decorator itself.
         for reason in [
@@ -1022,7 +990,7 @@ mod tests {
             let mut fact = original.clone();
             fact.decorators[0].uncertainty.insert(reason);
             assert!(
-                !supported_dataclass_proposal(StdlibDataclassPolicy::Stdlib, &fact),
+                !supported_dataclass_proposal(&fact),
                 "uncertain decorator admitted: {reason:?}"
             );
         }

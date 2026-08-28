@@ -272,7 +272,11 @@ pub(crate) fn own_checked_fields(
             field.declaring_class.definition == fact.identity
                 && field.declaring_class.source_digest == facts.source_digest
                 && field
-                    .required_write_type(facts.language_policy.checked_fields)
+                    .required_write_type(
+                        facts
+                            .language_policy
+                            .checked_fields(fact.identity.source_range),
+                    )
                     .is_some()
         })
         .cloned()

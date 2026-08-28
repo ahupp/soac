@@ -11,13 +11,14 @@ use std::collections::HashSet;
 pub(crate) fn rewrite(
     body: &mut Suite,
     canonical: Option<&crate::CanonicalAnnotationStrings>,
+    authenticated_source: bool,
 ) -> Result<HashSet<String>, ParseError> {
     let future_features = collect_future_imports(body)?;
     if future_features.contains("annotations") {
         let mut rewriter = FutureAnnotationsRewriter {
             indent: Indentation::new("    ".to_string()),
             canonical,
-            require_canonical: future_features.contains("strict"),
+            require_canonical: authenticated_source || future_features.contains("strict"),
             error: None,
         };
         rewriter.visit_body(body);

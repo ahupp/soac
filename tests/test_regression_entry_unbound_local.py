@@ -10,7 +10,7 @@ from tests._strict_integration import create_strict_project
 @pytest.fixture(scope="module")
 def strict_unbound_local_project(tmp_path_factory):
     source = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def f(flag):
     if flag:
@@ -22,7 +22,7 @@ def f(flag):
         {
             "unbound_local_model.py": source,
             "ordinary_unbound_local_model.py": source.replace(
-                "from __future__ import strict\n", "", 1
+                "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
             ),
         },
         modules={"unbound_local_model": "unbound_local_model.py"},

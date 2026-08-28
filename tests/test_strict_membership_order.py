@@ -4,7 +4,7 @@ import pytest
 
 from tests._strict_integration import create_strict_project
 
-SOURCE = """from __future__ import strict
+SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def contains(needle_factory, container_factory):
     return needle_factory() in container_factory()
 
@@ -27,7 +27,7 @@ def test_membership_evaluates_source_operands_once_in_order(
     membership_project, entry_interpreter
 ):
     expected_entry = "entry_interpreter" if entry_interpreter else "checked_native"
-    stock = SOURCE.removeprefix("from __future__ import strict\n")
+    stock = SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n")
     membership_project.run(
         f"STOCK_SOURCE = {stock!r}\nEXPECTED_ENTRY = {expected_entry!r}\n"
         + """import types

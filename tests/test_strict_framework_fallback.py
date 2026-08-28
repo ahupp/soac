@@ -10,7 +10,7 @@ from tests._strict_integration import ROOT, create_strict_project
 
 SOURCES = {
     "pydantic": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from functools import cached_property
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, field_validator
 
@@ -50,7 +50,7 @@ class Child(BaseModel):
     count: int
 """,
     "django": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from django.db import models
 
 class Record(models.Model):
@@ -64,7 +64,7 @@ class Record(models.Model):
         return value
 """,
     "sqlalchemy": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
@@ -189,7 +189,7 @@ def _exercise_source(framework, module, *, strict, entry_interpreter):
     if strict:
         load = f"model = importlib.import_module({module!r})\n"
     else:
-        ordinary = source.replace("from __future__ import strict\n", "", 1)
+        ordinary = source.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
         load = (
             f"model = types.ModuleType({module!r})\n"
             f"sys.modules[{module!r}] = model\n"
@@ -276,7 +276,7 @@ def _cpython_framework_exercise(framework, module, project, *, strict):
             ")\n"
         )
     else:
-        ordinary = source.replace("from __future__ import strict\n", "", 1)
+        ordinary = source.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
         load = (
             f"model = types.ModuleType({module!r})\n"
             f"sys.modules[{module!r}] = model\n"

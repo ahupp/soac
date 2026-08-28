@@ -14,7 +14,7 @@ def unrelated_annotation_members(tmp_path_factory):
         tmp_path_factory.mktemp("strict-unrelated-annotation-members"),
         {
             "annotation_members.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from annotation_member_support import install
 
 class Unrelated:
@@ -72,7 +72,7 @@ def minimal_annotations(tmp_path_factory):
         tmp_path_factory.mktemp("strict-minimal-annotations"),
         {
             "minimal.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 number: int = 1
                 def identity(value: int) -> int:
                     return value
@@ -117,7 +117,7 @@ def strict_annotations(tmp_path_factory):
         tmp_path_factory.mktemp("strict-annotation-replay"),
         {
             "annotated.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from typing import TYPE_CHECKING
                 from annotation_probe import remember, annotation_values
                 if TYPE_CHECKING:
@@ -314,9 +314,9 @@ def future_annotations(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-future-annotations"),
         {
-            "future_subject.py": source.replace(
-                "from __future__ import annotations",
-                "from __future__ import strict, annotations",
+            "future_subject.py": (
+                "# soac: module(strict_assign=true, checked_attr=true)\n"
+                + textwrap.dedent(source)
             ),
             "future_control.py": source,
             "future_probe.py": """
@@ -390,7 +390,7 @@ def lazy_aliases(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-lazy-aliases"),
         {
-            "alias_subject.py": "from __future__ import strict\n"
+            "alias_subject.py": "# soac: module(strict_assign=true, checked_attr=true)\n"
             + textwrap.dedent(source),
             "alias_control.py": source,
         },
@@ -518,7 +518,7 @@ def generic_type_expressions(tmp_path_factory):
         ("generic_context", class_context_source),
     ]:
         files[f"{stem}_subject.py"] = (
-            "from __future__ import strict\n" + textwrap.dedent(source)
+            "# soac: module(strict_assign=true, checked_attr=true)\n" + textwrap.dedent(source)
         )
         files[f"{stem}_control.py"] = source
         modules[f"{stem}_subject"] = f"{stem}_subject.py"
@@ -725,7 +725,7 @@ def decorated_class_annotations(tmp_path_factory, request):
         tmp_path_factory.mktemp("strict-decorated-class-annotations"),
         {
             "decorated_classes.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from typing import final
 
 @final
@@ -849,7 +849,7 @@ def test_decorated_class_and_method_providers_match_their_distinct_native_lines(
 @pytest.fixture(scope="module")
 def user_annotation_callbacks(tmp_path_factory):
     source = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from annotationlib import Format
 
 def annotate(format, /, __Format=Format, __Unsupported=NotImplementedError):
@@ -890,7 +890,7 @@ def nested_class_callback(format, /):
         {
             "user_annotations.py": source,
             "user_annotations_control.py": source.replace(
-                "from __future__ import strict\n", "", 1
+                "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
             ),
         },
         modules={"user_annotations": "user_annotations.py"},
@@ -1151,7 +1151,7 @@ def annotation_dictionary_cell_fallback(tmp_path_factory):
         tmp_path_factory.mktemp("strict-annotation-dictionary-cell"),
         {
             "annotation_cell_subject.py": (
-                "from __future__ import strict\n" + _ANNOTATION_CELL_SHADOW_SOURCE
+                "# soac: module(strict_assign=true, checked_attr=true)\n" + _ANNOTATION_CELL_SHADOW_SOURCE
             ),
             "annotation_cell_control.py": _ANNOTATION_CELL_SHADOW_SOURCE,
             "annotation_cell_observer.py": _ANNOTATION_CELL_SHADOW_OBSERVER,
@@ -1216,7 +1216,7 @@ def class_alias_shadow(tmp_path_factory):
         tmp_path_factory.mktemp("strict-class-alias-shadow"),
         {
             "class_alias_subject.py": (
-                "from __future__ import strict\n" + _CLASS_ALIAS_SHADOW_SOURCE
+                "# soac: module(strict_assign=true, checked_attr=true)\n" + _CLASS_ALIAS_SHADOW_SOURCE
             ),
             "class_alias_control.py": _CLASS_ALIAS_SHADOW_SOURCE,
         },
@@ -1331,7 +1331,7 @@ def inspect_before_seal(function):
         tmp_path,
         {
             "native_replay_owner.py": (
-                "from __future__ import strict\n"
+                "# soac: module(strict_assign=true, checked_attr=true)\n"
                 "from native_replay_probe import inspect_before_seal\n" + source
             ),
             "native_replay_probe.py": f"MUTATION = {mutation!r}\n" + support,
@@ -1389,7 +1389,7 @@ get_construction.argtypes = [
 get_construction.restype = ctypes.c_int
 module_witness = _soac_ext.strict_module_diagnostics(subject)
 ordinary_source = Path(subject.__file__).read_text().replace(
-    "from __future__ import strict\\n", "", 1,
+    "# soac: module(strict_assign=true, checked_attr=true)\\n", "", 1,
 )
 ordinary = {"__name__": "ordinary_final_class_control"}
 exec(compile(ordinary_source, "<ordinary-final-class-control>", "exec"), ordinary)

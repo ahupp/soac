@@ -9,7 +9,7 @@ from tests._strict_integration import create_strict_project
 from tests.test_strict_class_runtime import _CPYTHON_CLASS_CONSTRUCTION
 
 SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from typing import final
 
 EVENTS = []
@@ -87,7 +87,7 @@ def nominal_calls(tmp_path_factory):
         tmp_path_factory.mktemp("strict-nominal-call-sites"),
         {
             "targets.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 class Box:
     def __init__(self, value: int):
@@ -101,7 +101,7 @@ class Derived(Box):
         return self.value + extra + 1
 """,
             "callers.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from targets import Box
 
 def earlier(owner: Later, extra: int) -> int:
@@ -426,13 +426,9 @@ def test_cpython_final_method_policy_uses_the_admitted_class_and_actual_c_mutati
         tmp_path,
         {"checked_calls.py": SOURCE},
         modules={"checked_calls": "checked_calls.py"},
-        policy=(
-            '[tool.soac.strict]\ninclude = ["checked_calls.py"]\n'
-            'typing_final_policy = "enforce_for_participating_classes"\n'
-        ),
         backend="cpython",
     )
-    ordinary_source = SOURCE.replace("from __future__ import strict\n", "", 1)
+    ordinary_source = SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)\n", "", 1)
     project.run_case(
         "checked_calls",
         _CPYTHON_CLASS_CONSTRUCTION + f"\nordinary_source = {ordinary_source!r}\n" + """

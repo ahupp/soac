@@ -4,7 +4,7 @@ import pytest
 
 from tests._strict_integration import create_strict_project
 
-SOURCE = """from __future__ import strict
+SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def free_reader(value):
     def read():
         return value
@@ -87,7 +87,7 @@ def cell_errors_project(tmp_path_factory):
 def test_empty_cell_preserves_exact_exception_kind_and_name(
     cell_errors_project, entry_interpreter, case
 ):
-    stock = SOURCE.removeprefix("from __future__ import strict\n")
+    stock = SOURCE.removeprefix("# soac: module(strict_assign=true, checked_attr=true)\n")
     expected_entry = "entry_interpreter" if entry_interpreter else "checked_native"
     cell_errors_project.run(
         f"STOCK_SOURCE = {stock!r}\nEXPECTED_ENTRY = {expected_entry!r}\nCASE = {case!r}\n"

@@ -21,7 +21,7 @@ use soac_contracts::{
     BaseReference, BuiltinType, ClassDictionarySemantics, ClassMemberKind, ClassReference,
     ClassTypeFact, DescriptorFact, DescriptorKind, DynamicClassReason, FieldKind, Fingerprint,
     MetaclassFact, MethodBinding, ParticipationProposal, ResolvedStrictPolicy, SourceIdentity,
-    StaticType, TypingFinalPolicy,
+    StaticType,
 };
 use soac_core::block_py::CallableSourceRole;
 
@@ -2331,7 +2331,7 @@ fn class_plan_with_slots(
                 }
                 if field.declaring_class.definition == fact.identity {
                     if let Some(requirement) = selected_field_contract(
-                        policy.checked_fields,
+                        policy.checked_fields(fact.identity.source_range),
                         field.annotation_origin,
                         &field.value_type,
                     ) {
@@ -2422,10 +2422,7 @@ fn class_plan_with_slots(
                 return Err(DynamicClassReason::UnsupportedDescriptor);
             }
         }
-        if method.declared_final
-            && method.declaring_class.definition == fact.identity
-            && policy.typing_final_policy == TypingFinalPolicy::EnforceForParticipatingClasses
-        {
+        if method.declared_final && method.declaring_class.definition == fact.identity {
             names.final_methods.insert(method.name.clone());
         }
     }
@@ -4400,12 +4397,12 @@ pub(crate) mod tests {
     use soac_contracts::{
         AnnotationOrigin, ArtifactEnvironment, ArtifactExpectations, ArtifactSigningKey,
         BuiltinType, CallableSignature, CheckedFieldPolicy, ClassMemberFact, ClassOpenness,
-        ClassReference, ConservativeAnalysis, DefaultFact, DefinitionKind, DescriptorFact,
-        FieldReadPolicy, FieldTypeFact, FieldWritePolicy, Fingerprint, FunctionTypeFact,
-        InheritanceFact, InitializationPolicy, MethodTypeFact, ModuleArtifactIndex,
-        ModuleContentId, ModuleTypeFacts, OverridePolicy, ParameterKind, ParameterTypeFact,
-        PythonVersion, SourceDialect, SourceRange, TypeArtifactManifest, encode_module_shard,
-        sign_manifest, verify_manifest,
+        ClassPolicyOverride, ClassReference, ConservativeAnalysis, DefaultFact, DefinitionKind,
+        DescriptorFact, FieldReadPolicy, FieldTypeFact, FieldWritePolicy, Fingerprint,
+        FunctionTypeFact, InheritanceFact, InitializationPolicy, MethodTypeFact,
+        ModuleArtifactIndex, ModuleContentId, ModuleTypeFacts, OverridePolicy, ParameterKind,
+        ParameterTypeFact, PythonVersion, SourceDialect, SourceRange, TypeArtifactManifest,
+        encode_module_shard, sign_manifest, verify_manifest,
     };
 
     unsafe extern "C" {
@@ -4422,6 +4419,13 @@ pub(crate) mod tests {
         StaticType::NominalBuiltin {
             builtin,
             allow_subclasses: true,
+        }
+    }
+
+    fn checked_class_policy() -> ResolvedStrictPolicy {
+        ResolvedStrictPolicy {
+            checked_attr: true,
+            ..Default::default()
         }
     }
 
@@ -4551,7 +4555,7 @@ pub(crate) mod tests {
             arguments: BTreeMap::new(),
             uncertainty: BTreeSet::new(),
         });
-        let policy = ResolvedStrictPolicy::default();
+        let policy = checked_class_policy();
         assert_eq!(
             class_plan(&proposed, &policy, &[], None).err(),
             Some(DynamicClassReason::UnknownDecorator)
@@ -4575,7 +4579,7 @@ pub(crate) mod tests {
             method.binding = binding;
             fact.methods.push(method);
         }
-        let policy = ResolvedStrictPolicy::default();
+        let policy = checked_class_policy();
         let (storage, names) = class_plan(&fact, &policy, &[], None).unwrap();
         assert!(storage.fields.is_empty());
         assert!(storage.checks.is_empty());
@@ -4922,9 +4926,13 @@ pub(crate) mod tests {
     #[test]
     fn field_catalog_reserves_defaults_but_not_pseudo_fields_or_methods() {
         let mut fact = fact();
+        let mut own = field(&fact, "own", FieldKind::InstanceField);
+        own.annotation_origin = AnnotationOrigin::Inferred;
+        let mut shared = field(&fact, "shared", FieldKind::InstanceField);
+        shared.annotation_origin = AnnotationOrigin::Inferred;
         fact.instance_fields = vec![
-            field(&fact, "own", FieldKind::InstanceField),
-            field(&fact, "shared", FieldKind::InstanceField),
+            own,
+            shared,
             field(&fact, "class_only", FieldKind::ClassVariable),
             field(&fact, "constructor_only", FieldKind::InitOnly),
         ];
@@ -4946,7 +4954,7 @@ pub(crate) mod tests {
         };
         let (layout, names) = class_plan(
             &fact,
-            &ResolvedStrictPolicy::default(),
+            &checked_class_policy(),
             &[(&base, &base_names)],
             None,
         )
@@ -4964,6 +4972,19 @@ pub(crate) mod tests {
                 "inherited_method".into()
             ])
         );
+        // An annotation-only ClassVar has no namespace default. Its field
+        // record must preserve the same name protection without fake storage.
+        fact.class_members
+            .retain(|member| member.name != "class_only");
+        let (annotation_only_layout, annotation_only_names) = class_plan(
+            &fact,
+            &checked_class_policy(),
+            &[(&base, &base_names)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(annotation_only_layout, layout);
+        assert_eq!(annotation_only_names.protected, names.protected);
     }
 
     #[test]
@@ -4988,7 +5009,7 @@ pub(crate) mod tests {
         let (child, _) = class_plan_with_slots(
             StorageModel::Indexed,
             &fact,
-            &ResolvedStrictPolicy::default(),
+            &checked_class_policy(),
             &[(&slotted_base, &names)],
             None,
             Some(&actual),
@@ -5008,7 +5029,7 @@ pub(crate) mod tests {
         let (slotted, _) = class_plan_with_slots(
             StorageModel::Indexed,
             &fact,
-            &ResolvedStrictPolicy::default(),
+            &checked_class_policy(),
             &[],
             None,
             Some(&actual),
@@ -5027,7 +5048,7 @@ pub(crate) mod tests {
         let (hybrid, _) = class_plan_with_slots(
             StorageModel::Indexed,
             &fact,
-            &ResolvedStrictPolicy::default(),
+            &checked_class_policy(),
             &[(&dictionary_base, &names)],
             None,
             Some(&actual),
@@ -5183,7 +5204,7 @@ pub(crate) mod tests {
         assert_eq!(
             class_plan(
                 &fact,
-                &ResolvedStrictPolicy::default(),
+                &checked_class_policy(),
                 &[(&layout(&[]), &final_names)],
                 None,
             )
@@ -5195,7 +5216,7 @@ pub(crate) mod tests {
         assert_eq!(
             class_plan(
                 &fact,
-                &ResolvedStrictPolicy::default(),
+                &checked_class_policy(),
                 &[(&layout(&["base_field"]), &NamePolicy::default())],
                 None,
             )
@@ -5214,7 +5235,14 @@ pub(crate) mod tests {
             .push(field(&fact, "checked", FieldKind::InstanceField));
         let (child, _) = class_plan(
             &fact,
-            &ResolvedStrictPolicy::default(),
+            &ResolvedStrictPolicy {
+                checked_attr: true,
+                class_overrides: vec![ClassPolicyOverride {
+                    class_range: fact.identity.source_range,
+                    checked_attr: false,
+                }],
+                ..Default::default()
+            },
             &[(&base, &NamePolicy::default())],
             None,
         )
@@ -5251,7 +5279,10 @@ pub(crate) mod tests {
             partial_union,
         ];
         let policy = ResolvedStrictPolicy {
-            checked_fields: CheckedFieldPolicy::SupportedAnnotations,
+            class_overrides: vec![ClassPolicyOverride {
+                class_range: child_fact.identity.source_range,
+                checked_attr: true,
+            }],
             ..Default::default()
         };
         let names = NamePolicy::default();
@@ -5348,7 +5379,7 @@ pub(crate) mod tests {
         fact.instance_fields
             .push(field(&fact, "__private", FieldKind::InstanceField));
         assert_eq!(
-            class_plan(&fact, &ResolvedStrictPolicy::default(), &[], None).err(),
+            class_plan(&fact, &checked_class_policy(), &[], None).err(),
             Some(DynamicClassReason::UnresolvedAnalysis)
         );
         assert!(catalog_name_supported("_Parent__private"));
@@ -5383,7 +5414,11 @@ pub(crate) mod tests {
                 "class_prefix_plan_fixture",
                 SOURCE.as_bytes(),
                 SourceDialect::SoacStrict,
-                ResolvedStrictPolicy::default(),
+                ResolvedStrictPolicy {
+                    strict_assign: true,
+                    checked_attr: true,
+                    ..Default::default()
+                },
             )
             .map_err(fixture_error)?;
             let fixture = FieldCapabilityFixture::from_facts(py, SOURCE.as_bytes(), facts)?;
@@ -5520,7 +5555,11 @@ pub(crate) mod tests {
                 "field_capability_fixture",
                 source,
                 SourceDialect::SoacStrict,
-                ResolvedStrictPolicy::default(),
+                ResolvedStrictPolicy {
+                    strict_assign: true,
+                    checked_attr: true,
+                    ..Default::default()
+                },
             )
             .map_err(fixture_error)?;
             let mut class = fact();
@@ -5640,7 +5679,11 @@ pub(crate) mod tests {
                 "method_capability_fixture",
                 source.as_bytes(),
                 SourceDialect::SoacStrict,
-                ResolvedStrictPolicy::default(),
+                ResolvedStrictPolicy {
+                    strict_assign: true,
+                    checked_attr: true,
+                    ..Default::default()
+                },
             )
             .map_err(fixture_error)?;
             let identity = |name: &str, start: &str, last: &str, definition_kind| SourceIdentity {
@@ -5752,7 +5795,11 @@ pub(crate) mod tests {
                 "virtual_method_capability_fixture",
                 source.as_bytes(),
                 SourceDialect::SoacStrict,
-                ResolvedStrictPolicy::default(),
+                ResolvedStrictPolicy {
+                    strict_assign: true,
+                    checked_attr: true,
+                    ..Default::default()
+                },
             )
             .map_err(fixture_error)?;
             let module = facts.module.clone();
@@ -6292,7 +6339,7 @@ pub(crate) mod tests {
                     .unwrap_err()
                     .is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
             );
-            let value = py.eval(c"object()", None, None)?;
+            let value = py.eval(c"int('1000000')", None, None)?;
             receiver.setattr(&name, &value)?;
             let before = unsafe { ffi::Py_REFCNT(value.as_ptr()) };
             assert_eq!(
@@ -6459,7 +6506,7 @@ pub(crate) mod tests {
                     .unwrap_err()
                     .is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
             );
-            let value = py.eval(c"object()", None, None)?;
+            let value = py.eval(c"int('1000000')", None, None)?;
             dictionary.set_item(&name, &value)?;
             let before = unsafe { ffi::Py_REFCNT(value.as_ptr()) };
             assert_eq!(receiver.getattr(&name)?.as_ptr(), value.as_ptr());
@@ -6476,6 +6523,9 @@ pub(crate) mod tests {
                 unsafe { _PyDict_IndexedKeyIndex(dictionary.as_ptr(), name.as_ptr()) },
                 -1
             );
+            // This API rejects ordinary storage; consume its error before
+            // continuing to exercise the dictionary's normal operations.
+            assert!(PyErr::fetch(py).is_instance_of::<pyo3::exceptions::PyTypeError>(py));
             dictionary.del_item(&name)?;
             assert!(!receiver.hasattr(&name)?);
             dictionary.set_item(&name, &value)?;
@@ -6507,7 +6557,7 @@ pub(crate) mod tests {
             assert!(state.sealed_field("value")?.is_none());
             let receiver = class.call0()?;
             assert_eq!(receiver.getattr("value")?.as_ptr(), default.as_ptr());
-            let value = py.eval(c"object()", None, None)?;
+            let value = py.eval(c"int('1000000')", None, None)?;
             receiver.setattr("value", &value)?;
             assert_eq!(receiver.getattr("value")?.as_ptr(), value.as_ptr());
             default_type.setattr(
@@ -6553,8 +6603,8 @@ pub(crate) mod tests {
             let globals = PyDict::new(py);
             py.run(c"class Alias:\n enabled = False\n def __hash__(self): return hash('value')\n def __eq__(self, other): return self.enabled and other == 'value'\nalias = Alias()\n", Some(&globals), None)?;
             let alias = globals.get_item("alias")?.unwrap();
-            let ordinary = PyString::new(py, "canonical slot");
-            let aliased = PyString::new(py, "aliased value");
+            let ordinary = py.eval(c"int('1000001')", None, None)?;
+            let aliased = py.eval(c"int('1000002')", None, None)?;
             dictionary.set_item(&alias, &aliased)?;
             dictionary.set_item(&name, &ordinary)?;
             assert_eq!(receiver.getattr("value")?.as_ptr(), ordinary.as_ptr());
@@ -7978,7 +8028,11 @@ pub(crate) mod tests {
             "strict_callable_fixture",
             source.as_bytes(),
             SourceDialect::SoacStrict,
-            ResolvedStrictPolicy::default(),
+            ResolvedStrictPolicy {
+                strict_assign: true,
+                checked_attr: true,
+                ..Default::default()
+            },
         )
         .map_err(fixture_error)?;
         for &(name, parameters, suspended) in definitions {

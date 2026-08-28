@@ -140,6 +140,7 @@ def _assert_cpython_module_witness(
     source_path: str,
     source_sha256: str,
     artifact_generation: str,
+    strict_assign: bool = True,
 ) -> dict:
     """Check the native owner's diagnostic, not mutable module attributes."""
     from soac import _soac_ext
@@ -152,11 +153,13 @@ def _assert_cpython_module_witness(
     }, "the interpreter backend entered a SOAC compilation path"
     diagnostic = _soac_ext.strict_module_diagnostics(module)
     assert diagnostic is not None, "selected source executed without native ownership"
-    assert diagnostic["schema"] == 1
+    assert diagnostic["schema"] == 2
     assert diagnostic["backend"] == "cpython"
     assert diagnostic["initializer_entry_kind"] == "original_code"
     assert diagnostic["original_code_entered"] is True
-    assert diagnostic["sealed"] is True
+    assert diagnostic["ready"] is True
+    assert diagnostic["strict_assign"] is strict_assign
+    assert diagnostic["sealed"] is strict_assign
     assert diagnostic["module_name"] == module_name
     assert diagnostic["source_path"] == source_path
     assert diagnostic["source_sha256"] == source_sha256
@@ -222,7 +225,13 @@ class StrictProject:
     modules: Mapping[str, str]
     backend: str = "soac"
     environment: Mapping[str, str] | None = field(default=None, repr=False)
+    policies: Mapping[str, Mapping] = field(default_factory=dict)
     _invocations: int = field(default=0, init=False)
+
+    @property
+    def selected_modules(self) -> Mapping[str, str]:
+        """Checker-selected outputs; requested ordinary inputs remain ordinary."""
+        return {name: self.modules[name] for name in self.policies}
 
     def _selected_backend(self, requested: str | None) -> str:
         backend = self.backend if requested is None else requested
@@ -238,11 +247,12 @@ class StrictProject:
         entry_interpreter: bool,
         backend: str = "soac",
     ) -> str:
-        if module_name not in self.modules:
+        if module_name not in self.policies:
             raise ValueError(
-                f"integration module {module_name!r} was not selected for analysis"
+                f"integration module {module_name!r} has no selected source rules"
             )
         source_path = self.project / self.modules[module_name]
+        strict_assign = self.policies[module_name]["strict_assign"]
         if backend == "cpython":
             import hashlib
 
@@ -256,6 +266,7 @@ class StrictProject:
                     source_path={str(source_path)!r},
                     source_sha256={source_sha256!r},
                     artifact_generation={self.publication["generation"]!r},
+                    strict_assign={strict_assign!r},
                 )
                 for name in {case.required_functions!r}:
                     _assert_cpython_function_witness(
@@ -270,10 +281,11 @@ class StrictProject:
                     source_path={str(source_path)!r},
                     source_sha256={source_sha256!r},
                     artifact_generation={self.publication["generation"]!r},
+                    strict_assign={strict_assign!r},
                 )
                 assert after['startup_identity'] == diagnostic['startup_identity']
                 assert after['interpreter_id'] == diagnostic['interpreter_id']
-                for name in {case.required_functions!r}:
+                for name in {case.required_functions if strict_assign else ()!r}:
                     _assert_cpython_function_witness(
                         _plain_function_witness(module, name), after,
                     )
@@ -287,7 +299,9 @@ class StrictProject:
             module = importlib.import_module({module_name!r})
             diagnostic = _soac_ext.strict_module_diagnostics(module)
             assert diagnostic is not None, 'selected source executed as an ordinary module'
-            assert diagnostic['sealed'] is True
+            assert diagnostic['ready'] is True
+            assert diagnostic['strict_assign'] is {strict_assign!r}
+            assert diagnostic['sealed'] is {strict_assign!r}
             assert diagnostic['module_name'] == {module_name!r}
             assert diagnostic['source_path'] == {str(source_path)!r}
             assert diagnostic['artifact_generation'] == {self.publication["generation"]!r}
@@ -304,7 +318,7 @@ class StrictProject:
             exec_integration_validation(
                 {case.validate_source!r}, module, Path({str(case.module_path)!r}), mode={mode!r}
             )
-            for name in {case.required_functions!r}:
+            for name in {case.required_functions if strict_assign else ()!r}:
                 function = _plain_function_witness(module, name)
                 actual_entry = _soac_ext.strict_function_entry_kind(function)
                 assert actual_entry == {expected_entry!r}, (name, actual_entry)
@@ -443,7 +457,7 @@ class StrictProject:
         environment.update(
             SOAC_WORK_DIR=str(output / "soac-work"),
             SOAC_MODULE_ENABLED=",".join(
-                f"path:{self.project / path}" for path in self.modules.values()
+                f"path:{self.project / path}" for path in self.selected_modules.values()
             ),
         )
         if backend == "soac":
@@ -514,17 +528,21 @@ def create_strict_project(
     sources: Mapping[str, str],
     *,
     modules: Mapping[str, str],
-    policy: str | None = None,
+    configuration: str | None = None,
+    preserve_source: bool = False,
     python: str | Path | None = None,
     analysis_timeout: float = 180,
     backend: str = "soac",
 ) -> StrictProject:
     """Analyze explicit module-name/path pairs with the actual pinned checker.
 
-    ``policy`` optionally supplies the complete pyproject TOML. Other source
-    files may be ordinary imported dependencies and are not transformed unless
-    selected in ``modules``. Selected sources must contain their own valid
-    ``from __future__ import strict`` opt-in; this helper never injects one.
+    Source comments select module and class rules, including inherited package
+    rules. ``modules`` names the analysis inputs, not an implicit opt-in.
+    Ordinary inputs/dependencies keep their ordinary loaders. This helper never
+    injects or rewrites policy comments. ``configuration`` can supply unrelated
+    project/ty TOML for configuration-provenance tests, never strictness rules.
+    ``preserve_source`` writes already-materialized scenario sections exactly;
+    the default only dedents multiline fixture strings and strips leading blanks.
     Native startup authority is published by the CLI.
     ``backend`` selects the fixture's execution choice, not authority.
     Its effective environment is captured before checker publication and reused
@@ -543,12 +561,9 @@ def create_strict_project(
     for name, source in sources.items():
         path = project / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(textwrap.dedent(source).lstrip("\n"))
-    if policy is None:
-        policy = (
-            "[tool.soac.strict]\ninclude = " + json.dumps(list(modules.values())) + "\n"
-        )
-    (project / "pyproject.toml").write_text(policy)
+        path.write_text(source if preserve_source else textwrap.dedent(source).lstrip("\n"))
+    if configuration is not None:
+        (project / "pyproject.toml").write_text(configuration)
     authority = root / "authority"
     authority.mkdir()
     signing_key = authority / "signing.key"
@@ -600,9 +615,16 @@ def create_strict_project(
     )
     publication = json.loads(result.stdout)
     assert deployment.is_file()
+    deployed = json.loads(deployment.read_text())
+    policies = {
+        item["module_name"]: MappingProxyType(item["policy"])
+        for item in deployed["modules"]
+    }
+    assert policies.keys() <= modules.keys(), "checker published an undeclared test module"
     return StrictProject(
         root, project, deployment, publication, dict(modules),
         backend=backend, environment=MappingProxyType(dict(environment)),
+        policies=MappingProxyType(policies),
     )
 
 

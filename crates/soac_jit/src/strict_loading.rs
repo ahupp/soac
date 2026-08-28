@@ -637,8 +637,9 @@ impl StrictArtifactLoader {
             &shard,
         )?;
         ensure!(
-            type_facts.facts().source_dialect == SourceDialect::SoacStrict,
-            "selected source lacks an authenticated strict dialect"
+            type_facts.facts().source_dialect == SourceDialect::SoacStrict
+                && type_facts.facts().language_policy.is_selected(),
+            "selected source lacks an authenticated strict policy"
         );
         Ok(Some(Arc::new(VerifiedStrictModule {
             interpreter_id: self.interpreter_id,
@@ -708,7 +709,8 @@ impl VerifiedStrictModule {
             );
             let facts = type_facts.facts();
             ensure!(
-                facts.source_dialect == SourceDialect::SoacStrict,
+                facts.source_dialect == SourceDialect::SoacStrict
+                    && facts.language_policy.is_selected(),
                 "fixture requires verified strict facts"
             );
             ensure!(
@@ -742,8 +744,8 @@ mod tests {
         AnalysisFileConfiguration, AnalysisInput, ArtifactEnvironment, ArtifactSigningKey,
         ConservativeAnalysis, DEPLOYMENT_SCHEMA_VERSION, DeployedModule, InterpreterIdentity,
         ModuleArtifactIndex, ModuleContentId, ModuleTypeFacts, PythonVersion, ResolvedStrictPolicy,
-        TypeArtifactManifest, TypingFinalPolicy, capture_analysis_input, encode_module_shard,
-        legacy_source_hash, sign_manifest,
+        TypeArtifactManifest, capture_analysis_input, encode_module_shard, legacy_source_hash,
+        sign_manifest,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -803,7 +805,10 @@ mod tests {
                     DeployedModule {
                         module_name: name.into(),
                         source_path: path,
-                        policy: ResolvedStrictPolicy::default(),
+                        policy: ResolvedStrictPolicy {
+                            strict_assign: true,
+                            ..Default::default()
+                        },
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1049,9 +1054,9 @@ mod tests {
     #[test]
     fn startup_policy_and_module_selection_must_match_the_signed_catalog() {
         let mut fixture = Fixture::new();
-        fixture.deployment.modules[0].policy.typing_final_policy = TypingFinalPolicy::Advisory;
+        fixture.deployment.modules[0].policy.checked_attr = true;
         assert!(fixture.loader().is_err());
-        fixture.deployment.modules[0].policy = ResolvedStrictPolicy::default();
+        fixture.deployment.modules[0].policy.checked_attr = false;
         fixture.deployment.modules.pop();
         assert!(fixture.loader().is_err());
     }

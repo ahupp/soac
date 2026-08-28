@@ -41,7 +41,7 @@ def closure_project(tmp_path_factory, request):
     return create_strict_project(
         tmp_path_factory.mktemp(f"closure-code-{request.param}"),
         {
-            "closure_source.py": "from __future__ import strict\n" + _MODULE_SOURCE,
+            "closure_source.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _MODULE_SOURCE,
             "closure_ordinary.py": _MODULE_SOURCE,
         },
         modules={"closure_source": "closure_source.py"},

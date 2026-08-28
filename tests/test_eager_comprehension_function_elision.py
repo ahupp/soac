@@ -168,7 +168,7 @@ def eager_project(tmp_path_factory, request):
     return create_strict_project(
         tmp_path_factory.mktemp(f"eager-semantic-{request.param}"),
         {
-            "eager_source.py": "from __future__ import strict\n" + _MODULE_SOURCE,
+            "eager_source.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _MODULE_SOURCE,
             "eager_ordinary.py": _MODULE_SOURCE,
         },
         modules={"eager_source": "eager_source.py"},
@@ -273,7 +273,7 @@ def test_lambda_default_walrus_preserves_containing_scope_and_evaluation_order(
     project = create_strict_project(
         tmp_path,
         {
-            "lambda_defaults.py": "from __future__ import strict\n" + _LAMBDA_DEFAULT_SOURCE,
+            "lambda_defaults.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _LAMBDA_DEFAULT_SOURCE,
             "ordinary_lambda_defaults.py": _LAMBDA_DEFAULT_SOURCE,
         },
         modules={"lambda_defaults": "lambda_defaults.py"},
@@ -365,7 +365,7 @@ def nested_default_lambda_super_project(tmp_path_factory):
         tmp_path_factory.mktemp("nested-default-lambda-super"),
         {
             "nested_default_lambda_super.py": (
-                "from __future__ import strict\n" + _NESTED_DEFAULT_LAMBDA_SUPER_SOURCE
+                "# soac: module(strict_assign=true, checked_attr=true)\n" + _NESTED_DEFAULT_LAMBDA_SUPER_SOURCE
             ),
             "ordinary_nested_default_lambda_super.py": _NESTED_DEFAULT_LAMBDA_SUPER_SOURCE,
         },
@@ -474,7 +474,7 @@ def test_class_comprehensions_keep_lexical_cells_without_native_slot_corresponde
     project = create_strict_project(
         tmp_path,
         {
-            "class_comprehensions.py": "from __future__ import strict\n" + _CLASS_COMPREHENSION_SOURCE,
+            "class_comprehensions.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _CLASS_COMPREHENSION_SOURCE,
             "ordinary_class_comprehensions.py": _CLASS_COMPREHENSION_SOURCE,
         },
         modules={"class_comprehensions": "class_comprehensions.py"},

@@ -4,6 +4,7 @@ use crate::artifact::{canonicalize_dependencies, validate_dependencies};
 use crate::*;
 
 pub(crate) fn canonicalize_module(facts: &mut ModuleTypeFacts) -> Result<(), ContractError> {
+    facts.language_policy.class_overrides.sort();
     canonicalize_dependencies(&mut facts.consumed_dependencies);
     facts
         .global_bindings
@@ -99,6 +100,11 @@ pub fn validate_module_facts(
     }
     validate_module_name(&facts.module.module_name)?;
     validate_dependencies(&facts.consumed_dependencies, &facts.module.module_name)?;
+    if (facts.source_dialect == SourceDialect::SoacStrict) != facts.language_policy.is_selected() {
+        return Err(ContractError::InvalidPolicy(
+            "source admission must match the resolved comment rules".into(),
+        ));
+    }
     let source = source
         .map(|source| {
             if usize::try_from(facts.source_size).ok() != Some(source.len())
@@ -123,6 +129,19 @@ pub fn validate_module_facts(
             return structure("duplicate class source identity");
         }
         definitions.insert(class.identity.clone());
+    }
+    let mut class_rules = BTreeSet::new();
+    for rule in &facts.language_policy.class_overrides {
+        if !class_rules.insert(rule.class_range)
+            || !facts
+                .classes
+                .iter()
+                .any(|class| class.identity.source_range == rule.class_range)
+        {
+            return Err(ContractError::InvalidPolicy(
+                "class rules must uniquely identify an actual source class".into(),
+            ));
+        }
     }
     for function in &facts.functions {
         if !functions.insert(function.identity.clone()) {
@@ -187,10 +206,8 @@ pub fn validate_module_facts(
             context.reference(identity)?;
         }
         context.static_type(&binding.value_type, 0)?;
-        if facts.source_dialect == SourceDialect::OrdinaryPython
-            && binding.mutability != GlobalMutability::Unknown
-        {
-            return structure("ordinary source cannot propose strict global restrictions");
+        if !facts.language_policy.strict_assign && binding.mutability != GlobalMutability::Unknown {
+            return structure("strict global restrictions require strict_assign");
         }
     }
     for class in &facts.classes {
@@ -314,13 +331,9 @@ pub fn validate_module_facts(
         for definition in &diagnostic.related_definitions {
             context.reference(definition)?;
         }
-        if diagnostic.code == DiagnosticCode::StrictIncompatibleFieldWrite
-            && facts.language_policy.checked_fields == CheckedFieldPolicy::Disabled
-        {
-            return Err(ContractError::InvalidPolicy(
-                "a strict checked-field diagnostic requires enabled checked fields".into(),
-            ));
-        }
+        // A write can target a checked field declared in another module.
+        // Its owner's policy, not the writer's module default, selects the
+        // diagnostic. Referenced identities are validated above.
         if diagnostic.severity == DiagnosticSeverity::Error && !diagnostic.suppressed {
             return Err(ContractError::BlockingDiagnostic(format!(
                 "{:?} at {}..{} (suppressed={})",
@@ -937,12 +950,21 @@ impl Context<'_> {
         }
         match &class.participation {
             ParticipationProposal::Candidate => {
+                if !self
+                    .facts
+                    .language_policy
+                    .checked_attributes(class.identity.source_range)
+                {
+                    return Err(ContractError::InvalidPolicy(
+                        "a class opted out of checked_attr cannot propose participation".into(),
+                    ));
+                }
                 if self.facts.source_dialect != SourceDialect::SoacStrict
                     || class.metaclass != MetaclassFact::BuiltinType
                     || !class.inheritance.complete
                 {
                     return structure(
-                        "candidate participation requires strict source, builtin type, and resolved inheritance",
+                        "candidate participation requires selected checked_attr, builtin type, and resolved inheritance",
                     );
                 }
                 if class.decorators.iter().any(|decorator| {
@@ -956,22 +978,6 @@ impl Context<'_> {
                             && decorator.definition.is_none())
                 }) {
                     return structure("unmodeled decorators must retain dynamic classification");
-                }
-                let uses_stdlib_dataclass = class
-                    .decorators
-                    .iter()
-                    .any(|decorator| decorator.kind == DecoratorKind::StdlibDataclass)
-                    || class
-                        .transform
-                        .as_ref()
-                        .is_some_and(|transform| transform.kind == TransformKind::StdlibDataclass);
-                if uses_stdlib_dataclass
-                    && self.facts.language_policy.adapters.dataclasses
-                        != StdlibDataclassPolicy::Stdlib
-                {
-                    return Err(ContractError::InvalidPolicy(
-                        "stdlib dataclass candidates require the enabled stdlib adapter".into(),
-                    ));
                 }
                 if class.uncertainty.iter().any(|reason| {
                     matches!(

@@ -40,7 +40,7 @@ def cached_empty_annotations(tmp_path_factory, request):
         tmp_path_factory.mktemp("strict-empty-annotation-cache"),
         {
             "empty_annotation_cache.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from annotationlib import get_annotations
 
 class Plain:
@@ -238,7 +238,7 @@ def explicit_object_project(tmp_path_factory):
         tmp_path_factory.mktemp("strict-explicit-object"),
         {
             "explicit_object.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from builtins import object as root_object
 
 class Direct(object):
@@ -307,7 +307,7 @@ def explicit_slots_project(tmp_path_factory):
         tmp_path_factory.mktemp("strict-explicit-slots"),
         {
             "slot_model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import slot_support
 
 class Probe:
@@ -374,11 +374,6 @@ def observe(cls):
 """,
         },
         modules={"slot_model": "slot_model.py"},
-        policy="""
-[tool.soac.strict]
-include = ["slot_model.py"]
-checked_fields = "supported_annotations"
-""",
     )
 
 
@@ -603,7 +598,7 @@ def test_strict_class_storage_and_mutation_boundaries(tmp_path, backend, entry_i
         tmp_path,
         {
             "model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 class Box:
     value: int = 0
@@ -716,9 +711,10 @@ for function in (model.Box.__init__, model.Box.method):
         project.run(validation, entry_interpreter=entry_interpreter)
 
 
-def test_pending_allocation_and_ordinary_method_calls_precede_init_subclass(tmp_path):
-    project = create_strict_project(
-        tmp_path,
+@pytest.fixture(scope="module")
+def pending_method_calls_project(tmp_path_factory):
+    return create_strict_project(
+        tmp_path_factory.mktemp("strict-pending-method-calls"),
         {
             "support.py": """
 events = []
@@ -737,7 +733,7 @@ def observe(cls):
     events.append(('ordinary-result', cls.__name__))
 """,
             "model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import support
 
 class Base:
@@ -753,7 +749,12 @@ class Child(Base):
         },
         modules={"model": "model.py"},
     )
-    project.run(
+
+
+def test_pending_allocation_and_ordinary_method_calls_precede_init_subclass(
+    pending_method_calls_project,
+):
+    pending_method_calls_project.run(
         """
 import model
 import support
@@ -770,9 +771,51 @@ except StrictMutationError:
     pass
 else:
     raise AssertionError('admitted type lost its protected method')
-instance.value = 'wrong return type'
-assert instance.method() == 'wrong return type'
+# Ordinary calls keep their value semantics after admission as well. This
+# foreign receiver has no selected storage, unlike the real Child instance.
+class Foreign:
+    value = 'wrong return type'
+assert model.Child.method(Foreign()) == 'wrong return type'
+assert instance.value == 7
 """
+    )
+
+
+@pytest.mark.parametrize("entry_interpreter", [False, True])
+def test_pending_class_completion_installs_checks_on_actual_field_writes(
+    pending_method_calls_project, entry_interpreter
+):
+    pending_method_calls_project.run(
+        """
+import ctypes
+import model
+import support
+from soac.strict import StrictMutationError
+
+assert support.events == [('pending', 'Child'), ('ordinary-result', 'Child')]
+owner = ctypes.pythonapi.PyType_GetSoacContractOwner
+owner.argtypes = [ctypes.py_object]
+owner.restype = ctypes.c_void_p
+assert owner(model.Child)
+instance = model.Child()
+storage = vars(instance)
+for write in (
+    lambda: setattr(instance, 'value', 'wrong return type'),
+    lambda: object.__setattr__(instance, 'value', 'wrong return type'),
+    lambda: storage.__setitem__('value', 'wrong return type'),
+):
+    try:
+        write()
+    except TypeError as error:
+        assert not isinstance(error, StrictMutationError)
+    else:
+        raise AssertionError('completed class did not constrain its real field')
+    assert instance.value == 7 and instance.method() == 7
+    assert storage == {}
+instance.value = 9
+assert instance.method() == 9 and storage == {'value': 9}
+""",
+        entry_interpreter=entry_interpreter,
     )
 
 
@@ -788,7 +831,7 @@ class Token:
         events.append('token released')
 """,
             "model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import support
 
 token = support.Token()
@@ -848,7 +891,7 @@ def make():
 """
     project = create_strict_project(
         tmp_path,
-        {"model.py": "from __future__ import strict\n" + body},
+        {"model.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + body},
         modules={"model": "model.py"},
     )
     project.run(
@@ -908,7 +951,7 @@ class Meta(type):
     pass
 """,
             "model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from framework import Meta, instrument
 
 @instrument
@@ -939,7 +982,7 @@ import model
 stock = types.ModuleType('ordinary_unknown_class_control')
 sys.modules[stock.__name__] = stock
 source = Path(model.__file__).read_text()
-exec(compile(source.replace('from __future__ import strict', ''),
+exec(compile(source.replace('# soac: module(strict_assign=true, checked_attr=true)', ''),
              '<ordinary unknown class control>', 'exec'), vars(stock))
 
 def replacement(self):
@@ -1079,7 +1122,7 @@ for cls, method, provider in originals:
 def test_public_strict_errors_are_native_shared_classes(tmp_path):
     project = create_strict_project(
         tmp_path,
-        {"model.py": "from __future__ import strict\nvalue = 1\n"},
+        {"model.py": "# soac: module(strict_assign=true, checked_attr=true)\nvalue = 1\n"},
         modules={"model": "model.py"},
     )
     project.run(
@@ -1149,7 +1192,7 @@ def rewrite(namespace):
         namespace['method'].__code__ = replacement.__code__
 """,
             "model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import support
 
 def make():
@@ -1337,7 +1380,7 @@ def finish():
     assert not worker.is_alive()
 """,
             "admission_model.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import admission_support as support
 
 class Model:
@@ -2313,11 +2356,10 @@ def test_cpython_pending_type_blocks_callback_admission_then_enforces_final_type
     project = create_strict_project(
         tmp_path,
         {
-            "pending_type.py": "from __future__ import strict\n" + body,
+            "pending_type.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + body,
             "pending_type_support.py": _PENDING_TYPE_SUPPORT,
         },
         modules={"pending_type": "pending_type.py"},
-        policy='[tool.soac.strict]\ninclude = ["pending_type.py"]\nchecked_fields = "supported_annotations"\n',
         backend="cpython",
     )
     project.run_case(
@@ -2432,7 +2474,7 @@ def test_cpython_class_admission_seals_metadata_without_checking_forward_annotat
     project = create_strict_project(
         tmp_path,
         {
-            "early_class.py": "from __future__ import strict\n" + _EARLY_CLASS_ADMISSION_BODY,
+            "early_class.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _EARLY_CLASS_ADMISSION_BODY,
             "ordinary_early_class.py": _EARLY_CLASS_ADMISSION_BODY,
             "early_class_probe.py": _EARLY_CLASS_ADMISSION_PROBE,
         },
@@ -2485,12 +2527,10 @@ def test_soac_pending_type_preserves_layout_and_admits_only_after_required_const
     project = create_strict_project(
         tmp_path,
         {
-            "retained_pending_type.py": "from __future__ import strict\n" + body,
+            "retained_pending_type.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + body,
             "pending_type_support.py": _PENDING_TYPE_SUPPORT,
         },
         modules={"retained_pending_type": "retained_pending_type.py"},
-        policy='[tool.soac.strict]\ninclude = ["retained_pending_type.py"]\n'
-        'checked_fields = "supported_annotations"\n',
         backend="soac",
     )
     project.run_case(
@@ -2766,7 +2806,7 @@ def frozen_module_nominal_projects(tmp_path_factory):
     for suffix, span_seal in (("sync", False), ("spans_seal", True)):
         name = f"frozen_module_nominal_{suffix}"
         body = _FROZEN_MODULE_NOMINAL_BODY.format(span_seal=span_seal)
-        sources[f"{name}.py"] = "from __future__ import strict\n" + body
+        sources[f"{name}.py"] = "# soac: module(strict_assign=true, checked_attr=true)\n" + body
         sources[f"ordinary_{name}.py"] = body
         modules[name] = f"{name}.py"
     return create_strict_project(

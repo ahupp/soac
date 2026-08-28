@@ -231,6 +231,79 @@ def test_generated_top_commit_is_reproduced_without_source_or_patch_publication(
     with pytest.raises(CPythonEnvironmentError, match="generated.*stale|does not match"):
         regeneration.regenerate(repo, source, check=True)
     assert (output / "b.h").read_text() == "other = 3\n"
+    emitted = "other = 1\n"
+    with pytest.raises(CPythonEnvironmentError, match="no generated changes"):
+        regeneration.regenerate(repo, source, check=True)
+
+
+def test_logical_top_checks_unchanged_generated_output_at_exact_pin(
+    checkout, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, source, _, _ = generated_checkout(checkout)
+    (source / "a.h").write_text("value = 4\n")
+    logical = commit_source(source, "Logical change after generated output")
+    pin_source(repo, logical)
+    monkeypatch.setattr(regeneration, "GENERATED_FILES", ("b.h",))
+    inputs = []
+
+    def generate(staged: Path, build: Path) -> None:
+        inputs.append(git_output(staged, "rev-parse", "HEAD"))
+        assert (staged / "a.h").read_text() == "value = 4\n"
+        assert (staged / "b.h").read_text() == "other = 3\n"
+        (staged / "b.h").write_text("other = 3\n")
+
+    monkeypatch.setattr(regeneration, "generate_cases", generate)
+    before = preparation.verify_source(repo, source)
+    result = regeneration.regenerate(repo, source, check=True)
+    assert inputs == [logical]
+    assert result["input_revision"] == result["reference_revision"] == logical
+    assert result["matches_reference"] is True
+    assert result["generated_files"] == {}
+    assert preparation.verify_source(repo, source) == before
+    output = repo / "work/unchanged-generated-output"
+    regeneration.regenerate(repo, source, output=output)
+    assert sorted(path.name for path in output.iterdir()) == ["generation.json"]
+    assert json.loads((output / "generation.json").read_text())["generated_files"] == {}
+    assert preparation.verify_source(repo, source) == before
+
+
+def test_logical_top_rejects_stale_generated_output_without_modifying_source(
+    checkout, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, source = checkout
+    (source / "a.h").write_text("value = 2\n")
+    logical = commit_source(source, "Logical change without refreshed output")
+    pin_source(repo, logical)
+    monkeypatch.setattr(regeneration, "GENERATED_FILES", ("b.h",))
+
+    def generate(staged: Path, build: Path) -> None:
+        assert git_output(staged, "rev-parse", "HEAD") == logical
+        (staged / "b.h").write_text("other = 2\n")
+
+    monkeypatch.setattr(regeneration, "generate_cases", generate)
+    before = preparation.verify_source(repo, source)
+    with pytest.raises(CPythonEnvironmentError, match="generated.*stale|does not match"):
+        regeneration.regenerate(repo, source, check=True)
+    assert preparation.verify_source(repo, source) == before
+
+
+def test_logical_top_unchanged_output_still_rechecks_live_source_identity(
+    checkout, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, source = checkout
+    (source / "a.h").write_text("value = 2\n")
+    pin_source(repo, commit_source(source, "Logical source change"))
+    monkeypatch.setattr(regeneration, "GENERATED_FILES", ("b.h",))
+    output = repo / "work/changed-input-no-output"
+
+    def generate(staged: Path, build: Path) -> None:
+        (source / "a.h").write_text("external change during unchanged generation\n")
+
+    monkeypatch.setattr(regeneration, "generate_cases", generate)
+    with pytest.raises(CPythonEnvironmentError, match="uncommitted|checkout bytes"):
+        regeneration.regenerate(repo, source, output=output)
+    assert not output.exists()
+    assert (source / "a.h").read_text() == "external change during unchanged generation\n"
 
 
 @pytest.mark.parametrize("change", ["non_generated", "live_input"])

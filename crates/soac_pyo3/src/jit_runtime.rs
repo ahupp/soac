@@ -574,12 +574,16 @@ fn strict_module_diagnostics<'py>(
             return Err(unavailable());
         }
         let sealed = strict.is_sealed(py)?;
+        let ready = strict.is_ready(py)?;
         let initializer_entry = strict.initializer_entry_kind(py)?;
         let facts = verified.type_facts();
         let result = PyDict::new(py);
-        result.set_item("schema", 1)?;
+        result.set_item("schema", 2)?;
         result.set_item("backend", "soac")?;
         result.set_item("sealed", sealed)?;
+        result.set_item("ready", ready)?;
+        result.set_item("strict_assign", facts.facts().language_policy.strict_assign)?;
+        result.set_item("checked_attr", facts.facts().language_policy.checked_attr)?;
         result.set_item(
             "initializer_entry_kind",
             initializer_entry.map(soac_jit::StrictFunctionEntryKind::as_str),

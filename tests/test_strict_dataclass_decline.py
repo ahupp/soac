@@ -62,7 +62,7 @@ async def pause() -> bool:
 """
 
 _MODELS = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 import decline_support as support
 
@@ -163,7 +163,7 @@ dataclasses.dataclass = support.factory
 try:
     import decline_models as model
     stock = types.ModuleType('ordinary_decline_models')
-    exec(compile({_MODELS!r}.replace('from __future__ import strict\\n', ''),
+    exec(compile({_MODELS!r}.replace('# soac: module(strict_assign=true, checked_attr=true)\\n', ''),
                  '<ordinary decorator decline>', 'exec'), vars(stock))
 finally:
     dataclasses.dataclass = original
@@ -230,7 +230,7 @@ for asynchronous in (False, True):
 
 
 _UNKNOWN_OPTION_MODELS = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dataclasses import dataclass
 import unknown_option_support as support
 
@@ -275,11 +275,6 @@ def test_cpython_unknown_dataclass_option_preserves_stdlib_truth_and_dynamic_cla
             "unknown_option_support.py": _UNKNOWN_OPTION_SUPPORT,
         },
         modules={"unknown_option_model": "unknown_option_model.py"},
-        policy="""
-[tool.soac.strict]
-include = ["unknown_option_model.py"]
-checked_fields = "supported_annotations"
-""",
         backend="cpython",
     )
     project.run_case(
@@ -316,7 +311,7 @@ call_one.restype = ctypes.py_object
 
 stock = types.ModuleType("ordinary_unknown_dataclass_option")
 sys.modules[stock.__name__] = stock
-exec(compile(source.replace("from __future__ import strict", ""),
+exec(compile(source.replace("# soac: module(strict_assign=true, checked_attr=true)", ""),
              "<ordinary unknown dataclass option>", "exec"), vars(stock))
 
 def exercise(source_module):

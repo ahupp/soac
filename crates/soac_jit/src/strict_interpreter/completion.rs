@@ -325,9 +325,10 @@ pub(super) fn complete_invocation(
     complete_remaining_classes(py, state, &globals, None)?;
     if !data
         .execution
-        .is_sealed(py, &globals, data.source.verified())?
+        .is_ready(py, &globals, data.source.verified())?
     {
-        // Forward module bindings become final only in the one module seal.
+        // The initializer drains this inventory at authenticated completion,
+        // whether or not its policy also freezes the module's bindings.
         return Ok(());
     }
     while let Some((kind, object)) = data.execution.next_interpreter_pending(
@@ -366,7 +367,7 @@ pub(super) fn complete_definition(
         InterpreterCodeRole::SourceFunction | InterpreterCodeRole::AsyncSourceFunction => {
             if !data
                 .execution
-                .is_sealed(py, &globals, data.source.verified())?
+                .is_ready(py, &globals, data.source.verified())?
             {
                 return Ok(());
             }

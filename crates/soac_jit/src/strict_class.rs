@@ -1387,7 +1387,7 @@ fn construct_class<'py>(
             }
             if auth
                 .execution_ref()
-                .is_sealed(py, &*auth.globals()?, &verified)?
+                .is_ready(py, &*auth.globals()?, &verified)?
                 && !state.pending_dataclass()
             {
                 finalize_class(py, &class, &fact.identity)?;
@@ -1704,7 +1704,8 @@ fn adopt_function(
         crate::strict_function::authenticate_borrowed_strict_function(py, function.as_borrowed())?
     {
         if auth.awaits_module_nominals() {
-            // Metadata is already frozen and every call is checked.
+            // Required method metadata is already frozen. Calls themselves
+            // have no runtime parameter or return-type contract.
             // The existing weak function receipt, not a new owner registry,
             // completes unresolved module leaves at the one global seal.
             return Ok(());

@@ -66,7 +66,7 @@ def _run_class_case(
     def publish():
         return create_strict_project(
             root,
-            {filename: "from __future__ import strict\n" + source},
+            {filename: "# soac: module(strict_assign=true, checked_attr=true)\n" + source},
             modules={module_name: filename},
             backend=mode,
         )
@@ -556,7 +556,7 @@ def test_retained_unrepresented_class_cell_refuses_before_module_effects(
     tmp_path, entry_interpreter
 ):
     source = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 import body_effects
 
 body_effects.events.append("module body entered")

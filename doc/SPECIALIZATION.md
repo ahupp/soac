@@ -218,13 +218,14 @@ Capture selection follows enabled field-write predicates. A selected dataclass
 field still needs its actual declaration binding when `init=False`; inherited
 storage reuses the original declaring field owner. `InitVar`, parameter and
 return annotations create no runtime value obligations or private lifetime
-edges. Statically dynamic classes and disabled field policies remain outside
-this capture selection.
+edges. Statically dynamic or explicitly opted-out classes introduce no new
+local field predicates; inherited storage retains its declaring owner's checks.
 
 Compiler-owned namespace/construction helpers and verified generator-expression
 helpers without original execution code use a private denial-only code clone at
-creation. Its strict future bit prevents an early CREATE observer from executing
-uninitialized closure bytecode; it does not provide a source identity or runtime
+creation. Its internal `CO_FUTURE_STRICT` ownership guard prevents an early CREATE
+observer from executing uninitialized closure bytecode; it is not source-policy
+opt-in and does not provide a source identity or runtime
 authority. Generator expressions require their explicit code projection, current
 rooted template, and separate code-exposure entry; function kind or name alone
 does not select this path. Original source code and ordinary bootstrap code are

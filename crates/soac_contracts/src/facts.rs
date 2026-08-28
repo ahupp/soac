@@ -582,6 +582,7 @@ pub struct NominalBindingFact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DynamicClassReason {
+    PolicyOptOut,
     NonParticipatingMetaclass,
     UnknownDecorator,
     FrameworkManaged,
@@ -679,21 +680,6 @@ pub struct ClassTypeFact {
 }
 
 impl ClassTypeFact {
-    /// Exact source declaration membership, not a field-name or qualname
-    /// heuristic. A method-only instance annotation is not a class-body field
-    /// consumed by dataclasses, even if a different class member shares its name.
-    pub fn declares_field_annotation(&self, field: &FieldTypeFact) -> bool {
-        field.declaring_class.definition == self.identity
-            && field
-                .annotation_definition
-                .as_ref()
-                .is_some_and(|definition| {
-                    self.class_members.iter().any(|member| {
-                        member.name == field.name && member.definition.as_ref() == Some(definition)
-                    })
-                })
-    }
-
     /// Own field declarations consumed by selected storage write predicates.
     /// Constructor signatures and InitVars do not select storage requirements.
     /// Inherited checked declarations keep their original owner.
@@ -702,7 +688,11 @@ impl ClassTypeFact {
         self.instance_fields
             .iter()
             .filter(|field| field.declaring_class.definition == self.identity)
-            .filter(|field| field.required_write_type(policy.checked_fields).is_some())
+            .filter(|field| {
+                field
+                    .required_write_type(policy.checked_fields(self.identity.source_range))
+                    .is_some()
+            })
             .collect()
     }
 }

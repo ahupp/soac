@@ -65,12 +65,14 @@ added. No full-suite rerun was performed for this test-policy change.
 ## Runner and first checkpoint
 
 Use `tests._strict_integration.create_strict_project` with explicit selected
-modules whose strict variants contain the real `from __future__ import strict`.
-The helper does not insert the opt-in. `StrictProject.run_case` launches a fresh
-native-startup-configured interpreter, checks actual sealed-module diagnostics
-against source path and artifact generation, optionally checks registered native
-strict function witnesses, then runs ordinary validation after sealing. Stock
-controls keep their original sources.
+modules whose source contains production `# soac:` rules or inherits package
+rules. The helper inserts neither a future import nor a strictness config file.
+`StrictProject.run_case` launches a fresh native-startup-configured interpreter,
+checks authenticated module readiness and the selected binding-seal state
+against source path and artifact generation, optionally checks registered
+native function witnesses, then runs ordinary validation after initialization.
+Stock controls keep their original sources. The earlier checkpoints below
+retain their historical future/configuration-era evidence.
 
 When retaining a publication for replay, use the same repository pytest
 entrypoint for publication and execution. Launcher variables such as

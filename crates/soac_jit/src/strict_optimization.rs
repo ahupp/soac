@@ -1239,7 +1239,11 @@ mod tests {
             "field_request_fixture",
             source.as_bytes(),
             SourceDialect::SoacStrict,
-            ResolvedStrictPolicy::default(),
+            ResolvedStrictPolicy {
+                strict_assign: true,
+                checked_attr: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let class = ClassReference {
@@ -1351,7 +1355,10 @@ mod tests {
             "checked_unbound_fixture",
             source.as_bytes(),
             SourceDialect::SoacStrict,
-            ResolvedStrictPolicy::default(),
+            ResolvedStrictPolicy {
+                strict_assign: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let split = source.find("def run").unwrap();
@@ -1515,7 +1522,10 @@ mod tests {
                         "other",
                         b"other",
                         SourceDialect::SoacStrict,
-                        ResolvedStrictPolicy::default(),
+                        ResolvedStrictPolicy {
+                            strict_assign: true,
+                            ..Default::default()
+                        },
                     )
                     .unwrap()
                     .module
@@ -1756,7 +1766,10 @@ mod tests {
             "foreign_boxes",
             b"class Box: pass\n",
             SourceDialect::SoacStrict,
-            ResolvedStrictPolicy::default(),
+            ResolvedStrictPolicy {
+                checked_attr: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let (mut facts, mut module, index) = method_fixture();

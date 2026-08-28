@@ -122,7 +122,10 @@ executable/library identity; neither `Py_DEBUG` nor `-X dev` is sufficient.
 Existing nondebug provenance records are unchanged. Benchmark entrypoints
 reject stackref-debug as well. Regenerate bytecode cases with
 `just regenerate-cpython-cases`, never by editing the live selected checkout.
-`--check` verifies the generated-only pinned top commit from its logical parent.
+`--check` regenerates a generated-only pinned top commit from its exact logical
+parent. For a purely logical pinned top, it regenerates from that exact commit
+and requires byte-identical generated outputs; do not invent churn or a generated
+commit when there is no output change. Mixed logical/generated commits reject.
 `--source <shared-staging-checkout> --revision <logical-commit> --output
 work/cpython-generated/<review-name>` emits review files for a separate
 generated commit without promoting or changing sources.
@@ -203,6 +206,27 @@ because it should affect engineering decisions:
 
 
 ## DESIGN GOALS
+
+Source policy uses `# soac: package(...)`, `# soac: module(...)`, and
+`# soac: class(...)` comments, never `[tool.soac.strict]` configuration. Both
+`strict_assign` and `checked_attr` default to `false`. Package directives live
+in `__init__.py` and inherit outer-to-inner; module overrides affect only their
+own file. Missing keys inherit. A class directive before the declaration and
+its decorators binds that exact AST node and accepts only `checked_attr=true`
+or `false`. Class eligibility is automatic: `checked_attr` selects eligible
+class invariants and supported field-write checks; an opt-out introduces no new
+local contract but never revokes inherited checks. `strict_assign` independently
+selects module assignment invariants. Unsupported framework classes fall back
+without weakening an installed base contract.
+
+Ordinary CPython ignores these comments. Only authenticated startup and actual
+runtime binding install contracts. Strict test helpers and scenario adapters
+must preserve source bytes, with no implicit strict future import or synthesized
+TOML policy. The trusted raw compiler sets an internal strict ownership guard
+flag; this is not source policy. Reject retired TOML strictness configuration.
+Current publications use artifact schema 7, strict-contract version 3, dialect
+version 2 and deployment schema 3; regenerate older publications rather than
+relaxing version checks. Optimization and benchmarks remain deferred.
 
 
 1. SOAC should *always* either preserve CPython user-visible behavior,
@@ -335,9 +359,11 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    `tests._strict_integration.create_strict_project(...)` with explicit module
    selection, then `StrictProject.run(...)` or `run_case(...)`. These run the
    actual offline checker and native startup-configured subprocess; import-hook
-   and mode flags alone are not strict authority. Use
+   and mode flags alone are not strict authority. Put source-comment directives
+   in the supplied source or inherit package settings; the helper inserts no
+   future import or strict TOML policy. Use
    `tests._integration.stock_module(...)` for ordinary controls. Delimiter
-   validation tails run outside the sealed module and must either declare one
+   validation tails run outside the admitted module and must either declare one
    synchronous `validate_module(module)`/`validate(module)` or use top-level
    checks, not both. Never convert unexpected test failures to xfails based on
    exception text.
@@ -347,8 +373,9 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    original stock body and validator when enrolling it. A strict-only rejection
    validator must name the documented contract difference.
    New source-level cases can use one file under `tests/strict_scenarios/` with
-   `# module:name`, `# ok`, and `# raise:Exception` sections. Its adapter explicitly
-   adds strict opt-in, runs the real checker once per file/mode, then starts a
+   `# module:name`, `# ok`, and `# raise:Exception` sections. Each module section
+   supplies source-comment selection or inherits package defaults; the adapter
+   preserves those bytes, runs the real checker once per file/mode, then starts a
    fresh authenticated process for every block. Only the final top-level
    statement can satisfy `raise`; imports, admission and preceding setup must
    succeed independently. See `doc/STRICT_SCENARIO_TESTS.md`. Preserve existing
@@ -672,8 +699,10 @@ so a later turn can resume without rediscovering context.
   Refuses source changes and concurrent prepare/build commands; never fetches,
   applies patches, resets or discards edits. Rebuild after changing the pin.
 - `just regenerate-cpython-cases [--check]`
-  Recreates or checks the generated-only native top commit from its logical
-  parent in a disposable guest checkout. `--source <shared-staging-checkout>
+  Regenerates a generated-only native top commit from its exact logical parent
+  in a disposable guest checkout. A purely logical top is regenerated from its
+  own exact commit and must leave generated outputs byte-identical; mixed
+  logical/generated tops reject. `--source <shared-staging-checkout>
   --revision <logical-commit> --output work/cpython-generated/<review-name>`
   emits review files without editing selected sources. Commit generated files
   separately in CPython, with the command in that commit's description.
@@ -849,9 +878,14 @@ another revision's cache.
   initialization and executes unchanged measurement statements in an ordinary
   copied namespace after actual module sealing. Reject unsafe suffix global
   rebinding or unsupported reflection; never run timing during initialization
-  or silently drop a failed driver. Parameter/return checks use supported
-  annotations, class eligibility is automatic, frameworks fall back, and optional
-  checked fields are disabled for this benchmark policy. Exact opted-in paths
+  or silently drop a failed driver. Selected source overlays add
+  `# soac: module(strict_assign=true, checked_attr=true)`; eligible classes and
+  supported field writes are checked, frameworks fall back, and parameter/return
+  annotations remain static facts. The source manifest is schema 4 and execution
+  manifest schema 2. Upstream configuration bytes and absence remain unchanged:
+  no TOML policy projection or insertion is allowed, and retired strict TOML
+  policy rejects. This is harness maintenance, not authorization to resume
+  deferred optimization or benchmarks. Exact opted-in paths
   become the allow-list; workers reexec with native authenticated startup
   authority and validate real seal/source diagnostics before measured values.
   `soac.*` names and source manifests are not optimization authority.

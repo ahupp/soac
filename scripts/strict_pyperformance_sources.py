@@ -11,12 +11,12 @@ import __future__
 
 import argparse
 import ast
-import copy
 import hashlib
 import io
 import json
 import keyword
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -29,91 +29,70 @@ from typing import Any
 
 import tomllib
 
-SCHEMA = 3
+SCHEMA = 4
 SELECTION_POLICY = "driver-local-static-imports-v1"
+SOURCE_POLICY = "explicit-source-module-comments-v1"
+SOURCE_DECLARATION = "# soac: module(strict_assign=true, checked_attr=true)"
 HARNESS_POLICY = "terminal-main-measurement-suffix-v1"
-CONFIGURATION_POLICY = "preserve-upstream-append-strict-table-v1"
-EXECUTION_SCHEMA = 1
+CONFIGURATION_POLICY = "preserve-upstream-configuration-v2"
+LANGUAGE_DIFFERENCE = (
+    "explicit SOAC module comments select strict assignments and checked attributes; "
+    "upstream configuration bytes and absence are unchanged; unchanged terminal "
+    "measurement suffix runs through an ordinary harness after module sealing"
+)
+EXECUTION_SCHEMA = 2
 
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _require_unselected_source(text: str, filename: str) -> None:
+    for token in tokenize.generate_tokens(io.StringIO(text, newline=None).readline):
+        if token.type == tokenize.COMMENT and re.match(r"#\s*soac\b", token.string):
+            raise ValueError(f"source already declares SOAC policy: {filename}")
+
+
 def strict_opt_in(source: bytes, filename: str) -> tuple[bytes, int]:
-    """Insert only the future feature, retaining encoding, comments and code."""
+    """Insert one module comment without rewriting original source bytes."""
     encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
     text = source.decode(encoding)
-    original = ast.parse(text, filename=filename)
-    if any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "__future__"
-        and any(alias.name == "strict" for alias in node.names)
-        for node in original.body
-    ):
-        raise ValueError(f"stock benchmark already opts into strict: {filename}")
+    original = ast.parse(source, filename=filename)
+    _require_unselected_source(text, filename)
 
+    # A comment can precede a docstring or future import, including a header
+    # sharing its line with ordinary code. Leave shebangs/cookies in their
+    # original first two lines and keep a UTF-8 BOM at byte zero.
+    bom = b"\xef\xbb\xbf" if source.startswith(b"\xef\xbb\xbf") else b""
+    lines = source[len(bom):].splitlines(keepends=True)
     insertion_line = 0
-    body = iter(original.body)
-    first = next(body, None)
-    if (
-        isinstance(first, ast.Expr)
-        and isinstance(first.value, ast.Constant)
-        and isinstance(first.value.value, str)
-    ):
-        insertion_line = first.end_lineno
-        first = next(body, None)
-    while isinstance(first, ast.ImportFrom) and first.module == "__future__":
-        insertion_line = first.end_lineno
-        first = next(body, None)
-
-    lines = text.splitlines(keepends=True)
-    # Keep a shebang/coding cookie within the physical first two lines.
-    # With no docstring/future imports, leading comments may stay before the
-    # added future without changing Python's first-statement semantics.
-    if insertion_line == 0:
-        while insertion_line < len(lines):
-            stripped = lines[insertion_line].lstrip()
-            if stripped.startswith("#") or not stripped.strip():
-                insertion_line += 1
-            else:
-                break
-    newline = "\r\n" if "\r\n" in text else "\n"
-    if first is not None and first.lineno == insertion_line:
-        # A docstring/future header can share its physical line with ordinary
-        # statements. Insert before that first ordinary statement, preserving
-        # all existing bytes and the future-import ordering rule. AST columns
-        # use UTF-8 bytes even when the original source has another encoding.
-        header_line = lines[insertion_line - 1].encode("utf-8")
-        before = "".join(lines[:insertion_line - 1]) + header_line[:first.col_offset].decode("utf-8")
-        after = header_line[first.col_offset:].decode("utf-8") + "".join(lines[insertion_line:])
-        candidate = before + "from __future__ import strict; " + after
-        added_line = insertion_line
-    else:
-        before = "".join(lines[:insertion_line])
-        after = "".join(lines[insertion_line:])
-        if before and not before.endswith(("\n", "\r")):
-            before += newline
-        candidate = before + "from __future__ import strict" + newline + after
-        added_line = insertion_line + 1
-
+    while insertion_line < len(lines):
+        stripped = lines[insertion_line].lstrip()
+        if stripped.startswith(b"#") or not stripped.strip():
+            insertion_line += 1
+        else:
+            break
+    first_newline = re.search(rb"\r\n|[\r\n]", source)
+    newline = first_newline.group() if first_newline is not None else b"\n"
+    before = bom + b"".join(lines[:insertion_line])
+    after = b"".join(lines[insertion_line:])
+    separator = (
+        newline if before != bom and not before.endswith((b"\n", b"\r")) else b""
+    )
+    declaration_encoding = "utf-8" if encoding == "utf-8-sig" else encoding
+    candidate = (
+        before
+        + separator
+        + SOURCE_DECLARATION.encode(declaration_encoding)
+        + newline
+        + after
+    )
     transformed = ast.parse(candidate, filename=filename)
-    added = [
-        (index, node)
-        for index, node in enumerate(transformed.body)
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "__future__"
-        and len(node.names) == 1
-        and node.names[0].name == "strict"
-    ]
-    if len(added) != 1:
-        raise ValueError(f"strict overlay has no unique future insertion: {filename}")
-    del transformed.body[added[0][0]]
     if ast.dump(original, include_attributes=False) != ast.dump(
         transformed, include_attributes=False
     ):
         raise ValueError(f"strict overlay changed benchmark syntax: {filename}")
-    return candidate.encode(encoding), added_line
+    return candidate, insertion_line + 1
 
 
 def _main_guard(node: ast.stmt) -> bool:
@@ -159,13 +138,7 @@ def project_driver_harness(
     encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
     text = source.decode(encoding)
     original = ast.parse(text, filename=filename)
-    if any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "__future__"
-        and any(alias.name == "strict" for alias in node.names)
-        for node in original.body
-    ):
-        raise ValueError(f"stock benchmark already opts into strict: {filename}")
+    _require_unselected_source(text, filename)
     if not original.body or not _main_guard(original.body[-1]):
         raise ValueError(f"benchmark requires a terminal __main__ guard: {filename}")
     guard = original.body[-1]
@@ -341,7 +314,7 @@ def _selected_modules(root: Path, entry: Path, inventory: list[Path]) -> dict[st
 
     A .py file can be benchmark input (for example a parser/compiler fixture),
     not executable workload code. Merely copying a driver directory must not
-    add a future statement to that data. Dynamic imports and dependencies
+    add a policy comment to that data. Dynamic imports and dependencies
     outside the driver directory stay ordinary under this fixed policy.
     """
     candidates: dict[str, Path] = {}
@@ -393,10 +366,11 @@ def _source_fingerprint(manifest: dict[str, Any]) -> str:
     comparable = {
         "schema": manifest["schema"],
         "selection_policy": manifest["selection_policy"],
+        "source_policy": manifest["source_policy"],
         "modules": manifest["modules"],
         "files": manifest["files"],
-        "policy_sha256": manifest["policy_sha256"],
-        "policy_projection": manifest["policy_projection"],
+        "configuration_sha256": manifest["configuration_sha256"],
+        "configuration_provenance": manifest["configuration_provenance"],
         "harness_projection": manifest["harness_projection"],
     }
     return _digest(
@@ -422,71 +396,21 @@ def stock_source_fingerprint(script: Path) -> str:
     )
 
 
-def _project_strict_policy(
-    upstream: bytes | None, modules: Mapping[str, str]
-) -> tuple[bytes, dict[str, Any]]:
-    """Preserve upstream bytes and add only the explicitly declared policy."""
-    requested = {
-        "include": sorted(modules.values()),
-        "default_class_policy": "automatic",
-        "unsupported_class_policy": "dynamic",
-        "checked_fields": "disabled",
-    }
+def _configuration_provenance(upstream: bytes | None) -> dict[str, Any]:
+    """Disclose unchanged configuration, never add a strictness table."""
     original = upstream if upstream is not None else b""
     try:
         parsed = tomllib.loads(original.decode("utf-8"))
     except (UnicodeError, tomllib.TOMLDecodeError) as error:
         raise ValueError("upstream pyproject.toml must be valid UTF-8 TOML") from error
     tool = parsed.get("tool", {})
-    if not isinstance(tool, dict):
-        # This is an invalid TOML value, not a Python API argument type.
-        raise ValueError("upstream tool namespace conflicts with SOAC strict policy")  # noqa: TRY004
-    soac = tool.get("soac", {})
-    if not isinstance(soac, dict):
-        # Preserve a uniform configuration-error boundary for parsed TOML.
-        raise ValueError(  # noqa: TRY004 - invalid configuration value
-            "upstream tool.soac namespace conflicts with SOAC strict policy"
-        )
-    if "strict" in soac:
-        if soac["strict"] != requested:
-            raise ValueError(
-                "existing tool.soac.strict conflicts with benchmark policy"
-            )
-        appended = b""
-    else:
-        newline = b"\r\n" if b"\r\n" in original else b"\n"
-        separator = newline if original else b""
-        if original and not original.endswith(b"\n"):
-            separator = newline + separator
-        declarations = [
-            "[tool.soac.strict]",
-            *(
-                f"{key} = {json.dumps(value, ensure_ascii=False)}"
-                for key, value in requested.items()
-            ),
-        ]
-        appended = (
-            separator
-            + newline.join(line.encode("utf-8") for line in declarations)
-            + newline
-        )
-    policy = original + appended
-    expected = copy.deepcopy(parsed)
-    expected.setdefault("tool", {}).setdefault("soac", {})["strict"] = requested
-    try:
-        actual = tomllib.loads(policy.decode("utf-8"))
-    except tomllib.TOMLDecodeError as error:
-        # Inline-table namespaces cannot be extended by appending declarations.
-        # Do not reserialize or overwrite their upstream bytes to make room.
-        raise ValueError(
-            "upstream TOML namespace cannot accept SOAC policy without rewriting"
-        ) from error
-    if actual != expected:
-        raise ValueError("SOAC policy projection changed upstream configuration")
-    return policy, {
+    soac = tool.get("soac", {}) if isinstance(tool, dict) else {}
+    if isinstance(soac, dict) and "strict" in soac:
+        raise ValueError("retired [tool.soac.strict] is not a source-policy authority")
+    return {
         "policy": CONFIGURATION_POLICY,
         "upstream_sha256": None if upstream is None else _digest(upstream),
-        "appended_utf8": appended.decode("utf-8"),
+        "presence": "absent" if upstream is None else "preserved",
     }
 
 
@@ -514,12 +438,12 @@ def prepare_source_overlay(script: Path, output: Path) -> dict[str, Any]:
         )
         (temporary / "harness.py").write_bytes(harness)
         selected_paths = {relative: name for name, relative in modules.items()}
-        upstream_policy = (
+        upstream_configuration = (
             (root / "pyproject.toml").read_bytes()
             if Path("pyproject.toml") in inventory
             else None
         )
-        policy, policy_projection = _project_strict_policy(upstream_policy, modules)
+        configuration = _configuration_provenance(upstream_configuration)
         files = []
         for relative in inventory:
             original_path = root / relative
@@ -529,8 +453,6 @@ def prepare_source_overlay(script: Path, output: Path) -> dict[str, Any]:
                 candidate, insertion = strict_opt_in(
                     driver_prefix if relative == entry else source, str(original_path)
                 )
-            elif relative == Path("pyproject.toml"):
-                candidate, insertion = policy, None
             else:
                 candidate, insertion = source, None
             destination = project / relative
@@ -542,23 +464,27 @@ def prepare_source_overlay(script: Path, output: Path) -> dict[str, Any]:
                     "stock_sha256": _digest(source),
                     "strict_sha256": _digest(candidate),
                     "module_name": name,
-                    "strict_future_line": insertion,
+                    "strict_directive_line": insertion,
                 }
             )
-        (project / "pyproject.toml").write_bytes(policy)
         manifest = {
             "schema": SCHEMA,
             "selection_policy": SELECTION_POLICY,
+            "source_policy": SOURCE_POLICY,
             "stock_script": str(script),
             "strict_script": str(output / "project" / entry),
             "project": str(output / "project"),
             "modules": dict(sorted(modules.items())),
             "files": files,
-            "policy_sha256": _digest(policy),
-            "policy_projection": policy_projection,
+            "configuration_sha256": (
+                None
+                if upstream_configuration is None
+                else _digest(upstream_configuration)
+            ),
+            "configuration_provenance": configuration,
             "harness_projection": projection,
             "harness_script": str(output / "harness.py"),
-            "language_difference": "strict future opt-in; declared SOAC policy under a byte-preserving configuration projection; unchanged terminal measurement suffix runs through an ordinary harness after module sealing",
+            "language_difference": LANGUAGE_DIFFERENCE,
         }
         manifest["source_fingerprint"] = _source_fingerprint(manifest)
         manifest["stock_source_fingerprint"] = _stock_fingerprint(files)
@@ -586,6 +512,11 @@ def verify_source_overlay(output: Path) -> dict[str, Any]:
         raise ValueError("strict source manifest fingerprint/schema mismatch")
     if manifest.get("selection_policy") != SELECTION_POLICY:
         raise ValueError("strict source selection policy mismatch")
+    if (
+        manifest.get("source_policy") != SOURCE_POLICY
+        or manifest.get("language_difference") != LANGUAGE_DIFFERENCE
+    ):
+        raise ValueError("strict source comment policy mismatch")
     if manifest.get("source_fingerprint") != _source_fingerprint(manifest):
         raise ValueError("strict comparable source fingerprint mismatch")
     if manifest.get("stock_source_fingerprint") != _stock_fingerprint(
@@ -617,18 +548,14 @@ def verify_source_overlay(output: Path) -> dict[str, Any]:
     selected_paths = {relative: name for name, relative in expected_modules.items()}
     if {path.as_posix() for path in _source_inventory(stock_root)} != expected:
         raise ValueError("stock benchmark inventory changed")
-    if {path.as_posix() for path in _source_inventory(project)} != expected | {
-        "pyproject.toml"
-    }:
+    if {path.as_posix() for path in _source_inventory(project)} != expected:
         raise ValueError("strict benchmark inventory changed")
-    upstream_policy = (
+    upstream_configuration = (
         (stock_root / "pyproject.toml").read_bytes()
         if "pyproject.toml" in expected
         else None
     )
-    policy, policy_projection = _project_strict_policy(
-        upstream_policy, expected_modules
-    )
+    configuration = _configuration_provenance(upstream_configuration)
     for record in manifest["files"]:
         relative = Path(record["relative_path"])
         if relative.is_absolute() or ".." in relative.parts:
@@ -649,22 +576,23 @@ def verify_source_overlay(output: Path) -> dict[str, Any]:
             )
             if (
                 expected_source != candidate
-                or insertion != record["strict_future_line"]
+                or insertion != record["strict_directive_line"]
             ):
                 raise ValueError(
                     f"strict benchmark has a non-opt-in source change: {relative}"
                 )
-        elif relative == Path("pyproject.toml"):
-            if candidate != policy or record["strict_future_line"] is not None:
-                raise ValueError("strict benchmark configuration projection changed")
-        elif candidate != source:
+        elif candidate != source or record["strict_directive_line"] is not None:
             raise ValueError(f"benchmark data changed: {relative}")
     if (
-        (project / "pyproject.toml").read_bytes() != policy
-        or _digest(policy) != manifest["policy_sha256"]
-        or manifest.get("policy_projection") != policy_projection
+        manifest["configuration_sha256"]
+        != (
+            None
+            if upstream_configuration is None
+            else _digest(upstream_configuration)
+        )
+        or manifest.get("configuration_provenance") != configuration
     ):
-        raise ValueError("strict benchmark policy projection changed")
+        raise ValueError("strict benchmark configuration provenance changed")
     manifest["overlay_fingerprint"] = fingerprint
     return manifest
 
@@ -755,6 +683,7 @@ def prepare_strict_benchmark(
         "source_directory": str(source_directory),
         "source_fingerprint": source["source_fingerprint"],
         "selection_policy": source["selection_policy"],
+        "source_policy": source["source_policy"],
         "python_selection": selected_python,
         "deployment": str(deployment),
         "deployment_sha256": _digest(deployment.read_bytes()),
@@ -783,6 +712,7 @@ def verify_strict_benchmark(manifest_path: Path, python: Path) -> dict[str, Any]
     if (
         execution.get("source_fingerprint") != source["source_fingerprint"]
         or execution.get("selection_policy") != source["selection_policy"]
+        or execution.get("source_policy") != source["source_policy"]
     ):
         raise ValueError("strict benchmark source selection changed after analysis")
     deployment = Path(execution["deployment"])

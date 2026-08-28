@@ -11,7 +11,7 @@ def native_module_type_project(tmp_path_factory):
         tmp_path_factory.mktemp("strict-native-module-type"),
         {
             "observed.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 answer = 42
 
                 def read():

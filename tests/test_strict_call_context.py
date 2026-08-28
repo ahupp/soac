@@ -17,7 +17,7 @@ def test_late_method_callable_keeps_actual_context(
         tmp_path,
         {
             "context_target.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
 
                 def read(receiver):
                     return receiver.method()
@@ -135,7 +135,7 @@ def test_dir_alias_uses_actual_module_and_class_namespaces(
         tmp_path,
         {
             "dir_context.py": """
-                from __future__ import strict
+                # soac: module(strict_assign=true, checked_attr=true)
                 from builtins import dir as aliased_dir
 
                 MODULE_MARKER = object()
@@ -172,7 +172,7 @@ def test_dir_alias_uses_actual_module_and_class_namespaces(
 
 
 _EXPANDED_ARGUMENT_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def prefix(callee, source, predicate, value, first):
     return callee()(*source(), value() if predicate() else None)
@@ -334,7 +334,7 @@ _EXPANDED_ARGUMENT_CASES = (
 
 def test_native_expanded_argument_phase_and_cleanup_oracle():
     namespace = {}
-    exec(_EXPANDED_ARGUMENT_SOURCE.replace("from __future__ import strict", ""), namespace)
+    exec(_EXPANDED_ARGUMENT_SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)", ""), namespace)
     exec(_EXPANDED_ARGUMENT_OBSERVER, namespace)
     observe = namespace["observe_expanded_argument_case"]
     for case in _EXPANDED_ARGUMENT_CASES:
@@ -373,7 +373,7 @@ def test_strict_expanded_argument_callback_order_and_cleanup(
         {"expanded_arguments.py": _EXPANDED_ARGUMENT_SOURCE},
         modules={"expanded_arguments": "expanded_arguments.py"},
     )
-    ordinary_source = _EXPANDED_ARGUMENT_SOURCE.replace("from __future__ import strict", "")
+    ordinary_source = _EXPANDED_ARGUMENT_SOURCE.replace("# soac: module(strict_assign=true, checked_attr=true)", "")
     expected_entry = "entry_interpreter" if entry_interpreter else "checked_native"
     program = "\n".join(
         [

@@ -11,9 +11,9 @@ use crate::{
     legacy_source_hash, validate_module_facts,
 };
 
-pub const ARTIFACT_SCHEMA_VERSION: u32 = 6;
-pub const STRICT_CONTRACT_VERSION: u32 = 2;
-pub const DIALECT_VERSION: u32 = 1;
+pub const ARTIFACT_SCHEMA_VERSION: u32 = 7;
+pub const STRICT_CONTRACT_VERSION: u32 = 3;
+pub const DIALECT_VERSION: u32 = 2;
 
 const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SHARD_BYTES: usize = 16 * 1024 * 1024;

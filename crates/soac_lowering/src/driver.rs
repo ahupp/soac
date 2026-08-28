@@ -279,6 +279,36 @@ pub fn lower_source_to_blockpy_module_with_tracker(
             let parsed = parse_module(source)?;
             soac_source::validate_source_literals(source, parsed.tokens())
                 .map_err(AnyhowError::new)?;
+            // Lowering has source bytes, not an authenticated package path.
+            // The checker validates package placement and inheritance. Here
+            // we validate syntax and reject locally effective opt-in when no
+            // verified facts were supplied; comments never grant authority.
+            let directives =
+                soac_source::parse_soac_directives(source, parsed.tokens(), parsed.suite(), true)
+                    .map_err(AnyhowError::new)?;
+            let mut local_strict_assign = false;
+            let mut local_checked_attr = false;
+            for target in [
+                soac_source::SoacDirectiveTarget::Package,
+                soac_source::SoacDirectiveTarget::Module,
+            ] {
+                if let Some(directive) = directives.iter().find(|rule| rule.target == target) {
+                    if let Some(value) = directive.strict_assign {
+                        local_strict_assign = value;
+                    }
+                    if let Some(value) = directive.checked_attr {
+                        local_checked_attr = value;
+                    }
+                }
+            }
+            let local_selection = local_strict_assign
+                || local_checked_attr
+                || directives.iter().any(|directive| {
+                    matches!(
+                        directive.target,
+                        soac_source::SoacDirectiveTarget::Class { .. }
+                    ) && directive.checked_attr == Some(true)
+                });
             let original_tokens = options
                 .strict_facts
                 .as_ref()
@@ -327,21 +357,18 @@ pub fn lower_source_to_blockpy_module_with_tracker(
             let features = rewrite_future_annotations::rewrite(
                 &mut module.body,
                 options.canonical_annotations.as_deref(),
+                options.strict_facts.is_some(),
             )?;
-            match (&options.strict_facts, features.contains("strict")) {
-                (None, true) => {
+            match &options.strict_facts {
+                None if features.contains("strict") || local_selection => {
                     return Err(LoweringError::StrictAuthentication(
                         "strict source requires authenticated offline type facts".into(),
                     ))
                 }
-                (Some(_), false) => {
-                    return Err(LoweringError::StrictAuthentication(
-                        "strict artifact cannot authorize ordinary source".into(),
-                    ))
-                }
-                (Some(verified), true) => {
+                Some(verified) => {
                     let facts = verified.facts();
                     if facts.source_dialect != SourceDialect::SoacStrict
+                        || !facts.language_policy.is_selected()
                         || facts.source_digest != Fingerprint::digest(source.as_bytes())
                         || facts.source_size as usize != source.len()
                         || facts.module.source_hash
@@ -352,7 +379,7 @@ pub fn lower_source_to_blockpy_module_with_tracker(
                         ));
                     }
                 }
-                (None, false) => {}
+                None => {}
             }
             Ok((
                 module,

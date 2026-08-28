@@ -11,7 +11,7 @@ from tests._strict_integration import (
     create_strict_project,
 )
 
-_FUNCTION_SOURCE = """from __future__ import strict
+_FUNCTION_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def outer(a):
     x = 10
 
@@ -26,7 +26,7 @@ class Example:
         return 42
 """
 
-_GENERATOR_SOURCE = """from __future__ import strict
+_GENERATOR_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 def generator(value):
     yield value
     yield value + 1
@@ -129,7 +129,7 @@ assert second_async_result.value.value == 9
 """
 
 
-_GENERATOR_EXPRESSION_SHAPES_SOURCE = """from __future__ import strict
+_GENERATOR_EXPRESSION_SHAPES_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 
 def same_line(values):
     return (value for value in values), (value + 1 for value in values)
@@ -148,7 +148,7 @@ async def asynchronous(values):
 """
 
 
-_GENERATOR_CREATE_SOURCE = """from __future__ import strict
+_GENERATOR_CREATE_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 
 def make_zero():
     return (item for item in (1,))
@@ -179,9 +179,9 @@ class C{index}:
             "generator_expression_code_shapes.py": _GENERATOR_EXPRESSION_SHAPES_SOURCE,
             "generator_create_boundary.py": _GENERATOR_CREATE_SOURCE,
             "ordinary_generator_create_boundary.py": _GENERATOR_CREATE_SOURCE.replace(
-                "from __future__ import strict", "# ordinary creation control", 1
+                "# soac: module(strict_assign=true, checked_attr=true)", "# ordinary creation control", 1
             ),
-            "class_helper_import_storm.py": "from __future__ import strict\n"
+            "class_helper_import_storm.py": "# soac: module(strict_assign=true, checked_attr=true)\n"
             + class_defs[1:],
         },
         modules={
@@ -538,7 +538,7 @@ def test_generator_expression_helpers_reject_native_entry_during_creation(
     )
 
 
-_MANAGED_GENERATOR_SOURCE = """from __future__ import strict
+_MANAGED_GENERATOR_SOURCE = """# soac: module(strict_assign=true, checked_attr=true)
 
 def values(events, marker):
     events.append(("entered", marker))
@@ -569,7 +569,7 @@ def test_escaping_generators_preserve_native_identity_and_lifecycle(
     managed_generator_project, entry_interpreter
 ):
     ordinary_source = _MANAGED_GENERATOR_SOURCE.replace(
-        "from __future__ import strict", "# ordinary materialization control", 1
+        "# soac: module(strict_assign=true, checked_attr=true)", "# ordinary materialization control", 1
     )
     managed_generator_project.run_case(
         "managed_generator_materialization",

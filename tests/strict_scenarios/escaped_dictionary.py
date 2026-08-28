@@ -1,4 +1,5 @@
 # module:storage
+# soac: module(checked_attr=true)
 
 class A:
     foo: int = 0

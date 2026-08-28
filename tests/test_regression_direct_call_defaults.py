@@ -32,7 +32,7 @@ def run():
 
 
 _CHECKED_FREE_CALL_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from checked_free_support import initialize
 
 events = []
@@ -136,7 +136,7 @@ def test_original_wrong_arity_source_is_a_checker_rejection_with_stock_control(
     # strict source or suppressed diagnostics.
     diagnostics = assert_strict_source_rejected(
         tmp_path / "rejected",
-        "from __future__ import strict\n" + textwrap.dedent(_WRONG_ARITY_SOURCE),
+        "# soac: module(strict_assign=true, checked_attr=true)\n" + textwrap.dedent(_WRONG_ARITY_SOURCE),
         module_name="direct_entry_wrong_arity_case",
         diagnostic="missing-argument",
     )
@@ -158,7 +158,7 @@ def direct_default_project(tmp_path_factory):
         tmp_path_factory.mktemp("strict-direct-call-defaults"),
         {
             "direct_arity.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def add(a, b):
     return a + b
@@ -166,16 +166,16 @@ def add(a, b):
 def invoke(function, arguments):
     return function(*arguments)
 """,
-            "direct_defaults.py": "from __future__ import strict\n"
+            "direct_defaults.py": "# soac: module(strict_assign=true, checked_attr=true)\n"
             + textwrap.dedent(_DEFAULT_SOURCE),
             "ordinary_defaults.py": _DEFAULT_SOURCE,
             "ordinary_arity.py": _WRONG_ARITY_SOURCE,
-            "argument_errors.py": "from __future__ import strict\n"
+            "argument_errors.py": "# soac: module(strict_assign=true, checked_attr=true)\n"
             + textwrap.dedent(_ARGUMENT_ERROR_SOURCE),
             "ordinary_argument_errors.py": _ARGUMENT_ERROR_SOURCE,
             "checked_free_defaults.py": _CHECKED_FREE_CALL_SOURCE,
             "ordinary_checked_free_defaults.py": _CHECKED_FREE_CALL_SOURCE.replace(
-                "from __future__ import strict\n", "", 1
+                "# soac: module(strict_assign=true, checked_attr=true)\n", "", 1
             ),
             "checked_free_support.py": _CHECKED_FREE_SUPPORT_SOURCE,
         },

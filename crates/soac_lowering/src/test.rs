@@ -489,7 +489,11 @@ pub(crate) mod strict_source {
             functions,
             nominal_bindings,
             dependencies,
-            ResolvedStrictPolicy::default(),
+            ResolvedStrictPolicy {
+                strict_assign: true,
+                checked_attr: true,
+                ..Default::default()
+            },
         )
     }
 
@@ -588,6 +592,90 @@ pub(crate) mod strict_source {
     /// the selected native compiler's original class-binding metadata.
     pub(crate) fn lower_verified(source: &str) -> crate::Result<BlockPyModule<BlockPyModuleShape>> {
         lower(source, Some(verified_source(source)))
+    }
+
+    #[test]
+    fn verified_comment_or_inherited_policy_does_not_require_a_strict_future() {
+        for source in [
+            "# soac: module(strict_assign=false, checked_attr=true)\nvalue = 1\n",
+            "value = 1\n",
+        ] {
+            let facts = verified_source_with_nominal_catalog_policy(
+                source,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                ResolvedStrictPolicy {
+                    checked_attr: true,
+                    ..Default::default()
+                },
+            );
+            let module = lower(source, Some(facts.clone())).unwrap();
+            assert!(module
+                .strict_source
+                .as_ref()
+                .unwrap()
+                .matches_verified(&facts));
+        }
+    }
+
+    #[test]
+    fn effective_local_opt_in_requires_authenticated_facts() {
+        for source in [
+            "from __future__ import strict\nvalue = 1\n",
+            "# soac: module(strict_assign=true)\nvalue = 1\n",
+            "# soac: module(checked_attr=true)\nvalue = 1\n",
+            "# soac: package(checked_attr=true)\nvalue = 1\n",
+            "# soac: module(strict_assign=false, checked_attr=false)\n# soac: class(checked_attr=true)\nclass C: pass\n",
+        ] {
+            assert!(matches!(lower(source, None), Err(crate::LoweringError::StrictAuthentication(_))));
+        }
+    }
+
+    #[test]
+    fn explicit_local_opt_out_remains_ordinary_without_facts() {
+        for source in [
+            "# soac: module(strict_assign=false, checked_attr=false)\nvalue = 1\n",
+            "# soac: package(strict_assign=true, checked_attr=true)\n# soac: module(strict_assign=false, checked_attr=false)\nvalue = 1\n",
+            "# soac: class(checked_attr=false)\nclass C: pass\n",
+        ] {
+            let module = lower(source, None).unwrap();
+            assert!(module.strict_source.is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_policy_comments_fail_before_ordinary_lowering() {
+        let source = "# soac: class(strict_assign=false)\nclass C: pass\n";
+        let Err(crate::LoweringError::Other(error)) = lower(source, None) else {
+            panic!("wrong-scope rules must be a structured parser error");
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<soac_source::SoacDirectiveError>()
+                .unwrap()
+                .kind(),
+            soac_source::SoacDirectiveErrorKind::WrongScope,
+        );
+    }
+
+    #[test]
+    fn comment_selected_future_annotations_still_require_native_strings() {
+        let source = concat!(
+            "# soac: module(checked_attr=true)\n",
+            "from __future__ import annotations\n",
+            "value: int = 1\n",
+        );
+        let Err(crate::LoweringError::Parse(error)) = lower(source, Some(verified_source(source)))
+        else {
+            panic!("authenticated annotations require their native source spelling");
+        };
+        let start = source.find("int =").unwrap() as u32;
+        assert_eq!(
+            error.location,
+            ruff_text_size::TextRange::new(start.into(), (start + 3).into())
+        );
     }
 
     #[test]
@@ -1128,12 +1216,17 @@ def implicit_iteration(values):
     }
 
     #[test]
-    fn strict_source_cannot_be_enabled_by_an_alias_or_an_unverified_artifact() {
+    fn strict_source_requires_verified_ownership_not_a_future_alias() {
         let source = "from __future__ import strict as feature\nvalue = 1\n";
         assert!(lower(source, None).is_err());
         let ordinary = "from __future__ import annotations as strict\nvalue = 1\n";
         assert!(lower(ordinary, None).unwrap().strict_source.is_none());
-        assert!(lower(ordinary, Some(verified_source(ordinary))).is_err());
+        // Authenticated inherited policy can select a source with only an
+        // ordinary future import. Its alias neither grants nor defeats it.
+        assert!(lower(ordinary, Some(verified_source(ordinary)))
+            .unwrap()
+            .strict_source
+            .is_some());
         assert!(lower(
             "from __future__ import strict\nvalue = 2\n",
             Some(verified_source(source))
@@ -1290,7 +1383,7 @@ def implicit_iteration(values):
                 vec![leaf.clone()],
                 Vec::new(),
                 ResolvedStrictPolicy {
-                    checked_fields: soac_contracts::CheckedFieldPolicy::SupportedAnnotations,
+                    checked_attr: true,
                     ..Default::default()
                 },
             );
@@ -1427,14 +1520,24 @@ def implicit_iteration(values):
                 "class argument/body failure must enter an explicit cleanup region"
             );
 
+            let mut unchecked_classes =
+                vec![class(&target, Vec::new()), class(&holder, vec![field])];
+            for class in &mut unchecked_classes {
+                class.participation =
+                    ParticipationProposal::Dynamic([DynamicClassReason::PolicyOptOut].into());
+            }
             let unchecked = lower(
                 &source,
-                Some(verified_source_with_nominal_catalog(
+                Some(verified_source_with_nominal_catalog_policy(
                     &source,
-                    vec![class(&target, Vec::new()), class(&holder, vec![field])],
+                    unchecked_classes,
                     functions,
                     vec![leaf],
                     Vec::new(),
+                    ResolvedStrictPolicy {
+                        strict_assign: true,
+                        ..Default::default()
+                    },
                 )),
             )
             .unwrap();
@@ -1462,7 +1565,7 @@ def implicit_iteration(values):
             assert_eq!(
                 unchecked_body.scope.binding_kind("Target"),
                 Some(BindingKind::Local),
-                "an unchecked method-only annotation must not add a private cell edge"
+                "an opted-out field annotation must not add a private cell edge"
             );
             let mut unchecked_probe = Probe {
                 helper: unchecked_helper.function_id,
@@ -1696,7 +1799,7 @@ def implicit_iteration(values):
                 vec![leaf.clone()],
                 Vec::new(),
                 ResolvedStrictPolicy {
-                    checked_fields: CheckedFieldPolicy::SupportedAnnotations,
+                    checked_attr: true,
                     ..Default::default()
                 },
             );
@@ -1805,7 +1908,7 @@ def implicit_iteration(values):
                         vec![leaf],
                         Vec::new(),
                         ResolvedStrictPolicy {
-                            checked_fields: CheckedFieldPolicy::SupportedAnnotations,
+                            checked_attr: true,
                             ..Default::default()
                         },
                     )),
@@ -2175,8 +2278,7 @@ def factory(value):
 
     #[test]
     fn annotation_provider_roles_come_from_the_rewrite_not_helper_names() {
-        let source = concat!(
-            "from __future__ import strict\n",
+        let body = concat!(
             "module_value: int = 1\n",
             "class Item:\n",
             "    value: int = 2\n",
@@ -2187,65 +2289,89 @@ def factory(value):
             "def _dp_annotate_func_actual(format):\n",
             "    return {}\n",
         );
-        let module = lower(source, Some(verified_source(source))).unwrap();
-        let origins = module
-            .callable_defs
-            .iter()
-            .filter_map(|function| function.scope.source_origin.as_ref())
-            .collect::<Vec<_>>();
-        for name in ["<module>", "Item", "Item.method", "actual"] {
-            assert_eq!(
-                origins
-                    .iter()
-                    .filter(|origin| origin.definition.lexical_qualname == name
-                        && origin.role == CallableSourceRole::AnnotationProvider)
-                    .count(),
-                1,
-                "each generated provider identifies its real lexical owner"
-            );
-        }
-        let user = origins
-            .iter()
-            .find(|origin| origin.definition.lexical_qualname == "_dp_annotate_func_actual")
-            .expect("lookalike function must not be consumed as an annotation helper");
-        assert_eq!(user.role, CallableSourceRole::SourceFunction);
-        for function in &module.callable_defs {
-            let Some(origin) = &function.scope.source_origin else {
-                continue;
-            };
-            if origin.role != CallableSourceRole::AnnotationProvider {
-                continue;
-            }
-            assert_eq!(function.params.params.len(), 1);
-            assert_eq!(function.params.params[0].name, "format");
-            assert_eq!(
-                function.params.params[0].kind,
-                soac_core::block_py::ParamKind::PosOnly
-            );
-            assert!(!function.params.params[0].has_default);
-            let projection = function.scope.annotation_provider.as_ref().unwrap();
-            assert_ne!(projection.body_format_parameter, "format");
-            assert_eq!(
-                function.body_params().params[0].name,
-                projection.body_format_parameter
-            );
-            if origin.definition.lexical_qualname.starts_with("Item") {
+        for (prefix, module_first_line) in [
+            ("", 1),
+            ("\n\n", 3),
+            ("# soac: module(checked_attr=true)\n\n", 3),
+            ("\n# leading comment\n\n", 4),
+            (
+                "# soac: module(checked_attr=true)\n\"module documentation\"\n",
+                2,
+            ),
+            ("# leading comment\nfrom __future__ import division\n", 2),
+            ("from __future__ import strict\n", 1),
+            // Compile/lower only: native statement locations exclude decorators.
+            ("# leading comment\n@decorate\ndef first(): pass\n", 3),
+            ("# leading comment\n@decorate\nasync def first(): pass\n", 3),
+            ("# leading comment\n@decorate\nclass First: pass\n", 3),
+        ] {
+            let source = format!("{prefix}{body}");
+            let module = lower(&source, Some(verified_source(&source))).unwrap();
+            let origins = module
+                .callable_defs
+                .iter()
+                .filter_map(|function| function.scope.source_origin.as_ref())
+                .collect::<Vec<_>>();
+            for name in ["<module>", "Item", "Item.method", "actual"] {
                 assert_eq!(
-                    projection.class_dictionary.as_deref(),
-                    Some("__classdict__")
-                );
-                let captures = &function.public_storage_layout().unwrap().freevars;
-                assert_eq!(
-                    captures
+                    origins
                         .iter()
-                        .map(|slot| slot.logical_name.as_str())
-                        .collect::<Vec<_>>(),
-                    ["__classdict__"]
+                        .filter(|origin| origin.definition.lexical_qualname == name
+                            && origin.role == CallableSourceRole::AnnotationProvider)
+                        .count(),
+                    1,
+                    "each generated provider identifies its real lexical owner"
                 );
+            }
+            let user = origins
+                .iter()
+                .find(|origin| origin.definition.lexical_qualname == "_dp_annotate_func_actual")
+                .expect("lookalike function must not be consumed as an annotation helper");
+            assert_eq!(user.role, CallableSourceRole::SourceFunction);
+            for function in &module.callable_defs {
+                let Some(origin) = &function.scope.source_origin else {
+                    continue;
+                };
+                if origin.role != CallableSourceRole::AnnotationProvider {
+                    continue;
+                }
+                assert_eq!(function.params.params.len(), 1);
+                assert_eq!(function.params.params[0].name, "format");
                 assert_eq!(
-                    function.scope.cell_capture_projection("__classdict__"),
-                    soac_core::block_py::CellCaptureProjection::CellObject
+                    function.params.params[0].kind,
+                    soac_core::block_py::ParamKind::PosOnly
                 );
+                assert!(!function.params.params[0].has_default);
+                let projection = function.scope.annotation_provider.as_ref().unwrap();
+                if origin.definition.definition_kind == DefinitionKind::Module {
+                    assert_eq!(
+                        projection.native_first_line, module_first_line,
+                        "{prefix:?}"
+                    );
+                }
+                assert_ne!(projection.body_format_parameter, "format");
+                assert_eq!(
+                    function.body_params().params[0].name,
+                    projection.body_format_parameter
+                );
+                if origin.definition.lexical_qualname.starts_with("Item") {
+                    assert_eq!(
+                        projection.class_dictionary.as_deref(),
+                        Some("__classdict__")
+                    );
+                    let captures = &function.public_storage_layout().unwrap().freevars;
+                    assert_eq!(
+                        captures
+                            .iter()
+                            .map(|slot| slot.logical_name.as_str())
+                            .collect::<Vec<_>>(),
+                        ["__classdict__"]
+                    );
+                    assert_eq!(
+                        function.scope.cell_capture_projection("__classdict__"),
+                        soac_core::block_py::CellCaptureProjection::CellObject
+                    );
+                }
             }
         }
     }

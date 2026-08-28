@@ -44,9 +44,11 @@ carry verified strict contracts.
 
 The initial contract is:
 
-1. A module opts in with `from __future__ import strict` and fails closed if
-   strict enforcement is unavailable.
-2. After module initialization, new global names may be appended, but an
+1. Package/module/class `# soac:` source rules independently select global
+   binding and class/field contracts. They require authenticated publication
+   and startup to enforce; ordinary CPython ignores comments.
+2. With `strict_assign=true`, after module initialization new global names
+   may be appended, but an
    existing binding is immutable unless the source contains a lexical
    `global NAME` declaration for that binding. Appending never changes an
    existing binding's stable index; its name-to-index map may rehash.
@@ -79,8 +81,8 @@ The initial contract is:
    Unsupported framework classes automatically remain dynamic before any
    irreversible construction; installed restrictions and sealed capabilities
    are never revoked.
-6. Checked fields are disabled by default and have a separate project-level
-   supported-annotations opt-in. Every supported writer checks the actual
+6. `checked_attr=true` selects eligible classes and supported annotated field
+   writes independently of module freezing. Every supported writer checks the actual
    selected storage value before committing its write. Function calls retain
    ordinary argument binding and body behavior without runtime parameter or
    return-type checks. Shape alone never proves a value type, and a nominal
@@ -93,6 +95,81 @@ The initial contract is:
 
 This is an explicit language policy, not a new permission to change the
 semantics of existing transformed modules.
+
+## Source policy rules
+
+The 2026-08-27 (PDT) source-comment policy replaces the old configuration/future
+double opt-in. There is no strictness config file. Both settings default to
+false; omitted keys inherit their enclosing package/module defaults.
+
+```python
+# package/__init__.py
+# soac: package(strict_assign=true, checked_attr=true)
+
+# This override affects __init__.py itself, not its descendants.
+# soac: module(strict_assign=false)
+```
+
+```python
+# package/models.py
+# soac: module(strict_assign=false, checked_attr=true)
+
+class Checked:
+    value: int = 0
+
+# soac: class(checked_attr=false)
+class Dynamic:
+    value: int = 0
+```
+
+| Rule | Effect and scope |
+| --- | --- |
+| `package(strict_assign=..., checked_attr=...)` | Defaults for that package and descendants, only in `__init__.py`. Inner packages override specified keys. |
+| `module(strict_assign=..., checked_attr=...)` | Overrides this source file only, including when that file is `__init__.py`. |
+| `class(checked_attr=...)` | Overrides one exact class declaration, before its first decorator and at the same indentation. |
+
+`strict_assign` freezes selected global bindings after initialization; it does
+not type-check global values. `checked_attr` selects automatic eligible class
+contracts, supported annotated field-write checks and class/method-mutation
+barriers. Neither setting implies the other. Class opt-out does not disable
+checks inherited from a participating ancestor or retained by escaped storage.
+Class opt-in still requires supported actual construction; unsupported bases,
+metaclasses, decorators and frameworks remain dynamic. `Any`, unsupported
+annotation types and inferred-only fields do not acquire value predicates.
+There are no runtime parameter, return, `InitVar` or factory-result call checks.
+
+Package and module directives belong in the module header: before executable
+statements, allowing an initial docstring and future imports. A class rule
+binds by source range, not name, and does not flow into lexically nested
+classes. One directive per package/module/class is allowed. Only lowercase
+`true` and `false` are values. Unknown keys, duplicate settings and invalid
+placement are errors. Parenthesized settings may span consecutive comment-only
+lines:
+
+```python
+# soac: module(
+#     strict_assign=true,
+#     checked_attr=false,
+# )
+```
+
+The offline checker resolves package ancestry within `--source-root` and
+authenticates consulted `__init__.py` bytes **and absence**. Changing a rule or
+creating a previously absent package file invalidates the publication. The
+signed policy includes exact class-declaration ranges. The retired
+`[tool.soac.strict]` table is rejected, and the old `strict` future is not a
+policy-selection mechanism. Artifact schema 7, strict-contract version 3,
+dialect version 2 and deployment version 3 require republishing older artifacts.
+
+Comments request a contract; they do not install one. Ordinary CPython ignores
+them. The authenticated loader compiles verified source with a native guarded-
+code marker and binds actual objects before installing checks. Neither that
+marker nor copied code grants execution authority. For an admitted mutable
+module, native dictionary ownership protects authentication and terminal
+lifecycle without freezing keys or values. Readiness is separate from binding
+sealing (`StrictModuleRuntimeState::is_ready`); diagnostics report both.
+Nominal field checks capture the actual authenticated type at construction and
+do not change when a mutable module later rebinds the type's name.
 
 ### Source literal representation limitation
 
@@ -183,11 +260,12 @@ rather than its ordinary optimized field instruction. Its tests also document
 that subsequent class replacement can discard an instance override.
 
 SOAC should borrow the opt-in boundary and enforced-storage model;
-fixed layouts remain deferred. Its opt-in is a real Python future
-feature rather than CinderX's `import __strict__` marker. For class defaults,
+fixed layouts remain deferred. SOAC source comments request independently
+authenticated contracts; an import marker or future flag is not authority. For class defaults,
 preserve the actual class-dictionary entry, cover both annotated and unannotated data, and
 emit a fixed-index/default-fallback field operation without inferring checked
-values from the layout. Value checks require the selected project policy and
+values from the layout. Value checks require the declaring class's resolved
+`checked_attr=true` source rule and
 their own complete enforcement. Frozen classes prevent CinderX's class-patching
 conflict. SOAC should **not** copy import-side-effect bans, snapshot
 `module.__dict__` semantics, unchecked primitive overflow, or observable
@@ -197,93 +275,76 @@ design.
 
 ## Opt-in and runtime availability
 
-A strict module opts in with a standard future-feature directive:
+Source comments request the independently selected contracts:
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 ```
 
-Its placement and combination with other future features follow normal Python
-rules: an optional module docstring and other `__future__` imports may precede
-it, but an ordinary executable statement may not:
+The shared comment grammar permits package/module rules in the header before
+the first executable statement, allowing an initial docstring and ordinary
+future imports. Class rules precede the exact class and all its decorators.
+Package defaults and omitted-key inheritance follow the
+[source-policy rules](#source-policy-rules); neither flag implies the other.
+For example:
 
 ```python
 """Optional module docstring."""
-from __future__ import annotations, strict
+from __future__ import annotations
+# soac: module(checked_attr=true)
 ```
 
-Grouping, repeated future statements, and feature aliases follow CPython's
-ordinary future-import rules. The imported feature name `strict`, rather than a
-local alias or a later assignment, determines the module policy. Like other
-future imports, the directive binds its imported feature object in module
-globals. A module that needs SOAC's decorator helpers may subsequently import
-`from soac import strict` during initialization; that ordinary import replaces
-the feature-object binding but neither enables nor disables strict semantics.
+These comments add no Python statements or imported feature binding.
+Ordinary CPython ignores them and executes ordinary Python; comments alone
+neither install enforcement nor guarantee rejection when SOAC is absent.
+The retired `strict` future and `[tool.soac.strict]` configuration are not
+alternative selection mechanisms. Imports, aliases and assignments involving
+a Python name `strict` do not select or revoke a contract.
 
-An unmodified Python interpreter rejects the source at compile time with
-`SyntaxError: future feature strict is not defined`, before any module code can
-run. This is the fail-closed mechanism when interpreter support is absent: no
-compatibility package, marker import, or runtime `strict.require(...)` call is
-necessary.
-
-An interpreter that recognizes the feature must also check every execution of
-strict-flagged module code against authenticated compiler provenance, an
+A deployment promising selected contracts must authenticate its offline
+publication and runtime support before any selected module body executes.
+Every execution of internally guarded module code is checked against
+authenticated compiler provenance, an
 explicitly registered strict module, its actual protected globals, and its
 active runtime policy before the first user instruction. If the correct SOAC
 loader, module contract, or enforcement support is absent, it raises
-`StrictRuntimeUnavailableError`. Recognizing the syntax without authenticating
-the execution context must never permit an ordinary loader to run strict code
-with weakened semantics.
+`StrictRuntimeUnavailableError`. Recognizing a source comment or copying a
+code flag must never substitute for that authenticated execution context.
 
 An ordinary CPython process can host strict and ordinary modules together when
-it has the required SOAC runtime and interpreter support. Running strict source
-without that support is an explicit error, not a silently weakened dialect.
+it has the required SOAC runtime and interpreter support. An authenticated
+selected module may not fall back to ordinary execution when its authority
+is missing or stale.
 No inference from a module's name, location, type annotations, optimization
 mode, or prior profile is sufficient to opt it in.
 
-### Future-feature and dynamic-code semantics
+### Internal guarded code and dynamic-code semantics
 
-The pinned CPython build must register a real `__future__.strict` feature,
-assign it a distinct `CO_FUTURE_STRICT` code-object/compiler flag, include that
-flag in the CPython future-feature mask, and recognize its source spelling in
-the existing future-feature parser. The public feature object's
-`compiler_flag`, compiled `co_flags`, nested code objects, and standard
-future-import diagnostics must agree. The new bit must not collide with
-existing monitoring, docstring, method, parser, or future flags. In the pinned
-CPython layout, `0x10000000` is the next available candidate after the existing
-code-object flags; confirm the full interpreter and native-extension ABI
-before assigning it.
+The pinned CPython runtime retains `CO_FUTURE_STRICT` as an internal code
+ownership guard. Despite its historical name and retained parser recognition,
+it is not source-policy opt-in. The trusted raw compiler sets the guard while
+compiling verified source; it does not insert a future import, rewrite the
+source bytes, or introduce a Python-visible feature binding.
 
-SOAC must also preserve the recognized feature before its existing
-future-annotation rewrite strips future statements. The current lowering
-driver discards that rewrite's returned feature set; strictness therefore must
-be recorded explicitly in validated module IR and carried into both original
-CPython code compilation and transformed execution. Stripping the directive
-without preserving its policy or Python-visible import binding is invalid. The
-rewrite must also reject misplaced future imports rather than stripping them
-from arbitrary later positions in the module body.
+Source-comment resolution and exact class ranges must be authenticated before
+lowering removes comments or rewrites annotations. The resulting module policy
+and source ownership are explicit compiler/runtime inputs. Ordinary future
+imports retain their own Python syntax and placement rules.
 
-Nested functions, classes, generators, and comprehensions compiled from a
-strict module inherit its language policy. String-based `compile`, `exec`,
-and `eval` called from strict code inherit its future flags according to
-ordinary CPython rules; `compile(..., dont_inherit=True)` suppresses inherited
-flags unless the new source itself opts in or an explicit flag requests them.
-Ordinary imports compile each separate module without inheriting the calling
-module's future features, so importing a stock module never makes it strict.
-CPython's source loader already uses `dont_inherit=True`, but SOAC's current
-`compile_original_module_code` calls `compile(source, path, "exec")` without
-it. That entrypoint must explicitly pass `dont_inherit=True`; otherwise an
-ordinary module imported or compiled from a strict frame can accidentally
-inherit strict policy.
+Nested source code retains its authenticated module/source ownership; its
+presence in that code tree does not override the resolved class-specific
+`checked_attr` selection. Separately imported modules resolve their own source
+policy. Compile them without inheriting caller flags so ordinary imports do
+not acquire a guarded execution marker from their importer.
 
 An inherited or manually supplied `CO_FUTURE_STRICT` bit does not create a
 module contract. Strict-flagged dynamic code may execute only when its
 authenticated compiler provenance and actual globals both match an existing
 strict module; targeting an ordinary or unregistered namespace fails
-explicitly. It cannot retroactively add mutable globals, certify dynamically
-created classes/functions, or mint optimizer facts. Such objects remain
-ordinary unless an authenticated strict compiler entrypoint separately
-validates and publishes their contracts.
+explicitly. Neither that bit nor comments in dynamically compiled text can
+change resolved policy, certify new classes/functions, or mint optimizer
+facts. Ordinary dynamic writes still obey the installed storage policy.
+New contracts require a separately authenticated compiler/construction path.
 
 One narrow exception is CPython's own annotation-format replay.
 `annotationlib` implements `FORWARDREF` and `STRING` by recreating the
@@ -359,7 +420,11 @@ execution.
 
 ## Module lifecycle
 
-Every strict module has an explicit runtime state:
+Every selected module has an authenticated runtime lifecycle. Readiness and
+binding sealing are distinct: `strict_assign=false` completes admission without
+freezing module globals or ordinary free functions. Selected class/field/method
+contracts and failed/terminal ownership checks remain enforced independently.
+The following binding-seal lifecycle applies when `strict_assign=true`:
 
 ```text
 DISCOVERED -> INITIALIZING -> SEALING -> SEALED -> TEARING_DOWN -> CLEARED
@@ -441,13 +506,20 @@ the interpreter-owned clearing required by module garbage collection and
 shutdown. A privileged teardown clear is legal only after strict code can no
 longer observe the cleared state.
 
-The loader authenticates the future flag, source policy, module identity,
+The loader authenticates the internal guarded-code marker, resolved source
+policy, module identity,
 protected globals, and registered `INITIALIZING` contract before entering the
-module body. A strict feature without that authenticated contract is an import
-error; a claimed strict contract without the matching future feature is also
-rejected. No Python-level initialization call can replace this boundary.
+module body. Guarded code without that authenticated contract is rejected;
+a claimed selected contract without matching guarded compiler provenance is
+also rejected. No source future or Python-level initialization call can
+replace this boundary.
 
 ## Global binding contract
+
+The binding restrictions in this section apply when `strict_assign=true`.
+Selected modules with `strict_assign=false` retain ordinary binding mutation,
+subject to authentication/terminal ownership and any independently installed
+class or storage contracts.
 
 ### Declared mutable names
 
@@ -460,7 +532,7 @@ after sealing, but that new binding immediately becomes final unless the name
 belongs to this statically declared mutable set.
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 global requests
 
@@ -538,7 +610,7 @@ submodules, reserving import-only slots, or requiring `global child`:
 
 ```python
 # widgets/__init__.py
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 # widgets/lazily_loaded_child.py exists but has not been imported.
 ```
@@ -809,7 +881,7 @@ decorators on individual classes.
 For example:
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 
 class Point:
@@ -853,7 +925,7 @@ not force all of its classes to participate.
 The authenticated offline class contract records logical declared fields,
 annotation-only fields, ordinary class defaults, method kinds, inherited
 members, recognized transformations, and relevant uncertainty. It includes
-the pinned checker, source, project policy, dependencies, and environment in
+the pinned checker, source, resolved source policy, dependencies, and environment in
 its identity. `ty` supplies logical facts, not physical field offsets or
 method-table indexes. CPython constructs the source-requested storage, and
 SOAC validates actual final members before admission. Optional fixed-layout
@@ -952,7 +1024,7 @@ An ordinary class-data binding remains a class binding even when an instance
 overrides it:
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 
 class A:
@@ -997,8 +1069,9 @@ policy. A truly slotted class retains its actual source-requested descriptor
 and class-default behavior rather than receiving fabricated shadow slots.
 
 Assignments retain ordinary Python value semantics: `a.foo = "two"` is legal
-even when the default was annotated `foo: int = 1` unless the resolved project
-policy selects and enforces that checked field. The indexed storage remains
+even when the default was annotated `foo: int = 1` unless the declaring class's
+resolved `checked_attr` rule selects and enforces that field. Opting out in a
+subclass never revokes its inherited checks. The indexed storage remains
 GC-visible and follows ordinary per-field `INCREF`/`DECREF`, exception,
 deletion, and reentrant-finalizer rules; instance destruction may use the
 approved physical-layout field-release order described below. Python
@@ -1037,7 +1110,7 @@ stock shared-key storage does not always follow visible dictionary insertion
 order either:
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 events = []
 
@@ -1263,7 +1336,9 @@ methods or class defaults, add class attributes, alter `__bases__`, change
 slot descriptors or shadow eligibility, or replace dispatch-relevant dunder
 methods raise `StrictMutationError`. Instance values remain mutable under their
 field and descriptor policies unless the source requests frozen-instance
-behavior; checked values are a separate project-policy contract.
+behavior. Supported annotated field checks follow the declaring class's
+resolved `checked_attr` rule, independently of module `strict_assign` and any
+future fixed-layout capability.
 
 This requires an actual type-level and dictionary-level enforcement boundary,
 not only a Python mapping proxy or `Py_TPFLAGS_IMMUTABLETYPE`. Cover
@@ -1273,14 +1348,15 @@ supported APIs, mutable slot/descriptor objects, and relevant inherited owner
 dictionaries. A stock ancestor that can replace a relied-upon descriptor stays
 dynamic even if the immediate strict class is frozen.
 
-An optional `@strict.mutable_type` escape selects mutable class behavior before
-publication without retroactively making a fixed field prefix or native layout
-extensible. It may replace methods or defaults only when installed name/layout
-policies stay compatible, and change bases only when CPython and the inherited
-physical contract permit it. Its mutable methods/defaults never supply frozen
-dispatch facts. Unrestricted descriptor/MRO changes require generic behavior
-selected before publication, whether chosen automatically or explicitly;
-dictionary presence alone is neither an escape hatch nor an optimization veto.
+An exact `# soac: class(checked_attr=false)` rule declines a new local class
+contract before construction. It does not install a separate mutable fixed-layout
+capability or make inherited storage extensible. Ordinary method/default and
+base changes remain subject to CPython and any inherited or already-installed
+name, field, dictionary, and layout restrictions. Mutable methods/defaults never
+supply frozen dispatch facts. Unrestricted descriptor/MRO changes require
+ordinary generic behavior with no conflicting installed contract, selected
+before construction; dictionary presence alone is neither an escape hatch nor
+an optimization veto.
 
 The freeze occurs after decorators and legitimate class-construction
 configuration, at final admission before instances become possible. Code may
@@ -1388,9 +1464,10 @@ the function is created after its owner module has sealed. Decorators,
 function watchers, metaclasses, `__set_name__`, and `__init_subclass__` can
 observe or retain the function identity earlier; those observations are not
 forbidden or assumed impossible. An escaped function cannot acquire a trusted
-target until its required barriers are installed. Explicit
-`@strict.mutable_function` disables this guarantee and all unguarded dispatch
-facts derived from it.
+target until its required barriers are installed. With `strict_assign=false`,
+ordinary free functions retain mutable metadata; this does not unseal methods
+or providers protected by selected class contracts. There is no per-function
+mutable decorator in the source-comment interface.
 
 ### Frozen providers and reserved lazy annotation caches
 
@@ -1501,45 +1578,32 @@ change without silently retaining a stale direct target.
 
 ## Explicit escape hatches
 
-Automatic classification and shared project policy are the normal path.
-Unsupported classes do not require escape-hatch annotations to remain usable;
-the following optional controls select ordinary or mutable behavior before
-construction when a project wants to override an otherwise eligible candidate.
-They do not mint capabilities or bypass mandatory installed restrictions.
-
-The future directive initially binds `strict` to its `__future__._Feature`
-object. A module that needs decorator helpers imports SOAC's separate API after
-the directive; rebinding that name during initialization is allowed:
+Automatic classification and package defaults are the normal path. Unsupported
+classes require no escape-hatch annotations. An explicit source rule can decline
+a new local class contract before construction:
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
-from soac import strict
-
-
-@strict.dynamic
+# soac: class(checked_attr=false)
 class PluginRegistry:
     pass
 ```
 
-The future feature determines strictness even after the helper import replaces
-its module-global feature-object binding.
-
-The optional migration API and existing language declarations are:
+The supported source controls and ordinary language declarations are:
 
 | Construct | Effect | Lost optimization facts |
 | --- | --- | --- |
 | `global NAME` | Declares one mutable module binding. | Constant global identity for that binding. |
 | Source `__slots__` or stdlib `dataclass(slots=True)` | Requests Python's real native-slot behavior, including any inherited or explicit dictionary. | No capability follows from the spelling alone; construction validates actual storage. |
-| `@strict.dynamic_fields` | Selects generic instance storage and ordinary instance shadowing before construction, not merely dictionary presence. | Protected-name, fixed-field, and checked-field facts for that receiver. |
-| `@strict.mutable_type` | Allows class dictionary/base changes compatible with installed policies; select generic instance behavior for otherwise incompatible changes. | Frozen-method, MRO, default-identity, and unguarded dispatch facts. |
-| `@strict.mutable_function` | Allows function metadata mutation. | Stable code, defaults, and direct target facts. |
-| `@strict.dynamic` | Treats one class/function as ordinary dynamic Python. | All strict facts for that object. |
+| `# soac: module(strict_assign=false)` | Keeps this module's global bindings mutable without disabling selected class contracts. | Final global binding identity. |
+| `# soac: module(checked_attr=false)` | Declines new local class contracts unless an exact class rule opts back in. | New local class/field capabilities; inherited checks remain. |
+| `# soac: class(checked_attr=false)` | Declines a contract for this exact class before construction. | New local class/field capabilities; inherited checks remain. |
 | `typing.final` under the selected strict policy | Runtime-enforces no subclassing or method override for participating classes at actual type construction. | None once enforced; the annotation alone is not a finality proof. |
 
-Decorators are recognized by verified helper identity, not by a matching local
-name or attribute spelling. Unsupported combinations produce diagnostics
-rather than accidentally retaining invalid assumptions.
+The previously proposed `strict.dynamic`, `dynamic_fields`, `mutable_type` and
+`mutable_function` decorator APIs are not part of this comment-only interface.
+Rules never mint capabilities or bypass mandatory installed restrictions.
 
 No generic `allow_unsafe`, silent compatibility mode, test-only patch bypass,
 or global process-wide disablement is part of the initial contract. Tests that
@@ -1551,15 +1615,16 @@ sealed strict module or downgrade its guarantees.
 
 ### Builtins
 
-A strict module freezes the binding of its captured `__builtins__` mapping, but
-the shared process builtin namespace remains ordinary and mutable. Replacing
+With `strict_assign=true`, a module freezes the binding of its captured
+`__builtins__` mapping, but the shared process builtin namespace remains
+ordinary and mutable. Replacing
 `builtins.len` in stock Python must therefore remain visible to strict code
 unless that strict module explicitly requests a separate frozen snapshot.
 
 Append-only globals also preserve ordinary builtin shadowing:
 
 ```python
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 
 def size(value):
@@ -1597,27 +1662,12 @@ option may freeze or mutate the builtins observed by ordinary modules.
 
 ### Annotations and primitives
 
-The selected checked-value contract is authorized for implementation in
-`OPT_GOAL.md`; it is not an enforcement claim about the current runtime. The
-resolved project-level policy uses:
-
-```toml
-[tool.soac.strict]
-default_class_policy = "automatic"
-unsupported_class_policy = "dynamic"
-typing_final_policy = "enforce_for_participating_classes"
-checked_fields = "disabled"
-field_failure = "type_error"
-unsupported_value_type = "dynamic"
-```
-
-Only explicitly strict modules consume this policy. The same normalized
-settings and type contracts must govern offline diagnostics, artifact identity,
-runtime construction/storage, and native plans. Field checking can separately
-select `checked_fields = "supported_annotations"`; it is not implied by a field
-index, class freezing, or an annotation. Removed parameter/return policy keys
-are rejected rather than silently ignored or retained as disabled aliases. No choice
-depends on profile counts, JIT warmup, optimization level, or inlining.
+The source rules above select `checked_attr=true` independently of module
+binding freezing. The same normalized policy and type contracts govern offline
+diagnostics, artifact identity and runtime construction/storage. A field index,
+annotation or module membership alone does not authorize a check. There is no
+separate checked-fields configuration, nor a retained disabled call-policy
+alias. No selection depends on profiles, warmup, optimization level or inlining.
 
 No function-level runtime type checks apply, on any backend or generated
 constructor. Bind all arguments normally, including positional-only/keyword-only

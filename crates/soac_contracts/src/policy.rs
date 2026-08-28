@@ -1,39 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{AnnotationOrigin, ContractError, Fingerprint, StaticType};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutomaticClassPolicy {
-    Automatic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnsupportedClassPolicy {
-    Dynamic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TypingFinalPolicy {
-    Advisory,
-    EnforceForParticipatingClasses,
-}
+use crate::{AnnotationOrigin, ContractError, Fingerprint, SourceRange, StaticType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckedFieldPolicy {
     Disabled,
     SupportedAnnotations,
-}
-
-fn required_annotation_type(
-    origin: AnnotationOrigin,
-    value_type: &StaticType,
-) -> Option<&StaticType> {
-    (origin == AnnotationOrigin::Explicit && value_type.has_supported_value_shape())
-        .then_some(value_type)
 }
 
 impl CheckedFieldPolicy {
@@ -44,81 +17,56 @@ impl CheckedFieldPolicy {
         origin: AnnotationOrigin,
         value_type: &StaticType,
     ) -> Option<&StaticType> {
-        (self == Self::SupportedAnnotations)
-            .then(|| required_annotation_type(origin, value_type))
-            .flatten()
+        (self == Self::SupportedAnnotations
+            && origin == AnnotationOrigin::Explicit
+            && value_type.has_supported_value_shape())
+        .then_some(value_type)
     }
 }
 
+/// A source comment attached to one exact class declaration, not its name.
+/// A local opt-out cannot revoke a contract inherited from another class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailurePolicy {
-    TypeError,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnsupportedValueTypePolicy {
-    Dynamic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StdlibDataclassPolicy {
-    Stdlib,
-    Dynamic,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AdapterPolicy {
-    pub dataclasses: StdlibDataclassPolicy,
-    pub pydantic: UnsupportedClassPolicy,
-    pub django: UnsupportedClassPolicy,
-    pub sqlalchemy: UnsupportedClassPolicy,
+pub struct ClassPolicyOverride {
+    pub class_range: SourceRange,
+    pub checked_attr: bool,
 }
 
-impl Default for AdapterPolicy {
-    fn default() -> Self {
-        Self {
-            dataclasses: StdlibDataclassPolicy::Stdlib,
-            pydantic: UnsupportedClassPolicy::Dynamic,
-            django: UnsupportedClassPolicy::Dynamic,
-            sqlalchemy: UnsupportedClassPolicy::Dynamic,
-        }
-    }
-}
-
-/// Effective policy after project selection and per-file overrides. There
-/// are deliberately no per-class opt-in annotations or runtime revocation
-/// switches. An enabled check is a language requirement, not a JIT guard.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// Authenticated source rules after package inheritance and file overrides.
+/// Omitted source settings inherit; the outermost defaults are both false.
+/// Class overrides apply only to that declaration, not lexically nested ones.
+/// Unsupported classes remain dynamic even when checking is requested.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedStrictPolicy {
-    pub default_class_policy: AutomaticClassPolicy,
-    pub unsupported_class_policy: UnsupportedClassPolicy,
-    pub typing_final_policy: TypingFinalPolicy,
-    pub checked_fields: CheckedFieldPolicy,
-    pub field_failure: FailurePolicy,
-    pub unsupported_value_type: UnsupportedValueTypePolicy,
-    pub adapters: AdapterPolicy,
-}
-
-impl Default for ResolvedStrictPolicy {
-    fn default() -> Self {
-        Self {
-            default_class_policy: AutomaticClassPolicy::Automatic,
-            unsupported_class_policy: UnsupportedClassPolicy::Dynamic,
-            typing_final_policy: TypingFinalPolicy::EnforceForParticipatingClasses,
-            checked_fields: CheckedFieldPolicy::Disabled,
-            field_failure: FailurePolicy::TypeError,
-            unsupported_value_type: UnsupportedValueTypePolicy::Dynamic,
-            adapters: AdapterPolicy::default(),
-        }
-    }
+    pub strict_assign: bool,
+    pub checked_attr: bool,
+    pub class_overrides: Vec<ClassPolicyOverride>,
 }
 
 impl ResolvedStrictPolicy {
+    pub fn is_selected(&self) -> bool {
+        self.strict_assign
+            || self.checked_attr
+            || self.class_overrides.iter().any(|rule| rule.checked_attr)
+    }
+
+    pub fn checked_attributes(&self, class_range: SourceRange) -> bool {
+        self.class_overrides
+            .iter()
+            .find(|rule| rule.class_range == class_range)
+            .map_or(self.checked_attr, |rule| rule.checked_attr)
+    }
+
+    pub fn checked_fields(&self, class_range: SourceRange) -> CheckedFieldPolicy {
+        if self.checked_attributes(class_range) {
+            CheckedFieldPolicy::SupportedAnnotations
+        } else {
+            CheckedFieldPolicy::Disabled
+        }
+    }
+
     pub fn fingerprint(&self) -> Result<Fingerprint, ContractError> {
         crate::artifact::canonical_bytes(self).map(Fingerprint::digest)
     }

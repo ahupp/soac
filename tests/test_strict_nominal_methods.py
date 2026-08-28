@@ -7,7 +7,7 @@ import pytest
 from tests._strict_integration import create_strict_project
 
 _SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from nominal_support import (
     annotation_trap, arbitrary_result, assert_method_provider_frozen, events,
 )
@@ -96,7 +96,7 @@ def quoted_nominals(tmp_path_factory):
         tmp_path_factory.mktemp("strict-quoted-nominals"),
         {
             "quoted_nominals.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from typing import Optional
 from quoted_nominal_support import before_ready, arbitrary_result, annotation_trap
 
@@ -395,7 +395,7 @@ def alias_nominals(tmp_path_factory, request):
         tmp_path_factory.mktemp("strict-nominal-aliases"),
         {
             "nominal_aliases.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from nominal_alias_support import retarget_aliases
 
 def factory():
@@ -554,7 +554,7 @@ def prebound_closure_nominals(tmp_path_factory, request):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-nominal-prebound-closures"),
         {"nominal_prebound_closures.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 
 def factory():
     class Target:
@@ -640,7 +640,7 @@ def construction_nominals(tmp_path_factory):
         tmp_path_factory.mktemp("strict-nominal-construction"),
         {
             "nominal_construction.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from nominal_construction_support import check_before_name_store
 
 class Base:
@@ -702,7 +702,7 @@ def _initializing_nominals_project(root, *, backend="soac"):
         root,
         {
             "nominal_initializing.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from nominal_initializing_support import before_adoption, move_alias
 
 def factory():
@@ -845,7 +845,7 @@ def class_dictionary_nominals(tmp_path_factory, request):
         tmp_path_factory.mktemp("strict-nominal-class-dictionary"),
         {
             "nominal_class_dictionary.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from nominal_class_dictionary_support import before_ready, events
 
 class Token:
@@ -993,7 +993,7 @@ def dynamic_nominals(tmp_path_factory):
         tmp_path_factory.mktemp("strict-dynamic-nominals"),
         {
             "dynamic_nominals.py": """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from dynamic_nominal_support import Meta, Outside, events, wrong_value
 
 class Record(metaclass=Meta):
@@ -1264,7 +1264,7 @@ assert all(reference() is None for reference in references)
 
 
 _CPYTHON_CLASS_SCOPE_NOMINAL_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from cpython_class_scope_support import arbitrary_result, events
 
 class Token:
@@ -1475,7 +1475,7 @@ for provider in (first_provider, second_provider):
 
 
 _CPYTHON_PENDING_CLASS_SCOPE_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from cpython_pending_class_scope_support import inspect_pending, events
 
 class Base:
@@ -1604,7 +1604,7 @@ for Token, Holder in (module.first, module.second):
 
 
 _RETAINED_EARLY_MODULE_NOMINAL_SOURCE = """
-from __future__ import strict
+# soac: module(strict_assign=true, checked_attr=true)
 from retained_early_nominal_support import exercise, move_alias
 
 class Token:
@@ -1695,7 +1695,7 @@ def test_soac_early_sealed_method_keeps_metadata_seals_and_ordinary_binding_call
         {
             "retained_early_nominals.py": _RETAINED_EARLY_MODULE_NOMINAL_SOURCE,
             "ordinary_early_nominals.py": _RETAINED_EARLY_MODULE_NOMINAL_SOURCE.replace(
-                "from __future__ import strict\n", ""
+                "# soac: module(strict_assign=true, checked_attr=true)\n", ""
             ),
             "retained_early_nominal_support.py": _RETAINED_EARLY_MODULE_NOMINAL_SUPPORT,
         },

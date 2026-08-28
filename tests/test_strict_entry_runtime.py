@@ -474,7 +474,7 @@ def strict_entry_cases(tmp_path_factory, strict_entry_selected_case_modes):
     }
     sources = {
         modules[f"entry_{name}"]: (
-            "from __future__ import strict\n\n"
+            "# soac: module(strict_assign=true, checked_attr=true)\n\n"
             + textwrap.dedent(case.source).lstrip("\n")
         )
         for name, case in CASES.items() if name in selected_names
@@ -634,7 +634,7 @@ def native_comprehension_cases(tmp_path_factory):
     }
     sources = {
         modules[f"entry_{name}"]: (
-            "from __future__ import strict\n\n"
+            "# soac: module(strict_assign=true, checked_attr=true)\n\n"
             + textwrap.dedent(CASES[name].source).lstrip("\n")
         )
         for name in _COMPREHENSION_CAPTURE_CASES
@@ -764,7 +764,7 @@ def test_for_loop_next_receiver_native_control(tmp_path):
 def strict_loop_receiver_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-loop-receiver"),
-        {"loop_receiver.py": "from __future__ import strict\n" + _LOOP_RECEIVER_SOURCE},
+        {"loop_receiver.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _LOOP_RECEIVER_SOURCE},
         modules={"loop_receiver": "loop_receiver.py"},
     )
 
@@ -979,7 +979,7 @@ def test_for_loop_exit_native_control(tmp_path, case):
 def strict_loop_exit_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-loop-exit"),
-        {"loop_exit.py": "from __future__ import strict\n" + _LOOP_EXIT_SOURCE},
+        {"loop_exit.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _LOOP_EXIT_SOURCE},
         modules={"loop_exit": "loop_exit.py"},
     )
 
@@ -1162,7 +1162,7 @@ def test_for_loop_error_traceback_native_control(
 def strict_loop_traceback_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-loop-traceback"),
-        {"loop_traceback.py": "from __future__ import strict\n" + _LOOP_TRACEBACK_SOURCE},
+        {"loop_traceback.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _LOOP_TRACEBACK_SOURCE},
         modules={"loop_traceback": "loop_traceback.py"},
     )
 
@@ -1229,7 +1229,7 @@ def test_explicit_next_traceback_native_control(tmp_path, loop_error_native_exte
 def strict_explicit_next_traceback_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp("strict-next-traceback"),
-        {"next_traceback.py": "from __future__ import strict\n" + _EXPLICIT_NEXT_TRACEBACK_SOURCE},
+        {"next_traceback.py": "# soac: module(strict_assign=true, checked_attr=true)\n" + _EXPLICIT_NEXT_TRACEBACK_SOURCE},
         modules={"next_traceback": "next_traceback.py"},
     )
 
@@ -1386,7 +1386,7 @@ def strict_eager_comprehension_frame_project(tmp_path_factory):
         tmp_path_factory.mktemp('strict-comprehension-source-frame'),
         {
             'comprehension_source_frame.py': (
-                'from __future__ import strict\n' + _EAGER_COMPREHENSION_FRAME_SOURCE
+                '# soac: module(strict_assign=true, checked_attr=true)\n' + _EAGER_COMPREHENSION_FRAME_SOURCE
             ),
         },
         modules={'comprehension_source_frame': 'comprehension_source_frame.py'},
@@ -1500,7 +1500,7 @@ def strict_lambda_comprehension_frame_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp('strict-lambda-comprehension-frame'),
         {'lambda_comprehension_frame.py': (
-            'from __future__ import strict\n' + _LAMBDA_COMPREHENSION_FRAME_SOURCE
+            '# soac: module(strict_assign=true, checked_attr=true)\n' + _LAMBDA_COMPREHENSION_FRAME_SOURCE
         )},
         modules={'lambda_comprehension_frame': 'lambda_comprehension_frame.py'},
     )
@@ -1640,7 +1640,7 @@ def strict_nested_comprehension_binding_project(tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp('strict-nested-comprehension-binding'),
         {'nested_comprehension_binding.py': (
-            'from __future__ import strict\n' + _NESTED_COMPREHENSION_BINDING_SOURCE
+            '# soac: module(strict_assign=true, checked_attr=true)\n' + _NESTED_COMPREHENSION_BINDING_SOURCE
         )},
         modules={'nested_comprehension_binding': 'nested_comprehension_binding.py'},
     )
@@ -1842,7 +1842,7 @@ def strict_async_comprehension_semantics_project(request, tmp_path_factory):
     return create_strict_project(
         tmp_path_factory.mktemp('strict-async-comprehension-semantics'),
         {'async_comprehension_semantics.py': (
-            'from __future__ import strict\n' + _ASYNC_COMPREHENSION_SEMANTIC_SOURCE
+            '# soac: module(strict_assign=true, checked_attr=true)\n' + _ASYNC_COMPREHENSION_SEMANTIC_SOURCE
         )},
         modules={'async_comprehension_semantics': 'async_comprehension_semantics.py'},
         backend=getattr(request, 'param', 'soac'),

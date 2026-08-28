@@ -1,4 +1,5 @@
 # module:package
+# soac: package(strict_assign=true, checked_attr=true)
 
 """The module docstring survives strict opt-in."""; from .child import values
 
